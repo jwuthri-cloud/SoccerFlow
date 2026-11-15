@@ -43,6 +43,10 @@ Do this section, and steps 1 to 4 of section 4.1, by 16 Nov 2026 (`docs/PLAN.md`
 to-dos"). The owner does each step, or asks the assistant to do it. The assistant never commits
 or pushes without being asked.
 
+State on 14 Nov 2026: steps 1 to 3 are done. The owner chose a public repository
+(`docs/DECISIONS.md`, section "The code repository is public"). Its branch `main` holds the
+first build, and the branch `m1-first-build` is a pull request with the fixes of a review.
+
 1. Set the personal git identity for this repository only. The guard refuses a commit without
    both values.
 
@@ -53,12 +57,12 @@ or pushes without being asked.
 
 2. Make the first commit. A commit message has no co-author line (rule 10). The output of
    `git commit` must list the guard and the secret scan as passed.
-3. Make an empty private repository on a git host. Both machines need read and write access to
-   it. Put no token into the address of the remote. Add it as the remote and push the branch.
-   The two push hooks must pass.
+3. Make an empty repository on a git host. Both machines need read and write access to it.
+   Put no token into the address of the remote. Add it as the remote and push the branch. The
+   two push hooks must pass.
 
    ```bash
-   git remote add origin <address of the private repository>
+   git remote add origin <address of the repository>
    git push -u origin m1-first-build
    ```
 
@@ -95,7 +99,7 @@ the work tree and the scorer. So read each error.
 | # | Step | Done when |
 |---|---|---|
 | 1 | Install the tools: `git`, `uv`, `gitleaks` (version 8.30.1 or later), `pre-commit`, and the assistant. Keep about 45 GB of disk free | Each tool prints its version |
-| 2 | Clone the private repository and switch to the branch `m1-first-build` | `git status` shows a clean tree on that branch |
+| 2 | Clone the repository and switch to the branch `m1-first-build` (to `main` after its pull request is merged) | `git status` shows a clean tree on that branch |
 | 3 | Make the data folder: `mkdir -p ~/pitchvlm-data` | The folder exists, outside the repository |
 | 4 | Google AI Studio: a project with billing (paid tier only), a budget alert, an API key | The owner has the key. It is in no file |
 | 5 | Open a terminal in the top folder of the clone. Type the key with the first line of the prompt block of RUNBOOK section 1. Do not run its second line yet: the environment does not exist before step 6. Start the assistant from this terminal | The assistant runs `test -n "$GEMINI_API_KEY" && echo set`, and it prints `set` |
@@ -212,6 +216,9 @@ Only text goes back: metrics files, stored model answers, the cost ledger. They 
 files of the two specialist tools are written there too. Whether they travel is an open owner
 decision (`docs/DECISIONS.md`, last list).
 
+The remote `origin` is public since 14 Nov 2026. Do not push the branch `results` to it before
+the owner has decided where that branch goes (same list).
+
 1. On the run machine: `python -m pitchvlm.cli sync --results ../pitchvlm-results/results`. It
    checks the files and prints three git commands. It runs none of them.
 2. The owner runs the three commands.
@@ -246,12 +253,13 @@ does:
   probe and the pitch probe, without training and for free (RUNBOOK, section 3). A tool still
   replaces a Gemini step only after that step failed its gate.
 
-Nine decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
+Eleven decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
 of them wait for the first real answers: the label penalty of the tracker, the team-side rule
 with goalkeeper evidence, and the requests in flight at a budget stop. Four came with the
 measurement of the two specialist tools: its settings, the place of its run files, the work
 that lets the pipeline use a tool that passed its gate (not built, not budgeted), and the
-frames of gate G3.
+frames of gate G3. Two came with the public repository: where the branch `results` goes, and
+the licence of the repository.
 
 ## 12 Schedule after the handover
 

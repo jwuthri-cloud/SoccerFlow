@@ -590,8 +590,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    Apache-2.0; the model classes of its extension package have another licence and are not
    accepted by the experiment file. The code of PnLCalib is under GPL-2.0-or-later and its
    weights under CC BY 4.0. `tools/run_tool.py` imports code of the PnLCalib clone when it
-   runs. This repository is private. Before it is published, the owner checks what the licence
-   of PnLCalib means for that script (`docs/PLAN.md`, risks).
+   runs. The repository is public since 2026-11-14 (section "The code repository is public").
+   The check of what the licence of PnLCalib means for that script is still open
+   (`docs/PLAN.md`, risks).
 10. **Review of this change (2026-11-14).** Five reviews, each with one view (the package code,
     the script, the command line, the measurement, the documents), and a second reading of each
     finding. 50 findings, 48 confirmed: 6 major, 19 minor and 23 small ones. Repaired, each
@@ -619,6 +620,25 @@ Items 5 and 6 come from the checks of the change of item 4.
     with the settings of the experiment file. Named by the review and not built: the share of
     all frames within an error limit, by-view values per clip, and the limit for the
     reprojection error of PnLCalib (item 3).
+
+## 2026-11-14 — The code repository is public
+
+1. **The decision** (owner, 2026-11-14). The owner had the code pushed to a public repository
+   and asked for a pull request there. Before, the plan was "private for now" (first table of
+   this file). The branch `main` holds the first build. The fixes of the review of the tool
+   measurement are a pull request from the branch `m1-first-build`.
+2. **What follows for every commit.** A pushed commit is public at once and cannot be taken
+   back. So the rules 1 to 3 of `CLAUDE.md` now stand between a mistake and a public leak: the
+   guard and the secret scan must pass before every commit and every push, and no way around
+   them is allowed (rule 9).
+3. **What is open** (also in the last list of this file):
+   - The branch `results`. The RUNBOOK sends the text results (metrics, stored model answers,
+     the cost ledger) to the remote `origin`, which is public now. These files hold no pixels
+     and no label data. They hold the answers of the model for frames of the dataset, and the
+     dataset is for research use.
+   - The licence. The repository has no licence file. The code of PnLCalib is under
+     GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
+     means for the script was planned before publishing, and it is not done.
 
 ## Open questions (to settle with measurements)
 
@@ -695,3 +715,10 @@ Decisions for the owner that are open, each with its recommendation:
   Recommendation: keep the gate text, and add the run on the group `dev` with `--max-clips 3`
   for both engines when the values of the group `probe` are near a gate line; the frames of a
   gate are a part of the gate (rule 7).
+- **Branch `results` on a public remote** (section "The code repository is public").
+  Recommendation: do not push the branch `results` to the public remote before this is
+  decided. Keep it on the run machine, or give it a second remote that is private. The build
+  machine can read the files from either one.
+- **Licence of this repository.** It has no licence file, and one script imports GPL code of
+  another project when it runs. Recommendation: decide both before the two tools are installed
+  on the run machine (M2), and add a licence file.

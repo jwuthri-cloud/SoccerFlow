@@ -54,7 +54,7 @@ For code changes also: `docs/ARCHITECTURE.md` (module contracts), `configs/gates
    or a new branch on a commit that the remote has): run `python3 tools/guard.py --push` by
    hand before such a push.
 10. Commit only when the owner asks. Never push without being asked. A commit message has no
-    co-author line.
+    co-author line. The remote is public: a pushed commit cannot be taken back.
 
 ## How to work
 

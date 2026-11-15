@@ -583,6 +583,10 @@ Only text goes back: metrics files, stored model answers and the cost ledger. Th
 `../pitchvlm-results/results`. Videos, images, label files, `result.json` and prediction files
 stay in `~/pitchvlm-data`.
 
+The remote `origin` is public since 2026-11-14. A pushed result file is public at once. Do not
+push the branch `results` to that remote before the owner has decided where the branch goes
+(`docs/DECISIONS.md`, last list).
+
 ```bash
 python -m pitchvlm.cli sync --results ../pitchvlm-results/results
 ```

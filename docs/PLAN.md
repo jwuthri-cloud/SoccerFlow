@@ -293,6 +293,9 @@ be tested on the build machine; `doctor` is its first real test.
 - Before anything is published: use footage you have rights to, and review the licences of the
   fallback tools. The code of PnLCalib is under GPL-2.0-or-later, and `tools/run_tool.py` imports
   it when it runs; the weights of PnLCalib are under CC BY 4.0.
+- The code repository is public since 14 Nov 2026 (owner decision, `docs/DECISIONS.md`). The
+  licence review above is not done yet, and the repository has no licence file. No footage, no
+  dataset file and no video is in the repository, and none may go there.
 
 ## Key sources
 
