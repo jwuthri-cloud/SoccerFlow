@@ -1,0 +1,41 @@
+# Secret scan for every commit and every push.
+# The default rules know a Google API key in the old format (prefix AIza). The rules below add the
+# new format (prefix AQ.), keys with the sk- prefix and a Gemini key written as an assignment.
+#
+# A key can stand directly after the letter of an escape: in a JSON text a line break is written
+# as a backslash and the letter n. So the rule for the sk- prefix accepts such a letter before the
+# prefix. The rule for the AQ. prefix accepts every character before the prefix but a capital
+# letter: only a word in capitals can end with these two letters.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-sk-key"
+description = "API key with sk- prefix"
+regex = '''(?:\b|\\[abfnrtv])(sk-[a-zA-Z0-9_\-]{20,})(?:[\x60'"\s;]|\\[nr]|$)'''
+keywords = ["sk-"]
+
+[[rules]]
+id = "google-auth-key"
+description = "Google API key in the new format (prefix AQ.)"
+regex = '''(?:^|[^A-Z])(AQ\.[A-Za-z0-9_\-]{20,})'''
+keywords = ["aq."]
+
+[[rules]]
+id = "gemini-key-assignment"
+description = "Gemini or Google API key written as an assignment"
+regex = '''(?i)\b(?:GEMINI|GOOGLE)_API_KEY\s*[=:]\s*['"]?((?:AQ\.)?[A-Za-z0-9_\-]{20,})'''
+keywords = ["api_key", "API_KEY"]
+
+# A stored model answer (a cassette) is the file <clip>/<step>/<cache key>.json, and its first value
+# is that cache key: 32 hex digits. The default rule for generic keys reports this line, because its
+# name is "key". The cache key is a hash of the request and no secret, so this one line is allowed
+# in a cassette file. Any other value in a cassette, and the same line in any other file, is still
+# reported. Checked with gitleaks 8.30.1.
+[[allowlists]]
+description = "Cache key of a stored model answer: 32 hex digits in a cassette file."
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^\s*"key": "[0-9a-f]{32}",?\s*$''']
+paths = ['''(^|/)[^/]+/[^/]+/[0-9a-f]{32}\.json$''']

@@ -1,0 +1,45 @@
+# Environments and caches
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Lock files are machine-specific. The pinned list lives under locks/.
+uv.lock
+pylock*.toml
+
+# Settings of one machine: the deny-list of the guard and the local settings of an assistant.
+guard-deny.txt
+.claude/
+
+# Footage, datasets, crops, overlays and videos never enter the repository.
+local/
+data/
+outputs/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.zip
+*.tar
+*.gz
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/

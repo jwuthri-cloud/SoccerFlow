@@ -1,0 +1,10 @@
+# Measures the PnLCalib calibration (pretrained weights) on the frames of the pitch probe. It serves gate G3.
+name: pitch_probe_pnlcalib
+group: probe
+frames_per_clip: 5
+seed: 20261113
+tool:
+  name: pnlcalib
+  kp_threshold: 0.3434
+  line_threshold: 0.7867
+  pnl_refine: true

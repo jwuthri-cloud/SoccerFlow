@@ -1,0 +1,12 @@
+# Measures how often the number step reads the labelled shirt number from crops of labelled boxes. It serves gate G5a.
+name: number_probe
+probe: number
+group: probe
+tracks_per_clip: 17
+seed: 20261113
+repeat: 0
+step:
+  model: gemini-4-argon
+  thinking_level: low
+  resolution: low
+  service_tier: standard

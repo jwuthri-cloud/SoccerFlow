@@ -1,0 +1,91 @@
+# Default settings of the pipeline. They are the defaults of PipelineConfig in src/pitchvlm/config.py.
+# To change settings, copy this file and edit the copy.
+# A key that is left out of the copy keeps its default. This is also true inside a section: a key that is
+# left out of a step section keeps the default of that section (for example "resolution: low" in the number step).
+
+# Time between two keyframes, seconds (0.48 s is 12 frames at 25 frames per second).
+keyframe_interval_s: 0.48
+
+# Kit legend step: one request per clip that describes the kits of both teams.
+kit_legend:
+  # Model that answers the request.
+  model: gemini-4-argon
+  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  thinking_level: low
+  # Resolution at which the model reads the images: low, medium, high or ultra_high.
+  resolution: high
+  # Price tier: standard, or flex (half price, slower).
+  service_tier: standard
+
+# People step: one request per keyframe that finds every person.
+people:
+  # Model that answers the request.
+  model: gemini-4-argon
+  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  thinking_level: low
+  # Resolution at which the model reads the image: low, medium, high or ultra_high.
+  resolution: high
+  # Price tier: standard, or flex (half price, slower).
+  service_tier: standard
+
+# Landmarks step: one request per keyframe that points at the visible pitch landmarks.
+landmarks:
+  # Model that answers the request.
+  model: gemini-4-argon
+  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  thinking_level: low
+  # Resolution at which the model reads the frame: low, medium, high or ultra_high.
+  resolution: high
+  # Price tier: standard, or flex (half price, slower).
+  service_tier: standard
+
+# Number step: one request per track that reads the shirt number from enlarged crops.
+number:
+  # Model that answers the request.
+  model: gemini-4-argon
+  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  thinking_level: low
+  # Resolution at which the model reads the crops: low, medium, high or ultra_high.
+  resolution: low
+  # Price tier: standard, or flex (half price, slower).
+  service_tier: standard
+
+# Largest number of crops of one track in a number request.
+number_crops: 8
+
+# Enlargement of each crop before it is sent.
+crop_upscale: 4.0
+
+# RANSAC threshold of the landmark fit, image pixels.
+ransac_px: 8.0
+
+# A frame may borrow the pitch mapping of a keyframe that is at most this many frames away.
+max_gap_frames: 75
+
+# People who map further outside the pitch than this are dropped, metres.
+pitch_margin_m: 3.0
+
+# Limits for the matching of people between keyframes.
+tracking:
+  # Fastest plausible speed of a person on the pitch, metres per second.
+  max_speed_mps: 9.0
+  # Slack added to the distance that a person can reach, metres (covers mapping error).
+  reach_margin_m: 2.0
+  # Largest jump between the expected foot point of a track and a detection, in box heights.
+  max_image_jump: 2.5
+  # Cost added when role or team key differ from the vote of the track, in box heights, once more per missed keyframe.
+  mismatch_penalty: 0.5
+  # A track ends when it has missed more keyframes than this.
+  max_missed_keyframes: 4
+  # Longest time between two fragments that are joined, and longest time that the dense output fills, seconds.
+  max_stitch_gap_s: 3.0
+  # Speed that limits the distance between two fragments that are joined, metres per second.
+  stitch_speed_mps: 4.0
+  # Tracks with fewer observations are dropped before fragments are joined.
+  min_observations: 2
+
+# Largest number of model requests in flight at the same time, from 1 to 8.
+max_parallel: 4
+
+# Repeat index of the run. A repeat run uses 1, 2, ... so that the cache does not answer it.
+repeat: 0

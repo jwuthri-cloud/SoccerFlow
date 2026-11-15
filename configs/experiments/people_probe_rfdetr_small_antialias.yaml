@@ -1,0 +1,10 @@
+# Measures RF-DETR Small (pretrained weights, antialiased resize) on the frames of the people probe. It serves gate G2.
+name: people_probe_rfdetr_small_antialias
+group: probe
+frames_per_clip: 5
+seed: 20261113
+tool:
+  name: rfdetr
+  model: RFDETRSmall
+  min_score: 0.5
+  antialias: true

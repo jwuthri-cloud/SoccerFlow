@@ -1,0 +1,14 @@
+The image is one frame of a soccer broadcast.
+
+Kit legend of this match:
+{legend}
+
+Task: find every person on the pitch and next to the pitch.
+
+Rules:
+- Give one entry in "people" for each person: players, goalkeepers, referees, and other people next to the pitch, for example coaches, substitutes and staff. Include people who are small, far away or partly hidden. Do not include the spectators.
+- "box_2d": a tight box around the whole visible person, from the head to the feet. The feet must be inside the box. Format: [ymin, xmin, ymax, xmax]. Each value is an integer from 0 to 1000, normalised to the image: y goes from 0 at the top edge to 1000 at the bottom edge, and x goes from 0 at the left edge to 1000 at the right edge.
+- "role": "player" for an outfield player, "goalkeeper", "referee" for the referee and the assistant referees, or "other" for any other person.
+- "team": "A" or "B" from the kit legend, for players and goalkeepers. Use "none" for referees, for other people, and when the kit does not match a team.
+- "number": the shirt number, but only when you can read it clearly in this image. If you cannot, use null. Do not guess.
+- Decide by the colours of the kit only. Do not use faces and do not give names.

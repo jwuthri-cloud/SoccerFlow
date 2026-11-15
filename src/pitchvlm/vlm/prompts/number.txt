@@ -1,0 +1,15 @@
+Number of images: {n_crops}. Each image is an enlarged crop of the same person in one soccer broadcast clip, at a different moment. The person is in the centre of each crop.
+
+Kit legend of this match:
+{legend}
+
+The person belongs to {team}.
+
+Task: read the shirt number of this person.
+
+Rules:
+- "per_crop": one entry for each image, in the order of the images. Give the number that you can read clearly in that image. If you cannot, use null. The list must have exactly {n_crops} entries.
+- "number": the shirt number of the person, an integer from 0 to 99, decided from all images. Use null when no image shows the number clearly. Do not guess, and do not complete a number that is partly hidden.
+- "confidence": "high" when two or more images show the same number clearly, "medium" when one image shows it clearly, "low" in all other cases.
+- Read only the digits on the shirt or the shorts of this person. Ignore other people in the crop.
+- Use the kit only. Do not use faces and do not give names.

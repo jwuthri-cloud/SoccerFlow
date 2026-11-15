@@ -1,0 +1,44 @@
+# Public hosts that may appear in URLs inside this repository.
+# tools/guard.py reads this file for its [host] rule.
+#
+# Format: one bare host name per line, without a scheme and without a path.
+# A line that starts with "#" is a comment.
+# A line that starts with a dot allows every sub-domain: ".example.org" allows
+# "docs.example.org", but not "example.org" itself.
+# "localhost" and "127.0.0.1" are always allowed and are not listed here.
+
+# Source code and packages
+github.com
+raw.githubusercontent.com
+api.github.com
+pypi.org
+files.pythonhosted.org
+brew.sh
+
+# Models, datasets and papers
+huggingface.co
+arxiv.org
+doi.org
+zenodo.org
+roboflow.com
+playground.roboflow.com
+www.soccer-net.org
+
+# Google and Gemini
+aistudio.google.com
+ai.google.dev
+generativelanguage.googleapis.com
+deepmind.google
+policies.google.com
+cloud.google.com
+docs.cloud.google.com
+
+# Documentation
+docs.astral.sh
+docs.opencv.org
+docs.python.org
+docs.pydantic.dev
+
+# Video
+www.youtube.com
+youtu.be

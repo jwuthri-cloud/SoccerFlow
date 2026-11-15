@@ -1,0 +1,528 @@
+"""The four model steps: build each request and parse each answer.
+
+A builder returns a stateless request: the prompt text first, then the images.
+A parser turns the JSON answer of the model into a record of ``schemas.py``.
+
+What a parser does with a bad answer:
+
+- It raises ``ParseError`` when the answer is not a JSON object, or when a
+  required part is missing or has the wrong type. The required parts are the
+  lists (``people``, ``landmarks``, ``goalkeepers``, ``uncertain``,
+  ``per_crop``), the two team kits, ``referee_kit`` and ``confidence``.
+- It drops a bad entry of a list and keeps the other entries: a person with an
+  unusable box, role or team, a landmark with an unknown id or an unusable
+  point, a goalkeeper kit with no colour or an unknown team.
+- It turns a shirt number that is not an integer from 0 to 99 into None, also
+  inside ``per_crop``, so that the entries stay in the order of the crops. It
+  turns a view that is not a known view into None.
+- Coordinates outside 0-1000 are moved to the nearest limit by ``coords.py``.
+"""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import json
+import math
+import operator
+from collections.abc import Sequence
+from typing import Any, get_args
+
+import cv2
+import numpy as np
+
+from pitchvlm import pitch
+from pitchvlm.config import StepSettings
+from pitchvlm.schemas import (
+    ROLES,
+    Box,
+    Confidence,
+    FrameLandmarks,
+    FramePeople,
+    GoalkeeperKit,
+    KitDescription,
+    KitLegend,
+    LandmarkObs,
+    NumberReading,
+    PersonDet,
+    PitchView,
+    TeamKey,
+)
+from pitchvlm.vlm.coords import box_from_model, point_from_model
+from pitchvlm.vlm.prompts import PROMPT_NAMES, render_prompt
+from pitchvlm.vlm.types import ImagePart, RequestMeta, Resolution, TextPart, VLMRequest
+
+_TEAM_KEYS: tuple[str, ...] = get_args(TeamKey)
+_VIEWS: tuple[str, ...] = get_args(PitchView)
+_CONFIDENCES: tuple[str, ...] = get_args(Confidence)
+_KIT_PARTS: tuple[str, ...] = ("shirt", "shorts", "socks")
+#: How the number prompt names the team of the person in the crops.
+_TEAM_PHRASES: dict[str, str] = {"A": "team A", "B": "team B", "none": "an unknown team"}
+#: The pitch diagram has large dots and numbers, so a medium resolution is enough.
+_DIAGRAM_RESOLUTION: Resolution = "medium"
+#: A shirt-number crop is larger than the box of the person by this share of the box size, on every side.
+CROP_PADDING = 0.15
+
+
+class ParseError(ValueError):
+    """A model answer cannot be turned into a record."""
+
+
+def encode_jpeg(image: np.ndarray, quality: int = 90) -> bytes:
+    """Encode a BGR ``uint8`` image of shape (height, width, 3) as JPEG bytes."""
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3 or image.size == 0:
+        raise ValueError(f"expected a uint8 image of shape (height, width, 3), got {image.dtype} {image.shape}")
+    if not 1 <= quality <= 100:
+        raise ValueError(f"the JPEG quality must be from 1 to 100, got {quality}")
+    ok, encoded = cv2.imencode(".jpg", np.ascontiguousarray(image), [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+    if not ok:
+        raise ValueError("OpenCV could not encode the image as JPEG")
+    return encoded.tobytes()
+
+
+# --- Answer schemas ----------------------------------------------------------
+# Each function returns a new dict, so that a request never shares its schema.
+
+
+def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
+    """Return the schema of an object in which every listed key is required."""
+    return {"type": "object", "properties": properties, "required": list(properties)}
+
+
+def _list_schema(items: dict[str, Any], length: int | None = None) -> dict[str, Any]:
+    """Return the schema of a list. ``length`` fixes the number of entries."""
+    schema: dict[str, Any] = {"type": "array", "items": items}
+    if length is not None:
+        schema["minItems"] = length
+        schema["maxItems"] = length
+    return schema
+
+
+def _text_schema() -> dict[str, Any]:
+    return {"type": "string"}
+
+
+def _choice_schema(values: Sequence[str]) -> dict[str, Any]:
+    return {"type": "string", "enum": list(values)}
+
+
+def _integer_schema() -> dict[str, Any]:
+    return {"type": "integer"}
+
+
+def _integer_or_null_schema() -> dict[str, Any]:
+    return {"type": ["integer", "null"]}
+
+
+def _kit_schema() -> dict[str, Any]:
+    return _object_schema({part: _text_schema() for part in _KIT_PARTS})
+
+
+def _kit_legend_schema() -> dict[str, Any]:
+    goalkeeper = _object_schema({"kit": _text_schema(), "team": _choice_schema(_TEAM_KEYS)})
+    return _object_schema(
+        {
+            "team_a": _kit_schema(),
+            "team_b": _kit_schema(),
+            "goalkeepers": _list_schema(goalkeeper),
+            "referee_kit": _text_schema(),
+            "uncertain": _list_schema(_text_schema()),
+        }
+    )
+
+
+def _people_schema() -> dict[str, Any]:
+    person = _object_schema(
+        {
+            "box_2d": _list_schema(_integer_schema(), length=4),
+            "role": _choice_schema(ROLES),
+            "team": _choice_schema(_TEAM_KEYS),
+            "number": _integer_or_null_schema(),
+        }
+    )
+    return _object_schema({"people": _list_schema(person)})
+
+
+def _landmarks_schema() -> dict[str, Any]:
+    landmark = _object_schema({"id": _integer_schema(), "point": _list_schema(_integer_schema(), length=2)})
+    return _object_schema({"view": _choice_schema(_VIEWS), "landmarks": _list_schema(landmark)})
+
+
+def _number_schema(n_crops: int) -> dict[str, Any]:
+    return _object_schema(
+        {
+            "per_crop": _list_schema(_integer_or_null_schema(), length=n_crops),
+            "number": _integer_or_null_schema(),
+            "confidence": _choice_schema(_CONFIDENCES),
+        }
+    )
+
+
+# --- Request builders --------------------------------------------------------
+
+
+def _image_part(image: np.ndarray, resolution: Resolution) -> ImagePart:
+    return ImagePart(data=encode_jpeg(image), resolution=resolution)
+
+
+@functools.cache
+def _diagram_jpeg() -> bytes:
+    """Return the numbered pitch diagram as JPEG bytes. It never changes, so it is drawn once."""
+    return encode_jpeg(pitch.draw_landmark_diagram())
+
+
+def _request(
+    *,
+    text: str,
+    images: Sequence[ImagePart],
+    schema: dict[str, Any],
+    meta: RequestMeta,
+    settings: StepSettings,
+    context: dict[str, Any],
+) -> VLMRequest:
+    """Assemble a request: the text part first, then the images in their order."""
+    return VLMRequest(
+        model=settings.model,
+        thinking_level=settings.thinking_level,
+        parts=(TextPart(text=text), *images),
+        response_schema=schema,
+        prompt_name=PROMPT_NAMES[meta.step],
+        meta=meta,
+        service_tier=settings.service_tier,
+        context=context,
+    )
+
+
+def build_kit_legend_request(
+    images: Sequence[np.ndarray], *, clip_id: str, settings: StepSettings, repeat: int = 0
+) -> VLMRequest:
+    """Build the request for the kit colours of a clip. ``images`` are a few frames of the clip."""
+    if len(images) == 0:
+        raise ValueError("the kit legend request needs at least one image")
+    return _request(
+        text=render_prompt("kit_legend", n_images=len(images)),
+        images=[_image_part(image, settings.resolution) for image in images],
+        schema=_kit_legend_schema(),
+        meta=RequestMeta(clip_id=clip_id, step="kit_legend", repeat=repeat),
+        settings=settings,
+        context={},
+    )
+
+
+def build_people_request(
+    image: np.ndarray,
+    legend: KitLegend,
+    *,
+    clip_id: str,
+    frame: int,
+    settings: StepSettings,
+    repeat: int = 0,
+    item: str | None = None,
+) -> VLMRequest:
+    """Build the request for the people in one frame.
+
+    ``item`` names a part of the frame, for example one tile, when a frame is
+    sent in several requests.
+    """
+    return _request(
+        text=render_prompt("people", legend=legend.prompt_text()),
+        images=[_image_part(image, settings.resolution)],
+        schema=_people_schema(),
+        meta=RequestMeta(clip_id=clip_id, step="people", frame=frame, item=item, repeat=repeat),
+        settings=settings,
+        context={},
+    )
+
+
+def build_landmarks_request(
+    image: np.ndarray, *, clip_id: str, frame: int, settings: StepSettings, repeat: int = 0
+) -> VLMRequest:
+    """Build the request for the pitch landmarks in one frame.
+
+    The request has two images: first the numbered pitch diagram, then the frame.
+    """
+    diagram = ImagePart(data=_diagram_jpeg(), resolution=_DIAGRAM_RESOLUTION)
+    return _request(
+        text=render_prompt("landmarks", landmark_list=pitch.landmark_legend_text()),
+        images=[diagram, _image_part(image, settings.resolution)],
+        schema=_landmarks_schema(),
+        meta=RequestMeta(clip_id=clip_id, step="landmarks", frame=frame, repeat=repeat),
+        settings=settings,
+        context={},
+    )
+
+
+def crop_rect(box: Box, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """Return the pixel area of the shirt-number crop of a box: ``(left, top, right, bottom)``.
+
+    ``width`` and ``height`` are the size of the frame. The box gets the
+    padding ``CROP_PADDING`` on every side, is widened to whole pixels and is
+    cut at the image border. Rows ``top`` to ``bottom - 1`` and columns
+    ``left`` to ``right - 1`` of the frame are the crop. The result is None
+    when no pixel is left, because the box lies outside the image.
+
+    Every crop of a number request must be cut with this function: the item
+    of the request is made from the same pixel areas.
+    """
+    pad_x, pad_y = CROP_PADDING * box.width, CROP_PADDING * box.height
+    left, right = max(math.floor(box.x1 - pad_x), 0), min(math.ceil(box.x2 + pad_x), width)
+    top, bottom = max(math.floor(box.y1 - pad_y), 0), min(math.ceil(box.y2 + pad_y), height)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _number_item(
+    track_id: int | None, frames: Sequence[int], rects: Sequence[tuple[int, int, int, int]], crop_upscale: float
+) -> str:
+    """Return the item of a number request: a hash of what its crops show, after the track id when there is one.
+
+    The cache key of a request sees the item and not the pixels. The hash is
+    made from the frames, the pixel areas and the enlargement of the crops.
+    So a stored answer is used again only for the same crops.
+
+    Without a track id the item is ``crops-<16 hex digits>``: the same crops
+    find their stored answer whatever id their track has. With a track id the
+    item is ``track-<id>-<8 hex digits>``: the id is part of the cache key,
+    so it must be a lasting name of the track.
+    """
+    facts = {"frames": list(frames), "rects": [list(rect) for rect in rects], "upscale": float(crop_upscale)}
+    digest = hashlib.sha256(json.dumps(facts, sort_keys=True).encode("utf-8")).hexdigest()
+    if track_id is None:
+        return f"crops-{digest[:16]}"
+    return f"track-{track_id}-{digest[:8]}"
+
+
+def build_number_request(
+    crops: Sequence[np.ndarray],
+    legend: KitLegend,
+    team_key: TeamKey,
+    *,
+    clip_id: str,
+    track_id: int | None,
+    crop_frames: Sequence[int],
+    crop_boxes: Sequence[Box],
+    image_size: tuple[int, int],
+    crop_upscale: float,
+    settings: StepSettings,
+    repeat: int = 0,
+) -> VLMRequest:
+    """Build the request for the shirt number of one track from several crops of it.
+
+    ``crops`` are the pictures that are sent: each one is cut out of its frame
+    at ``crop_rect`` of its box and then enlarged by ``crop_upscale``.
+    ``crop_frames`` and ``crop_boxes`` say where each crop comes from. They go
+    into the request context, not to the model. The context is part of the
+    cache key, and fake backends read it. A stored answer keeps the frames
+    and not the boxes (``VLMRequest.stored_context``).
+
+    ``track_id`` must be a lasting name of the track, for example the track
+    id of a label file, or None. A track id of the pipeline is no lasting
+    name: it is a place in the track list, and it changes with the tracking
+    code and its settings. So the pipeline gives None.
+
+    The item of the request is ``crops-<16 hex digits>`` without a track id
+    and ``track-<id>-<8 hex digits>`` with one. The digits are a hash of the
+    crop frames, of the pixel areas of the crops and of the enlargement.
+    ``image_size`` is the ``(width, height)`` of the frames; it gives the
+    pixel areas (``crop_rect``). The context alone does not tell two
+    enlargements apart, and the cache key sees no pixels, so the item does.
+    A box that lies outside the image raises ``ValueError``.
+    """
+    if len(crops) == 0:
+        raise ValueError("the number request needs at least one crop")
+    if not len(crops) == len(crop_frames) == len(crop_boxes):
+        raise ValueError(
+            f"got {len(crops)} crops, {len(crop_frames)} crop frames and {len(crop_boxes)} crop boxes: "
+            "the three counts must be equal"
+        )
+    if team_key not in _TEAM_PHRASES:
+        raise ValueError(f"unknown team key: {team_key!r}")
+    if not 0.0 < crop_upscale < math.inf:
+        raise ValueError(f"the enlargement of the crops must be a finite number above 0, got {crop_upscale}")
+    width, height = image_size
+    frames = [operator.index(frame) for frame in crop_frames]
+    rects: list[tuple[int, int, int, int]] = []
+    for frame, box in zip(frames, crop_boxes, strict=True):
+        rect = crop_rect(box, width, height)
+        if rect is None:
+            raise ValueError(
+                f"the box of the crop of frame {frame} ({box}) lies outside the image of {width} x {height} pixels"
+            )
+        rects.append(rect)
+    context = {"frames": frames, "boxes": [[box.x1, box.y1, box.x2, box.y2] for box in crop_boxes]}
+    return _request(
+        text=render_prompt(
+            "number", n_crops=len(crops), legend=legend.prompt_text(), team=_TEAM_PHRASES[team_key]
+        ),
+        images=[_image_part(crop, settings.resolution) for crop in crops],
+        schema=_number_schema(len(crops)),
+        meta=RequestMeta(
+            clip_id=clip_id, step="number", item=_number_item(track_id, frames, rects, crop_upscale), repeat=repeat
+        ),
+        settings=settings,
+        context=context,
+    )
+
+
+# --- Answer parsers ----------------------------------------------------------
+
+
+def _load_object(text: str) -> dict[str, Any]:
+    """Read the answer text as a JSON object."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ParseError(f"the answer is not valid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise ParseError(f"the answer must be a JSON object, got {type(data).__name__}")
+    return data
+
+
+def _list_field(data: dict[str, Any], key: str) -> list[Any]:
+    """Return the list under ``key``. The list is required."""
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise ParseError(f'the answer needs a list under "{key}"')
+    return value
+
+
+def _is_finite_number(value: object) -> bool:
+    """Say whether a JSON value is a number that can be a coordinate. A truth value is not."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _coordinates(value: object, count: int) -> list[float] | None:
+    """Return the value when it is a list of ``count`` numbers, else None."""
+    if not isinstance(value, list) or len(value) != count:
+        return None
+    if not all(_is_finite_number(entry) for entry in value):
+        return None
+    return value
+
+
+def _shirt_number(value: object) -> int | None:
+    """Return the value when it is an integer from 0 to 99, else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 99:
+        return value
+    return None
+
+
+def _is_landmark_id(value: object) -> bool:
+    """Say whether a JSON value is the id of a landmark of the pitch table."""
+    return isinstance(value, int) and not isinstance(value, bool) and value in pitch.LANDMARK_BY_ID
+
+
+def _kit_description(data: dict[str, Any], key: str) -> KitDescription:
+    """Read the kit of one team. The kit and its three colour texts are required."""
+    kit = data.get(key)
+    if not isinstance(kit, dict) or not all(isinstance(kit.get(part), str) for part in _KIT_PARTS):
+        raise ParseError(f'the answer needs "{key}" with the texts shirt, shorts and socks')
+    return KitDescription(shirt=kit["shirt"], shorts=kit["shorts"], socks=kit["socks"])
+
+
+def _goalkeeper_kit(item: object) -> GoalkeeperKit | None:
+    """Build one goalkeeper kit, or return None when the colour or the team is not usable."""
+    if not isinstance(item, dict):
+        return None
+    kit, team = item.get("kit"), item.get("team")
+    if not isinstance(kit, str) or not kit.strip() or team not in _TEAM_KEYS:
+        return None
+    return GoalkeeperKit(kit=kit, team_key=team)
+
+
+def _person(item: object, width: int, height: int) -> PersonDet | None:
+    """Build one person, or return None when the box, the role or the team is not usable."""
+    if not isinstance(item, dict):
+        return None
+    coordinates = _coordinates(item.get("box_2d"), 4)
+    role, team = item.get("role"), item.get("team")
+    if coordinates is None or role not in ROLES or team not in _TEAM_KEYS:
+        return None
+    box = box_from_model(coordinates, width, height)
+    if box is None:
+        return None
+    return PersonDet(box=box, role=role, team_key=team, number=_shirt_number(item.get("number")))
+
+
+def _landmark(item: object, width: int, height: int) -> LandmarkObs | None:
+    """Build one landmark observation, or return None when the id or the point is not usable."""
+    if not isinstance(item, dict):
+        return None
+    landmark_id = item.get("id")
+    coordinates = _coordinates(item.get("point"), 2)
+    if coordinates is None or not _is_landmark_id(landmark_id):
+        return None
+    x, y = point_from_model(coordinates, width, height)
+    return LandmarkObs(landmark_id=landmark_id, x=x, y=y)
+
+
+def parse_kit_legend(text: str) -> KitLegend:
+    """Turn the answer of the kit legend request into a ``KitLegend``.
+
+    The answer key ``team`` of a goalkeeper becomes ``team_key``. Goalkeeper
+    kits and notes that are not usable are dropped.
+    """
+    data = _load_object(text)
+    referee_kit = data.get("referee_kit")
+    if not isinstance(referee_kit, str):
+        raise ParseError('the answer needs a text under "referee_kit"')
+    goalkeepers = (_goalkeeper_kit(item) for item in _list_field(data, "goalkeepers"))
+    notes = (note for note in _list_field(data, "uncertain") if isinstance(note, str) and note.strip())
+    return KitLegend(
+        team_a=_kit_description(data, "team_a"),
+        team_b=_kit_description(data, "team_b"),
+        goalkeepers=tuple(keeper for keeper in goalkeepers if keeper is not None),
+        referee_kit=referee_kit,
+        uncertain=tuple(notes),
+    )
+
+
+def parse_people(text: str, *, frame: int, width: int, height: int) -> FramePeople:
+    """Turn the answer of the people request into a ``FramePeople`` with boxes in pixels.
+
+    ``width`` and ``height`` are the size of the image that was sent. The answer
+    key ``team`` becomes ``team_key``. A person with a bad box, role or team is
+    dropped. A number that is not an integer from 0 to 99 becomes None.
+    """
+    data = _load_object(text)
+    people = (_person(item, width, height) for item in _list_field(data, "people"))
+    return FramePeople(frame=frame, people=tuple(person for person in people if person is not None))
+
+
+def parse_landmarks(text: str, *, frame: int, width: int, height: int) -> FrameLandmarks:
+    """Turn the answer of the landmarks request into a ``FrameLandmarks`` with points in pixels.
+
+    ``width`` and ``height`` are the size of the frame that was sent, not of the
+    diagram. A landmark with an unknown id or a bad point is dropped. A view that
+    is not a known view becomes None.
+    """
+    data = _load_object(text)
+    view = data.get("view")
+    landmarks = (_landmark(item, width, height) for item in _list_field(data, "landmarks"))
+    return FrameLandmarks(
+        frame=frame,
+        view=view if view in _VIEWS else None,
+        landmarks=tuple(landmark for landmark in landmarks if landmark is not None),
+    )
+
+
+def parse_number(text: str) -> NumberReading:
+    """Turn the answer of the number request into a ``NumberReading``.
+
+    ``per_crop`` keeps one entry for each crop, in order. An entry or a final
+    number that is not an integer from 0 to 99 becomes None.
+    """
+    data = _load_object(text)
+    confidence = data.get("confidence")
+    if confidence not in _CONFIDENCES:
+        raise ParseError(f'the answer needs "confidence" as one of {", ".join(_CONFIDENCES)}')
+    return NumberReading(
+        per_crop=tuple(_shirt_number(value) for value in _list_field(data, "per_crop")),
+        number=_shirt_number(data.get("number")),
+        confidence=confidence,
+    )

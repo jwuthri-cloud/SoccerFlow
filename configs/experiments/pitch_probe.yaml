@@ -1,0 +1,12 @@
+# Measures the pitch mapping from the landmarks step on the frames of the people probe. It serves gate G3.
+name: pitch_probe
+probe: pitch
+group: probe
+frames_per_clip: 5
+seed: 20261113
+repeat: 0
+step:
+  model: gemini-4-argon
+  thinking_level: low
+  resolution: high
+  service_tier: standard

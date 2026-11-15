@@ -1,0 +1,12 @@
+# Measures the people step on labelled frames: recall, precision, small boxes, foot-point error. It serves gate G2.
+name: people_probe
+probe: people
+group: probe
+frames_per_clip: 5
+seed: 20261113
+repeat: 0
+step:
+  model: gemini-4-argon
+  thinking_level: low
+  resolution: high
+  service_tier: standard

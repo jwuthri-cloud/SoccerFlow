@@ -1,0 +1,39 @@
+[project]
+name = "pitchvlm"
+version = "0.1.0"
+description = "Soccer broadcast clip to annotated video and 2D pitch radar, driven by a vision language model."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "scipy>=1.13",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# The model SDK is needed only on the machine that calls the API. The client asks the SDK for one
+# HTTP attempt per call (attempts=1) and repeats a failed call itself. Before version 3.0 the SDK
+# read that value as the number of repeats, so one more attempt was hidden.
+gemini = ["google-genai>=3.0,<4"]
+
+[project.scripts]
+pitchvlm = "pitchvlm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pitchvlm"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+# Supply-chain cooldown: never resolve a release younger than 7 days.
+exclude-newer = "7 days"
