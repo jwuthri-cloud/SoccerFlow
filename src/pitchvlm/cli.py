@@ -21,7 +21,8 @@ other error). So the exit code 1 never comes from an error. An error ends with a
 ``error: ...`` on the standard error stream. An error that can be a fault of the code also
 shows its traceback before that line. A wrong settings file, roster file, label file or
 experiment file is wrong input: the line names the file and the fault, and no traceback is
-printed.
+printed. The same holds for a split list, for a run file of an external tool, and for a clip
+folder whose frames do not fit its label file (``probe``, ``tool-job``, ``tool-score``).
 
 The standard output is written line by line, also into a pipe or a file. So the cost
 estimate and the budget line of a paid command can be read before its first model call,
@@ -69,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -187,6 +189,8 @@ RESULTS_FOLDER = "results"
 CACHE_FOLDER = "cache"
 #: Folder of the run files of external tools below the results folder (docs/RUNBOOK.md, section 3).
 TOOL_RUNS_FOLDER = "tools"
+#: The script that runs an external tool, below the top folder of the repository.
+TOOL_SCRIPT = Path("tools") / "run_tool.py"
 #: Name of the first file of the cost ledger inside the cache folder. The later files are
 #: ledger-0002.jsonl and so on (``vlm.cost.ledger_file_number``).
 LEDGER_NAME = "ledger.jsonl"
@@ -975,20 +979,35 @@ def clips_of_split(root: Path, split: str, wanted: Sequence[str] | None) -> list
 def dataset_clip(root: Path, split: str, clip: str) -> tuple[ImageFolderSource, GsrLabels]:
     """Open the frames and the labels of one clip of the dataset: ``root/SoccerNetGS-<split>/<clip>``.
 
-    The frame rate comes from the label file.
+    The frame rate comes from the label file. A frame folder with a file that is no frame
+    file raises ``CliError`` with the clip folder.
     """
     folder = split_dir(root, split) / clip
     labels = read_labels(folder / LABEL_FILE_NAME)
-    return ImageFolderSource(folder / FRAME_FOLDER, clip, labels.fps), labels
+    try:
+        source = ImageFolderSource(folder / FRAME_FOLDER, clip, labels.fps)
+    except ValueError as error:
+        raise CliError(f"the clip folder {folder} cannot be used: {error}") from error
+    return source, labels
+
+
+def matched_clip(source: FrameSource, labels: GsrLabels, folder: Path) -> LabelledClip:
+    """Join the frames and the labels of one clip of the dataset.
+
+    Frames and labels that do not belong together (another clip id, another number of
+    frames, another image size) raise ``CliError`` with the clip folder: the cause lies in
+    the data folder, for example a clip that was not extracted to its end.
+    """
+    try:
+        return LabelledClip(source=source, labels=labels)
+    except ValueError as error:
+        raise CliError(f"the clip folder {folder} cannot be used: {error}") from error
 
 
 def labelled_clip(root: Path, split: str, clip: str) -> LabelledClip:
-    """Open one clip of the dataset with its labels (``dataset_clip``).
-
-    ``ValueError`` is raised when the frames and the labels do not belong together.
-    """
+    """Open one clip of the dataset with its labels (``dataset_clip``, ``matched_clip``)."""
     source, labels = dataset_clip(root, split, clip)
-    return LabelledClip(source=source, labels=labels)
+    return matched_clip(source, labels, split_dir(root, split) / clip)
 
 
 def disk_spelling(path: Path) -> Path:
@@ -1885,7 +1904,8 @@ def _experiment_data(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     except OSError as error:
         raise CliError(f"the experiment file {path} cannot be read: {error}") from error
-    except yaml.YAMLError as error:
+    except (ValueError, yaml.YAMLError) as error:
+        # A ValueError comes from bytes that are not UTF-8 text and from a value that YAML cannot build.
         raise wrong_file("experiment file", path, error) from error
     if not isinstance(data, dict):
         raise CliError(f"{path}: the top level of an experiment file must be a mapping")
@@ -1944,12 +1964,16 @@ class GroupClips:
 def clips_of_group(args: argparse.Namespace, group: str) -> GroupClips:
     """Find the clips of a group in the split list of a command (``--manifest``, ``--max-clips``).
 
-    ``CliError`` is raised when the split list is missing and when the group holds no clip.
+    ``CliError`` is raised when the split list is missing, when it is no JSON object and
+    when the group holds no clip.
     """
     manifest_path = args.manifest if args.manifest is not None else repository_root() / SPLIT_LIST_FILE
     if not manifest_path.is_file():
         raise CliError(f"the split list {manifest_path} does not exist: write it with the data command")
-    manifest = load_manifest(manifest_path)
+    try:
+        manifest = load_manifest(manifest_path)
+    except ValueError as error:
+        raise wrong_file("split list", manifest_path, error) from error
     split, clip_names = group_clips(manifest, group)
     if args.max_clips is not None:
         clip_names = clip_names[: args.max_clips]
@@ -1959,10 +1983,16 @@ def clips_of_group(args: argparse.Namespace, group: str) -> GroupClips:
 
 
 def print_main_metric(payload: Mapping[str, Any]) -> None:
-    """Print the main metric of a measurement: its mean over the clips and the interval of the mean."""
+    """Print the main metric of a measurement: its mean over the clips and the interval of the mean.
+
+    The line names the clips that have a value and all clips of the measurement. A clip
+    without a value is left out of the mean: for a pitch measurement that is a clip
+    without any mapping.
+    """
     metric = payload["main_metric"]
     print(
-        f"main metric {metric['name']}: mean {metric['mean']:.3f} over {metric['n_clips']} clips "
+        f"main metric {metric['name']}: mean {metric['mean']:.3f} over {metric['n_clips']} of "
+        f"{payload['n_clips']} clips "
         f"({metric['confidence']:.0%} interval from {metric['low']:.3f} to {metric['high']:.3f})"
     )
 
@@ -2081,6 +2111,7 @@ def _cmd_tool_job(args: argparse.Namespace) -> int:
     frames per clip and seed (``probes.probe_frames``). The job file names each image by
     its path below the data folder. The script ``tools/run_tool.py`` reads the job file.
     """
+    refuse_input_as_output(args.out, {"--experiment": args.experiment})
     experiment = load_tool_experiment(args.experiment)
     group = clips_of_group(args, experiment.group)
     sources: dict[str, ImageFolderSource] = {}
@@ -2088,8 +2119,8 @@ def _cmd_tool_job(args: argparse.Namespace) -> int:
     for clip in group.clips:
         source, labels = dataset_clip(args.root, group.split, clip)
         sources[clip] = source
-        clips.append(LabelledClip(source=source, labels=labels))
-    chosen = probes.probe_frames(clips, frames_per_clip=experiment.frames_per_clip, seed=experiment.seed)
+        clips.append(matched_clip(source, labels, split_dir(args.root, group.split) / clip))
+    chosen = frames_of_probe(clips, experiment)
     frames = tuple(
         JobFrame(clip=clip, frame=frame, image=sources[clip].path(frame).relative_to(args.root).as_posix())
         for clip, clip_frames in chosen.items()
@@ -2103,6 +2134,60 @@ def _cmd_tool_job(args: argparse.Namespace) -> int:
     )
     print(f"job file: {args.out}")
     return EXIT_OK
+
+
+def refuse_input_as_output(out: Path, inputs: Mapping[str, Path]) -> None:
+    """Raise ``CliError`` when the output file of a command is one of its input files.
+
+    ``inputs`` maps the option of each input file to its path. The command would replace
+    its input: for ``tool-score`` the answers of the tool would be gone.
+    """
+    for option, path in inputs.items():
+        if out.resolve() == path.resolve():
+            raise CliError(f"--out names the same file as {option} ({out}): the command would replace its input")
+
+
+def frames_of_probe(clips: Sequence[LabelledClip], experiment: ToolExperiment) -> dict[str, list[int]]:
+    """Return the frames of the probe of a tool experiment, by clip id (``probes.probe_frames``).
+
+    ``CliError`` is raised when the frames cannot be chosen: a clip whose labels have no
+    scored frame, or a group of the split list that names a clip two times.
+    """
+    try:
+        return probes.probe_frames(clips, frames_per_clip=experiment.frames_per_clip, seed=experiment.seed)
+    except ValueError as error:
+        raise CliError(f"the frames of the probe cannot be chosen: {error}") from error
+
+
+def file_sha256(path: Path) -> str:
+    """Return the SHA-256 of a file as hexadecimal text."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def print_axis_check(check: Mapping[str, float]) -> int:
+    """Print the axis check of a pitch measurement and return the exit code that it gives.
+
+    The check passes when the matrices as they are give the smallest median error of the
+    four sign changes (``probes.AXIS_SIGNS``). Then the result is ``EXIT_OK``, and the size
+    of the value is for the reader: it must be small, some metres at most. When another
+    sign change gives a smaller error, a line says what that can mean, and the result is
+    ``EXIT_FAILED``. Without any frame with a mapping nothing can be compared: ``EXIT_OK``.
+    """
+    print("axis check, median error in m: " + ", ".join(f"{name} {value:.3f}" for name, value in check.items()))
+    finite = {name: value for name, value in check.items() if math.isfinite(value)}
+    if not finite:
+        print("axis check: no frame has a mapping, so nothing can be compared")
+        return EXIT_OK
+    smallest = min(finite, key=finite.__getitem__)
+    if finite.get("as_given") == finite[smallest]:
+        return EXIT_OK
+    print(
+        f"axis check failed: {smallest} gives a smaller error than as_given. Either the matrices of the run "
+        "file are in another pitch convention: then that value is small (about 1 m) and tools/run_tool.py has "
+        "a fault. Or the cameras are wrong on most frames: then all four values are large. Read docs/RUNBOOK.md, "
+        "section 3, before any other value of the metrics file"
+    )
+    return EXIT_FAILED
 
 
 def read_tool_run(path: Path) -> ToolRun:
@@ -2207,14 +2292,20 @@ def _cmd_tool_score(args: argparse.Namespace) -> int:
     No model is called and nothing is paid. The metrics file holds the values of the probe
     (``probes.score_people_answers`` or ``probes.score_pitch_mappings``) and
     ``seconds_per_frame``: the time that the tool needed for each measured frame, as the
-    run file reports it.
+    run file reports it. Its provenance names the run file with its SHA-256, and it says
+    whether the script that made the run file is the ``tools/run_tool.py`` of this work
+    tree, so that the commit of the code also names the script.
+
+    For a pitch measurement the command prints the axis check (``print_axis_check``). When
+    the check fails, the metrics file is written and the exit code is 1.
     """
+    refuse_input_as_output(args.out, {"--experiment": args.experiment, "--run": args.run})
     experiment = load_tool_experiment(args.experiment)
     state = require_clean_tree(args.allow_dirty)
     group = clips_of_group(args, experiment.group)
     clips = [labelled_clip(args.root, group.split, clip) for clip in group.clips]
     run = read_tool_run(args.run)
-    frames = probes.probe_frames(clips, frames_per_clip=experiment.frames_per_clip, seed=experiment.seed)
+    frames = frames_of_probe(clips, experiment)
     answers = probe_answers(run, experiment, frames, args.run)
     print(
         f"{experiment.probe} probe {experiment.name} of the tool {experiment.tool.name}: {len(answers)} frames of "
@@ -2226,6 +2317,12 @@ def _cmd_tool_score(args: argparse.Namespace) -> int:
     measured = score_tool(experiment, clips, answers, load_gates(), args.run)
     seconds = np.array([answer.seconds for answer in answers.values()], dtype=np.float64)
     payload = {**measured, "seconds_per_frame": summarize(seconds)}
+    script_is_current = run.runner.get("script_sha256") == file_sha256(repository_root() / TOOL_SCRIPT)
+    if not script_is_current:
+        print(
+            f"the run file was not made by the {TOOL_SCRIPT.as_posix()} of this work tree: "
+            "the commit of the metrics file does not name the script that ran the tool"
+        )
     provenance = {
         "command": "tool-score",
         "commit": state.commit,
@@ -2239,14 +2336,17 @@ def _cmd_tool_score(args: argparse.Namespace) -> int:
         "max_clips": args.max_clips,
         "clips": group.clips,
         "run_file": args.run.name,
+        "run_file_sha256": file_sha256(args.run),
         "runner": run.runner,
+        "script_is_current": script_is_current,
         "n_answers_not_used": n_not_used,
     }
     write_metrics(args.out, payload, provenance=provenance)
     print_main_metric(payload)
+    code = print_axis_check(payload["axis_check"]) if "axis_check" in payload else EXIT_OK
     print(f"tool time per frame: median {payload['seconds_per_frame']['median']:.3f} s")
     print(f"metrics file: {args.out}")
-    return EXIT_OK
+    return code
 
 
 # --- eval ----------------------------------------------------------------------------
@@ -2398,11 +2498,13 @@ def secret_scan_findings(work_tree: Path, folder: Path) -> list[str] | None:
     return [line for line in completed.stdout.splitlines() if line.strip()]
 
 
-def print_result_listing(folder: Path, files: Sequence[Path]) -> None:
+def print_result_listing(folder: Path, files: Sequence[Path], work_tree: Path) -> None:
     """Print the text result files of a folder: cassettes by folder, every other file by name.
 
-    A file in a folder with the name ``tools`` is listed as a run file of an external tool, a
-    ledger file as a cost ledger, and any other file as a metrics file.
+    A ledger file is listed as a cost ledger. A file below a folder with the name ``tools``
+    is listed as a run file of an external tool: the folders are counted from the top of
+    the work tree, so the listing of the folder ``tools`` itself names its files right.
+    Any other file is listed as a metrics file.
     """
     cassettes: Counter[str] = Counter()
     print(f"{len(files)} text result files below {folder}:")
@@ -2413,7 +2515,7 @@ def print_result_listing(folder: Path, files: Sequence[Path]) -> None:
             continue
         if ledger_file_number(LEDGER_NAME, path.name) is not None:
             kind = "cost ledger"
-        elif relative.parent.name == TOOL_RUNS_FOLDER:
+        elif TOOL_RUNS_FOLDER in path.relative_to(work_tree).parent.parts:
             kind = "tool run"
         else:
             kind = "metrics"
@@ -2464,7 +2566,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     if not files:
         raise CliError(f"{folder} holds no result file")
     work_tree = results_work_tree(folder)
-    print_result_listing(folder, files)
+    print_result_listing(folder, files, work_tree)
     violations = guard_violations(work_tree, files)
     if violations:
         print(f"The guard refuses {len(violations)} places. No git command is printed.")

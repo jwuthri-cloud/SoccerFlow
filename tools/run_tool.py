@@ -18,7 +18,11 @@ and it does not import pitchvlm. It needs Python 3.10 or newer.
 the device name of PyTorch, for example ``mps`` (Apple Silicon), ``cpu`` or ``cuda:0``.
 
 Exit code 0 means that the run file was written. Exit code 2 means that the script could not
-run; its last line on the standard error stream then starts with ``error:``.
+run; its last line on the standard error stream then starts with ``error:``. A wrong command
+line also gives the exit code 2, and its last line is the ``error:`` line of the argument parser.
+
+The script takes the variable ``GEMINI_API_KEY`` out of its environment before it loads a
+tool: the tools are code of other projects, and they must not see the key of the model API.
 
 What each tool gets, and what the script takes from it:
 
@@ -61,7 +65,14 @@ from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    print(
+        "error: NumPy is not installed here. Run this script with the Python of the environment of the tool",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from None
 
 #: Format names of the job file and the run file: those of ``pitchvlm.fallbacks.runs``.
 JOB_FORMAT = "pitchvlm-tool-job-1"
@@ -83,6 +94,8 @@ PNLCALIB_PACKAGES = ("model", "utils")
 PNLCALIB_INPUT = (960, 540)
 #: Pitch convention that a calibration payload states.
 PITCH_ORIGIN = "centre"
+#: Variable that holds the key of the model API on the run machine: the one of ``pitchvlm.cli``.
+KEY_VARIABLE = "GEMINI_API_KEY"
 EXIT_OK = 0
 EXIT_ERROR = 2
 #: What to do when a package or a module of a tool is missing.
@@ -169,7 +182,6 @@ def answer_frames(job: Mapping[str, Any], root: Path, answer: Answer) -> list[di
     because of an error.
     """
 
-
     def ask(entry: Mapping[str, Any], image: np.ndarray) -> dict[str, Any]:
         try:
             return answer(image)
@@ -178,11 +190,19 @@ def answer_frames(job: Mapping[str, Any], root: Path, answer: Answer) -> list[di
             print(f"the tool stopped on {where}", file=sys.stderr)
             raise
 
+    def read(entry: Mapping[str, Any]) -> np.ndarray:
+        try:
+            return read_rgb(root / entry["image"])
+        except OSError:
+            where = f"clip {entry['clip']}, frame {entry['frame']} ({entry['image']})"
+            print(f"the image cannot be read: {where}", file=sys.stderr)
+            raise
+
     frames = job["frames"]
-    ask(frames[0], read_rgb(root / frames[0]["image"]))
+    ask(frames[0], read(frames[0]))
     entries = []
     for entry in frames:
-        image = read_rgb(root / entry["image"])
+        image = read(entry)
         start = time.perf_counter()
         payload = ask(entry, image)
         seconds = time.perf_counter() - start
@@ -197,8 +217,7 @@ def write_run(
 ) -> None:
     """Write the run file of a job: its name and tool settings, the facts of the run and the answers.
 
-    The folder of the file is made when it is missing. A value that JSON does not have (NaN,
-    infinity) raises ``ValueError``.
+    A value that JSON does not have (NaN, infinity) raises ``ValueError``.
     """
     document = {
         "format": RUN_FORMAT,
@@ -207,18 +226,22 @@ def write_run(
         "runner": dict(runner),
         "frames": list(frames),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def machine_facts(device: str) -> dict[str, Any]:
-    """Return the facts of the run that do not depend on the tool: the device, the machine and the versions."""
+    """Return the facts of the run that do not depend on the tool: the device, the machine and the versions.
+
+    ``script_sha256`` is the SHA-256 of this script: the command ``tool-score`` compares it
+    with the script of its work tree.
+    """
     return {
         "device": device,
         "machine": platform.machine(),
         "system": platform.system(),
         "python": platform.python_version(),
         "torch": installed_version("torch"),
+        "script_sha256": file_sha256(Path(__file__).resolve()),
     }
 
 
@@ -234,7 +257,9 @@ def tool_module(name: str) -> ModuleType:
     """Import a module of the tool or of its environment. A module that cannot be imported raises ``RunnerError``."""
     try:
         return importlib.import_module(name)
-    except ImportError as error:
+    except ModuleNotFoundError as error:
+        if error.name is None or not f"{name}.".startswith(f"{error.name}."):
+            raise
         raise RunnerError(f"the module {name} cannot be imported: {error}. {WRONG_ENVIRONMENT}") from error
 
 
@@ -271,6 +296,8 @@ def rfdetr_engine(settings: Mapping[str, Any], device: str) -> tuple[dict[str, A
 
     def answer(image: np.ndarray) -> dict[str, Any]:
         detections = model.predict(image, threshold=min_score, include_source_image=False, antialias=antialias)
+        if not (np.isfinite(detections.xyxy).all() and np.isfinite(detections.confidence).all()):
+            raise RunnerError("the detector gave a box or a score that is not a finite number")
         names = detections.data["class_name"]
         return {
             "detections": [
@@ -356,6 +383,23 @@ def clone_commit(repo: Path) -> str:
     return done.stdout.strip()
 
 
+def clone_changes(repo: Path) -> list[str]:
+    """Return the tracked files of a clone that differ from its commit, as the lines of ``git status``.
+
+    Files that git does not track are left out: the clone has no ignore file, so the bytecode
+    folders that an import makes are such files.
+    """
+    done = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise RunnerError(f"the state of the clone {repo} cannot be read: {' '.join(done.stderr.split())}")
+    return done.stdout.splitlines()
+
+
 def file_sha256(path: Path) -> str:
     """Return the SHA-256 of a file as hexadecimal text."""
     digest = hashlib.sha256()
@@ -406,6 +450,13 @@ def pnlcalib_engine(
             f"this script was written for the commit {PNLCALIB_COMMIT} of PnLCalib, and {repo} has {commit}. "
             "Check out that commit. Or read what changed in inference.py of the clone, change the script "
             "where needed and set PNLCALIB_COMMIT"
+        )
+    changes = clone_changes(repo)
+    if changes:
+        raise RunnerError(
+            f"{len(changes)} tracked files of {repo} differ from the commit {commit} "
+            f"(for example: {changes[0].strip()}). The run file names the commit, so the files must be "
+            "those of the commit: undo the changes in the clone"
         )
     bind_clone_packages(repo)
     # A file of the clone imports the plot library. Without a display backend it opens no window.
@@ -506,16 +557,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the script and return the exit code. ``argv`` defaults to the arguments of the process."""
     args = build_parser().parse_args(argv)
+    # The tools are code of other projects. They get no key of the model API.
+    os.environ.pop(KEY_VARIABLE, None)
     try:
         if sys.version_info < (3, 10):
             raise RunnerError(f"this script needs Python 3.10 or newer, and this is Python {platform.python_version()}")
         job = read_job(args.job, args.tool)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        machine = machine_facts(args.device)
         if args.tool == "rfdetr":
             facts, answer = rfdetr_engine(job["tool"], args.device)
         else:
             facts, answer = pnlcalib_engine(job["tool"], args.device, args.repo, args.weights_kp, args.weights_lines)
         frames = answer_frames(job, args.root, answer)
-        write_run(args.out, job, {**machine_facts(args.device), **facts}, frames)
+        write_run(args.out, job, {**machine, **facts}, frames)
     except (RunnerError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR

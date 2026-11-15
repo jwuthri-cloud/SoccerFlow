@@ -62,6 +62,7 @@ from pitchvlm.evalx.metrics import (
     DetectionScores,
     detection_scores,
     foot_errors_m,
+    match_boxes,
     number_exact_match,
     summarize,
     t_interval,
@@ -71,6 +72,7 @@ from pitchvlm.frames import FrameSource
 from pitchvlm.geometry import apply_homography, fit_from_landmarks, fit_homography, matrix_from_record
 from pitchvlm.labels import GsrAthlete, GsrLabels, gsr_frame_people
 from pitchvlm.pipeline import MIN_CROP_GAP_S, crop_choice, fit_problems
+from pitchvlm.pitch import inside_pitch
 from pitchvlm.schemas import Box, FrameLandmarks, FramePeople, HomographyRecord, KitLegend, TeamKey
 from pitchvlm.vlm import steps
 from pitchvlm.vlm.prompts import PROMPT_NAMES
@@ -337,6 +339,8 @@ class _PeopleResult:
     #: Foot-point errors of the matched boxes in metres, shape (n,).
     foot_errors_m: np.ndarray
     n_without_label_mapping: int
+    #: Answered boxes without a match whose foot point lies off the pitch (``_wrong_boxes_off_pitch``).
+    n_wrong_off_pitch: int
 
 
 def probe_people(
@@ -360,6 +364,12 @@ def probe_people(
     The result holds:
 
     - ``recall`` and ``precision`` at IoU 0.5 over all frames, and ``counts``.
+      ``counts.fp_off_pitch`` is the part of the wrong boxes (``fp``) whose
+      foot point lies more than 3 m outside the pitch, by the mapping that is
+      fitted from the labels of the frame. The pipeline drops such people,
+      and the people prompt tells the model to leave the spectators out. The
+      precision counts them as wrong boxes. A frame whose labels give no
+      mapping adds nothing to this count.
     - ``small_boxes``: the same for the labelled boxes up to
       ``small_box_max_height_px`` high. A prediction without a match counts as
       wrong here too (see ``evalx.metrics.detection_scores``).
@@ -451,7 +461,11 @@ def _people_report(
         **step_facts,
         "recall": scores.recall,
         "precision": scores.precision,
-        "counts": {"predicted_boxes": scores.tp + scores.fp, **_counts(scores)},
+        "counts": {
+            "predicted_boxes": scores.tp + scores.fp,
+            **_counts(scores),
+            "fp_off_pitch": sum(result.n_wrong_off_pitch for result in results),
+        },
         "small_boxes": {"recall": small_scores.recall, "precision": small_scores.precision, **_counts(small_scores)},
         "foot_error_m": _error_summary(_concat([result.foot_errors_m for result in results])),
         "n_frames_without_label_mapping": sum(result.n_without_label_mapping for result in results),
@@ -526,7 +540,35 @@ def _score_people(task: _PeopleTask, answers: Sequence[FramePeople], small_box_m
         ),
         foot_errors_m=foot_errors_m(answers, task.truth, to_pitch, iou_threshold=IOU_THRESHOLD),
         n_without_label_mapping=sum(1 for mapping in task.mappings.values() if mapping is None),
+        n_wrong_off_pitch=_wrong_boxes_off_pitch(task, answers),
     )
+
+
+def _wrong_boxes_off_pitch(task: _PeopleTask, answers: Sequence[FramePeople]) -> int:
+    """Count the answered boxes without a match whose foot point lies off the pitch.
+
+    ``answers`` holds the answer of each frame in the order of ``task.frames``.
+    A box is off the pitch when the label mapping of its frame puts its foot
+    point more than ``PITCH_MARGIN_M`` outside the pitch. That is the rule
+    with which the pipeline drops a person (``pipeline._people_on_pitch``): a
+    foot point without a finite pitch position counts as outside. A frame
+    whose labels give no mapping adds nothing, because its boxes cannot be
+    judged.
+    """
+    count = 0
+    for people, truth in zip(answers, task.truth, strict=True):
+        mapping = task.mappings[truth.frame]
+        if mapping is None:
+            continue
+        boxes = [person.box for person in people.people]
+        matched = {index for index, _ in match_boxes(boxes, [person.box for person in truth.people], IOU_THRESHOLD)}
+        feet = [box.foot for index, box in enumerate(boxes) if index not in matched]
+        if not feet:
+            continue
+        with np.errstate(invalid="ignore"):  # A foot point at infinity is outside the pitch.
+            on_pitch = inside_pitch(apply_homography(mapping, np.array(feet, dtype=np.float64)), PITCH_MARGIN_M)
+        count += int((~on_pitch).sum())
+    return count
 
 
 def _answer_of_frame(answer: _FrameAnswer, clip_id: str, frame: int) -> _FrameAnswer:
@@ -684,10 +726,18 @@ def score_pitch_mappings(
     ``axis_check`` tests the pitch convention of the tool output. It is not a
     result of the tool. It holds the median position error of all valid
     frames for the mapped points as they are (``as_given``), and with the
-    sign of x, of y or of both changed. When ``as_given`` is not the smallest
-    of the four, the matrices are in another pitch convention: the script
-    that ran the tool has a fault, and the other values say nothing about the
-    tool.
+    sign of x, of y or of both changed. The convention is right when
+    ``as_given`` is the smallest of the four and small (some metres at most).
+    When ``as_given`` is large and another value is small, the matrices are
+    in another pitch convention: the script that ran the tool has a fault,
+    and the other values say nothing about the tool. When all four values
+    are large, the check decides nothing: the output of the tool is wrong
+    for another reason.
+
+    The error values are counted on the valid frames. So the results of two
+    engines that refuse a different number of frames are not counted on the
+    same frames; a weak mapping of an engine that never refuses shows in the
+    90th percentile and in the mean of ``error_m``, not in its median.
     """
     _check_clips(clips)
     _check_at_least("frames_per_clip", frames_per_clip, 1)

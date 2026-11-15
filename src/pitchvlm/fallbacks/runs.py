@@ -58,7 +58,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, StrictBool, model_validator
+from pydantic import Field, StrictBool, StrictInt, model_validator
 
 from pitchvlm.schemas import FiniteFloat, Record
 
@@ -78,7 +78,7 @@ class RfdetrSettings(Record):
     #: Class of the ``rfdetr`` package that builds the detector with its pretrained weights.
     model: RfdetrModel
     #: A detection counts when its score is at least this value. The tool gets the same value as its threshold.
-    min_score: float = Field(ge=0.0, le=1.0)
+    min_score: float = Field(strict=True, ge=0.0, le=1.0)
     #: True when the tool makes the frame smaller with antialiasing. By itself the tool uses none.
     #: Only true and false are taken: the script that runs the tool refuses any other value.
     antialias: StrictBool
@@ -89,9 +89,9 @@ class PnlcalibSettings(Record):
 
     name: Literal["pnlcalib"]
     #: Score from which the tool uses a keypoint of its keypoint model.
-    kp_threshold: float = Field(ge=0.0, le=1.0)
+    kp_threshold: float = Field(strict=True, ge=0.0, le=1.0)
     #: Score from which the tool uses a line of its line model.
-    line_threshold: float = Field(ge=0.0, le=1.0)
+    line_threshold: float = Field(strict=True, ge=0.0, le=1.0)
     #: True when the tool refines the camera with the lines after it found it from the keypoints.
     #: Only true and false are taken, as for ``RfdetrSettings.antialias``.
     pnl_refine: StrictBool
@@ -106,7 +106,7 @@ class JobFrame(Record):
 
     clip: str = Field(min_length=1)
     #: Index of the frame in its clip, from 0.
-    frame: int = Field(ge=0)
+    frame: StrictInt = Field(ge=0)
     #: Path of the image file below the data folder, with forward slashes.
     image: str = Field(min_length=1)
 
@@ -125,9 +125,9 @@ class RunFrame(Record):
     """The answer of the tool for one frame."""
 
     clip: str = Field(min_length=1)
-    frame: int = Field(ge=0)
+    frame: StrictInt = Field(ge=0)
     #: Time that the tool needed for the frame, seconds, without the time to read the image file.
-    seconds: FiniteFloat = Field(ge=0.0)
+    seconds: FiniteFloat = Field(strict=True, ge=0.0)
     #: The answer in the format of the adapter module of the tool.
     payload: dict[str, Any]
 
@@ -159,8 +159,18 @@ class ToolRun(Record):
 def load_tool_run(path: Path) -> ToolRun:
     """Read a run file.
 
-    ``ValueError`` is raised for a file that holds no JSON and for content that does not
-    follow the format of the module docstring. The payloads are not checked here: the adapter
-    of the tool reads them.
+    ``ValueError`` is raised for a file that holds no JSON, for a JSON object that has a key
+    two times, and for content that does not follow the format of the module docstring. The
+    numbers of the file are read as they are written: text or a truth value is no number.
+    The payloads are not checked here: the adapter of the tool reads them.
     """
-    return ToolRun.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+    return ToolRun.model_validate(json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_keys))
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Turn the key-value pairs of a JSON object into a mapping. A key that comes twice raises ``ValueError``."""
+    mapping = dict(pairs)
+    if len(mapping) != len(pairs):
+        twice = sorted(key for key, count in Counter(key for key, _ in pairs).items() if count > 1)
+        raise ValueError(f"these keys of one JSON object come more than once: {twice}")
+    return mapping

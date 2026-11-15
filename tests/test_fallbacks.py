@@ -200,6 +200,21 @@ def test_detector_error_names_the_place_in_the_payload() -> None:
         people_from_detections(payload, frame=0, min_score=MIN_SCORE)
 
 
+def test_detector_adapter_has_no_default_score_limit() -> None:
+    """The experiment file of a measurement names the limit. A call without it is a fault of the caller."""
+    with pytest.raises(TypeError, match="min_score"):
+        people_from_detections(detections_payload(), frame=0)  # type: ignore[call-arg]
+
+
+def test_whole_number_that_is_too_large_for_a_float_is_refused() -> None:
+    huge = 10**400
+
+    with pytest.raises(ValueError, match=r"the whole number is too large for a float \(401 digits\)"):
+        payload_number(huge, "payload")
+    with pytest.raises(ValueError, match="too large for a float"):
+        people_from_detections(detections_payload(detection([huge, 50.0, 140.0, 150.0])), frame=0, min_score=MIN_SCORE)
+
+
 @pytest.mark.parametrize("min_score", [-0.1, 1.5, float("nan")])
 def test_min_score_must_be_from_0_to_1(min_score: float) -> None:
     with pytest.raises(ValueError, match="min_score"):
@@ -366,8 +381,9 @@ def test_record_of_a_matrix_is_a_landmark_mapping() -> None:
     assert np.linalg.norm(matrix_from_record(record)) == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("factor", [1e-6, -3.0, 1e6])
+@pytest.mark.parametrize("factor", [1e-300, 1e-160, 1e-6, -3.0, 1e6, 1e150, 1e160])
 def test_scale_and_sign_of_the_payload_matrix_do_not_matter(factor: float) -> None:
+    """Also a very small and a very large scale: the squares of such values are not numbers of the machine."""
     record = homography_from_payload(calibration_payload(camera_matrix() * factor), frame=0)
 
     np.testing.assert_allclose(apply_homography(matrix_from_record(record), image_points()), PITCH_POINTS, atol=1e-6)

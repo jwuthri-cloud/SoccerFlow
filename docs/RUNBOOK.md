@@ -14,6 +14,8 @@ Where things are:
 | Text results | `../pitchvlm-results/results` (work tree of the branch `results`, next to the repository) |
 | Stored model answers and cost ledger | `../pitchvlm-results/results/cache` (the default of `--cache`); the ledger is `ledger.jsonl`, then `ledger-0002.jsonl` and so on |
 | Metrics files | `../pitchvlm-results/results/metrics` |
+| Run files of the two specialist tools | `../pitchvlm-results/results/tools` (section 3) |
+| Job files of the two specialist tools | `~/pitchvlm-data/jobs`; they name image paths and stay there |
 
 Every command has `--help`. Exit code 0 means done, 1 means that a check or a gate failed, 2 means
 that the command could not run. Every error gives the exit code 2 and ends with a line
@@ -219,7 +221,7 @@ the seed, the repeat index and the model settings.
 | Probe | Gate | Planned budget, all settings together |
 |---|---|---|
 | people | G2: recall, precision, small boxes, foot-point error | 14 USD |
-| pitch | G3: position error near the goals and in midfield, share of frames with a mapping | 15 USD |
+| pitch | G3: median position error near the goals and in midfield, 90th percentile of the position error (`error_p90_m_max`), share of frames with a mapping | 15 USD |
 | number | G5a: exact-match rate on crops of labelled boxes (upper bound, no pass line) | 11 USD |
 
 ```bash
@@ -249,10 +251,10 @@ python -m pitchvlm.cli probe number --experiment configs/experiments/number_prob
 
 The owner decided on 2026-11-14 that the RF-DETR detector and the PnLCalib calibration are
 measured on the frames of the people probe and of the pitch probe, with their pretrained weights
-and without training. So the decision of 24 Nov has measured values for both engines of each
-step. No model is called and nothing is paid. Rule 8 of section 7 does not change: a tool
-replaces a Gemini step only after that step failed its gate and the tool passed the same gate on
-the same frames.
+and without training. So the decision of 24 Nov has measured values of both tools next to the
+values of the two model steps: boxes for RF-DETR, pitch mappings for PnLCalib. No model is
+called and nothing is paid. Rule 8 of section 7 does not change: a tool replaces a Gemini step
+only after that step failed its gate and the tool passed the same gate on the same frames.
 
 | Tool | Experiment file | Frames and gate |
 |---|---|---|
@@ -286,16 +288,16 @@ curl -L --fail -o ~/pitchvlm-data/weights/pnlcalib/SV_lines \
 ls -l ~/pitchvlm-data/weights/pnlcalib    # SV_kp: 264964645 bytes, SV_lines: 264857893 bytes
 ```
 
-- The install of RF-DETR takes the packages that `rfdetr` needs without a fixed version. Give
-  it the package age limit of the setup (section 8, fact 19).
+- Both installs take packages without a fixed version: `rfdetr` brings what it needs, and the
+  nine packages of PnLCalib bring theirs (for example `sympy` and `fonttools`). Give both the
+  package age limit of the setup (section 8, fact 19).
 - RF-DETR downloads the weights of a model class when the class is used for the first time
   (Small: 386 MB, Large: 136 MB) from the host of its maker into `~/.roboflow/models`.
 - The requirements file of PnLCalib is for Linux with an NVIDIA GPU and cannot be installed
-  here. The install above names the packages that its files `model/` and `utils/` import, each
-  in the version of that requirements file. The package index has a file of each one for an
-  Apple Silicon machine with Python 3.12 (read on 2026-11-14). Do not take a newer
-  `opencv-python`: its version 5 moved the camera functions that the tool calls, and the tool
-  was not tested with it.
+  here. The install above names the packages that the script needs, each in the version of
+  that requirements file. The package index has a file of each one for an Apple Silicon machine
+  with Python 3.12 (read on 2026-11-14). Do not take a newer `opencv-python`: the tool was not
+  tested with OpenCV 5.
 - Write the versions that the two environments got into `docs/DECISIONS.md`
   (`uv pip freeze --python <the interpreter of the environment>`).
 
@@ -307,7 +309,7 @@ mkdir -p ~/pitchvlm-data/jobs
 
 python -m pitchvlm.cli tool-job --experiment configs/experiments/people_probe_rfdetr_small.yaml \
     --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/people_probe_rfdetr_small.json
-~/pitchvlm-data/envs/rfdetr/bin/python tools/run_tool.py rfdetr --device mps \
+env -u GEMINI_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python tools/run_tool.py rfdetr --device mps \
     --job ~/pitchvlm-data/jobs/people_probe_rfdetr_small.json --root ~/pitchvlm-data \
     --out ../pitchvlm-results/results/tools/people_probe_rfdetr_small.json
 python -m pitchvlm.cli tool-score --experiment configs/experiments/people_probe_rfdetr_small.yaml \
@@ -316,7 +318,7 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/people_probe_
 
 python -m pitchvlm.cli tool-job --experiment configs/experiments/pitch_probe_pnlcalib.yaml \
     --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/pitch_probe_pnlcalib.json
-~/pitchvlm-data/envs/pnlcalib/bin/python tools/run_tool.py pnlcalib --device mps \
+env -u GEMINI_API_KEY ~/pitchvlm-data/envs/pnlcalib/bin/python tools/run_tool.py pnlcalib --device mps \
     --job ~/pitchvlm-data/jobs/pitch_probe_pnlcalib.json --root ~/pitchvlm-data \
     --repo ~/pitchvlm-data/PnLCalib \
     --weights-kp ~/pitchvlm-data/weights/pnlcalib/SV_kp \
@@ -329,41 +331,90 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
 
 - First run: add `--max-clips 2` to `tool-job` and to `tool-score`, and do the first check of
   section 8 (row "Tool script") before the full run. The script never ran with a real tool.
+- These commands measure a tool. They do not switch it on: `run` takes the people and the pitch
+  mapping from the model steps only, and the pipeline has no setting for another engine. RF-DETR
+  gives boxes only, so the role, the team key and the number of each person would need one more
+  step, which is not designed. This work and its cost are an open owner decision
+  (`docs/DECISIONS.md`, last list).
+- The two tools are the code of other projects. The two commands above start the script without
+  the variable `GEMINI_API_KEY` (`env -u`), and the script also takes the variable out of its
+  environment before it loads a tool.
 - The frames are those of the model probe: the tool file and the probe file have the same group,
   frames per clip and seed. Give `tool-job`, `tool-score` and the model probe the same
   `--max-clips` when you compare them.
 - The metrics file has the keys of the model probe without the values that only a model step has
   (`prompts`, unparsed answers, the values of the landmark fit). Compare it with the same gate.
+  Its provenance names the run file with its SHA-256 (`run_file_sha256`) and says whether the
+  script that made the run file is the `tools/run_tool.py` of this work tree
+  (`script_is_current`). When it is not, `tool-score` prints a line: the commit of the metrics
+  file then does not name the script that ran the tool.
 - `seconds_per_frame` is the time of the tool for one frame on this machine, without the reading
   of the image file. For RF-DETR it is the time of the plain `predict` of the tool. The tool also
   has a compiled predictor, which its pages give as about twice as fast on an M4 Max (11.1 ms
   against 20.0 ms for the Small model): that value is published, not measured here. The paper of
-  PnLCalib gives 439 ms per frame on an NVIDIA GPU for the settings of this experiment file.
+  PnLCalib gives 439 ms per frame on an NVIDIA RTX 2080 Ti for the same voting with line
+  refinement. That time was measured with the reading of the image, at 960 x 540 pixels, with
+  other weights and other thresholds: it is published, not measured here, and not for the
+  settings of this experiment file.
 - `tool-score` refuses a run file that was made for another experiment name or with other tool
   settings, and a run file that has no answer for a frame of the probe. After a change of the
-  experiment file, write the job again and run the tool again.
+  experiment file, write the job again and run the tool again. Both commands refuse an `--out`
+  file that is the experiment file, and `tool-score` also one that is the run file.
 - `tool-score` refuses a work tree with changes, like `probe`.
-- Pitch: read `axis_check` first. It holds the median position error for the matrices as they
-  are (`as_given`) and with the sign of x, of y or of both changed. `as_given` must be the
-  smallest of the four. When it is not, the script gives the matrices in another pitch
-  convention: that is a fault of `tools/run_tool.py`, and the other values say nothing about
-  the tool.
-- Pitch: PnLCalib gives the best camera that it finds and never refuses one. So its
-  `valid_share` is high by the way the tool works, and a weak camera shows in the error values
-  and in `plausible_share`. Read these next to `valid_share`. The landmark fit of the model step
-  refuses a weak fit, so its `valid_share` is lower for the same reason.
-- Two engines on the same frames: `per_clip` of each metrics file holds the value of every clip.
-  Take the difference clip by clip, as the plan says for every comparison of two settings.
+- Pitch: read `axis_check` first; `tool-score` prints it. It holds the median position error for
+  the matrices as they are (`as_given`) and with the sign of x, of y or of both changed. The
+  pitch convention is right when `as_given` is the smallest of the four and small (some metres
+  at most; the other three are then many times larger). When another value is smaller,
+  `tool-score` prints `axis check failed`, writes the metrics file and ends with the exit code
+  1. Then look at the size of the values. `as_given` large and one other value small: the script
+  gives the matrices in another pitch convention; that is a fault of `tools/run_tool.py`, and
+  the other values say nothing about the tool. All four values large (about 10 m and more),
+  also when `as_given` is the smallest of them: the check decides nothing, because the output
+  of the tool is wrong for another reason (device, weights, frame size). Compare with
+  `--device cpu` first, and do not change `camera_homography`.
+- Pitch: PnLCalib gives the best camera that it finds and never refuses one. The landmark fit
+  of the model step refuses a weak fit, so its `valid_share` is lower. So `error_m`, the errors
+  under `by_view`, `plausible_error_m`, `main_metric` and `per_clip.error_median_m` are counted
+  on the frames where that engine gave a mapping: the two engines are not measured on the same
+  frames there. A weak camera of the tool shows in `error_m.p90` and `error_m.mean`. It does
+  not show in the medians until about half of the cameras are weak, and not in
+  `plausible_share` when the camera is only some metres off. So the tool must also meet
+  `error_p90_m_max` of `configs/gates.yaml`, like the model step.
+- Pitch: `plausible_share` of a tool is counted with a stricter rule than that of a landmark
+  fit. A record of a tool has no count of agreeing landmarks, so its plausibility check always
+  wants 9 of 10 people on the pitch; a landmark fit with 7 or more agreeing landmarks needs 2
+  of 3. The gate values (`error_m`, `valid_share`) do not use this check.
+- Pitch: the main metric leaves out the clips without a valid frame, and its printed line names
+  how many clips it used ("over N of M clips"). Compare it between two results only when both
+  used all clips. The values under `by_view`, which decide G3, are counted over the frames of
+  all clips together: they have no value per clip and no interval. So a difference near a gate
+  line of G3 cannot be tested from the metrics files.
+- Pitch: the benchmark script of PnLCalib for main-camera pictures drops a camera whose
+  reprojection error is above 100 pixels at 960 x 540 pixels (`--max_reproj_err`). The
+  measurement here drops none. The run file keeps `rep_err` of every frame, in pixels of the
+  frame (100 pixels at 960 x 540 are about 200 pixels of a frame of 1920 x 1080), so such a
+  limit can be counted later without a new run of the tool. It is a setting that is not built:
+  it needs a key in the experiment file.
+- People: `per_clip` of each metrics file holds the recall, the precision and the small-box
+  recall of every clip, on the same frames and the same labels for both engines. Take the
+  difference clip by clip, as the plan says for every comparison of two settings.
 - People: a detector that was trained on everyday pictures can also find people in the stands.
-  They count as wrong boxes, as they do for the model step. The run file keeps every detection
-  above the score limit with its class name, so another count can be made later without a new
-  run of the tool.
-- RF-DETR makes a frame of 1920 pixels about 4 times narrower for its input. Since its version
-  1.9 it does that without antialiasing, and its weights are older than that version. No page
-  of the tool says which resize fits the weights. So each model class has two experiment files:
-  one with the resize that the tool uses by itself (`antialias: false`) and one with
-  antialiasing (`antialias: true`). Run both. The setting that is taken later is confirmed on
-  fresh frames, as the plan says for every chosen setting.
+  They count as wrong boxes. The people prompt tells the model to leave the spectators out, and
+  the pipeline drops every person whose foot point lies more than 3 m outside the pitch. So
+  read the precision of a detector next to `counts.fp_off_pitch`: the wrong boxes whose foot
+  point the label mapping of the frame puts more than 3 m outside the pitch. A frame without a
+  label mapping adds nothing to this count. The metrics file of the model step has the same
+  count. The run file keeps every detection above the score limit with its class name, so
+  another count can be made later without a new run of the tool.
+- People: `foot_error_m` is counted on the matched boxes only. Read it next to
+  `small_boxes.recall`: the engine that finds fewer small boxes has the easier boxes.
+- RF-DETR makes a frame of 1920 pixels about 4 times narrower for the input of the Small model
+  and about 3 times for the Large model. Since its version 1.9 it does that without
+  antialiasing, and its weights are older than that version. No page of the tool says which
+  resize fits the weights. So Small and Large each have two experiment files: one with the
+  resize that the tool uses by itself (`antialias: false`) and one with antialiasing
+  (`antialias: true`). Run both. The setting that is taken later is confirmed on fresh frames,
+  as the plan says for every chosen setting.
 - Another setting: copy the experiment file, change `name` and one value under `tool`, commit,
   and run the three commands again. For RF-DETR the values are the model class (`RFDETRNano`,
   `RFDETRSmall`, `RFDETRMedium`, `RFDETRLarge`), the score limit `min_score` (0.5 is the
@@ -375,8 +426,9 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   for NVIDIA GPUs. Run the first two clips also with `--device cpu` and another `--out` file, and
   compare the two metrics files before the full run.
 - The run files are text results: boxes that the detector found and camera matrices, no pixels
-  and no label data. They go to the results branch with `sync` (section 6). The job files stay
-  in the data folder.
+  and no label data. The commands above write them into the results work tree, and `sync`
+  (section 6) lists them as tool runs. Whether they go to the results branch is an open owner
+  decision (`docs/DECISIONS.md`, last list). The job files stay in the data folder.
 - Licences: the code of RF-DETR and the weights of its four model classes above are under
   Apache-2.0. The code of PnLCalib is under GPL-2.0-or-later and its weights under CC BY 4.0
   (name the paper of the tool when the weights are used). `tools/run_tool.py` imports code of
@@ -531,6 +583,10 @@ Only text goes back: metrics files, stored model answers and the cost ledger. Th
 `../pitchvlm-results/results`. Videos, images, label files, `result.json` and prediction files
 stay in `~/pitchvlm-data`.
 
+The remote `origin` is public since 2026-11-14. A pushed result file is public at once. Do not
+push the branch `results` to that remote before the owner has decided where the branch goes
+(`docs/DECISIONS.md`, last list).
+
 ```bash
 python -m pitchvlm.cli sync --results ../pitchvlm-results/results
 ```
@@ -568,7 +624,7 @@ On the build machine, fetch the branch `results` and read the files there.
 1. No secret in the repository: no API key, no token, no `.env` file.
 2. No pixels and no dataset files in the repository; the branch `results` holds text only, with no box, no pitch position and no role, team or shirt number from a label file.
 3. No machine-specific text in tracked files, and nothing about the owner or the policies of a machine; no lock file is committed, the pinned list is in `locks/`.
-4. Only `src/pitchvlm/vlm/client.py` imports the model SDK.
+4. Only `src/pitchvlm/vlm/client.py` imports the model SDK. Only `tools/run_tool.py` imports an external tool.
 5. Model calls: paid tier only, `store=False`, no sampling parameters; players are identified by shirt number and roster, never by face.
 6. Money: estimate first, measured cost after; a run stops at 1.3 times its estimate (the contract checks of `doctor`: at the 2 USD of gate G0); hard stop at 135 USD; no paid run without the owner's go-ahead.
 7. Gates are fixed in `configs/gates.yaml` before a run; the 10 test clips are run once, after the freeze tag.
@@ -583,7 +639,7 @@ Check each one with its first check before you rely on it.
 
 | Part | File | First check | When it fails |
 |---|---|---|---|
-| Offline tests on this machine | `tests/` | `python -m pytest -rs` after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of disk: install the tool. A failed test names the code that this machine runs in another way: repair the code, not the test. |
+| Offline tests on this machine | `tests/` | `python -m pytest -rs` after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of disk: install the tool. One test of the tool script is skipped without Pillow. Pillow belongs to the environments of the two specialist tools (row "Tool script"): leave this test skipped. A failed test names the code that this machine runs in another way: repair the code, not the test. |
 | Setup commands | section 1 | Each command of section 1 ends without an error, and `doctor --no-api` shows the SDK as a version 3.x. Most commands of section 1 never ran: the install with the extra `gemini`, the pinned list, the work tree and the scorer | Read the error of the command. Fact 19 below is about the package age limit of `uv pip`. |
 | Gemini client | `src/pitchvlm/vlm/client.py` | `doctor` with one model (step 2 of day 1). The cost estimate and the budget line must be on the screen before the first check line of a model | Read the failed check and the report file. A failed contract check (`boxes`, `landmarks`, `store flag`, `token sum`, `served tier`, `flex tier`) is a client fault: repair the client before any footage is sent. A value of `box accuracy` or `landmark accuracy` that does not reach the value of the gate file is not a client fault. A line `[info] flex tier: not checked` is no client fault either: the flex tier was busy (section 2). When the check `boxes` fails, read the answers under `contract.<model>.answers` in the report file first: a model that names no person for the coloured rectangles of the synthetic frames fails this check without a client fault. |
 | Download | `src/pitchvlm/datasets.py` | `data --split valid`; then `ls ~/pitchvlm-data/SoccerNetGS-valid` shows about 58 clip folders | Run the command again: it continues the download. An archive whose `.part` file in `~/pitchvlm-data/archives` already holds every byte gets its final name at the next start: the server answers the range with the status 416 and the size of the archive, and the command compares that size with the file. When the sizes differ, or the answer names no size, the command stops with an error that names the `.part` file: compare its size with the size on the dataset page, or delete it to start again. When the host refuses the request or its certificate (the download itself was never run), download `valid.zip` by hand into `~/pitchvlm-data/archives` and run the command again: it then only extracts. |
@@ -592,7 +648,7 @@ Check each one with its first check before you rely on it.
 | Video encoding | `src/pitchvlm/render.py` | `python -m pitchvlm.cli demo --out outputs/demo`, then open `outputs/demo/demo.mp4` | Check the OpenCV build (codec `mp4v`). |
 | Video decoding | `src/pitchvlm/frames.py` | The free dry run of the demo clip (section 4) prints the frames, the frame rate and the keyframes: frames divided by the rate must be the length of the clip in seconds, and the clip must have about 2.1 keyframes per second at any frame rate. Only synthetic clips of 25 frames per second ran before | A video with a variable frame rate, rotation data or interlaced frames was never read here. Convert it to a constant frame rate, or extract its frames into a folder and use `--fps`. |
 | Roster file | `src/pitchvlm/roster.py` | The same dry run with `--roster` reads the roster file before any model call. After the paid run, the video shows a name next to every displayed number of the roster | The error names the key and, for YAML, the line (section 4). |
-| Tool script | `tools/run_tool.py`, `src/pitchvlm/fallbacks/` | After the install of the two tools (section 3): the three commands of each tool with `--max-clips 2`. The script was written from the source of the tools (`rfdetr` 1.12.0 and 1.12.1, PnLCalib at one commit) and never ran with them: the tests replace each tool by a stand-in. Its image reader needs Pillow and ran nowhere. RF-DETR: the recall is far above 0, and the largest box values of the run file are near the width and the height of the frames. PnLCalib: `axis_check.as_given` is the smallest of its four values, `valid_share` is above 0, and the payloads of the run file show a camera on the near side above the grass (`camera_position_m`: y above 34, z below 0). Then compare the device `mps` with `cpu` on the same two clips | An `error:` line about a version or a commit: install the version that the line names. A traceback inside a tool: the line before it names the frame on which the tool stopped. When the first frame fails, the tool does not have the interface that the script expects: read the source of the installed version, repair `tools/run_tool.py` with a test, and do not change the tool. When one later frame fails, the tool has an error for that picture: tell the owner; the script counts no frame as a frame without an answer because of an error. An error of `torch.load` about the weights of PnLCalib: the file is not plain weights. Do not switch that check off without the owner: a file that is not plain weights can run code when it is loaded. A recall near 0 with many boxes: the boxes are not in pixels of the frame, or the class names are not those of the tool (read `label` in the run file). `axis_check` with another smallest value: the matrix is in another pitch convention; repair `camera_homography` of the script. Values that differ between `mps` and `cpu`: tell the owner, and use `cpu` for the measurement. A `ValueError` of an adapter names the key or the value of a payload that does not follow its format. |
+| Tool script | `tools/run_tool.py`, `src/pitchvlm/fallbacks/` | After the install of the two tools (section 3): the three commands of each tool, with `--max-clips 2` for `tool-job` and `tool-score`. The script was written from the source of the tools (`rfdetr` 1.12.0 and 1.12.1, PnLCalib at one commit) and never ran with them: the tests replace each tool by a stand-in. Its image reader needs Pillow and ran nowhere. RF-DETR: the recall is far above 0, and the largest box values of the run file are near the width and the height of the frames. PnLCalib: `axis_check.as_given` is the smallest of its four values and small (some metres at most), `tool-score` ends with the exit code 0, `valid_share` is above 0, and the payloads of the run file show a camera on the near side above the grass (`camera_position_m`: y above 34, z below 0). Then compare the device `mps` with `cpu` on the same two clips | An `error:` line about a version or a commit: install the version that the line names. A traceback inside a tool: the line before it names the frame on which the tool stopped. When the first frame fails, the tool does not have the interface that the script expects: read the source of the installed version, repair `tools/run_tool.py` with a test, and do not change the tool. When one later frame fails, the tool has an error for that picture: tell the owner; the script counts no frame as a frame without an answer because of an error. An error of `torch.load` about the weights of PnLCalib: the file is not plain weights. Do not switch that check off without the owner: a file that is not plain weights can run code when it is loaded. A recall near 0 with many boxes: the boxes are not in pixels of the frame, or the class names are not those of the tool (read `label` in the run file). `axis check failed` with a large `as_given` and one small other value: the matrix is in another pitch convention; repair `camera_homography` of the script, with a test. All four values of `axis_check` large (about 10 m and more): the check decides nothing, and the output of the tool is wrong for another reason (device, weights, frame size); compare with `--device cpu` first and do not change `camera_homography`. Values that differ between `mps` and `cpu`: tell the owner, and use `cpu` for the measurement. A `ValueError` of an adapter names the key or the value of a payload that does not follow its format. |
 | Git hooks | `.pre-commit-config.yaml` | `doctor --no-api` shows `[ok  ] guard hooks`. The first commit that the owner asks for must list the guard and the secret scan as passed, and the first push the two push hooks. `git -C ../pitchvlm-results rev-parse --git-path hooks` must name the hook folder of this clone: the results work tree then runs the same hooks | `pre-commit install --hook-type pre-commit --hook-type pre-push`. The hooks ran on the build machine in scratch clones only, never in this repository, never against a real remote and never with signed commits. A results work tree that names another hook folder has its own `core.hooksPath`: remove that setting. |
 
 The cost pilot is also the first use of the stored answers and of the ledger with real probe

@@ -20,6 +20,7 @@ import base64
 import copy
 import dataclasses
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -776,7 +777,16 @@ TOOL_RUNS: dict[str, dict[str, Any]] = {
         "format": "pitchvlm-tool-run-1",
         "name": "people_probe_rfdetr_small",
         "tool": {"name": "rfdetr", "model": "RFDETRSmall", "min_score": 0.5, "antialias": False},
-        "runner": {"device": "mps", "machine": "arm64", "python": "3.12.8", "torch": "2.9.0", "tool_version": "1.12.0"},
+        "runner": {
+            "device": "mps",
+            "machine": "arm64",
+            "system": "Darwin",
+            "python": "3.12.8",
+            "torch": "2.9.0",
+            "script_sha256": hashlib.sha256(b"the script that ran the detector").hexdigest(),
+            "tool_version": "1.12.0",
+            "predictor": "predict() of the model, not compiled",
+        },
         "frames": [
             {
                 "clip": f"SNGS-{21 + index // 5:03d}",
@@ -814,11 +824,17 @@ TOOL_RUNS: dict[str, dict[str, Any]] = {
         "tool": {"name": "pnlcalib", "kp_threshold": 0.3434, "line_threshold": 0.7867, "pnl_refine": True},
         "runner": {
             "device": "mps",
+            "machine": "arm64",
+            "system": "Darwin",
+            "python": "3.12.8",
+            "torch": "2.3.1",
+            "script_sha256": hashlib.sha256(b"the script that ran the calibration").hexdigest(),
             "tool_commit": "42088864170f75ea02e76d20e9a9a1db59edb3e3",
             "weights_kp": "SV_kp",
-            "weights_kp_sha256": "0f" * 32,
+            "weights_kp_sha256": hashlib.sha256(b"weights of the keypoint model").hexdigest(),
             "weights_lines": "SV_lines",
-            "weights_lines_sha256": "a1" * 32,
+            "weights_lines_sha256": hashlib.sha256(b"weights of the line model").hexdigest(),
+            "calibration_size": "the size of the frame, as in inference.py",
         },
         "frames": [
             {
@@ -838,6 +854,8 @@ TOOL_RUNS: dict[str, dict[str, Any]] = {
                         "rep_err": 1.5 + 0.125 * index,
                         "mode": "full",
                         "use_ransac": 5.0,
+                        "calib_plane": 0,
+                        "camera_position_m": [0.3125 + index, 58.625, -11.9375],
                     }
                 ),
             }
@@ -966,9 +984,12 @@ def test_parser_reads_options_and_defaults() -> None:
     assert (tool_score.max_clips, tool_score.manifest, tool_score.allow_dirty) == (None, None, False)
     # The two tool commands call no model: they have no option for stored answers or for the budget.
     for arguments in (COMMAND_LINES["tool-job"], COMMAND_LINES["tool-score"]):
-        for option in ("--cache", "--replay", "--start-over-budget"):
+        for option in (["--cache", "cache"], ["--replay"], ["--start-over-budget"]):
             with pytest.raises(SystemExit):
-                parser.parse_args([*arguments, option])
+                parser.parse_args([*arguments, *option])
+    # The job file is no result: the command that writes it does not look at the state of the work tree.
+    with pytest.raises(SystemExit):
+        parser.parse_args([*COMMAND_LINES["tool-job"], "--allow-dirty"])
 
 
 @pytest.mark.parametrize(
@@ -5430,6 +5451,38 @@ def test_sync_prints_the_git_commands_and_runs_none_of_them(
     # Nothing is staged and nothing is committed: the result folder and the rules file are still untracked.
     assert git(results_tree, "status", "--porcelain").split() == ["??", ".gitleaks.toml", "??", "results/"]
     assert git(results_tree, "branch", "--list").strip() == ""
+
+
+def test_sync_names_a_run_file_of_a_tool_below_and_inside_the_folder_of_the_tools(
+    results_tree: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run file is named as a tool run in a folder below ``tools``, and when the command gets ``tools`` itself."""
+    tools = results_tree / "results" / "tools"
+    (tools / "cpu").mkdir(parents=True)
+    detector, calibration = TOOL_RUNS
+    (tools / detector).write_text(json.dumps(TOOL_RUNS[detector]) + "\n", encoding="utf-8")
+    (tools / "cpu" / calibration).write_text(json.dumps(TOOL_RUNS[calibration]) + "\n", encoding="utf-8")
+    # A metrics file of a tool is in the folder of the metrics files: it is no run file.
+    metrics = results_tree / "results" / "metrics"
+    metrics.mkdir()
+    (metrics / detector).write_text(json.dumps({"n_frames": 40}) + "\n", encoding="utf-8")
+
+    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 0
+
+    output = capsys.readouterr().out
+    assert "3 text result files" in output
+    assert f"  tool run: tools/{detector}" in output
+    assert f"  tool run: tools/cpu/{calibration}" in output
+    assert f"  metrics: metrics/{detector}" in output
+
+    assert cli.main(["sync", "--results", str(tools)]) == 0
+
+    output = capsys.readouterr().out
+    assert "2 text result files" in output
+    assert f"  tool run: {detector}" in output
+    assert f"  tool run: cpu/{calibration}" in output
+    assert "metrics:" not in output
+    assert "add -- results/tools" in output
 
 
 def test_sync_runs_the_secret_scan_of_the_hooks_with_the_rules_of_the_work_tree(

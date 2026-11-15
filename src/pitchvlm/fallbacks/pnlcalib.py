@@ -22,8 +22,11 @@ Payload format (one frame)::
   origin is the centre mark, x grows towards the right goal and y grows towards the main camera.
   So the far touchline is y = -34 and the near touchline is y = +34, on a pitch of 105 x 68 m.
   Only a payload without a matrix may leave this key out.
-- Other keys are ignored. The script also writes ``rep_err`` (the reprojection error of the
-  keypoints of the tool, pixels), and ``fault`` (why a frame has no matrix).
+- Other keys are ignored. The script also writes keys that this adapter does not read:
+  ``rep_err`` (the reprojection error of the keypoints of the tool, pixels), ``mode``,
+  ``use_ransac`` and ``calib_plane`` (the setting and the plane of the camera that the tool
+  took), ``camera_position_m`` (the place of the camera, pitch metres) and ``fault`` (why a
+  frame has no matrix).
 
 The script converts the result of the tool into this convention. For a 3x4 projection matrix
 ``P`` whose world frame has these x and y axes and the grass at height 0, the homography is
@@ -60,8 +63,10 @@ def homography_from_payload(payload: dict[str, Any], *, frame: int) -> Homograph
 
     The matrix of the payload maps pitch metres to image pixels. The record holds its inverse,
     which maps image pixels to pitch metres, with ``source="landmarks"``. The matrix of the
-    record is scaled to a Frobenius norm of 1, like the landmark fits of ``geometry``. The record
-    has no inlier count and no reprojection error, because the payload has none.
+    record is scaled to a Frobenius norm of 1, like the landmark fits of ``geometry``. The scale
+    of the payload matrix is free, also a very small or a very large one. The record has no
+    inlier count and no reprojection error: the adapter does not read ``rep_err``, which is the
+    error of the keypoints of the tool and not of a landmark fit.
 
     A payload whose matrix is null gives a record with ``source="none"``.
 
@@ -73,6 +78,9 @@ def homography_from_payload(payload: dict[str, Any], *, frame: int) -> Homograph
     if rows is None:
         return HomographyRecord(frame=frame)
     pitch_to_image = _matrix(rows)
+    largest = float(np.abs(pitch_to_image).max())
+    if largest > 0.0:
+        pitch_to_image = pitch_to_image / largest  # The scale is free: the inverse then has no huge values.
     image_to_pitch = None if _is_singular(pitch_to_image) else invert_homography(pitch_to_image)
     if image_to_pitch is None:
         raise ValueError(f"payload: '{_MATRIX_KEY}' is singular, so it has no inverse")

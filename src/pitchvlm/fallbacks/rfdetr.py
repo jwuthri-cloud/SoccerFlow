@@ -25,7 +25,9 @@ The payload holds class names, not class numbers, and boxes in pixels of the ful
 when the detector worked on a smaller image. The detector gives both in this form.
 
 A detector does not know roles, teams or shirt numbers. So every person gets the role
-``player``, the team key ``none`` and no number. The model step assigns these attributes later.
+``player``, the team key ``none`` and no number. No step of the package assigns these
+attributes to detector boxes yet, and the pipeline does not read this adapter: it is used to
+measure the detector (command ``tool-score``).
 """
 
 from __future__ import annotations

@@ -468,19 +468,31 @@ Items 5 and 6 come from the checks of the change of item 4.
 1. **The decision** (owner, 2026-11-14). The RF-DETR detector and the PnLCalib calibration are
    measured in M3 on the frames of the people probe and of the pitch probe, with their
    pretrained weights and without training. No model is called, so it costs no API money.
-   Reason: the decision of 24 Nov then has measured values for both engines of each step, and
-   the time per frame of each tool on the run machine. Rule 8 does not change: a tool replaces
-   a Gemini step only after that step failed its gate and the tool passed the same gate on the
-   same frames. Not decided and not started: a detector that is trained on answers of the model.
+   Reason: the decision of 24 Nov then has measured values of both tools next to the values of
+   the two model steps (boxes for RF-DETR, pitch mappings for PnLCalib), and the time per frame
+   of each tool on the run machine. Rule 8 does not change: a tool replaces a Gemini step only
+   after that step failed its gate and the tool passed the same gate on the same frames. The
+   two commands measure a tool. They do not switch it on: `run` takes the people and the pitch
+   mapping from the model steps only, the pipeline has no setting for another engine, and
+   RF-DETR gives boxes without role, team key and number. That work is an open owner decision
+   (last list of this file). Not decided and not started: a detector that is trained on answers
+   of the model.
 2. **How.** Three steps (`docs/RUNBOOK.md`, section 3): the command `tool-job` writes the frames
    and the settings; the script `tools/run_tool.py` runs the tool in the environment of the tool
    and writes one answer per frame; the command `tool-score` measures the answers. The frames
    are those of the model probe, because the tool file and the probe file have the same group,
    frames per clip and seed; a test holds that for the files of the repository. The values come
    from the code that scores the model answers. Tested: for the same boxes and for the same
-   mappings, the tool result and the model result are equal in every shared value.
-   `tool-score` refuses a run file that was made for another experiment name or with other tool
-   settings, and a run file that lacks a frame of the probe.
+   mapping records, the tool result and the model result are equal in every shared value. A
+   record of a tool has no count of agreeing landmarks, so its plausibility check is always the
+   strict one (9 of 10 people on the pitch); a model fit with 7 or more agreeing landmarks
+   needs 2 of 3. `tool-score` refuses a run file that was made for another experiment name or
+   with other tool settings, and a run file that lacks a frame of the probe. The run file is
+   read strictly: a key that comes twice is refused, a number must be written as a number (no
+   text, no truth value) and a truth value as true or false. The provenance of the metrics file
+   names the run file with its SHA-256 and holds the facts of the run that the script wrote,
+   among them the SHA-256 of the script. `tool-score` says when that is not the script of its
+   work tree: the commit of the metrics file then does not name the script that ran the tool.
 3. **Settings of the five experiment files.** They are the settings that each tool documents
    for its own use, so the first values are those of the tools as they come. One setting is
    measured in both of its values, the resize of the detector:
@@ -498,13 +510,21 @@ Items 5 and 6 come from the checks of the change of item 4.
      script does it.
    Settings that exist in the tools and are not in an experiment file: a frame shape for
    RF-DETR that keeps the side ratio; for PnLCalib the lower thresholds of its benchmark script
-   (0.0966 and 0.3441, which need no new key) and a calibration at 960 x 540 pixels, the size
-   of its benchmarks. The frame shape and the calibration size each need a key in the
-   experiment file and in the script. They are not built, because no option stays unused in
-   this repository.
+   (0.0966 and 0.3441, which need no new key), a calibration at 960 x 540 pixels, the size
+   of its benchmarks, and the limit of that benchmark script for the reprojection error of a
+   camera (`--max_reproj_err 100`, in pixels at 960 x 540): the script drops a camera above it.
+   The measurement here drops none, so the published values of the tool come from a setting
+   that refuses weak cameras. The run file keeps the error of every camera (`rep_err`, in
+   pixels of the frame), so such a limit can be counted in `tool-score` without a new run of
+   the tool. The frame shape and the calibration size each need a key in the experiment file
+   and in the script, the error limit a key in the experiment file. They are not built, because
+   no option stays unused in this repository.
 4. **What was read from the source of the tools on 2026-11-14.** Nothing of it was run.
-   - `rfdetr` 1.12.1 (uploaded 2026-11-12) and 1.12.0 (2026-11-06): the files of `predict` are
-     the same in both. The model classes with pretrained weights for everyday pictures are
+   - `rfdetr` 1.12.1 (uploaded 2026-11-12) and 1.12.0 (2026-11-06): `detr.py`, which defines
+     `predict`, is the same in both. `_prediction/core.py`, which does its work, differs only in
+     code that the script does not reach (float input with a value that is not a number, the
+     batch size of a compiled predictor, masks). The model classes with pretrained weights for
+     everyday pictures are
      `RFDETRNano`, `RFDETRSmall`, `RFDETRMedium` and `RFDETRLarge`. `predict` takes a frame as
      red, green and blue values of shape (height, width, 3), keeps a detection when its score
      is above the threshold, and returns boxes in pixels of the frame with the class name of
@@ -518,24 +538,37 @@ Items 5 and 6 come from the checks of the change of item 4.
      place of the camera and the plane that it was calibrated on. Its requirements file is for
      Linux with an NVIDIA GPU. The install of `docs/RUNBOOK.md` takes the versions of that file
      for the packages that the script needs; an install without versions would take OpenCV 5,
-     which moved the camera functions that the tool calls.
-   - A second agent checked each of these facts against the source again: 99 of 105 facts about
-     PnLCalib and 98 of 100 about RF-DETR were confirmed. The 4 that were wrong do not concern
-     a call of the script. The 4 that cannot be checked without a download are about the
-     content of the weight files.
+     and the tool was not tested with it.
+   - A second check read each of these facts in the source again: 99 of 105 facts about
+     PnLCalib and 98 of 100 about RF-DETR were confirmed. Four were wrong, and no sentence of
+     the documents and no call of the script uses them: the transforms of the training of
+     PnLCalib (the script uses the plain one of `inference.py`); which matrix the calibration
+     object holds after the vote (the script builds its matrix from the camera that the vote
+     returns); the side on which the line filter of PnLCalib drops a line; and the version in
+     which RF-DETR moved the source picture of an answer (1.6.5, not 1.7). The 4 that cannot be
+     checked without a download are about the content of the weight files.
    - Published values, not measured here: RF-DETR Small needs 20.0 ms per frame on an M4 Max
      with its plain `predict` and 11.1 ms with its compiled predictor; its box accuracy on the
-     COCO pictures is 53.0 (Small) and 56.5 (Large). PnLCalib needs 439 ms per frame on an
-     NVIDIA RTX 2080 Ti for the settings above.
+     COCO pictures is 53.0 (Small) and 56.5 (Large). The paper of PnLCalib gives 439 ms per
+     frame on an NVIDIA RTX 2080 Ti for the same voting with line refinement. That time was
+     measured with the reading of the image, at 960 x 540 pixels, with other weights and other
+     thresholds: it is not for the settings above.
 5. **What guards against a wrong script.** The script was written without the tools, and its
    tests use stand-ins. An error of a tool on a frame stops the run and names the frame: no
    frame counts as a frame without an answer because of an error. And: (a) the script refuses
-   another version of `rfdetr` and another commit of PnLCalib than those that were read; (b) the pitch result holds `axis_check`, the median
-   position error with the sign of x, of y or of both changed: when the matrices as they are do
-   not give the smallest value, the script has the wrong pitch convention; (c) a test compares
-   the format names, the settings and the model classes of the script with the package;
-   (d) `docs/RUNBOOK.md`, section 8, has the first check on two clips, with the comparison of
-   the GPU with the CPU.
+   another version of `rfdetr` and another commit of PnLCalib than those that were read, and a
+   PnLCalib clone with a changed tracked file; (b) the pitch result holds `axis_check`, the
+   median position error for the matrices as they are and with the sign of x, of y or of both
+   changed. The pitch convention is right when the matrices as they are give the smallest value
+   and that value is small (some metres at most). When another sign gives a smaller value,
+   `tool-score` says so, writes the metrics file and ends with the exit code 1: a large value
+   as given next to one small other value means that the script has the wrong pitch convention.
+   When all four values are large (about 10 m and more), the check decides nothing: the output
+   of the tool is wrong for another reason; (c) a test compares the format names, the settings
+   and the model classes of the script with the package; (d) `docs/RUNBOOK.md`, section 8, has
+   the first check on two clips, with the comparison of the GPU with the CPU; (e) the script
+   takes the variable `GEMINI_API_KEY` out of its environment before it loads a tool, and the
+   commands of the RUNBOOK start it without that variable.
 6. **The adapter of the detector has no default score limit.** Before, it kept detections from
    0.3 when the caller named no limit, and the tool keeps them above 0.5 by itself. Now the
    experiment file names the limit, the script gives it to the tool, and the adapter gets the
@@ -546,16 +579,66 @@ Items 5 and 6 come from the checks of the change of item 4.
    these folders, also when the clone comes first on the module path. So the script sets both
    names to the folders of the clone before it imports from them.
 8. **The run files of a tool are text results.** They hold the boxes that a detector found, or
-   camera matrices, and no pixels and no value of a label file. They go to the results branch
-   like stored model answers. Tested: the command `sync`, with the guard and the secret scan,
-   passes a detector run file of 135 frames and 770,559 bytes and a calibration run file. The
-   listing of `sync` names a file in a folder `tools` a tool run.
+   camera matrices, and no pixels and no value of a label file. The commands of the RUNBOOK
+   write them into the results work tree. Whether they go to the results branch like stored
+   model answers is an open owner decision (last list of this file): the owner decision of
+   13 Nov names three kinds of files that may return, and a run file is a fourth kind. Tested:
+   the command `sync`, with the guard and the secret scan, passes a detector run file of 135
+   frames and 770,559 bytes and a calibration run file. The listing of `sync` names a file
+   below a folder `tools` a tool run.
 9. **Licences.** The code of RF-DETR and the weights of its four model classes above are under
    Apache-2.0; the model classes of its extension package have another licence and are not
    accepted by the experiment file. The code of PnLCalib is under GPL-2.0-or-later and its
    weights under CC BY 4.0. `tools/run_tool.py` imports code of the PnLCalib clone when it
-   runs. This repository is private. Before it is published, the owner checks what the licence
-   of PnLCalib means for that script (`docs/PLAN.md`, risks).
+   runs. The repository is public since 2026-11-14 (section "The code repository is public").
+   The check of what the licence of PnLCalib means for that script is still open
+   (`docs/PLAN.md`, risks).
+10. **Review of this change (2026-11-14).** Five reviews, each with one view (the package code,
+    the script, the command line, the measurement, the documents), and a second reading of each
+    finding. 50 findings, 48 confirmed: 6 major, 19 minor and 23 small ones. Repaired, each
+    code change with a test:
+    - The script: a box or a score of the detector that is not a finite number stops the run
+      at its frame; an error inside an installed tool keeps its traceback; a PnLCalib clone
+      with a changed tracked file is refused; the place of the run file is made before the tool
+      is built; the script writes its own SHA-256 into the run file and takes the key variable
+      out of its environment.
+    - The package: the run file is read strictly; a number of a payload that is too large for
+      a float is refused in one line; a camera matrix with very large or very small values is
+      scaled before the test for a matrix that cannot be inverted; the people result counts
+      the wrong boxes off the pitch (`counts.fp_off_pitch`).
+    - The command line: a split list that is not JSON, an experiment file that is no text and
+      a clip folder that does not fit its label file end with one line and no traceback;
+      `tool-score` prints the axis check and ends with the exit code 1 when it fails; the line
+      of the main metric names how many clips it used; the metrics file names the content of
+      the run file and whether the script is the one of the work tree; an output file that is
+      an input file is refused; `sync` names a run file in every folder below `tools`.
+    - The documents: what the two commands do not do (item 1), which pitch values of two
+      engines are not on the same frames, the size rule of the axis check, the stricter
+      plausibility rule of a tool record, and four new open owner decisions.
+    Kept as it is: one run of the detector serves one score limit. A run file with a lower
+    limit could serve a higher one, but then the metrics file would not prove that the tool ran
+    with the settings of the experiment file. Named by the review and not built: the share of
+    all frames within an error limit, by-view values per clip, and the limit for the
+    reprojection error of PnLCalib (item 3).
+
+## 2026-11-14 — The code repository is public
+
+1. **The decision** (owner, 2026-11-14). The owner had the code pushed to a public repository
+   and asked for a pull request there. Before, the plan was "private for now" (first table of
+   this file). The branch `main` holds the first build. The fixes of the review of the tool
+   measurement are a pull request from the branch `m1-first-build`.
+2. **What follows for every commit.** A pushed commit is public at once and cannot be taken
+   back. So the rules 1 to 3 of `CLAUDE.md` now stand between a mistake and a public leak: the
+   guard and the secret scan must pass before every commit and every push, and no way around
+   them is allowed (rule 9).
+3. **What is open** (also in the last list of this file):
+   - The branch `results`. The RUNBOOK sends the text results (metrics, stored model answers,
+     the cost ledger) to the remote `origin`, which is public now. These files hold no pixels
+     and no label data. They hold the answers of the model for frames of the dataset, and the
+     dataset is for research use.
+   - The licence. The repository has no licence file. The code of PnLCalib is under
+     GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
+     means for the script was planned before publishing, and it is not done.
 
 ## Open questions (to settle with measurements)
 
@@ -583,7 +666,7 @@ Items 5 and 6 come from the checks of the change of item 4.
 - Position error and share of frames with a camera of PnLCalib on the frames of the pitch
   probe? Do the GPU and the CPU of the run machine give the same values for both tools?
 
-Decisions for the owner that the second review left open, each with its recommendation:
+Decisions for the owner that are open, each with its recommendation:
 
 - **Label penalty.** Keep the growth with missed keyframes for the role and the team key, or
   let it grow for the team key only. Recommendation: keep it now. Take the growth for the team
@@ -607,9 +690,35 @@ Decisions for the owner that the second review left open, each with its recommen
   bare list of 32 or more check sums. Recommendation: keep both refusals; each has the form of
   a leak that the first review closed (RUNBOOK, section 9, says how to write such text).
 - **Settings of the tool measurements** (section "Both specialist tools are measured on the
-  probe frames", item 3). The five experiment files use the settings that each tool documents
-  for itself. Recommendation: measure these first. Add one setting at a time after the first
-  values, where a gate is missed: for RF-DETR a frame shape that keeps the side ratio, for
-  PnLCalib the thresholds of its benchmark script.
-- **Run files of the tools on the results branch** (item 8 of the same section).
-  Recommendation: keep them there; they are the stored answers of the two tools.
+  probe frames", item 3). Three experiment files use the settings of the tools as they come;
+  two more measure the antialiased resize of the detector. Recommendation: measure these first.
+  Add one setting at a time after the first values, where a gate is missed: for RF-DETR a frame
+  shape that keeps the side ratio, for PnLCalib the thresholds of its benchmark script and,
+  when weak cameras miss the limit of the 90th percentile, its limit for the reprojection error.
+- **Run files of the tools on the results branch** (item 8 of the same section). The owner
+  decision of 13 Nov lets three kinds of text return: metrics, stored model answers and the
+  cost ledger. Recommendation: let the run files return too; they are the stored answers of the
+  two tools, without pixels and without label data. After a yes, add them to rule 2 of
+  `CLAUDE.md`, to section 6 of the RUNBOOK and to section 9 of the HANDOVER.
+- **A tool that passes its gate cannot be used by the pipeline yet** (item 1 of the same
+  section). Needed before M4: a setting that names the engine of the people step and of the
+  pitch mapping, a path of `run` that reads the answers of a tool, and for RF-DETR one more
+  step that gives each box its role, team key and number (a paid model step on crops, or
+  plain code with the kit legend). None of it is designed, and no budget line holds it.
+  Recommendation: decide on 24 Nov with the measured values; build the switch only for a step
+  whose Gemini gate failed and whose tool passed (rule 8). When G3 fails and PnLCalib passes,
+  the switch is small, because a camera matrix needs no other step. When G2 fails and RF-DETR
+  passes, plan the step for role and team first, with its cost.
+- **Frames of gate G3.** `docs/PLAN.md` and `configs/gates.yaml` name the frames of the people
+  probe plus 3 of the dev clips. Both pitch experiment files (the model step and PnLCalib)
+  measure the group `probe` only, and the RUNBOOK has no command for the 3 dev clips.
+  Recommendation: keep the gate text, and add the run on the group `dev` with `--max-clips 3`
+  for both engines when the values of the group `probe` are near a gate line; the frames of a
+  gate are a part of the gate (rule 7).
+- **Branch `results` on a public remote** (section "The code repository is public").
+  Recommendation: do not push the branch `results` to the public remote before this is
+  decided. Keep it on the run machine, or give it a second remote that is private. The build
+  machine can read the files from either one.
+- **Licence of this repository.** It has no licence file, and one script imports GPL code of
+  another project when it runs. Recommendation: decide both before the two tools are installed
+  on the run machine (M2), and add a licence file.

@@ -78,12 +78,16 @@ cached, replays for free, and can use the half-price tier.
 - Add-ons, measured later and not built first: IDs carried by Gemini (the recipe of the post),
   tiles or crops for small players, several queries averaged, line and circle fit for midfield.
 - Fallbacks: RF-DETR for boxes (Apache-2.0), PnLCalib for pitch mapping (separate tool). Their
-  adapters are written in M1 and installed in M2. A failed gate is then a config switch, used only
-  after the fallback is scored on the same frames against the same gate.
+  adapters are written in M1 and installed in M2. A fallback replaces a step only after the gate
+  of the step failed and the fallback is scored on the same frames against the same gate.
+- The pipeline has no switch for a fallback yet: `run` takes the people and the pitch mapping
+  from the model steps only. A tool that passes its gate needs a pipeline path, and RF-DETR also
+  needs a step that gives each box its role and team key. This work is not built and not
+  budgeted (open owner decision, `docs/DECISIONS.md`).
 - Both tools are measured in M3 on the frames of the people probe and the pitch probe, with their
   pretrained weights and without training (owner decision, 14 Nov 2026). It costs no API money.
-  So the decision of 24 Nov has measured values for both engines of each step, and the time per
-  frame of each tool on the run machine.
+  So the decision of 24 Nov has measured values of both tools next to those of the two model
+  steps, and the time per frame of each tool on the run machine.
 
 ## Gates (numbers fixed before each run, kept in `configs/gates.yaml`)
 
@@ -95,7 +99,7 @@ They may change once after the free stage, then they are frozen.
 | G0 Contract | < 2 USD | Synthetic 1080p frames through the real API, per model | The contract verdict. The answered boxes land on the true boxes (at least half of the possible pairs, median IoU >= 0.3); the median landmark is within 5% of the image side; token sums add up; `store=False` is set; the half-price tier (Flex) answers for a model that has one, or the check reports that the tier had no capacity for 900 seconds (a fact without a verdict: run the doctor again before the first Flex run). The mean IoU (>= 0.6) and the mean point error (<= 1% of the image side) are reported and are no verdict | Fix the client before any footage is sent |
 | G1 Harness | free | Labels only | Ground truth = 100 (>= 99.5); 1 m shift = 89.5 +/- 0.5; keyframes only = about 8.5; 2 fps + interpolation >= 92; team-side rule right on >= 97% of all valid clips | Fix exporter, sampling or the side rule |
 | G2 People | paid | 120 frames from 24 clips | Recall >= 0.85, precision >= 0.85; recall for boxes up to 110 px high >= 0.70 (at least 300 such boxes); foot-point error median <= 0.7 m | Higher resolution, crop, tiles, other Gemini model, then RF-DETR |
-| G3 Pitch mapping | paid | Same frames + 3 of the dev clips | Position error median <= 1.2 m near goals, <= 2.0 m in midfield; valid on >= 85% of keyframes. Kill-switch after 20 frames (valid < 50% or median > 3 m), counted only after five overlay images are checked by eye | One more Gemini arm, then PnLCalib. Decision on 24 Nov |
+| G3 Pitch mapping | paid | Same frames + 3 of the dev clips | Position error median <= 1.2 m near goals, <= 2.0 m in midfield; 90th percentile of the position error <= 3.0 m; valid on >= 85% of keyframes. Kill-switch after 20 frames (valid < 50% or median > 3 m), counted only after five overlay images are checked by eye | One more Gemini arm, then PnLCalib. Decision on 24 Nov |
 | G4 Identity | paid | 6 dev clips | >= 80% of each true track under one ID; <= 6 switches per clip | Gemini-carried IDs if better on 5 of 6 clips; else denser keyframes for step 3 only (about +1 USD per clip, test set cut to 6 clips) |
 | G5a Number reading | paid | About 400 tracks cut from ground-truth boxes | Reported as an upper bound (oracle input); no gate | — |
 | G5b Number, role, side | free from cache | Pipeline tracks of the 6 dev clips | Exported number equals the label (null counts) on >= 50% of player tracks; role and side >= 95%; no clip with left/right swapped | One more layout; below 40%: stop spending on numbers, report the rate |
@@ -171,7 +175,7 @@ pitch-mapping error.
 | M1 | 13-16 Nov | build | Repo: schemas, pitch table, geometry, tracking, camera motion, exporter + checker, Gemini client (real, replay, fake) with cache and ledger, fallback adapters, renderer, roster lookup, CLI, guard, handoff docs | All tests pass offline with no SDK. Synthetic clip gives video + radar + a valid prediction file | To-dos 1-4 by 16 Nov (about 1 h) |
 | M2 | 17-18 Nov | run | Setup, `doctor`, data, split list, free label stage, cost pilot, fallback install | G0 and G1 pass. Real token counts replace the estimates. Spend <= 2 USD | Start the session; approve first paid calls |
 | M3 | 19-24 Nov | run | People probe, pitch probe, number probe on ground-truth crops. RF-DETR and PnLCalib measured on the frames of the people probe and the pitch probe | G2 and G3 decided with numbers by 24 Nov | Check 10 overlay images; confirm the gate decisions |
-| M4 | 24-26 Nov | run | Fallback switched on if G2 or G3 failed. First end-to-end dev clip. Your demo clip: free dry run (decode, frame rate, keyframes), then a first paid pass | A watchable video + radar on 26 Nov | Demo clip + roster by 22 Nov; watch the video |
+| M4 | 24-26 Nov | run | If G2 or G3 failed and the tool passed: the fallback wired into the pipeline (not built, not budgeted; open owner decision). First end-to-end dev clip. Your demo clip: free dry run (decode, frame rate, keyframes), then a first paid pass | A watchable video + radar on 26 Nov | Demo clip + roster by 22 Nov; watch the video |
 | M5 | 27-30 Nov | run | Identity probe; 6 dev clips scored through the half-price tier | G4, G5b decided. First GS-HOTA. Standard-price runs end 30 Nov | Read the numbers |
 | M6 | 1-5 Dec | run | Fixes from G4-G6, smoothing, look of the video, 3 fresh clips once, freeze tag | G6 passes or is reported as is | Approve the freeze |
 | M7 | 6-10 Dec | run | 10 test clips once; final demo clip with names; report | Report rebuilds from cached answers with one command | Watch the demo; read the report |
@@ -275,7 +279,8 @@ be tested on the build machine; `doctor` is its first real test.
 ## Risks and limits
 
 - Pitch mapping from Gemini landmarks may fail, mainly in midfield views with few line crossings.
-  It is measured first (19-24 Nov) and has a tested fallback.
+  It is measured first (19-24 Nov). Its fallback, PnLCalib, has a tested adapter; the tool itself
+  never ran, and the pipeline cannot use its answers yet.
 - Shirt numbers are often unreadable in wide shots. The radar then shows team colours for all
   players and numbers or names for some.
 - The Gemini client and the scorer wrapper are written on the build machine without a real test.
@@ -288,6 +293,9 @@ be tested on the build machine; `doctor` is its first real test.
 - Before anything is published: use footage you have rights to, and review the licences of the
   fallback tools. The code of PnLCalib is under GPL-2.0-or-later, and `tools/run_tool.py` imports
   it when it runs; the weights of PnLCalib are under CC BY 4.0.
+- The code repository is public since 14 Nov 2026 (owner decision, `docs/DECISIONS.md`). The
+  licence review above is not done yet, and the repository has no licence file. No footage, no
+  dataset file and no video is in the repository, and none may go there.
 
 ## Key sources
 
