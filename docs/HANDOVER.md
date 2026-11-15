@@ -27,9 +27,9 @@ Words:
 |---|---|
 | Milestone | M1 (first build) is done. M2 starts on the run machine on 17 Nov |
 | Code | Branch `m1-first-build`. Package `pitchvlm` under `src/`, tests under `tests/` |
-| Offline tests | 2624 passed and 1 skipped on the build machine (Python 3.13, no model SDK installed). The skipped test reads an image with Pillow, which the environment of the package does not have |
+| Offline tests | 2698 passed and 1 skipped on the build machine (Python 3.13, no model SDK installed). The skipped test reads an image with Pillow, which the environment of the package does not have |
 | Demo | `demo` gives a video, a radar and a valid prediction file from a synthetic clip and a fake model |
-| Reviews | Two reviews tested the code. Each finding was repaired, or kept with a measured reason (`docs/DECISIONS.md`) |
+| Reviews | Two reviews tested the first build, and a third one the measurement of the two specialist tools. Each finding was repaired, or kept with a measured reason (`docs/DECISIONS.md`) |
 | Real API, real scorer, real footage | Never used. Every result so far is synthetic |
 | Money spent | 0 USD of the planned 120 USD |
 
@@ -173,7 +173,8 @@ RUNBOOK, section 3 has the commands of the install and of the measurement. Ask t
 this install: it downloads packages and about 1 GB of weights. The commands never ran, and the
 script that runs the tools (`tools/run_tool.py`) was tested with stand-ins only (RUNBOOK,
 section 8, row "Tool script"). In M3 both tools are measured on the frames of the people probe
-and the pitch probe, for free (owner decision of 2026-11-14).
+and the pitch probe, for free (owner decision of 2026-11-14). The commands measure a tool. The
+pipeline cannot use the answers of a tool yet: that work is an open owner decision.
 
 ## 7 The first-day checks that matter most
 
@@ -207,7 +208,9 @@ whether the next days can start:
 ## 9 Sending results back to the build machine
 
 Only text goes back: metrics files, stored model answers, the cost ledger. They live in
-`../pitchvlm-results/results` and travel on the branch `results` (RUNBOOK, section 6).
+`../pitchvlm-results/results` and travel on the branch `results` (RUNBOOK, section 6). The run
+files of the two specialist tools are written there too. Whether they travel is an open owner
+decision (`docs/DECISIONS.md`, last list).
 
 1. On the run machine: `python -m pitchvlm.cli sync --results ../pitchvlm-results/results`. It
    checks the files and prints three git commands. It runs none of them.
@@ -243,10 +246,12 @@ does:
   probe and the pitch probe, without training and for free (RUNBOOK, section 3). A tool still
   replaces a Gemini step only after that step failed its gate.
 
-Seven decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
+Nine decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
 of them wait for the first real answers: the label penalty of the tracker, the team-side rule
-with goalkeeper evidence, and the requests in flight at a budget stop. Two are about the
-measurement of the two specialist tools: its settings, and the place of its run files.
+with goalkeeper evidence, and the requests in flight at a budget stop. Four came with the
+measurement of the two specialist tools: its settings, the place of its run files, the work
+that lets the pipeline use a tool that passed its gate (not built, not budgeted), and the
+frames of gate G3.
 
 ## 12 Schedule after the handover
 

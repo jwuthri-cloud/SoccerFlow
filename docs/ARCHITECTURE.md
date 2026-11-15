@@ -954,14 +954,24 @@ def score_pitch_mappings(clips, mapping_of: Callable[[str, int], HomographyRecor
   raises `ValueError`.
 - `score_people_answers` returns the keys of `probe_people` without `prompts` and
   `n_answers_not_parsed`. Both functions score the answers with the same code
-  (`probes._score_people`), so the same boxes give the same values.
+  (`probes._score_people`), so the same boxes give the same values. `counts.fp_off_pitch` of
+  both results is the number of wrong boxes whose foot point the label mapping of the frame
+  puts more than `PITCH_MARGIN_M` outside the pitch: the pipeline drops such people, and a
+  detector cannot leave the spectators out as the people prompt tells the model. A frame
+  without a label mapping adds nothing to this count.
 - `score_pitch_mappings` returns the keys of `probe_pitch` that do not belong to a landmark
   fit. A frame is valid when the tool gave a matrix. The plausibility check is
   `pipeline.fit_problems`; a tool record has no count of agreeing landmarks, so the check wants
-  9 of 10 people on the pitch. `axis_check` holds the median position error of the valid frames
-  for the mapped points as they are and with the sign of x, of y or of both changed
-  (`probes.AXIS_SIGNS`). It tests the pitch convention of the tool output: when `as_given` is
-  not the smallest value, the script that ran the tool has a fault.
+  9 of 10 people on the pitch; a landmark fit with 7 or more agreeing landmarks needs 2 of 3.
+  The error values are counted on the valid frames of that engine, so two engines that refuse
+  a different number of frames are not measured on the same frames there. `axis_check` holds
+  the median position error of the valid frames for the mapped points as they are and with the
+  sign of x, of y or of both changed (`probes.AXIS_SIGNS`). It tests the pitch convention of
+  the tool output. The convention is right when `as_given` is the smallest value and small
+  (some metres at most). A large `as_given` next to one small other value means that the
+  script that ran the tool has a fault. When all four values are large, the check decides
+  nothing. The command `tool-score` prints the check and ends with the exit code 1 when another
+  value is smaller than `as_given` (`cli.print_axis_check`).
 - The settings block of a tool result holds the tool section of the experiment file under
   `tool`, and the seed and the measurement values of the probe. It has no `step_settings` and
   no `repeat`.
@@ -977,7 +987,9 @@ package:
 - The run file (`ToolRun`, format `pitchvlm-tool-run-1`): the name and the tool section of the
   job, the facts of the run (`runner`), and one entry per frame with `seconds` (the time of the
   tool for the frame, without the reading of the image file) and `payload` (the answer in the
-  format of the adapter module of the tool). No frame may have two answers.
+  format of the adapter module of the tool). No frame may have two answers. The file is read
+  strictly (`load_tool_run`): a key that comes twice is refused, a number must be written as a
+  number and a truth value as true or false.
 - The tool section is `RfdetrSettings` (`name`, `model`, `min_score`, `antialias`) or
   `PnlcalibSettings` (`name`, `kp_threshold`, `line_threshold`, `pnl_refine`); the key `name`
   says which one. `antialias` and `pnl_refine` take only true and false.
@@ -987,16 +999,22 @@ package:
   (`cli.probe_answers`). So the settings of the experiment file are those that the tool ran
   with. Answers for other frames are counted (`provenance.n_answers_not_used`) and not
   measured. The metrics file holds the values of the probe, `seconds_per_frame` (the summary of
-  the times of the measured frames) and, under `provenance`, the facts of the run. The command
-  refuses a work tree with changes like `probe`.
+  the times of the measured frames) and, under `provenance`, the facts of the run (`runner`),
+  the SHA-256 of the run file (`run_file_sha256`) and `script_is_current`: whether
+  `runner.script_sha256` is the SHA-256 of the `tools/run_tool.py` of the work tree. The
+  command refuses a work tree with changes like `probe`. Both tool commands refuse an output
+  file that is one of their input files (`cli.refuse_input_as_output`).
 - `fallbacks.rfdetr.people_from_detections` has no default score limit: the experiment file
   names it, and the script gives the same value to the tool as its threshold.
 
 `tools/run_tool.py` (`rfdetr` and `pnlcalib` sub-commands) reads a job file and writes a run
 file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`) and the commit of the PnLCalib clone
-(`PNLCALIB_COMMIT`) and refuses another one, because it was written from the source of these
-versions and never ran with the tools. An error of a tool on a frame is not caught: the script
-names the frame and stops, so no frame counts as a frame without an answer because of an error. For PnLCalib it binds the package names `model` and
+(`PNLCALIB_COMMIT`) and refuses another one, and a clone with a changed tracked file, because it
+was written from the source of these versions and never ran with the tools. It takes the
+variable `GEMINI_API_KEY` out of its environment before it loads a tool, and it writes its own
+SHA-256 into the facts of the run. An error of a tool on a frame is not caught: the script
+names the frame and stops, so no frame counts as a frame without an answer because of an
+error. For PnLCalib it binds the package names `model` and
 `utils` to the two folders of the clone before it imports from them, loads the weight files as
 plain weights, and takes the mapping of the grass from the camera of the tool
 (`camera_homography`: the projection matrix without the column of the height). The world frame

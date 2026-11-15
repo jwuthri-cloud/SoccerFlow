@@ -347,7 +347,18 @@ def test_run_file_of_the_detector_holds_every_detection_and_the_facts_of_the_run
     runner = run["runner"]
     assert (runner["device"], runner["tool_version"], runner["torch"]) == ("mps", "1.12.1", "2.9.0")
     assert runner["predictor"] == "predict() of the model, not compiled"
-    assert set(runner) == {"device", "machine", "system", "python", "torch", "tool_version", "predictor"}
+    assert set(runner) == {
+        "device",
+        "machine",
+        "system",
+        "python",
+        "torch",
+        "script_sha256",
+        "tool_version",
+        "predictor",
+    }
+    # The run file names the script that made it: tool-score compares it with the script of its work tree.
+    assert runner["script_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
     # The package reads the file, and the file holds no absolute path.
     assert runs.load_tool_run(out).tool == runs.RfdetrSettings(**DETECTOR_SETTINGS)
     assert str(tmp_path) not in out.read_text(encoding="utf-8")
@@ -475,8 +486,8 @@ def test_error_of_the_tool_on_its_first_call_names_the_first_frame(
 def test_script_in_an_environment_without_the_tool_says_so_in_one_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The package rfdetr is not installed where the tests run, and no stand-in takes its place here."""
-    monkeypatch.delitem(sys.modules, "rfdetr", raising=False)
+    """The import of the tool fails here, also on a machine where the package rfdetr is installed."""
+    monkeypatch.setitem(sys.modules, "rfdetr", None)
     job = job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data"))
 
     code, out = run_detector(tmp_path, job)
@@ -485,13 +496,13 @@ def test_script_in_an_environment_without_the_tool_says_so_in_one_line(
     stderr = capsys.readouterr().err
     assert "Traceback" not in stderr
     assert stderr.splitlines()[-1] == (
-        "error: the module rfdetr cannot be imported: No module named 'rfdetr'. "
+        "error: the module rfdetr cannot be imported: import of rfdetr halted; None in sys.modules. "
         "Run this script with the Python of the environment of the tool"
     )
     assert not out.exists()
     # The version of a package that is not installed gives the same advice.
-    with pytest.raises(run_tool.RunnerError, match="the package rfdetr is not installed here. Run this script with"):
-        installed_version_of_the_script("rfdetr")
+    with pytest.raises(run_tool.RunnerError, match="the package no-such-tool is not installed here. Run this script"):
+        installed_version_of_the_script("no-such-tool")
     assert installed_version_of_the_script("numpy") == np.__version__
 
 
@@ -851,8 +862,8 @@ class FramebyFrameCalib:
         self.given = None
         CALLS.append(("init", iwidth, iheight, denormalize))
 
-    def update(self, keypoints_dict, lines_dict):
-        self.given = (dict(keypoints_dict), dict(lines_dict))
+    def update(self, kp_dict, lines_dict):
+        self.given = (dict(kp_dict), dict(lines_dict))
         CALLS.append(("update", *self.given))
 
     def heuristic_voting(self, refine=False, refine_lines=False, th=5.0):
@@ -895,6 +906,7 @@ def clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (tmp_path / "SV_lines").write_bytes(b"weights of the line model")
     monkeypatch.setattr(sys, "path", [str(site.resolve()), *sys.path])
     monkeypatch.setattr(run_tool, "clone_commit", lambda repo: run_tool.PNLCALIB_COMMIT)
+    monkeypatch.setattr(run_tool, "clone_changes", lambda repo: [])
     monkeypatch.delenv("MPLBACKEND", raising=False)
     for name in STAND_IN_MODULES:
         monkeypatch.delitem(sys.modules, name, raising=False)
@@ -1145,6 +1157,9 @@ def test_detector_goes_from_the_job_of_the_package_to_its_metrics(
     assert measured["settings"]["tool"] == job["tool"]
     assert measured["provenance"]["runner"]["tool_version"] == "1.12.1"
     assert measured["seconds_per_frame"]["n"] == len(job["frames"])
+    # The run file was made by the script of this work tree, and the metrics file names its content.
+    assert measured["provenance"]["script_is_current"] is True
+    assert measured["provenance"]["run_file_sha256"] == hashlib.sha256(run_file.read_bytes()).hexdigest()
 
 
 def camera_of_projection(projection: np.ndarray, width: int, height: int) -> dict[str, Any]:
@@ -1223,3 +1238,236 @@ def test_script_does_not_import_the_package() -> None:
     assert imports
     assert not [line for line in imports if "pitchvlm" in line]
     assert not [line for line in lines if "import_module(" in line and "pitchvlm" in line]
+
+
+# --- Errors of a tool, of its environment and of the machine ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("box", "score"),
+    [
+        ([10.0, 20.0, math.nan, 60.0], 0.9),
+        ([10.0, 20.0, math.inf, 60.0], 0.9),
+        ([10.0, 20.0, 30.0, 60.0], math.nan),
+        ([10.0, 20.0, 30.0, 60.0], math.inf),
+    ],
+)
+def test_box_or_score_that_is_not_finite_stops_the_run_at_its_frame(
+    tmp_path: Path,
+    detector: type[Detector],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    box: list[float],
+    score: float,
+) -> None:
+    def find(image: np.ndarray) -> list[Any]:
+        if image[0, 0, 0] == 31:
+            return [([10.0, 20.0, 30.0, 60.0], 0.9, "person"), (box, score, "person")]
+        return []
+
+    monkeypatch.setattr(detector, "find", staticmethod(find))
+
+    code, out = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [
+        "the tool stopped on clip CLIP-A, frame 1 (SoccerNetGS-valid/CLIP-A/img1/000002.png)",
+        "error: the detector gave a box or a score that is not a finite number",
+    ]
+    assert not out.exists()
+    # The run stopped at the frame: the first call, frame 0 and frame 1.
+    assert len(detector.made[0].calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("import_line", "error_name"),
+    [
+        # A name that another version of a package has.
+        ("from json import a_name_of_another_version", "ImportError"),
+        # A package that the tool needs and that is not installed: the tool itself is installed.
+        ("import a_package_that_the_tool_needs", "ModuleNotFoundError"),
+    ],
+)
+def test_import_error_inside_an_installed_tool_keeps_its_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    import_line: str,
+    error_name: str,
+) -> None:
+    site = tmp_path / "site" / "rfdetr"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text("from rfdetr.detr import RFDETRSmall\n", encoding="utf-8")
+    (site / "detr.py").write_text(f"{import_line}\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(site.parent), *sys.path])
+    for name in ("rfdetr", "rfdetr.detr"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    code, out = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0].startswith("Traceback")
+    assert any("detr.py" in line for line in lines)
+    assert lines[-1] == f"error: the script stopped with {error_name}; the traceback above says where"
+    assert not any("Run this script with the Python" in line for line in lines)
+    for name in ("rfdetr", "rfdetr.detr"):
+        sys.modules.pop(name, None)
+
+
+def test_missing_module_of_the_environment_gives_one_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "torchvision", None)
+    with pytest.raises(run_tool.RunnerError, match="the module torchvision.transforms cannot be imported"):
+        run_tool.tool_module("torchvision.transforms")
+
+
+def test_image_that_cannot_be_read_names_its_frame(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def read(path: Path) -> np.ndarray:
+        if path.name == "000003.png":
+            raise OSError("image file is truncated (5 bytes not processed)")
+        return read_rgb_with_opencv(path)
+
+    monkeypatch.setattr(run_tool, "read_rgb", read)
+
+    code, out = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    assert capsys.readouterr().err.splitlines() == [
+        "the image cannot be read: clip CLIP-A, frame 2 (SoccerNetGS-valid/CLIP-A/img1/000003.png)",
+        "error: image file is truncated (5 bytes not processed)",
+    ]
+    assert not out.exists()
+
+
+def test_place_of_the_run_file_is_checked_before_the_tool_is_built(
+    tmp_path: Path, detector: type[Detector], capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "runs").write_text("a file, not a folder", encoding="utf-8")
+
+    code, out = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    assert error_line(capsys).startswith("error: [Errno 17] File exists")
+    assert detector.made == []
+
+
+def test_clone_with_a_changed_file_is_refused(
+    tmp_path: Path, clone: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    monkeypatch.undo()
+    monkeypatch.setattr(run_tool, "read_rgb", read_rgb_with_opencv)
+    monkeypatch.setattr(run_tool, "installed_version", {"torch": "2.9.0"}.__getitem__)
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+
+    def git(*arguments: str) -> str:
+        identity = ["-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgsign=false"]
+        done = subprocess.run(
+            ["git", "-C", str(clone), *identity, *arguments], capture_output=True, text=True, check=True
+        )
+        return done.stdout.strip()
+
+    git("init", "--quiet", "--template=")
+    git("add", "model", "utils", "config")
+    git("commit", "--quiet", "--no-verify", "-m", "first")
+    monkeypatch.setattr(run_tool, "PNLCALIB_COMMIT", git("rev-parse", "HEAD"))
+    # Files that git does not track do not count: results.json of the stand-in, and bytecode folders.
+    (clone / "utils" / "__pycache__").mkdir()
+    (clone / "utils" / "__pycache__" / "x.pyc").write_bytes(b"bytecode")
+    assert run_tool.clone_changes(clone) == []
+    with (clone / "utils" / "utils_calib.py").open("a", encoding="utf-8") as stream:
+        stream.write("# changed by hand\n")
+    frames = small_frames(tmp_path / "data", count=1)
+
+    code, out = run_calibration(tmp_path, clone, job_of(CALIBRATION_SETTINGS, frames), [None, None])
+
+    assert code == 2
+    line = error_line(capsys)
+    assert "1 tracked files of" in line and "utils/utils_calib.py" in line
+    assert not out.exists()
+    assert "utils.utils_calib" not in sys.modules
+
+
+def test_state_of_a_folder_that_is_no_clone_cannot_be_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    folder = tmp_path / "no_clone"
+    folder.mkdir()
+
+    # The text after the colon is the error line of git.
+    with pytest.raises(run_tool.RunnerError, match=r"the state of the clone \S+no_clone cannot be read: \S"):
+        run_tool.clone_changes(folder)
+
+
+def test_older_python_is_refused_in_one_line(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data"))
+    monkeypatch.setattr(sys, "version_info", (3, 9, 18, "final", 0))
+
+    code, out = run_detector(tmp_path, job)
+
+    monkeypatch.undo()
+    assert code == 2
+    assert error_line(capsys).startswith("error: this script needs Python 3.10 or newer, and this is Python ")
+    assert not out.exists()
+    assert detector.made == []
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_line_refinement_that_is_no_truth_value_is_refused(
+    tmp_path: Path, clone: Path, capsys: pytest.CaptureFixture[str], value: Any
+) -> None:
+    settings = {**CALIBRATION_SETTINGS, "pnl_refine": value}
+    frames = small_frames(tmp_path / "data", count=1)
+
+    code, out = run_calibration(tmp_path, clone, job_of(settings, frames), [None, None])
+
+    assert code == 2
+    assert error_line(capsys) == f"error: the tool setting 'pnl_refine' must be true or false, got {value!r}"
+    assert not out.exists()
+
+
+def test_tools_do_not_get_the_key_of_the_model_api(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminal of the run machine holds the key. A tool is code of another project and must not see it."""
+    seen: list[str | None] = []
+
+    def find(image: np.ndarray) -> list[Any]:
+        seen.append(os.environ.get("GEMINI_API_KEY"))
+        return []
+
+    monkeypatch.setattr(detector, "find", staticmethod(find))
+    monkeypatch.setenv("GEMINI_API_KEY", "a-made-up-value")
+
+    code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 0
+    assert seen == [None] * 4
+    assert "GEMINI_API_KEY" not in os.environ
+    # The script names the variable of the package.
+    assert run_tool.KEY_VARIABLE == cli.KEY_VARIABLE == "GEMINI_API_KEY"
+
+
+def test_interpreter_without_numpy_gets_one_line_and_the_code_2(tmp_path: Path) -> None:
+    """Python without its installed packages (the options -S and -I): the wrong interpreter for the script."""
+    arguments = ["rfdetr", "--job", "job.json", "--root", "data", "--out", "run.json", "--device", "cpu"]
+
+    done = subprocess.run(
+        [sys.executable, "-S", "-I", str(SCRIPT), *arguments], capture_output=True, text=True, cwd=tmp_path, check=False
+    )
+
+    assert done.returncode == 2
+    assert done.stderr.splitlines() == [
+        "error: NumPy is not installed here. Run this script with the Python of the environment of the tool"
+    ]

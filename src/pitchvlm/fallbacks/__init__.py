@@ -38,9 +38,13 @@ def payload_number(value: Any, where: str) -> float:
     """Return a payload value as a float.
 
     ``where`` names the place in the payload for the error text. ``ValueError`` is raised for a
-    value that is not a number. A truth value is not a number here, although Python counts it as
-    an integer. NaN and infinity pass this check: the caller decides what they mean.
+    value that is not a number, and for a whole number that is too large for a float. A truth
+    value is not a number here, although Python counts it as an integer. NaN and infinity pass
+    this check: the caller decides what they mean.
     """
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{where}: expected a number, got {value!r}")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError as error:
+        raise ValueError(f"{where}: the whole number is too large for a float ({len(str(value))} digits)") from error

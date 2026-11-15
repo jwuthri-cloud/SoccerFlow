@@ -413,7 +413,8 @@ def test_probe_people_counts_found_wrong_and_missed_boxes() -> None:
     assert (result["probe"], result["n_clips"], result["n_frames"]) == ("people", 1, 3)
     # Frames 0 and 2: 7 of 7 found. Frame 1: tracks 1, 2, 3, 4 and 6 found, tracks 5 and 7 missed,
     # and three boxes that match nobody.
-    assert result["counts"] == {"predicted_boxes": 22, "true_boxes": 21, "tp": 19, "fp": 3, "fn": 2}
+    counts = result["counts"]
+    assert counts == {"predicted_boxes": 22, "true_boxes": 21, "tp": 19, "fp": 3, "fn": 2, "fp_off_pitch": 2}
     assert result["recall"] == pytest.approx(19 / 21)
     assert result["precision"] == pytest.approx(19 / 22)
     # Small boxes are the three short boxes of each frame. In frame 1 only track 6 is found.
@@ -423,6 +424,63 @@ def test_probe_people_counts_found_wrong_and_missed_boxes() -> None:
     assert small["precision"] == pytest.approx(7 / 10)
     assert result["n_answers_not_parsed"] == 0
     assert_plain(result)
+
+
+def test_wrong_boxes_off_the_pitch_are_counted_next_to_the_wrong_boxes() -> None:
+    """Every frame gets the seven right boxes and wrong boxes of 64 x 72 pixels.
+
+    - frame 0: one box with its foot at the pitch position (16, -18), where nobody is, and one
+      box with its foot at (0, 45), 11 m behind the near touchline;
+    - frame 1: one box with its foot at (-60, 0), 7.5 m behind the left goal line, and one box
+      with its foot at (0, 36.9), 2.9 m behind the near touchline: inside the margin of 3 m;
+    - frame 2: one box with its foot at (0, 45). The labels of this frame give no mapping.
+    """
+
+    def wrong_box(pitch_xy: tuple[float, float]) -> list[int]:
+        foot_x, foot_y = to_pixels(pitch_xy)
+        return model_box(Box(x1=foot_x - 32.0, y1=foot_y - 72.0, x2=foot_x + 32.0, y2=foot_y))
+
+    wrong = {0: [(16.0, -18.0), (0.0, 45.0)], 1: [(-60.0, 0.0), (0.0, 36.9)], 2: [(0.0, 45.0)]}
+
+    def answers(request: VLMRequest) -> dict[str, Any]:
+        return people_answer([*exact_boxes(), *(wrong_box(spot) for spot in wrong[request.meta.frame])])
+
+    def people_of(clip_id: str, frame: int) -> FramePeople:
+        boxes = [*exact_boxes(), *(wrong_box(spot) for spot in wrong[frame])]
+        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT)
+
+    model = run_people_probe([people_clip()], StubBackend({"kit_legend": legend_answer, "people": answers}))
+    tool = score_people([people_clip()], people_of=people_of)
+
+    for result in (model, tool):
+        counts = result["counts"]
+        # Five wrong boxes. Two of them are off the pitch in a frame whose labels give a mapping.
+        assert (counts["tp"], counts["fp"], counts["fp_off_pitch"]) == (21, 5, 2)
+        assert result["n_frames_without_label_mapping"] == 1
+        # The precision counts every wrong box.
+        assert result["precision"] == pytest.approx(21 / 26)
+
+
+def test_right_box_off_the_pitch_is_not_counted_as_a_wrong_box_off_the_pitch() -> None:
+    """A labelled person stands 11 m behind the near touchline, and the tool finds that person.
+
+    The tool also gives one box where nobody is, 7.5 m behind the right goal line. Only that
+    box is a wrong box off the pitch.
+    """
+    layout = [*people_layout(), standing(8, (0.0, 45.0), role="other", team=None)]
+    clip = hand_clip("HAND-8", [layout, layout])
+    foot_x, foot_y = to_pixels((60.0, 0.0))
+    nobody = model_box(Box(x1=foot_x - 32.0, y1=foot_y - 72.0, x2=foot_x + 32.0, y2=foot_y))
+    boxes = [*(model_box(box_of(athlete)) for athlete in layout), nobody]
+
+    def people_of(clip_id: str, frame: int) -> FramePeople:
+        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT)
+
+    result = score_people([clip], people_of=people_of)
+
+    assert result["n_frames_without_label_mapping"] == 0
+    counts = result["counts"]
+    assert (counts["true_boxes"], counts["tp"], counts["fp"], counts["fp_off_pitch"]) == (16, 16, 2, 2)
 
 
 def test_probe_people_measures_foot_errors_through_the_label_mapping() -> None:
@@ -506,7 +564,8 @@ def test_probe_people_reports_every_clip() -> None:
     backend = people_backend()
     result = run_people_probe([people_clip("HAND-1"), people_clip("HAND-2")], backend)
     assert (result["n_clips"], result["n_frames"]) == (2, 6)
-    assert result["counts"] == {"predicted_boxes": 44, "true_boxes": 42, "tp": 38, "fp": 6, "fn": 4}
+    counts = result["counts"]
+    assert counts == {"predicted_boxes": 44, "true_boxes": 42, "tp": 38, "fp": 6, "fn": 4, "fp_off_pitch": 4}
     assert result["foot_error_m"]["n"] == 24
     assert result["n_frames_without_label_mapping"] == 2
     assert set(result["per_clip"]) == {"HAND-1", "HAND-2"}
@@ -553,12 +612,27 @@ def test_people_answer_that_cannot_be_parsed_counts_as_no_people() -> None:
     result = run_people_probe([people_clip()], backend)
     assert result["n_answers_not_parsed"] == 1
     # The seven people of frame 1 are missed. Nothing is found wrongly.
-    assert result["counts"] == {"predicted_boxes": 14, "true_boxes": 21, "tp": 14, "fp": 0, "fn": 7}
+    counts = result["counts"]
+    assert counts == {"predicted_boxes": 14, "true_boxes": 21, "tp": 14, "fp": 0, "fn": 7, "fp_off_pitch": 0}
     assert result["recall"] == pytest.approx(14 / 21)
     assert result["precision"] == 1.0
     # Only frame 0 has matched boxes and a label mapping.
     assert result["foot_error_m"]["n"] == 7
     assert len(backend.sent("people")) == 3
+
+
+def test_unparsed_people_answers_of_every_clip_are_counted() -> None:
+    """Frame 1 of the first clip cannot be parsed. The second clip has no such answer."""
+
+    def answers(request: VLMRequest) -> Any:
+        if (request.meta.clip_id, request.meta.frame) == ("HAND-1", 1):
+            return "this is not JSON"
+        return people_answer(exact_boxes())
+
+    backend = StubBackend({"kit_legend": legend_answer, "people": answers})
+    result = run_people_probe([people_clip("HAND-1"), people_clip("HAND-2")], backend)
+
+    assert result["n_answers_not_parsed"] == 1
 
 
 def test_kit_legend_that_cannot_be_parsed_stops_the_probe() -> None:
@@ -933,6 +1007,8 @@ LANDMARK_KEYS = {
 #: same camera with the pitch mirrored in x and in y.
 CAMERA = ((0.1, 0.0, -64.0), (0.0, 0.125, -45.0), (0.0, 0.0, 1.0))
 CAMERA_X_MIRRORED = ((-0.1, 0.0, 64.0), (0.0, 0.125, -45.0), (0.0, 0.0, 1.0))
+#: The camera of the hand-made clips with every point 2 m too far right on the pitch.
+CAMERA_2M_RIGHT = ((0.1, 0.0, -62.0), (0.0, 0.125, -45.0), (0.0, 0.0, 1.0))
 CAMERA_Y_MIRRORED = ((0.1, 0.0, -64.0), (0.0, -0.125, 45.0), (0.0, 0.0, 1.0))
 
 
@@ -964,15 +1040,20 @@ def without_keys(result: dict[str, Any], keys: Collection[str]) -> dict[str, Any
     return cut
 
 
-def score_people(clips: Sequence[LabelledClip], **changes: Any) -> dict[str, Any]:
-    """Score the tool people on hand-made clips with all frames (10 is more than a clip has)."""
+def score_people(
+    clips: Sequence[LabelledClip], people_of: Callable[[str, int], FramePeople] | None = None, **changes: Any
+) -> dict[str, Any]:
+    """Score the people of a tool on hand-made clips with all frames (10 is more than a clip has).
+
+    Without ``people_of`` the tool gives the boxes of the stub model (``tool_people``).
+    """
     arguments: dict[str, Any] = {
         "frames_per_clip": 10,
         "seed": 0,
         "small_box_max_height_px": SMALL_BOX_MAX_HEIGHT_PX,
         **changes,
     }
-    return score_people_answers(clips, tool_people, DETECTOR, **arguments)
+    return score_people_answers(clips, tool_people if people_of is None else people_of, DETECTOR, **arguments)
 
 
 def test_probe_frames_are_the_frames_that_the_probes_sample() -> None:
@@ -1002,7 +1083,8 @@ def test_tool_people_are_measured_like_the_answers_of_the_model() -> None:
 
     tool = score_people([people_clip()])
 
-    assert tool["counts"] == {"predicted_boxes": 22, "true_boxes": 21, "tp": 19, "fp": 3, "fn": 2}
+    counts = tool["counts"]
+    assert counts == {"predicted_boxes": 22, "true_boxes": 21, "tp": 19, "fp": 3, "fn": 2, "fp_off_pitch": 2}
     assert tool["foot_error_m"]["n"] == 12
     step_only = {"settings", "prompts", "n_answers_not_parsed"}
     assert without_keys(tool, step_only) == without_keys(model, step_only)
@@ -1058,6 +1140,31 @@ def test_tool_answer_must_name_its_frame() -> None:
         )
 
 
+def test_tool_answer_that_names_an_earlier_frame_is_refused() -> None:
+    def people_of(clip_id: str, frame: int) -> FramePeople:
+        return FramePeople(frame=max(frame - 1, 0))
+
+    with pytest.raises(ValueError, match="the answer for frame 1 names frame 0"):
+        score_people_answers(
+            [people_clip()], people_of, DETECTOR, frames_per_clip=10, seed=0, small_box_max_height_px=100.0
+        )
+    with pytest.raises(ValueError, match="the answer for frame 1 names frame 0"):
+        score_pitch_mappings(
+            [pitch_clip()], lambda clip_id, frame: HomographyRecord(frame=0), CALIBRATION, frames_per_clip=10, seed=0
+        )
+
+
+def test_tool_people_refuse_no_clip_and_two_clips_with_one_id() -> None:
+    def people_of(clip_id: str, frame: int) -> FramePeople:
+        raise AssertionError("the tool must not be asked")
+
+    arguments: dict[str, Any] = {"frames_per_clip": 2, "seed": 0, "small_box_max_height_px": 100.0}
+    with pytest.raises(ValueError, match="at least one clip"):
+        score_people_answers([], people_of, DETECTOR, **arguments)
+    with pytest.raises(ValueError, match="more than once"):
+        score_people_answers([people_clip(), people_clip()], people_of, DETECTOR, **arguments)
+
+
 @pytest.mark.parametrize(
     "changes", [{"frames_per_clip": 0}, {"small_box_max_height_px": 0.0}, {"small_box_max_height_px": math.nan}]
 )
@@ -1092,6 +1199,72 @@ def test_tool_mappings_are_measured_like_the_fits_of_the_model() -> None:
     assert set(tool) - set(model) == {"axis_check"}
     assert not LANDMARK_KEYS & set(tool["by_view"]["goal"])
     assert_plain(tool)
+
+
+def test_tool_mappings_of_two_clips_keep_the_values_of_each_clip() -> None:
+    """HAND-1 (one midfield frame) has the exact camera. HAND-2 (two goal frames) has a camera that is 2 m off."""
+    first = hand_clip("HAND-1", [people_at(MIDFIELD_SPOTS)])
+    second = hand_clip("HAND-2", [people_at(GOAL_SPOTS), people_at(GOAL_SPOTS)])
+
+    def mapping_of(clip_id: str, frame: int) -> HomographyRecord:
+        return tool_mapping(CAMERA if clip_id == "HAND-1" else CAMERA_2M_RIGHT)(clip_id, frame)
+
+    result = score_pitch_mappings([first, second], mapping_of, CALIBRATION, frames_per_clip=10, seed=0)
+
+    assert (result["n_clips"], result["n_frames"], result["n_frames_valid"]) == (2, 3, 3)
+    assert result["per_clip"] == {
+        "HAND-1": {"n_frames": 1, "valid_share": 1.0, "error_median_m": pytest.approx(0.0, abs=1e-9)},
+        "HAND-2": {"n_frames": 2, "valid_share": 1.0, "error_median_m": pytest.approx(2.0)},
+    }
+    main = result["main_metric"]
+    assert (main["n_clips"], main["mean"]) == (2, pytest.approx(1.0))
+    # 6 people without an error and 12 people with 2 m: the median of all 18 is 2 m.
+    assert (result["error_m"]["n"], result["error_m"]["median"]) == (18, pytest.approx(2.0))
+    assert result["axis_check"]["as_given"] == pytest.approx(2.0)
+    # The views take the frames of both clips.
+    goal, midfield = result["by_view"]["goal"], result["by_view"]["midfield"]
+    assert (goal["n_frames"], goal["error_m"]["n"], goal["error_m"]["median"]) == (2, 12, pytest.approx(2.0))
+    assert (midfield["n_frames"], midfield["error_m"]["n"]) == (1, 6)
+    assert midfield["error_m"]["median"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_probe_pitch_of_two_clips_keeps_the_values_of_each_clip() -> None:
+    """HAND-1 (one midfield frame) gets the right landmarks. HAND-2 (two goal frames): the landmarks of
+    frame 0 are 22 model units too low in the picture (1.98 m of pitch y), and the answer of frame 1
+    cannot be parsed.
+    """
+
+    def answers(request: VLMRequest) -> Any:
+        answer = landmark_answer(LANDMARK_IDS)
+        if request.meta.clip_id == "HAND-2":
+            if request.meta.frame == 1:
+                return "this is not JSON"
+            for landmark in answer["landmarks"]:
+                landmark["point"][0] += 22  # A model point is [y, x].
+        return answer
+
+    clips = [hand_clip("HAND-1", [people_at(MIDFIELD_SPOTS)]), hand_clip("HAND-2", [people_at(GOAL_SPOTS)] * 2)]
+    backend = StubBackend({"landmarks": answers})
+    result = probe_pitch(clips, backend, SETTINGS, frames_per_clip=10, seed=0, ransac_px=8.0)
+
+    assert (result["n_clips"], result["n_frames"], result["n_frames_valid"]) == (2, 3, 2)
+    assert set(result["per_clip"]) == {"HAND-1", "HAND-2"}
+    first, second = result["per_clip"]["HAND-1"], result["per_clip"]["HAND-2"]
+    assert (first["n_frames"], first["valid_share"]) == (1, 1.0)
+    assert first["error_median_m"] < 0.1
+    assert (second["n_frames"], second["valid_share"]) == (2, 0.5)
+    assert second["error_median_m"] == pytest.approx(1.98, abs=0.1)
+    main = result["main_metric"]
+    assert (main["n_clips"], main["mean"]) == (2, pytest.approx(0.99, abs=0.1))
+    # The values of all frames, the views and the facts of the answers take the frames of both clips.
+    assert result["error_m"]["n"] == 12
+    goal, midfield = result["by_view"]["goal"], result["by_view"]["midfield"]
+    assert (goal["n_frames"], goal["n_frames_valid"], goal["error_m"]["n"]) == (2, 1, 6)
+    assert (midfield["n_frames"], midfield["n_frames_valid"], midfield["error_m"]["n"]) == (1, 1, 6)
+    assert result["n_answers_not_parsed"] == 1
+    # Landmarks per frame: 8, 8 and 0.
+    assert (result["landmarks_per_frame"]["n"], result["landmarks_per_frame"]["mean"]) == (3, pytest.approx(16 / 3))
+    assert (result["inliers_per_valid_frame"]["n"], result["inliers_per_valid_frame"]["median"]) == (2, 8)
 
 
 def test_tool_mappings_count_valid_and_plausible_frames() -> None:
@@ -1591,6 +1764,7 @@ def test_people_probe_finds_every_person_of_the_synthetic_clip(
         "tp": n_people,
         "fp": 0,
         "fn": 0,
+        "fp_off_pitch": 0,
     }
     # Far people have small boxes and near people have tall boxes: both kinds are in the clip.
     small = exact_people["small_boxes"]
