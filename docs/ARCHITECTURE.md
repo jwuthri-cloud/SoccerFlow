@@ -23,6 +23,13 @@ else.
 | 9 | Votes, team side, names | `tracking`, `roster` | code |
 | 10 | Fill, export, draw | `fill`, `export_gsr`, `render` | code |
 
+Two steps have a second engine (`PipelineConfig.engines`, section "Engines: detector and
+calibration" below). The people engine `detector` replaces steps 2, 3 and 9 (role and team) with
+a detector on every frame and plain code on the kit colours, makes step 8 optional and adds a
+ball. The pitch engine `calibration` replaces steps 4 and 6 (the landmark fit) with the camera of
+a calibration tool on every frame. A tool runs in its own environment through
+`tools/run_tool.py`; the package reads its clip run file.
+
 ## 2. Conventions (do not deviate)
 
 - **Image**: pixels, origin top-left, x right, y down. Images are BGR `uint8` arrays `(H, W, 3)`.
@@ -108,8 +115,9 @@ else.
     refused these attempts, so none of them is billed.
   - `OtherImagesError(message)` is a `BackendError`: a stored answer was recorded with other
     image bytes than its request shows now.
-- `config.py` — `StepSettings`, `TrackingConfig`, `PipelineConfig`, `load_config`,
-  `THINKING_LEVELS`, `MAX_PARALLEL_LIMIT`.
+- `config.py` — `StepSettings`, `TrackingConfig`, `EngineSettings`, `PipelineConfig`,
+  `load_config`, `THINKING_LEVELS`, `MAX_PARALLEL_LIMIT`, `DEFAULT_DETECTOR`,
+  `DEFAULT_CALIBRATION`.
   - `load_config` lays the file over the defaults. A section that names one key keeps the
     defaults of its other keys: `number: {model: ...}` keeps the low resolution of the number step.
     An empty file gives the defaults. Any other content that is not a mapping raises `ValueError`.
@@ -973,7 +981,8 @@ def run_trackeval(...same arguments..., output_dir: Path,
   `FileNotFoundError` when the run wrote no `person_detailed.csv`.
 - The evaluator process gets the environment of the command without the variables that
   `drop_env` names. The evaluator is the code of another project and needs no key, so the
-  commands `oracle` and `eval` pass the name of the model key variable (`cli.KEY_VARIABLE`).
+  commands `oracle` and `eval` pass the names of the key variables of every provider
+  (`cli.KEY_VARIABLES`).
 - The scorer is `sn-trackeval` in a separate environment (Python 3.12, numpy 1.26). The script
   that the wrapper starts belongs to a clone of the scorer repository, and it puts that clone
   first on its Python path. So the code that scores is the code of the clone (the tag `v0.4.1`,
@@ -1057,15 +1066,16 @@ frame, its trail has a gap.
 ### `pipeline.py`, `cli.py`, `doctor.py`, `fallbacks/` (integration layer)
 
 ```python
-def run_clip(source: FrameSource, backend: Backend, config: PipelineConfig = PipelineConfig(), *,
-             roster: Roster | None = None, motion: MotionField | None = None) -> ClipResult
+def run_clip(source: FrameSource, backend: Backend | None, config: PipelineConfig = PipelineConfig(), *,
+             roster: Roster | None = None, motion: MotionField | None = None,
+             tools: ToolAnswers = ToolAnswers(), clock: StageClock | None = None) -> ClipResult
 def fit_problems(record: HomographyRecord, feet_xy: np.ndarray, image_size: tuple[int, int], *,
                  pitch_margin_m: float) -> list[str]
 def crop_choice(boxes: Sequence[tuple[int, Box]], fps: float, max_crops: int) -> tuple[tuple[int, Box], ...]
 ```
 
-CLI commands: `demo` (synthetic clip, fake backend, no network), `run`, `doctor`, `data`,
-`oracle`, `probe`, `tool-job`, `tool-score`, `eval`, `sync`. Exit code 0 means done, 1 means
+CLI commands: `demo` (synthetic clip, fake backend or stand-ins of the tools, no network), `run`,
+`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`, `clip-job`, `eval`, `sync`. Exit code 0 means done, 1 means
 that a check or a gate failed, 2 means that the command could not run. Fallback adapters convert
 the JSON output of external tools (RF-DETR boxes, PnLCalib mappings) into `FramePeople` and
 `HomographyRecord`.
@@ -1129,7 +1139,8 @@ sends its requests with `httpx2`.
   in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
   shirt number of one team. `ClipResult.cuts` names the cuts.
 - Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
-  `geometry.paint_alignment` on its keyframe, in `ClipResult.paint` (`schemas.PaintCheck`:
+  `geometry.paint_alignment` on its keyframe (with the pitch engine `calibration`, the camera
+  of the tool at each keyframe, also before its check), in `ClipResult.paint` (`schemas.PaintCheck`:
   frame, score or reason). It decides nothing. `demo` and `run` print the cuts and the median
   score; the demo summary holds `cuts` and `paint_alignment`. The pitch probe and `tool-score`
   report `paint_alignment` (`probes.paint_report`): counts, the score distribution, the AUROC of
@@ -1291,8 +1302,8 @@ package:
 file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`) and the commit of the PnLCalib clone
 (`PNLCALIB_COMMIT`) and refuses another one, and a clone with a changed tracked file, because it
 was written from the source of these versions and never ran with the tools. It takes the
-variable `GEMINI_API_KEY` out of its environment before it loads a tool, and it writes its own
-SHA-256 into the facts of the run. Before the tool is built it checks the place of the run
+variables `GEMINI_API_KEY` and `OPENROUTER_API_KEY` out of its environment before it loads a
+tool (`KEY_VARIABLES`), and it writes its own SHA-256 into the facts of the run. Before the tool is built it checks the place of the run
 file (`check_out_place`: no folder, write access, not the job file), so that the answers of a
 long run are not lost at its end. An error of a tool on a frame is not caught: the script
 names the frame and stops, so no frame counts as a frame without an answer because of an
@@ -1379,6 +1390,143 @@ python3 tools/guard.py (--staged | --push | --tracked | --paths FILE ...) [--rep
 - A file of the repository must pass every rule. A test checks this for the files of the
   repository that holds the test. A value that only looks like a secret must be built at run
   time in a test, as `tests/test_guard.py` does.
+
+### Engines: detector and calibration (owner decision of 2026-11-22)
+
+```python
+# config.py
+PeopleEngine = Literal["model", "detector"]; PitchEngine = Literal["model", "calibration"]
+NumberEngine = Literal["model", "none"]
+class EngineSettings(Record): people: PeopleEngine = "model"; pitch_mapping: PitchEngine = "model"; number: NumberEngine = "model"
+# PipelineConfig gets: engines: EngineSettings; detector: RfdetrSettings = DEFAULT_DETECTOR (RFDETRMedium, 0.5,
+# no antialias); calibration: PnlcalibSettings = DEFAULT_CALIBRATION (the settings of the pitch probe of PnLCalib)
+
+# pipeline.py
+@dataclass(frozen=True)
+class ToolAnswers:
+    people: Sequence[FramePeople] | None = None                   # every frame, people[i].frame == i
+    balls: Mapping[int, Sequence[BallCandidate]] | None = None    # frame -> ball candidates
+    cameras: Sequence[HomographyRecord] | None = None             # every frame
+def every_frame_tracking(config: PipelineConfig, fps: float) -> TrackingConfig
+BALL_MAX_GAP_S = 0.5 ; KIT_CLUSTER_SEED = 0
+
+# kitcolour.py
+def torso_feature(image: np.ndarray, box: Box) -> np.ndarray | None      # shape (15,), unit length
+@dataclass(frozen=True)
+class KitClusters: centres: np.ndarray; limits: tuple[float, float]; def team_key(self, feature) -> TeamKey
+def fit_kit_clusters(features: np.ndarray, *, seed: int = 0) -> KitClusters
+def kit_roles(tracks: Sequence[Track], mean_position: Mapping[int, tuple[float, float]]) -> list[Track]
+
+# ball.py
+class BallCandidate(Record): frame: int; box: Box; score: float          # 0 to 1
+@dataclass(frozen=True)
+class BallTrack: boxes: Mapping[int, Box]; observed: frozenset[int]
+def track_ball(candidates: Mapping[int, Sequence[BallCandidate]], n_frames: int, *, fps: float,
+               warp: MotionWarp, max_gap_frames: int, cuts: Sequence[int] = ()) -> BallTrack
+def gate_px(box: Box, frames: int, fps: float) -> float
+
+# timing.py
+class StageClock: def stage(self, name) (context manager); def add(self, name, seconds); def report(self, n_frames)
+
+# schemas.py
+class BallState(Record): box: Box; pitch_x: float | None; pitch_y: float | None; observed: bool = False
+# FrameState gets: ball: BallState | None = None
+
+# fallbacks/runs.py
+CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"; CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"; CLIP_RUN_PART_MAX_BYTES = 1_000_000
+class ClipJob(Record): format; clip: str; tool: ToolSettings; images: tuple[str, ...]
+class ClipRun(Record): clip; tool; n_frames; job_sha256; runner; frames: tuple[ClipRunFrame, ...]   # frames[i].frame == i
+def clip_run_part_path(first: Path, part: int) -> Path
+def load_clip_run(first: Path) -> ClipRun
+
+# fallbacks/rfdetr.py: BALL_LABEL = "sports ball"; expand_rows(payload) -> payload; ball_candidates(payload, *, frame, min_score)
+# fallbacks/answers.py: detector_answers(run) -> (people, balls); calibration_answers(run) -> cameras; AnswerError
+# fallbacks/fake.py: fake_detector_answers(scene, ...), fake_calibration_answers(scene), fake_ball_position(scene, frame)
+# render.py: draw_ball(image, ball, style) -> image; RenderStyle.ball_bgr; the radar draws a ball with a pitch position
+```
+
+- `run_clip` checks the tool answers first: each engine of a tool needs its answers for every
+  frame, and answers that no engine uses are refused (`ValueError`). `backend` may be None only
+  when no engine is `model`. The kit legend is asked when the people or the numbers come from the
+  model. `_model_answers` asks the people requests, the landmark requests or both, as the engines
+  say, with the two requests of a keyframe next to each other.
+- People engine `detector`: every frame of `ToolAnswers.people` is a tracking frame. The motion
+  field masks the boxes of every frame. People who map more than `pitch_margin_m` outside the
+  pitch are dropped, as for the model. `_kit_team_keys` reads every frame with people, takes the
+  torso feature of each box, fits the two kit clusters on all features of the clip and gives each
+  person the team key of its cluster or `none` (an outlier, or no feature). A clip without two
+  different features keeps `none` for everyone and logs a warning. Tracks: `tracking.associate`
+  with `every_frame_tracking` (the same time for a missed person as in the keyframe design: 4
+  keyframes of 0.48 s become 48 frames at 25 fps), then `kitcolour.kit_roles`, then
+  `tracking.stitch_fragments`, on each shot on its own as in the model engine (no track crosses
+  a cut; ids 0..n-1 in the order of the shots). With `tracking.split_team_swaps` the split runs
+  after `kit_roles` and before the joins of the shot; `tracking.team_slots` runs in the shared
+  `finalize_tracks` with the cuts. `tracking.py` is used as it is. The tracking values without
+  labels (`evalx.diagnostics`) are written and printed for this engine too; they count every
+  observed frame, not keyframes.
+- `kit_roles`: a track whose observations are mostly `none` by box height is a goalkeeper when
+  its mean pitch position lies in a goal zone (`tracking.goal_side`) with `|y|` at most the half
+  width of the penalty area (20.16 m), and a referee otherwise (a linesman stands near a
+  touchline). Its observations get that role and the team key `none`; `finalize_tracks` then
+  gives a goalkeeper the side of its goal zone. The team key `A` or `B` of a player is a kit
+  cluster: it is not the team of a kit legend, so a number request of this engine names no team.
+- Shirt numbers: only with the number engine `model`, as for the model engine (one request per
+  track, crops by `crop_choice`). With `none` no track has a number.
+- Ball: `ball.track_ball` on the candidates of `ToolAnswers.balls` with the warp of the pipeline,
+  `BALL_MAX_GAP_S` and the cuts of the motion field: a run ends at a cut, and nothing is filled
+  across it. A frame state gets a `BallState`; its pitch position is the foot point of
+  the box and is left out where the frame has no mapping or the point lies more than
+  `pitch_margin_m` outside the pitch. The export writes no ball.
+- Pitch engine `calibration` (`_camera_mapping`): each camera of the tool is checked with
+  `fit_problems` and the people of its frame who are not `other`; a tool record has no inlier
+  count, so the strict share rule holds. A refused camera is dropped (log line); frames without a
+  camera take the nearest kept camera within `max_gap_frames`, moved with the camera motion
+  (`propagate_homographies`, which carries nothing across a cut). A warning is logged when no
+  frame keeps a camera. The camera of each keyframe gets its paint-alignment score in
+  `ClipResult.paint`, like a landmark fit, so both pitch engines are scored on the same frames.
+- `ClipResult.engines` names `kit_legend`, `people`, `team_role`, `landmarks`, `number`, `ball`,
+  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<tool>:<model class>`,
+  `tool:<tool>`, `code`, `code:kit-colour`, `code:ball-tracker`, or `none` for a step that does
+  not run. `<model>` is `config.model_label` of the step: the bare name for Gemini,
+  `openrouter:<slug>` for OpenRouter.
+- `clock` (`timing.StageClock`) gets the time of each stage that runs: `kit_legend`,
+  `model_people_landmarks`, `motion`, `pitch_mapping`, `paint`, `kit_colour`, `tracks`,
+  `number`, `votes_fill`, `ball`. `report(n_frames)` gives seconds, milliseconds per frame and frames per
+  second of each, and `total` (their sum).
+
+Clip job and clip run (`fallbacks/runs.py` describes both): the clip job names the image of every
+frame of one clip below the data folder and the tool settings. The clip run is a series of part
+files named like the ledger (`detections.json`, `detections-0002.json`, ...), each at most
+1,000,000 bytes, each with the same head (format, clip, tool, number of frames, the SHA-256 of
+the job file, the facts of the run, the number of parts) and its frames as
+`[frame, seconds, payload]`. The payload of the detector is compact: the class names of the
+frame and one row per detection (`[x1, y1, x2, y2, score, label index]`, the box rounded to 0.1
+pixel, the score to 0.0001). `load_clip_run` refuses a missing part, a part with another head,
+a part file beyond the last part, and a series that does not hold every frame once, in order.
+
+`tools/run_tool.py` takes a clip job with the same sub-commands: it tells it by its format name,
+answers every frame like a job, writes the compact rows of the detector and cuts the run into
+parts (`clip_run_texts`). It refuses to start when files with the names of later parts lie next
+to `--out`, and a frame whose answer does not fit into one part.
+
+Command line:
+
+- `clip-job --tool rfdetr|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]` writes
+  the clip job with the tool section of the settings file. A video file is refused, and so is a
+  clip folder that is not below the data folder.
+- `run --detections FILE --calibration FILE`: each is needed when the settings name its engine,
+  and refused otherwise. A clip run with other tool settings than the settings file, or of
+  another clip or frame count, is refused. The plan of model calls (`model_plan`) holds only the
+  steps whose engine is `model`, each with its provider. A run without a model step opens no
+  model session, builds no model backend, needs no key of any provider and no cache folder, and
+  prints that it costs nothing; its cost record is `null`. `result.json` gets
+  `timing` (the stages of the package, plus `detector` and `calibration`: the sum of the times
+  per frame that the script measured) and `provenance.tool_runs` (file, parts, job SHA-256,
+  `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the
+  engine of every step, a line when no step reads shirt numbers, and the time of each stage.
+- `demo --engine model|detector`: the detector demo runs the people engine `detector` and the
+  pitch engine `calibration` with the stand-ins of `fallbacks/fake.py` and no model step. Its
+  summary holds the engines, the frames with a ball and the timing.
 
 ## 5. Tests
 

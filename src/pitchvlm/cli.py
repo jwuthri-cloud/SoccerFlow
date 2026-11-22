@@ -101,7 +101,15 @@ import yaml
 from pydantic import Field, model_validator
 
 from pitchvlm import __version__, doctor, probes
-from pitchvlm.config import DEFAULT_MODEL, PipelineConfig, StepSettings, load_config, model_label, model_ref
+from pitchvlm.config import (
+    DEFAULT_MODEL,
+    EngineSettings,
+    PipelineConfig,
+    StepSettings,
+    load_config,
+    model_label,
+    model_ref,
+)
 from pitchvlm.datasets import (
     LABEL_FILE_NAME,
     SPLITS,
@@ -126,26 +134,34 @@ from pitchvlm.evalx.oracle import (
 )
 from pitchvlm.evalx.scorer import COMBINED, run_trackeval
 from pitchvlm.export_gsr import check_predictions, image_ids_without_items, write_predictions
+from pitchvlm.fallbacks.answers import calibration_answers, detector_answers
+from pitchvlm.fallbacks.fake import fake_calibration_answers, fake_detector_answers
 from pitchvlm.fallbacks.pnlcalib import homography_from_payload
 from pitchvlm.fallbacks.rfdetr import people_from_detections
 from pitchvlm.fallbacks.runs import (
+    CLIP_JOB_FORMAT,
     JOB_FORMAT,
+    ClipJob,
+    ClipRun,
     JobFrame,
     RfdetrSettings,
     RunFrame,
     ToolJob,
     ToolRun,
     ToolSettings,
+    clip_run_part_path,
+    load_clip_run,
     load_tool_run,
 )
 from pitchvlm.frames import FrameSource, ImageFolderSource, VideoFileSource, keyframe_indices
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
-from pitchvlm.pipeline import run_clip
+from pitchvlm.pipeline import ToolAnswers, run_clip
 from pitchvlm.probes import LabelledClip, write_metrics
 from pitchvlm.render import render_clip
 from pitchvlm.roster import Roster, load_roster
-from pitchvlm.schemas import ClipResult, FrameState, PaintCheck, Record
+from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
+from pitchvlm.timing import StageClock
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
     FLEX_TIMEOUT_S,
@@ -235,6 +251,12 @@ DEMO_VIDEO_NAME = "demo.mp4"
 #: Split name in the prediction path of the demo clip.
 DEMO_SPLIT = "demo"
 DEMO_FRAMES = 100
+#: Engines of the demo: the model steps through the fake model, or the detector and the
+#: calibration through their stand-ins (no model step, so no number).
+DEMO_ENGINES = {
+    "model": EngineSettings(),
+    "detector": EngineSettings(people="detector", pitch_mapping="calibration", number="none"),
+}
 #: Number requests that the cost estimate of one clip assumes. The real number is known only
 #: after the tracking step: one request per track of a player or a goalkeeper, before the
 #: tracks of one person are linked by their shirt number. Measured on the synthetic clip of
@@ -1112,16 +1134,24 @@ def open_clip(path: Path, *, fps: float | None, labels: GsrLabels | None) -> Fra
     the ending, as the disk spells it; a link keeps its own name.
     """
     if path.is_dir():
-        folder = path.resolve()
-        if (folder / FRAME_FOLDER).is_dir():
-            folder = folder / FRAME_FOLDER
-        folder = disk_spelling(folder)
+        folder = frame_folder(path)
         return ImageFolderSource(folder, clip_id_of_folder(folder), folder_frame_rate(fps, labels))
     if path.is_file():
         if fps is not None:
             raise CliError("--fps is for a folder of frame images; a video file has its own frame rate")
         return VideoFileSource(disk_spelling(path.absolute()))
     raise CliError(f"{path} is not a folder of frame images and not a video file")
+
+
+def frame_folder(path: Path) -> Path:
+    """Return the folder of the frame images of a clip folder: the folder, or its frame folder ``img1``.
+
+    The folder is resolved and spelled as the disk stores it (``open_clip`` says why).
+    """
+    folder = path.resolve()
+    if (folder / FRAME_FOLDER).is_dir():
+        folder = folder / FRAME_FOLDER
+    return disk_spelling(folder)
 
 
 def clip_id_of_folder(folder: Path) -> str:
@@ -1297,28 +1327,36 @@ def write_json(path: Path, document: Mapping[str, Any]) -> None:
 
 
 def paint_summary(checks: Sequence[PaintCheck]) -> dict[str, Any]:
-    """Summarise the paint-alignment scores of the landmark fits of a clip: counts and score distribution."""
+    """Summarise the paint-alignment scores of the keyframe mappings of a clip: counts and score distribution.
+
+    The mappings are the landmark fits of the pitch engine ``model`` or the cameras of the
+    pitch engine ``calibration`` (``ClipResult.paint``).
+    """
     scores = np.array([check.score for check in checks if check.score is not None], dtype=np.float64)
     return {"n_fits": len(checks), "n_cannot_judge": len(checks) - scores.size, "score": summarize(scores)}
 
 
 def print_shots_and_paint(result: ClipResult) -> None:
-    """Print the cuts of a clip and the paint-alignment scores of its landmark fits (diagnostics only)."""
+    """Print the cuts of a clip and the paint-alignment scores of its keyframe mappings (diagnostics only)."""
     cuts = ", ".join(str(frame) for frame in result.cuts) if result.cuts else "none"
     print(f"hard cuts (frames that start a new shot): {cuts}")
     summary = paint_summary(result.paint)
     score = summary["score"]
     if score["n"]:
         print(
-            f"paint alignment of {summary['n_fits']} landmark fits (diagnostic): median {score['median']:.2f}, "
+            f"paint alignment of {summary['n_fits']} keyframe mappings (diagnostic): median {score['median']:.2f}, "
             f"mean {score['mean']:.2f}; {summary['n_cannot_judge']} frames cannot judge"
         )
     else:
-        print(f"paint alignment: no score for the {summary['n_fits']} landmark fits (diagnostic)")
+        print(f"paint alignment: no score for the {summary['n_fits']} keyframe mappings (diagnostic)")
 
 
 def _cmd_demo(args: argparse.Namespace) -> int:
-    """Run a synthetic clip and the fake model through the whole package. No network and no key are used.
+    """Run a synthetic clip through the whole package with stand-ins of the model or of the tools.
+
+    No network and no key are used. With the engine ``model`` the fake model answers the
+    model steps. With the engine ``detector`` the stand-ins of the detector and of the
+    calibration answer for every frame (``fallbacks.fake``), and no model step runs.
 
     The prediction file and the summary are written before the video, so that they
     exist also on a machine that cannot write the video. The exit code is 1 when the
@@ -1327,9 +1365,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     scene = SyntheticScene(n_frames=args.frames, seed=args.seed)
     source = SyntheticSource(scene)
     info = scene.info
-    config = PipelineConfig()
-    require_enough_keyframes(len(keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)), config)
-    result = run_clip(source, FakeBackend(scene, seed=args.seed), config)
+    config = PipelineConfig(engines=DEMO_ENGINES[args.engine])
+    clock = StageClock()
+    if args.engine == "detector":
+        people, balls = fake_detector_answers(scene, seed=args.seed)
+        tools = ToolAnswers(people=people, balls=balls, cameras=fake_calibration_answers(scene))
+        result = run_clip(source, None, config, tools=tools, clock=clock)
+    else:
+        require_enough_keyframes(len(keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)), config)
+        result = run_clip(source, FakeBackend(scene, seed=args.seed), config, clock=clock)
     labels = scene_labels(scene)
     predictions = write_clip_predictions(
         result.frames,
@@ -1345,31 +1389,43 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     truth = [scene.frame_state(frame) for frame in range(info.n_frames)]
     errors = summarize(position_errors_m(result.frames, truth))
     identity = identity_scores(result.frames, truth)
+    timing = clock.report(info.n_frames)
     diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
     summary = {
         "clip_id": info.clip_id,
+        "engine": args.engine,
+        "engines": result.engines,
         "n_frames": info.n_frames,
         "n_tracks": len(result.tracks),
         "median_position_error_m": errors["median"],
         "position_error_m": errors,
         "identity": dataclasses.asdict(identity),
+        "frames_with_ball": sum(state.ball is not None for state in result.frames),
         "diagnostics": diagnostics.as_dict(),
         "checker": {"valid": not problems, "problems": problems},
         "scored_frames": scored_frames,
         "scored_frames_without_prediction": empty_frames,
+        "timing": timing,
         "cuts": list(result.cuts),
         "paint_alignment": paint_summary(result.paint),
     }
     write_metrics(args.out / SUMMARY_NAME, summary, provenance={"command": "demo", "seed": args.seed})
-    print(f"demo clip {info.clip_id}: {info.n_frames} frames, {len(result.tracks)} tracks")
+    print(f"demo clip {info.clip_id}: {info.n_frames} frames, {len(result.tracks)} tracks, engine {args.engine}")
+    print_engines(result.engines)
     print(f"median position error: {errors['median']:.2f} m over {errors['n']:.0f} positions")
     # The median position error does not see a person who gets a new track id. These values do.
     print(
         f"identity: {identity.coverage:.0%} of a true track under one id, {identity.switches} id switches, "
         f"{identity.track_ratio:.2f} predicted tracks per true track"
     )
+    if args.engine == "detector":
+        print(
+            f"ball: {summary['frames_with_ball']} of {info.n_frames} frames "
+            "(a stand-in ball that the picture does not show)"
+        )
     print_shots_and_paint(result)
     print_diagnostics(diagnostics.lines())
+    print_timing(timing)
     print(f"prediction file: {predictions}")
     print_problems(problems)
     print(f"scored frames without a prediction: {empty_frames} of {scored_frames}")
@@ -1379,6 +1435,22 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     video = render_clip(source, result, args.out / DEMO_VIDEO_NAME)
     print(f"video: {video}")
     return EXIT_FAILED if problems or empty is not None else EXIT_OK
+
+
+def print_engines(engines: Mapping[str, str]) -> None:
+    """Print the engine of every step on one line. A number engine ``none`` gets a line of its own."""
+    print("engines: " + ", ".join(f"{step} {engine}" for step, engine in engines.items()))
+    if engines.get("number") == "none":
+        print("shirt numbers: no step reads them (number engine none), so no player of this clip has a number")
+
+
+def print_timing(timing: Mapping[str, Mapping[str, float | None]]) -> None:
+    """Print the measured time of each stage: milliseconds per frame and frames per second."""
+    print("measured time per stage (milliseconds per frame, frames per second):")
+    for stage, values in timing.items():
+        fps = values["frames_per_second"]
+        rate = "-" if fps is None else f"{fps:.1f}"
+        print(f"  {stage}: {values['ms_per_frame']:.2f} ms, {rate} fps")
 
 
 # --- run -----------------------------------------------------------------------------
@@ -1406,6 +1478,110 @@ def require_enough_keyframes(n_keyframes: int, config: PipelineConfig) -> None:
         )
 
 
+def model_plan(config: PipelineConfig, n_keyframes: int) -> list[PlannedCalls]:
+    """List the model calls of a run for the engines of its settings: (step, settings, number of requests).
+
+    The kit legend is asked when the people or the numbers come from the model. The number
+    of number requests is a guess (``EXPECTED_NUMBER_REQUESTS``).
+    """
+    engines = config.engines
+    plan: list[PlannedCalls] = []
+    if engines.people == "model" or engines.number == "model":
+        plan.append(("kit_legend", config.kit_legend, 1))
+    if engines.people == "model":
+        plan.append(("people", config.people, n_keyframes))
+    if engines.pitch_mapping == "model":
+        plan.append(("landmarks", config.landmarks, n_keyframes))
+    if engines.number == "model":
+        plan.append(("number", config.number, EXPECTED_NUMBER_REQUESTS))
+    return plan
+
+
+def check_tool_inputs(config: PipelineConfig, detections: Path | None, calibration: Path | None) -> None:
+    """Raise ``CliError`` unless a clip run file is given for exactly the engines of the settings that read one."""
+    named = (
+        ("--detections", detections, config.engines.people == "detector", "the people engine detector"),
+        ("--calibration", calibration, config.engines.pitch_mapping == "calibration", "the pitch engine calibration"),
+    )
+    for option, path, used, engine in named:
+        if used and path is None:
+            raise CliError(f"the settings name {engine}: give the clip run file of its tool with {option}")
+        if not used and path is not None:
+            raise CliError(f"{option} is given, but the settings do not name {engine}")
+
+
+def read_clip_run(path: Path, settings: ToolSettings, info: ClipInfo) -> ClipRun:
+    """Read all parts of a clip run, and check that it was made for this clip with the tool settings of the run.
+
+    ``CliError`` is raised for a part that cannot be read, for wrong content, for other tool
+    settings than the settings file names, and for a run of another clip or another
+    number of frames.
+    """
+    try:
+        run = load_clip_run(path)
+    except OSError as error:
+        raise CliError(f"the clip run file {path} cannot be read: {error}") from error
+    except ValueError as error:
+        raise wrong_file("clip run file", path, error) from error
+    if run.tool != settings:
+        raise CliError(
+            f"the clip run file {path} was made with other tool settings than the settings file: "
+            f"{run.tool.model_dump(mode='json')} against {settings.model_dump(mode='json')}. "
+            "Write the clip job again and run the tool again"
+        )
+    if (run.clip, run.n_frames) != (info.clip_id, info.n_frames):
+        raise CliError(
+            f"the clip run file {path} is a run of the clip {run.clip} with {run.n_frames} frames, "
+            f"not of the clip {info.clip_id} with {info.n_frames} frames"
+        )
+    return run
+
+
+def tool_answers(
+    config: PipelineConfig, info: ClipInfo, detections: Path | None, calibration: Path | None, clock: StageClock
+) -> tuple[ToolAnswers, dict[str, Any]]:
+    """Read the clip run files of the engines of a run. Return the answers and the facts of each run.
+
+    The time of each tool on the frames of the clip goes to ``clock`` as the stage
+    ``detector`` or ``calibration``: the script measured it per frame. A payload that cannot
+    be used raises ``CliError`` with the file and the frame.
+    """
+    facts: dict[str, Any] = {}
+    people = balls = cameras = None
+    if detections is not None:
+        run = read_clip_run(detections, config.detector, info)
+        try:
+            people, balls = detector_answers(run)
+        except ValueError as error:
+            raise wrong_file("clip run file", detections, error) from error
+        clock.add("detector", math.fsum(run.seconds()))
+        facts["detections"] = clip_run_facts(run, detections)
+    if calibration is not None:
+        run = read_clip_run(calibration, config.calibration, info)
+        try:
+            cameras = calibration_answers(run)
+        except ValueError as error:
+            raise wrong_file("clip run file", calibration, error) from error
+        clock.add("calibration", math.fsum(run.seconds()))
+        facts["calibration"] = clip_run_facts(run, calibration)
+    return ToolAnswers(people=people, balls=balls, cameras=cameras), facts
+
+
+def clip_run_facts(run: ClipRun, path: Path) -> dict[str, Any]:
+    """Return what the result file records about a clip run: its file, its job, the facts of the run and its times."""
+    n_parts = 1
+    while clip_run_part_path(path, n_parts + 1).exists():
+        n_parts += 1
+    return {
+        "file": path.name,
+        "parts": n_parts,
+        "job_sha256": run.job_sha256,
+        "runner": run.runner,
+        "script_is_current": run.runner.get("script_sha256") == file_sha256(repository_root() / TOOL_SCRIPT),
+        "seconds_per_frame": summarize(np.array(run.seconds(), dtype=np.float64)),
+    }
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Run one clip through the pipeline and write its result file, its prediction file and its video.
 
@@ -1421,6 +1597,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     empty prediction file lets the scorer count the clip as missed.
     """
     config = PipelineConfig() if args.config is None else read_settings(args.config)
+    check_tool_inputs(config, args.detections, args.calibration)
     roster = None if args.roster is None else read_roster(args.roster)
     labels = None if args.labels is None else read_labels(args.labels)
     state = require_clean_tree(args.allow_dirty)
@@ -1433,31 +1610,38 @@ def _cmd_run(args: argparse.Namespace) -> int:
         f"clip {info.clip_id}: {info.n_frames} frames, {info.fps:g} frames per second, "
         f"{info.width} x {info.height} pixels, {len(keyframes)} keyframes"
     )
-    require_enough_keyframes(len(keyframes), config)
-    plan: list[PlannedCalls] = [
-        ("kit_legend", config.kit_legend, 1),
-        ("people", config.people, len(keyframes)),
-        ("landmarks", config.landmarks, len(keyframes)),
-        ("number", config.number, EXPECTED_NUMBER_REQUESTS),
-    ]
-    session = open_session(
-        "run",
-        info.clip_id,
-        plan,
-        cache_dir=_cache_dir(args),
-        replay=args.replay,
-        repeat=config.repeat,
-        over_budget=args.start_over_budget,
-        allow_other_images=args.allow_other_images,
-    )
-    print(
-        f"the {EXPECTED_NUMBER_REQUESTS} number requests of the estimate are a guess: the run sends one for each "
-        "track of a player or a goalkeeper, and the tracks are known only after the people step"
-    )
+    if config.engines.people == "model":
+        require_enough_keyframes(len(keyframes), config)
+    clock = StageClock()
+    tools, tool_runs = tool_answers(config, info, args.detections, args.calibration, clock)
+    plan = model_plan(config, len(keyframes))
+    session = None
+    if plan:
+        session = open_session(
+            "run",
+            info.clip_id,
+            plan,
+            cache_dir=_cache_dir(args),
+            replay=args.replay,
+            repeat=config.repeat,
+            over_budget=args.start_over_budget,
+            allow_other_images=args.allow_other_images,
+        )
+    else:
+        print("no step of the settings asks a model: this run makes no model call and costs nothing")
+    if config.engines.number == "model":
+        print(
+            f"the {EXPECTED_NUMBER_REQUESTS} number requests of the estimate are a guess: the run sends one for each "
+            "track of a player or a goalkeeper, and the tracks are known only after the people step"
+        )
+    cost: dict[str, Any] | None = None
     try:
-        result = run_clip(source, session.backend, config, roster=roster)
+        result = run_clip(
+            source, None if session is None else session.backend, config, roster=roster, tools=tools, clock=clock
+        )
     finally:
-        cost = close_session(session)
+        if session is not None:
+            cost = close_session(session)
     print_shots_and_paint(result)
     clip_dir = args.out / info.clip_id
     provenance = {
@@ -1471,6 +1655,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "config": config.model_dump(mode="json"),
         "roster": roster is not None,
         "cost": cost,
+        "tool_runs": tool_runs,
     }
     problems: list[str] = []
     prediction_file: dict[str, Any] | None = None
@@ -1498,11 +1683,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
     empty = empty_result_reason(result.frames, scored)
     if empty is not None:
         print_empty_result(empty)
+    timing = clock.report(info.n_frames)
+    print_engines(result.engines)
     diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
     print_diagnostics(diagnostics.lines())
+    print_timing(timing)
     document = {
         "provenance": provenance,
         "prediction_file": prediction_file,
+        "timing": timing,
         "diagnostics": diagnostics.as_dict(),
         "result": result.model_dump(mode="json"),
     }
@@ -2287,6 +2476,40 @@ def _cmd_tool_job(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_clip_job(args: argparse.Namespace) -> int:
+    """Write the clip job of one tool for every frame of one clip.
+
+    The tool settings come from the settings file of the run (``detector`` or
+    ``calibration``), so that ``run`` with the same file accepts the clip run. The clip is a
+    folder of frame images below the data folder; the job names each image by its path below
+    that folder. A video file is refused: its frames must be written as images first.
+    """
+    if args.config is not None:
+        refuse_input_as_output(args.out, {"--config": args.config})
+    config = PipelineConfig() if args.config is None else read_settings(args.config)
+    if not args.clip.is_dir():
+        raise CliError(
+            f"{args.clip} is not a folder of frame images: a clip job names image files, so write the frames "
+            "of a video as images below the data folder first"
+        )
+    folder = frame_folder(args.clip)
+    source = ImageFolderSource(folder, clip_id_of_folder(folder))
+    root = args.root.resolve()
+    try:
+        images = tuple(source.path(frame).relative_to(root).as_posix() for frame in range(source.info.n_frames))
+    except ValueError as error:
+        raise CliError(
+            f"the clip folder {folder} does not lie below the data folder {root}: the job names each image by its "
+            "path below the data folder"
+        ) from error
+    settings: ToolSettings = config.detector if args.tool == "rfdetr" else config.calibration
+    job = ClipJob(format=CLIP_JOB_FORMAT, clip=source.info.clip_id, tool=settings, images=images)
+    write_json(args.out, job.model_dump(mode="json"))
+    print(f"clip job of the tool {args.tool}: {len(images)} frames of the clip {source.info.clip_id}")
+    print(f"job file: {args.out}")
+    return EXIT_OK
+
+
 def refuse_input_as_output(out: Path, inputs: Mapping[str, Path]) -> None:
     """Raise ``CliError`` when the output file of a command is one of its input files.
 
@@ -2880,6 +3103,13 @@ def _add_demo(commands: Any) -> None:
         help=f"frames of the clip (default: {DEMO_FRAMES})",
     )
     parser.add_argument("--seed", type=_seed, default=0, metavar="S", help="seed of the synthetic scene (default: 0)")
+    parser.add_argument(
+        "--engine",
+        choices=tuple(DEMO_ENGINES),
+        default="model",
+        help="model: the fake model answers the model steps; detector: stand-ins of the detector and of the "
+        "calibration answer for every frame (default: model)",
+    )
     parser.set_defaults(handler=_cmd_demo)
 
 
@@ -2932,6 +3162,18 @@ def _add_run(commands: Any) -> None:
         default=DEFAULT_TRACKER,
         metavar="NAME",
         help=f"tracker name in the prediction path (default: {DEFAULT_TRACKER})",
+    )
+    parser.add_argument(
+        "--detections",
+        type=_path,
+        metavar="FILE",
+        help="first part of the clip run of the detector; needed for the people engine detector",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=_path,
+        metavar="FILE",
+        help="first part of the clip run of the calibration; needed for the pitch engine calibration",
     )
     _add_stored_answer_options(parser)
     _add_model_options(parser)
@@ -3044,6 +3286,27 @@ def _add_tool_job(commands: Any) -> None:
     parser.set_defaults(handler=_cmd_tool_job)
 
 
+def _add_clip_job(commands: Any) -> None:
+    """Add the command ``clip-job`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "clip-job", help="write every frame of one clip and the settings that an external tool must run on"
+    )
+    parser.add_argument("--tool", choices=tuple(TOOL_PROBES), required=True, help="the tool of the job")
+    parser.add_argument(
+        "--clip",
+        type=_path,
+        required=True,
+        metavar="DIR",
+        help="a folder of frame images, or a clip folder of the dataset",
+    )
+    parser.add_argument(
+        "--config", type=_path, metavar="FILE", help="settings file of the run (YAML); default: the built-in settings"
+    )
+    parser.add_argument("--root", type=_path, required=True, metavar="DIR", help="data folder")
+    parser.add_argument("--out", type=_path, required=True, metavar="FILE", help="clip job file to write (JSON)")
+    parser.set_defaults(handler=_cmd_clip_job)
+
+
 def _add_tool_score(commands: Any) -> None:
     """Add the command ``tool-score`` to the sub-parsers object of argparse."""
     parser = commands.add_parser(
@@ -3117,6 +3380,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_probe,
         _add_tool_job,
         _add_tool_score,
+        _add_clip_job,
         _add_eval,
         _add_sync,
     ):

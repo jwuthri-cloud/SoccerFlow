@@ -5,6 +5,14 @@ stateless questions (kit legend, people, pitch landmarks, shirt numbers) and
 does everything else with plain code. The backend can be the real API, a cache
 in front of it, or the fake backend of the tests.
 
+Two steps have a second engine (``config.engines``). The people engine
+``detector`` takes the people of every frame from the answers of a detector
+(``ToolAnswers.people``), gives them a team key and a role from the kit colours
+(``kitcolour``) and follows the ball (``ball``). The pitch engine
+``calibration`` takes the camera of every frame from the answers of a
+calibration tool (``ToolAnswers.cameras``). The answers of a tool are read from
+its clip run file by the caller: this package never imports a tool.
+
 Frames are read and requests are built in the calling thread. Only the calls
 to the backend run in a thread pool.
 """
@@ -22,7 +30,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from pitchvlm.config import PipelineConfig, TrackingConfig
+from pitchvlm.ball import BallCandidate, track_ball
+from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig, model_label
 from pitchvlm.fill import dense_frame_states
 from pitchvlm.frames import FrameSource, keyframe_indices
 from pitchvlm.geometry import (
@@ -34,16 +43,19 @@ from pitchvlm.geometry import (
     matrix_from_record,
     paint_alignment,
 )
+from pitchvlm.kitcolour import fit_kit_clusters, kit_roles, torso_feature
 from pitchvlm.motion import MotionField, MotionWarp, bridged_warp, compute_motion_field, propagate_homographies
 from pitchvlm.pitch import inside_pitch
 from pitchvlm.roster import Roster
 from pitchvlm.schemas import (
     TEAM_ROLES,
+    BallState,
     Box,
     ClipInfo,
     ClipResult,
     FrameLandmarks,
     FramePeople,
+    FrameState,
     HomographyRecord,
     KitLegend,
     NumberReading,
@@ -53,6 +65,7 @@ from pitchvlm.schemas import (
     Track,
     TrackObs,
 )
+from pitchvlm.timing import StageClock
 from pitchvlm.tracking import (
     PitchMap,
     associate,
@@ -101,19 +114,41 @@ MAX_PEOPLE_OUTSIDE = 1
 #: say more than some people who warm up behind a line. But a fit that puts more than a third
 #: of the people outside the pitch is wrong, however many landmarks agree with it.
 STRONG_FIT_MIN_SHARE_ON_PITCH = 2.0 / 3.0
+#: The ball tracker fills a gap of at most this many seconds between two sightings of the ball.
+#: An estimate: a short occlusion by a player, not a ball that left the picture.
+BALL_MAX_GAP_S = 0.5
+#: Seed of the k-means of the kit colours, so that a run gives the same team keys again.
+KIT_CLUSTER_SEED = 0
+
+
+@dataclass(frozen=True)
+class ToolAnswers:
+    """The answers of external tools for every frame of a clip, read from their clip run files.
+
+    ``people`` and ``balls`` come from the detector (people engine ``detector``), ``cameras``
+    from the calibration (pitch engine ``calibration``). Each holds one entry per frame of
+    the clip: ``people[i]`` and ``cameras[i]`` belong to frame ``i``, and ``balls`` maps a
+    frame to its ball candidates.
+    """
+
+    people: Sequence[FramePeople] | None = None
+    balls: Mapping[int, Sequence[BallCandidate]] | None = None
+    cameras: Sequence[HomographyRecord] | None = None
 
 
 def run_clip(
     source: FrameSource,
-    backend: Backend,
+    backend: Backend | None,
     config: PipelineConfig = PipelineConfig(),
     *,
     roster: Roster | None = None,
     motion: MotionField | None = None,
+    tools: ToolAnswers = ToolAnswers(),
+    clock: StageClock | None = None,
 ) -> ClipResult:
     """Run the whole pipeline on one clip.
 
-    The steps are:
+    The steps of the model engines are:
 
     1. Keyframes: one frame every ``config.keyframe_interval_s`` seconds, plus the last frame.
     2. Kit legend: one model request with the first, the middle and the last keyframe.
@@ -144,47 +179,119 @@ def run_clip(
     Nothing is carried across a cut: no pitch mapping, no track link by position or image
     motion, no filled state. Only a shown shirt number joins two tracks across a cut (step 9).
 
+    The people engine ``detector`` changes steps 2, 3, 7 and 8 and adds a ball:
+
+    - No people request: the detector gives the people of every frame. The kit legend is
+      asked only for the number engine ``model``, whose prompt shows it.
+    - Team key and role from the kit colours: a colour histogram of the torso of each box,
+      two kit clusters of the clip and outliers (``kitcolour``).
+    - Tracks: the people of every frame are linked, with the same limits in seconds as the
+      keyframe design (``every_frame_tracking``). A track of mostly outlier kits becomes a
+      goalkeeper or a referee by its pitch position (``kitcolour.kit_roles``) before the
+      broken tracks are joined.
+    - Shirt numbers only with the number engine ``model``. The number request names no
+      team: a kit cluster is no team of the kit legend. Without it no track has a number.
+    - Ball: the ball candidates of the detector are followed by the ball tracker
+      (``ball.track_ball``), and each frame state gets the ball when it has one.
+    - As in the model engine, each shot is tracked on its own, and no run of the ball
+      crosses a cut.
+
+    The pitch engine ``calibration`` replaces steps 4 and 5: no landmark request; the camera
+    of every frame comes from the calibration tool, a camera that is not plausible with the
+    people of its frame (``fit_problems``) is refused, and a frame without a camera takes
+    the camera of the nearest frame that has one, moved with the camera motion (never across
+    a cut). The camera of every keyframe gets its paint-alignment score, as a landmark fit does.
+
     ``roster`` gives the player names by team side and shirt number. All model
     requests carry ``config.repeat``. A request that fails and an answer that
-    cannot be parsed raise an error. Nothing is skipped.
+    cannot be parsed raise an error. Nothing is skipped. ``backend`` may be None only
+    when no step uses a model. ``ValueError`` is raised when an engine of ``config`` needs
+    tool answers that ``tools`` does not hold, when ``tools`` holds answers that no engine
+    uses, and when the answers do not cover the frames of the clip.
+
+    ``clock`` gets the measured time of each stage (``timing.StageClock``).
     """
     info = source.info
     if motion is not None and motion.n_frames != info.n_frames:
         raise ValueError(f"the motion field has {motion.n_frames} frames, the clip has {info.n_frames} frames")
+    _check_tool_answers(tools, config, info.n_frames)
+    if backend is None and _uses_model(config):
+        raise ValueError("the settings name a model step, so the pipeline needs a model backend")
+    clock = clock if clock is not None else StageClock()
+    engines = config.engines
+    detector = engines.people == "detector"
     keyframes = keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)
-    legend = _kit_legend(source, backend, keyframes, config)
-    people, landmarks = _people_and_landmarks(source, backend, keyframes, legend, config)
-    field = motion if motion is not None else _measured_motion(source, people)
-    landmark_fits = [fit_from_landmarks(frame_landmarks, ransac_px=config.ransac_px) for frame_landmarks in landmarks]
-    paint = _paint_checks(source, landmark_fits)
-    homographies = _pitch_mapping(landmarks, landmark_fits, people, field, info, config)
+    legend = None
+    if engines.people == "model" or engines.number == "model":
+        with clock.stage("kit_legend"):
+            legend = _kit_legend(source, _backend(backend), keyframes, config)
+    model_people: list[FramePeople] = []
+    landmarks: list[FrameLandmarks] = []
+    if not detector or engines.pitch_mapping == "model":
+        with clock.stage("model_people_landmarks"):
+            model_people, landmarks = _model_answers(source, _backend(backend), keyframes, legend, config)
+    people = list(tools.people or ()) if detector else model_people
+    with clock.stage("motion"):
+        field = motion if motion is not None else _measured_motion(source, people)
+    with clock.stage("pitch_mapping"):
+        if engines.pitch_mapping == "model":
+            landmark_fits = [
+                fit_from_landmarks(frame_landmarks, ransac_px=config.ransac_px) for frame_landmarks in landmarks
+            ]
+            by_frame = {frame_people.frame: frame_people for frame_people in people}
+            keyframe_people = [by_frame[frame] for frame in keyframes]
+            homographies = _pitch_mapping(landmarks, landmark_fits, keyframe_people, field, info, config)
+        else:
+            cameras = tools.cameras or ()
+            landmark_fits = [cameras[frame] for frame in keyframes]
+            homographies = _camera_mapping(cameras, people, field, info, config)
+    with clock.stage("paint"):
+        paint = _paint_checks(source, landmark_fits)
     to_pitch = _pitch_map(homographies)
     warp = bridged_warp(field, homographies)
     on_pitch = [_people_on_pitch(frame_people, to_pitch, config.pitch_margin_m) for frame_people in people]
-    tracks = _tracks(on_pitch, warp, to_pitch, info.fps, config.tracking, field)
+    if detector:
+        with clock.stage("kit_colour"):
+            on_pitch = _kit_team_keys(source, on_pitch)
+        with clock.stage("tracks"):
+            tracks = _detector_tracks(
+                on_pitch, warp, to_pitch, info.fps, every_frame_tracking(config, info.fps), field
+            )
+    else:
+        with clock.stage("tracks"):
+            tracks = _tracks(on_pitch, warp, to_pitch, info.fps, config.tracking, field)
     # Without any pitch mapping no track gets a state, so a shirt number would be paid for nothing.
     has_mapping = any(record.valid for record in homographies)
-    readings = _shirt_numbers(source, backend, tracks, legend, config) if has_mapping else {}
-    decided = finalize_tracks(
-        tracks,
-        readings=readings,
-        mean_pitch_x=_mean_pitch_x(tracks, to_pitch),
-        fps=info.fps,
-        to_pitch=to_pitch,
-        config=config.tracking,
-        roster=roster,
-        cuts=field.cuts,
-    )
-    frames = dense_frame_states(
-        decided,
-        homographies,
-        info.n_frames,
-        warp=warp,
-        image_size=(info.width, info.height),
-        max_fill_gap_frames=round(config.tracking.max_stitch_gap_s * info.fps),
-        pitch_margin_m=config.pitch_margin_m,
-        cuts=field.cuts,
-    )
+    readings: dict[int, NumberReading] = {}
+    if engines.number == "model" and has_mapping and legend is not None:
+        with clock.stage("number"):
+            readings = _shirt_numbers(source, _backend(backend), tracks, legend, config, name_team=not detector)
+    with clock.stage("votes_fill"):
+        decided = finalize_tracks(
+            tracks,
+            readings=readings,
+            mean_pitch_x=_mean_pitch_x(tracks, to_pitch),
+            fps=info.fps,
+            to_pitch=to_pitch,
+            config=config.tracking,
+            roster=roster,
+            cuts=field.cuts,
+        )
+        frames = dense_frame_states(
+            decided,
+            homographies,
+            info.n_frames,
+            warp=warp,
+            image_size=(info.width, info.height),
+            max_fill_gap_frames=round(config.tracking.max_stitch_gap_s * info.fps),
+            pitch_margin_m=config.pitch_margin_m,
+            cuts=field.cuts,
+        )
+    if detector:
+        with clock.stage("ball"):
+            frames = _with_ball(
+                frames, tools.balls or {}, warp, to_pitch, info.fps, config.pitch_margin_m, cuts=field.cuts
+            )
     return ClipResult(
         info=info,
         frames=tuple(frames),
@@ -194,6 +301,53 @@ def run_clip(
         cuts=field.cuts,
         paint=tuple(paint),
     )
+
+
+def every_frame_tracking(config: PipelineConfig, fps: float) -> TrackingConfig:
+    """Return the tracking limits for people that are found on every frame.
+
+    The limits of ``config.tracking`` were set for keyframes ``config.keyframe_interval_s``
+    apart. A track ends after ``max_missed_keyframes`` keyframes without a match: on every
+    frame this becomes the same time in frames, so a person may be hidden for as long as in
+    the keyframe design. The other limits are in seconds, metres or box heights and stay.
+    """
+    missed_s = config.tracking.max_missed_keyframes * config.keyframe_interval_s
+    return config.tracking.model_copy(update={"max_missed_keyframes": round(missed_s * fps)})
+
+
+# --- Engines and tool answers ----------------------------------------------------
+
+
+def _uses_model(config: PipelineConfig) -> bool:
+    """Tell whether any step of the settings asks the model."""
+    engines = config.engines
+    return "model" in (engines.people, engines.pitch_mapping, engines.number)
+
+
+def _backend(backend: Backend | None) -> Backend:
+    """Return the backend of a model step. ``run_clip`` checked before that it exists."""
+    if backend is None:
+        raise ValueError("a model step needs a model backend")
+    return backend
+
+
+def _check_tool_answers(tools: ToolAnswers, config: PipelineConfig, n_frames: int) -> None:
+    """Raise ``ValueError`` unless the tool answers are exactly those that the engines need, for every frame."""
+    detector = config.engines.people == "detector"
+    calibration = config.engines.pitch_mapping == "calibration"
+    needed = {"people": detector, "balls": detector, "cameras": calibration}
+    for name, is_needed in needed.items():
+        answers = getattr(tools, name)
+        if is_needed and answers is None:
+            raise ValueError(f"the settings name the engine of a tool, but the tool answers have no {name}")
+        if not is_needed and answers is not None:
+            raise ValueError(f"the tool answers hold {name}, but no engine of the settings uses them")
+    for name in ("people", "cameras"):
+        answers = getattr(tools, name)
+        if answers is not None and [item.frame for item in answers] != list(range(n_frames)):
+            raise ValueError(f"the tool answers must hold the {name} of every frame from 0 to {n_frames - 1}, in order")
+    if tools.balls is not None and any(not 0 <= frame < n_frames for frame in tools.balls):
+        raise ValueError(f"the ball candidates name a frame outside the clip of {n_frames} frames")
 
 
 # --- Frames and model calls ----------------------------------------------------
@@ -326,63 +480,64 @@ def _kit_legend(
         return parse_kit_legend(answer.text)
 
 
-def _keyframe_requests(
-    source: FrameSource, keyframes: Sequence[int], legend: KitLegend, config: PipelineConfig
-) -> list[tuple[VLMRequest, VLMRequest]]:
-    """Build the people request and the landmarks request of every keyframe.
-
-    The frames are read here, in the calling thread.
-    """
-    clip_id = source.info.clip_id
-    pairs: list[tuple[VLMRequest, VLMRequest]] = []
-    for frame in keyframes:
-        image = _read_frame(source, frame)
-        people_request = build_people_request(
-            image, legend, clip_id=clip_id, frame=frame, settings=config.people, repeat=config.repeat
-        )
-        landmarks_request = build_landmarks_request(
-            image, clip_id=clip_id, frame=frame, settings=config.landmarks, repeat=config.repeat
-        )
-        pairs.append((people_request, landmarks_request))
-    return pairs
-
-
-def _people_and_landmarks(
-    source: FrameSource, backend: Backend, keyframes: Sequence[int], legend: KitLegend, config: PipelineConfig
+def _model_answers(
+    source: FrameSource, backend: Backend, keyframes: Sequence[int], legend: KitLegend | None, config: PipelineConfig
 ) -> tuple[list[FramePeople], list[FrameLandmarks]]:
-    """Ask the model for the people and for the pitch landmarks of every keyframe.
+    """Ask the model for the people and for the pitch landmarks of every keyframe, as far as the engines ask for them.
 
-    Both result lists are in keyframe order. The two requests of a keyframe
-    are sent next to each other, so that a fault in one of the two steps shows
-    at the start of a run. A person whose box repeats the box of another
-    person of the same answer is dropped, and a warning names their number.
+    The people are asked with the people engine ``model`` and the landmarks with the pitch
+    engine ``model``; a list that is not asked for is empty. Both result lists are in
+    keyframe order. The frames are read and the requests are built in the calling thread.
+    When both are asked, the two requests of a keyframe are sent next to each other, so that
+    a fault in one of the two steps shows at the start of a run. A person whose box repeats
+    the box of another person of the same answer is dropped, and a warning names their number.
     """
     info = source.info
-    pairs = _keyframe_requests(source, keyframes, legend, config)
-    answers = _generate_all(backend, [request for pair in pairs for request in pair], config.max_parallel)
+    ask_people = config.engines.people == "model"
+    ask_landmarks = config.engines.pitch_mapping == "model"
+    requests: list[VLMRequest] = []
+    for frame in keyframes:
+        image = _read_frame(source, frame)
+        if ask_people:
+            if legend is None:
+                raise ValueError("the people request needs the kit legend")
+            requests.append(
+                build_people_request(
+                    image, legend, clip_id=info.clip_id, frame=frame, settings=config.people, repeat=config.repeat
+                )
+            )
+        if ask_landmarks:
+            requests.append(
+                build_landmarks_request(
+                    image, clip_id=info.clip_id, frame=frame, settings=config.landmarks, repeat=config.repeat
+                )
+            )
+    answers = iter(zip(requests, _generate_all(backend, requests, config.max_parallel), strict=True))
     people: list[FramePeople] = []
     landmarks: list[FrameLandmarks] = []
     n_repeated = 0
-    for frame, (people_request, landmarks_request), people_answer, landmarks_answer in zip(
-        keyframes, pairs, answers[0::2], answers[1::2], strict=True
-    ):
-        with _answer_of(people_request):
-            answered = parse_people(
-                people_answer.text, frame=frame, width=info.width, height=info.height, coords=config.people.coords
-            )
-        kept = _without_repeated_boxes(answered)
-        n_repeated += len(answered.people) - len(kept.people)
-        people.append(kept)
-        with _answer_of(landmarks_request):
-            landmarks.append(
-                parse_landmarks(
-                    landmarks_answer.text,
-                    frame=frame,
-                    width=info.width,
-                    height=info.height,
-                    coords=config.landmarks.coords,
+    for frame in keyframes:
+        if ask_people:
+            people_request, people_answer = next(answers)
+            with _answer_of(people_request):
+                answered = parse_people(
+                    people_answer.text, frame=frame, width=info.width, height=info.height, coords=config.people.coords
                 )
-            )
+            kept = _without_repeated_boxes(answered)
+            n_repeated += len(answered.people) - len(kept.people)
+            people.append(kept)
+        if ask_landmarks:
+            landmarks_request, landmarks_answer = next(answers)
+            with _answer_of(landmarks_request):
+                landmarks.append(
+                    parse_landmarks(
+                        landmarks_answer.text,
+                        frame=frame,
+                        width=info.width,
+                        height=info.height,
+                        coords=config.landmarks.coords,
+                    )
+                )
     if n_repeated:
         logger.warning(
             "the people answers of clip %s repeat %d boxes; each repeated box is dropped", info.clip_id, n_repeated
@@ -481,10 +636,13 @@ def fit_problems(
 
 
 def _paint_checks(source: FrameSource, landmark_fits: Sequence[HomographyRecord]) -> list[PaintCheck]:
-    """Score every landmark fit with the paint alignment of its keyframe (``geometry.paint_alignment``).
+    """Score the mapping of every keyframe with the paint alignment of its frame (``geometry.paint_alignment``).
 
-    The fits are scored before the plausibility check, so a rejected fit has a score too. A
-    keyframe without a fit has no entry. The score is a diagnostic: it decides nothing.
+    ``landmark_fits`` holds the mapping of each keyframe before the plausibility check: the
+    landmark fit of the pitch engine ``model``, or the camera of the calibration tool for the
+    pitch engine ``calibration``. So both engines are scored on the same frames, and a
+    refused mapping has a score too. A keyframe without a mapping has no entry. The score is
+    a diagnostic: it decides nothing.
     """
     checks: list[PaintCheck] = []
     for record in landmark_fits:
@@ -605,6 +763,49 @@ def _pitch_mapping(
     return propagate_homographies(key_fits, motion, info.n_frames, max_gap_frames=config.max_gap_frames)
 
 
+def _camera_mapping(
+    cameras: Sequence[HomographyRecord],
+    people: Sequence[FramePeople],
+    motion: MotionField,
+    info: ClipInfo,
+    config: PipelineConfig,
+) -> list[HomographyRecord]:
+    """Give every frame the pitch mapping of the calibration tool, as far as it is plausible.
+
+    ``cameras`` holds the mapping of the tool for every frame. ``people`` holds the people
+    of the frames that have any (every frame for the detector, the keyframes for the model).
+    A mapping is refused when ``fit_problems`` finds a problem with the people of its frame
+    who stand on the pitch; a record of the tool has no count of agreeing landmarks, so the
+    strict share rule holds (9 of 10 people on the pitch). A frame without a plausible
+    mapping takes the mapping of the nearest frame that has one, within
+    ``config.max_gap_frames``, moved with the camera motion (``propagate_homographies``).
+    """
+    people_of = {frame_people.frame: frame_people.people for frame_people in people}
+    kept: dict[int, HomographyRecord] = {}
+    n_refused = 0
+    for record in cameras:
+        if not record.valid:
+            continue
+        on_pitch = [person for person in people_of.get(record.frame, ()) if person.role != _ROLE_NEXT_TO_PITCH]
+        problems = fit_problems(
+            record, _feet(on_pitch), (info.width, info.height), pitch_margin_m=config.pitch_margin_m
+        )
+        if problems:
+            logger.info("frame %d: the camera of the calibration is refused: %s", record.frame, "; ".join(problems))
+            n_refused += 1
+            continue
+        kept[record.frame] = record
+    if not kept:
+        logger.warning(
+            "no frame of clip %s has a plausible camera of the calibration (%d refused, %d without a camera), so "
+            "the clip gets no pitch position",
+            info.clip_id,
+            n_refused,
+            sum(not record.valid for record in cameras),
+        )
+    return propagate_homographies(kept, motion, info.n_frames, max_gap_frames=config.max_gap_frames)
+
+
 def _pitch_map(homographies: Sequence[HomographyRecord]) -> PitchMap:
     """Build the function that maps image points of a frame to pitch metres.
 
@@ -666,6 +867,89 @@ def _tracks(
     return tracks
 
 
+def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[FramePeople]:
+    """Give every person of every frame the team key of the kit colour of their torso (``kitcolour``).
+
+    The two kit clusters are fitted on the torso features of all people of the clip. A
+    person whose kit fits neither cluster, or whose torso is too small for a feature, gets
+    the team key ``none``. When the clip does not have two different kit colours, every
+    person keeps the team key ``none`` and a warning says so.
+    """
+    features: list[list[np.ndarray | None]] = []
+    for frame_people in people:
+        if not frame_people.people:
+            features.append([])
+            continue
+        image = _read_frame(source, frame_people.frame)
+        features.append([torso_feature(image, person.box) for person in frame_people.people])
+    known = [feature for frame_features in features for feature in frame_features if feature is not None]
+    if len(known) < 2 or len(np.unique(np.stack(known), axis=0)) < 2:
+        logger.warning(
+            "clip %s has %d torso features and not two different kit colours: no person gets a team key",
+            source.info.clip_id,
+            len(known),
+        )
+        return list(people)
+    clusters = fit_kit_clusters(np.stack(known), seed=KIT_CLUSTER_SEED)
+    return [
+        FramePeople(
+            frame=frame_people.frame,
+            people=tuple(
+                person.model_copy(update={"team_key": clusters.team_key(feature)})
+                for person, feature in zip(frame_people.people, frame_features, strict=True)
+            ),
+        )
+        for frame_people, frame_features in zip(people, features, strict=True)
+    ]
+
+
+def _detector_tracks(
+    people: Sequence[FramePeople],
+    warp: MotionWarp,
+    to_pitch: PitchMap,
+    fps: float,
+    config: TrackingConfig,
+    motion: MotionField,
+) -> list[Track]:
+    """Link the people of every frame into tracks, give the tracks of outlier kits their role, then join broken tracks.
+
+    The roles come before the joins: ``stitch_fragments`` joins only tracks with the same
+    role and team key, so a goalkeeper must already be one. Each shot of ``motion`` is
+    tracked on its own, as in ``_tracks``, so no position links two people across a cut.
+    The ids are 0..n-1 in the order of the shots and, inside a shot, in the order of the
+    first frame. With ``config.split_team_swaps`` a track is cut where it took over a
+    person of the other kit cluster (``tracking.split_team_swaps``), after the kit roles
+    (a goalkeeper or a referee has the team key ``none`` and is never cut) and before the
+    joins of its shot, which link the pieces.
+    """
+    shots: dict[int, list[FramePeople]] = {}
+    for frame_people in people:
+        shots.setdefault(motion.shot_of(frame_people.frame), []).append(frame_people)
+    tracks: list[Track] = []
+    for shot in sorted(shots):
+        fragments = associate(shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config)
+        with_roles = kit_roles(fragments, _mean_positions(fragments, to_pitch))
+        if config.split_team_swaps:
+            with_roles = split_team_swaps(with_roles)
+        for track in stitch_fragments(with_roles, fps=fps, to_pitch=to_pitch, config=config):
+            tracks.append(track.model_copy(update={"track_id": len(tracks)}))
+    return tracks
+
+
+def _mean_positions(tracks: Sequence[Track], to_pitch: PitchMap) -> dict[int, tuple[float, float]]:
+    """Return the mean pitch position (x, y) of every track that has one, by track id."""
+    means: dict[int, tuple[float, float]] = {}
+    for track in tracks:
+        points = [_pitch_point(observation, to_pitch) for observation in track.observations]
+        known = [point for point in points if point is not None]
+        if known:
+            means[track.track_id] = (
+                math.fsum(x for x, _ in known) / len(known),
+                math.fsum(y for _, y in known) / len(known),
+            )
+    return means
+
+
 # --- Step 8: shirt numbers -----------------------------------------------------------
 
 
@@ -722,13 +1006,19 @@ def _crop_observations(track: Track, fps: float, max_crops: int) -> tuple[TrackO
     return tuple(by_frame[frame] for frame, _ in chosen)
 
 
-def _crop_plans(tracks: Sequence[Track], fps: float, max_crops: int) -> list[_CropPlan]:
-    """Plan the crops of every track that is voted player or goalkeeper."""
+def _crop_plans(tracks: Sequence[Track], fps: float, max_crops: int, *, name_team: bool) -> list[_CropPlan]:
+    """Plan the crops of every track that is voted player or goalkeeper.
+
+    With ``name_team`` False the plan names no team (``none``): the team key of a track is
+    then a kit cluster of the detector engine, not a team of the kit legend.
+    """
     plans: list[_CropPlan] = []
     for track in tracks:
         role, team_key = vote_role_team(track)
         if role in TEAM_ROLES:
-            plans.append(_CropPlan(track.track_id, team_key, _crop_observations(track, fps, max_crops)))
+            plans.append(
+                _CropPlan(track.track_id, team_key if name_team else "none", _crop_observations(track, fps, max_crops))
+            )
     return plans
 
 
@@ -805,14 +1095,21 @@ def _number_request(
 
 
 def _shirt_numbers(
-    source: FrameSource, backend: Backend, tracks: Sequence[Track], legend: KitLegend, config: PipelineConfig
+    source: FrameSource,
+    backend: Backend,
+    tracks: Sequence[Track],
+    legend: KitLegend,
+    config: PipelineConfig,
+    *,
+    name_team: bool,
 ) -> dict[int, NumberReading]:
     """Ask the model for the shirt number of every track that is voted player or goalkeeper.
 
     The result maps a track id to the reading of that track. The crops are cut
     and enlarged in the calling thread; the requests go through the thread pool.
+    ``name_team`` says whether the request names the team key of the track (``_crop_plans``).
     """
-    plans = _crop_plans(tracks, source.info.fps, config.number_crops)
+    plans = _crop_plans(tracks, source.info.fps, config.number_crops, name_team=name_team)
     crops = _cut_crops(source, plans)
     requests = [_number_request(plan, crops, legend, source.info, config) for plan in plans]
     answers = _generate_all(backend, requests, config.max_parallel)
@@ -826,12 +1123,18 @@ def _shirt_numbers(
 # --- Steps 9 and 10: inputs of the votes, and the engine table ---------------------
 
 
-def _pitch_x(observation: TrackObs, to_pitch: PitchMap) -> float | None:
-    """Return the pitch x of the foot point of an observation, or None when it has no finite pitch position."""
+def _pitch_point(observation: TrackObs, to_pitch: PitchMap) -> tuple[float, float] | None:
+    """Return the pitch position of the foot point of an observation, or None when it has no finite one."""
     position = to_pitch(observation.frame, np.array([observation.box.foot], dtype=np.float64))
     if position is None or not np.isfinite(position).all():
         return None
-    return float(position[0, 0])
+    return float(position[0, 0]), float(position[0, 1])
+
+
+def _pitch_x(observation: TrackObs, to_pitch: PitchMap) -> float | None:
+    """Return the pitch x of the foot point of an observation, or None when it has no finite pitch position."""
+    point = _pitch_point(observation, to_pitch)
+    return None if point is None else point[0]
 
 
 def _mean_pitch_x(tracks: Sequence[Track], to_pitch: PitchMap) -> dict[int, float]:
@@ -849,15 +1152,67 @@ def _mean_pitch_x(tracks: Sequence[Track], to_pitch: PitchMap) -> dict[int, floa
     return means
 
 
+def _with_ball(
+    frames: Sequence[FrameState],
+    candidates: Mapping[int, Sequence[BallCandidate]],
+    warp: MotionWarp,
+    to_pitch: PitchMap,
+    fps: float,
+    margin_m: float,
+    *,
+    cuts: Sequence[int],
+) -> list[FrameState]:
+    """Follow the ball (``ball.track_ball``) and give each frame state the ball of its frame.
+
+    No run of the ball crosses a cut (``cuts``, the frames that start a new shot). The pitch position of the ball is the foot point of its box. It is left out where the
+    frame has no mapping, and where it lies more than ``margin_m`` outside the pitch: a ball
+    in the air maps far beyond where it is.
+    """
+    track = track_ball(
+        candidates, len(frames), fps=fps, warp=warp, max_gap_frames=round(BALL_MAX_GAP_S * fps), cuts=cuts
+    )
+    result: list[FrameState] = []
+    for state in frames:
+        box = track.boxes.get(state.frame)
+        if box is None:
+            result.append(state)
+            continue
+        position = to_pitch(state.frame, np.array([box.foot], dtype=np.float64))
+        pitch: dict[str, float] = {}
+        if position is not None and np.isfinite(position).all() and bool(inside_pitch(position, margin_m)[0]):
+            pitch = {"pitch_x": float(position[0, 0]), "pitch_y": float(position[0, 1])}
+        ball = BallState(box=box, observed=state.frame in track.observed, **pitch)
+        result.append(state.model_copy(update={"ball": ball}))
+    return result
+
+
+def _model_engine(settings: StepSettings) -> str:
+    """Name the engine of a model step: its provider and its model (``model_label``)."""
+    return f"model:{model_label(settings.provider, settings.model)}"
+
+
 def _engines(config: PipelineConfig) -> dict[str, str]:
-    """Name what does each step: ``model:<model id>`` for a model step, ``code`` for plain code."""
+    """Name what does each step.
+
+    ``model:<model>`` for a model step, with the model as the command line writes it
+    (``model_label``: the bare name for Gemini, ``openrouter:<slug>`` for OpenRouter),
+    ``detector:<tool>:<model class>`` and ``tool:<tool>`` for the answers of an external
+    tool, ``code`` for plain code, and ``none`` for a step that does not run.
+    """
+    engines = config.engines
+    detector = engines.people == "detector"
+    asks_legend = not detector or engines.number == "model"
+    landmarks = engines.pitch_mapping == "model"
+    people = f"detector:{config.detector.name}:{config.detector.model}" if detector else _model_engine(config.people)
     return {
-        "kit_legend": f"model:{config.kit_legend.model}",
-        "people": f"model:{config.people.model}",
-        "landmarks": f"model:{config.landmarks.model}",
-        "number": f"model:{config.number.model}",
+        "kit_legend": _model_engine(config.kit_legend) if asks_legend else "none",
+        "people": people,
+        "team_role": "code:kit-colour" if detector else _model_engine(config.people),
+        "landmarks": _model_engine(config.landmarks) if landmarks else "none",
+        "number": _model_engine(config.number) if engines.number == "model" else "none",
+        "ball": "code:ball-tracker" if detector else "none",
         "motion": "code",
-        "pitch_mapping": "code",
+        "pitch_mapping": "code" if landmarks else f"tool:{config.calibration.name}",
         "tracks": "code",
         "fill": "code",
     }

@@ -267,9 +267,32 @@ class PlayerState(Record):
     observed: bool = False
 
 
+class BallState(Record):
+    """The ball in one frame of the final output (detector engine only).
+
+    The pitch position is the foot point of the box on the grass. A ball in the air is not on
+    the grass, so its pitch position is wrong by the height of the ball: it is drawn on the
+    radar and never exported. Both pitch values are given, or neither.
+    """
+
+    box: Box
+    pitch_x: FiniteFloat | None = None
+    pitch_y: FiniteFloat | None = None
+    #: True in frames where the detector saw the ball; False where the ball tracker filled it in.
+    observed: bool = False
+
+    @model_validator(mode="after")
+    def _check_pitch(self) -> BallState:
+        if (self.pitch_x is None) != (self.pitch_y is None):
+            raise ValueError("a ball state needs both pitch values or neither")
+        return self
+
+
 class FrameState(Record):
     frame: int = Field(ge=0)
     players: tuple[PlayerState, ...] = ()
+    #: The ball, or None when the frame has no ball (always None for the model engine).
+    ball: BallState | None = None
 
 
 class ClipInfo(Record):
@@ -281,7 +304,10 @@ class ClipInfo(Record):
 
 
 class PaintCheck(Record):
-    """The paint-alignment score of the landmark fit of one keyframe (``geometry.paint_alignment``).
+    """The paint-alignment score of the pitch mapping of one keyframe (``geometry.paint_alignment``).
+
+    The mapping is the landmark fit (pitch engine ``model``) or the camera of the calibration
+    tool (pitch engine ``calibration``), before the plausibility check.
 
     ``score`` is in 0 to 1, or None when the frame cannot judge a mapping; ``reason`` then says why.
     """
@@ -309,5 +335,5 @@ class ClipResult(Record):
     engines: dict[str, str] = Field(default_factory=dict)
     #: The frames that start a new shot (hard cuts), in increasing order.
     cuts: tuple[int, ...] = ()
-    #: The paint-alignment score of every landmark fit, in keyframe order. A diagnostic only.
+    #: The paint-alignment score of every keyframe mapping, in keyframe order. A diagnostic only.
     paint: tuple[PaintCheck, ...] = ()

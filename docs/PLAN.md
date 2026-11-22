@@ -80,10 +80,16 @@ cached, replays for free, and can use the half-price tier.
 - Fallbacks: RF-DETR for boxes (Apache-2.0), PnLCalib for pitch mapping (separate tool). Their
   adapters are written in M1 and installed in M2. A fallback replaces a step only after the gate
   of the step failed and the fallback passed the same gate on the same frames (rule 8).
-- The pipeline has no switch for a fallback yet: `run` takes the people and the pitch mapping
-  from the model steps only. A tool that passes its gate needs a pipeline path, and RF-DETR also
-  needs a step that gives each box its role and team key. This work is not built and not
-  budgeted (open owner decision, `docs/DECISIONS.md`).
+- Detector engine (owner decision of 22 Nov 2026, `docs/DECISIONS.md`): the settings name the
+  engine of the people step (`model` or `detector`), of the pitch mapping (`model` or
+  `calibration`) and of the shirt numbers (`model` or `none`). The detector engine takes the
+  people and the ball of every frame from a detector run (RF-DETR, Apache-2.0), gives team and
+  role from the kit colours with plain code, and follows the ball; the calibration engine takes
+  the camera of every frame from a PnLCalib run. With both and no number step a run calls no
+  model and costs no API money; without the number step no player has a number. Tools run in
+  their own environments (`tools/run_tool.py`, RUNBOOK section 11). The ball goes to the video
+  and the radar only (it is outside the scored result). Nothing of this engine ran with a real
+  tool or real footage, and no speed is claimed before it is measured on the run machine.
 - Both tools are measured in M3 on the frames of the people probe and the pitch probe, with their
   pretrained weights and without training (owner decision, 14 Nov 2026). It costs no API money.
   So the decision of 24 Nov has measured values of both tools next to those of the two model
@@ -316,4 +322,5 @@ be tested on the build machine; `doctor` is its first real test.
 - Scorer: https://github.com/SoccerNet/sn-trackeval
 - Gemini docs: https://aistudio.google.com/docs/image-understanding , https://aistudio.google.com/docs/pricing
 - OpenRouter docs: https://openrouter.ai/docs/api-reference/overview , https://openrouter.ai/docs/features/provider-routing
-  (all pages that the client relies on: `docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22, item 4)
+  (all pages that the client relies on: `docs/DECISIONS.md`, entry "Image models through
+  OpenRouter" of 2026-11-22, item 4)

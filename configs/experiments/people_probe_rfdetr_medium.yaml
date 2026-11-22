@@ -1,0 +1,10 @@
+# Measures RF-DETR Medium (pretrained weights), the default detector of the detector engine, on the frames of the people probe. It serves gate G2.
+name: people_probe_rfdetr_medium
+group: probe
+frames_per_clip: 5
+seed: 20261113
+tool:
+  name: rfdetr
+  model: RFDETRMedium
+  min_score: 0.5
+  antialias: false

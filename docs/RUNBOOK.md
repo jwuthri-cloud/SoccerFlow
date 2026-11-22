@@ -268,6 +268,7 @@ only after that step failed its gate and the tool passed the same gate on the sa
 | RF-DETR Large | `configs/experiments/people_probe_rfdetr_large.yaml` | people probe, G2 |
 | RF-DETR Large, antialiased resize | `configs/experiments/people_probe_rfdetr_large_antialias.yaml` | people probe, G2 |
 | PnLCalib | `configs/experiments/pitch_probe_pnlcalib.yaml` | pitch probe, G3 |
+| RF-DETR Medium, the default detector of the detector engine (section 11) | `configs/experiments/people_probe_rfdetr_medium.yaml` | people probe, G2 |
 
 Each tool gets its own environment, because its packages do not fit the environment of the
 package. Ask the owner before the install: it downloads packages and about 1 GB of weights.
@@ -340,11 +341,9 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
 
 - First run: add `--max-clips 2` to `tool-job` and to `tool-score`, and do the first check of
   section 8 (row "Tool script") before the full run. The script never ran with a real tool.
-- These commands measure a tool. They do not switch it on: `run` takes the people and the pitch
-  mapping from the model steps only, and the pipeline has no setting for another engine. RF-DETR
-  gives boxes only, so the role, the team key and the number of each person would need one more
-  step, which is not designed. This work and its cost are an open owner decision
-  (`docs/DECISIONS.md`, last list).
+- These commands measure a tool on the probe frames. They do not switch it on: the settings
+  of `run` name the engine of each step, and section 11 runs the tools on every frame of a clip
+  for the detector engine.
 - The two tools are the code of other projects. The two commands above start the script without
   the variable `GEMINI_API_KEY` (`env -u`), and the script also takes the variable out of its
   environment before it loads a tool. Code of the tool environment runs before that line of the
@@ -471,10 +470,11 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
 ### Paint alignment of the pitch mappings (free)
 
 Every metrics file of the pitch probe and of `tool-score` for PnLCalib has the key
-`paint_alignment` (`docs/DECISIONS.md`, entry "Paint alignment of pitch mappings, and hard cuts" of 2026-11-22): a score from 0 to 1 per valid mapping, how
-well the projected pitch lines lie on the white paint of the frame, and how well the score
-separates the mappings with a median position error above 3 m from those at or below 2 m. It is
-a diagnostic: no rule uses it yet. The measurement needs no model call. It runs on the frames
+`paint_alignment` (`docs/DECISIONS.md`, entry "Paint alignment of pitch mappings, and hard
+cuts" of 2026-11-22): a score from 0 to 1 per valid mapping, how well the projected pitch
+lines lie on the white paint of the frame, and how well the score separates the mappings with
+a median position error above 3 m from those at or below 2 m. It is a diagnostic: no rule uses
+it yet. The measurement needs no model call. It runs on the frames
 of the group `probe` of the split list, which are valid clips only; never run it on test clips.
 
 When the pitch probe ran before this code was there, replay it from the stored answers (free):
@@ -491,7 +491,8 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   `n_bad`, `score_good` and `score_bad`. Also read `n_cannot_judge` and `cannot_judge_reasons`:
   a frame with too little paint, or with too much white, gets no score.
 - Write the numbers of both engines into `docs/DECISIONS.md` with the date. The rule that would
-  follow from them is in that file (2026-11-22, item 4); it needs an entry of its own.
+  follow from them is in that file (entry "Paint alignment of pitch mappings, and hard cuts",
+  item 4); it needs an entry of its own.
 - `paint_alignment.frames` holds one entry per mapping: clip, frame, score and median position
   error. They are text and go back with the metrics file.
 - The constants of the score were chosen on synthetic frames only. Before the numbers are read,
@@ -499,8 +500,9 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   paint mask misses the lines of real frames), the median score of the good mappings is high,
   and the score of a frame does not depend on the run (it is deterministic).
 
-`demo` and `run` print the hard cuts of a clip and the median paint score of its landmark fits,
-and the result file of `run` holds both (`cuts`, `paint`). The clips of SoccerNet GSR have no
+`demo` and `run` print the hard cuts of a clip and the median paint score of its keyframe
+mappings (the landmark fits of the pitch engine `model`, or the cameras of the pitch engine
+`calibration`), and the result file of `run` holds both (`cuts`, `paint`). The clips of SoccerNet GSR have no
 cut, so no gate measures the cut test: it guards the demo clip and other broadcast footage. A
 cut that `run` names on a dataset clip is a false cut: tell the owner.
 
@@ -1106,10 +1108,10 @@ What the guard does not see:
 ## 10 Image models through OpenRouter
 
 Every model step can use an image model of OpenRouter in the place of Gemini
-(`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22). A step names its provider, its model and the
-coordinate convention of that model (`provider`, `model`, `coords` in `configs/default.yaml` and
-in the `step` section of an experiment file). Nothing here ran against the real API before this
-machine: the first check of each model is its doctor run.
+(`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22). A step names
+its provider, its model and the coordinate convention of that model (`provider`, `model`,
+`coords` in `configs/default.yaml` and in the `step` section of an experiment file). Nothing here
+ran against the real API before this machine: the first check of each model is its doctor run.
 
 | Setting | Gemini | OpenRouter |
 |---|---|---|
@@ -1208,7 +1210,8 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
 - Another OpenRouter model: add its price to `configs/openrouter_prices.yaml` from its model page
   (the highest price of its providers, with the day as `valid_from`), commit, and run its doctor
   first.
-- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22, item 7).
+- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of
+  2026-11-22, item 7).
 
 What was never tested before this machine, for OpenRouter:
 
@@ -1219,3 +1222,143 @@ What was never tested before this machine, for OpenRouter:
 | Strict answer schema | the doctor answers parse, `boxes` and `landmarks` pass | A status 400 that names the schema: a provider does not take a keyword. Tell the owner. |
 | Coordinate convention | `boxes` and `landmarks` pass with the `--coords` of the model card | Read the answers and run again with the convention that they show. |
 | Reasoning effort | a doctor with `--thinking-level low` for a model whose page lists `reasoning` | A status 503 or 404: no provider of the model takes the reasoning setting. Use `model_default`. |
+
+## 11 Detector engine (owner decision of 2026-11-22)
+
+The pipeline has a second engine for the people step and for the pitch mapping
+(`docs/DECISIONS.md`, entry "A real-time detector engine next to the model engine" of
+2026-11-22). The people engine `detector` takes the people and the ball of every frame from a
+detector run, gives each person a team key and a role from the kit colours, and follows the
+ball. The pitch engine `calibration` takes the camera of every frame from a PnLCalib run. With
+the settings file `configs/engines/detector_calibration.yaml` no step calls a model, so the run
+is free. `configs/engines/detector_calibration_numbers.yaml` adds the paid shirt-number step (one
+kit legend request and one number request per track): it prints its estimate like every paid run
+and needs the owner's go-ahead.
+
+The track repairs of section 4 ("The track repairs against gate G4") work with this engine too.
+`run` reads one settings file, so an arm of the detector engine needs a file with the `engines`
+section of `configs/engines/detector_calibration.yaml` and the `tracking` section of the arm.
+Commit that file before the run (rule 7). The tracking values without labels of a detector run
+count every observed frame, not keyframes: do not compare them with those of the model engine.
+
+The tools run as in section 3, in their own environments, through `tools/run_tool.py`. The
+package never imports a tool. Three commands per clip: write the clip job, run the tool on every
+frame, run the pipeline. None of them ran before with a real tool, a real clip or real weights.
+
+```bash
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+SETTINGS=configs/engines/detector_calibration.yaml
+mkdir -p ~/pitchvlm-data/jobs/<clip> ../pitchvlm-results/results/tools/<clip>
+
+# 1. Clip jobs: every frame of the clip, with the tool settings of the settings file.
+python -m pitchvlm.cli clip-job --tool rfdetr --config $SETTINGS --clip $CLIP --root ~/pitchvlm-data \
+    --out ~/pitchvlm-data/jobs/<clip>/rfdetr.json
+python -m pitchvlm.cli clip-job --tool pnlcalib --config $SETTINGS --clip $CLIP --root ~/pitchvlm-data \
+    --out ~/pitchvlm-data/jobs/<clip>/pnlcalib.json
+
+# 2. The tools on every frame. The run is written in parts of at most 1,000,000 bytes:
+#    detections.json, detections-0002.json, ... A clip of 30 s with 25 people is about 0.75 MB, one part.
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python tools/run_tool.py rfdetr \
+    --device mps --job ~/pitchvlm-data/jobs/<clip>/rfdetr.json --root ~/pitchvlm-data \
+    --out ../pitchvlm-results/results/tools/<clip>/detections.json
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/pnlcalib/bin/python tools/run_tool.py pnlcalib \
+    --device mps --job ~/pitchvlm-data/jobs/<clip>/pnlcalib.json --root ~/pitchvlm-data \
+    --repo ~/pitchvlm-data/PnLCalib \
+    --weights-kp ~/pitchvlm-data/weights/pnlcalib/SV_kp \
+    --weights-lines ~/pitchvlm-data/weights/pnlcalib/SV_lines \
+    --out ../pitchvlm-results/results/tools/<clip>/calibration.json
+
+# 3. The pipeline with both tool engines. No model call: it needs no cache folder and costs nothing.
+python -m pitchvlm.cli run --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+    --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+    --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+    --out ~/pitchvlm-data/runs/dev-detector --tracker pitchvlm-detector
+```
+
+- `run` refuses a clip run whose tool settings differ from the settings file, a run of another
+  clip or of another number of frames, a missing part, a part of another run, and a payload that
+  cannot be used (the line names the file and the frame). It refuses `--detections` when the
+  settings do not name the people engine `detector`, and the same for `--calibration`.
+- The script refuses to start when files with the names of later parts lie next to `--out`
+  (`detections-0002.json` of an older run): remove them first. It deletes nothing itself.
+- A clip job reads a folder of frame images. A video file is refused: its frames must first be
+  written as numbered images below the data folder (no command does this yet).
+- `result.json` holds `timing`: seconds, milliseconds per frame and frames per second of each
+  stage, and `total`. The stages `detector` and `calibration` are the times that the script
+  measured per frame on its device (without reading the image file); the other stages are the
+  times of the package on this machine, with the reading of the frames. `provenance.tool_runs`
+  names each clip run, its parts, its device and versions (`runner`) and whether the script is
+  the one of this work tree. Nothing is "real time" until these values are measured here and
+  the total is above the frame rate of the clip. Write the measured values into
+  `docs/DECISIONS.md` with the device.
+- Without the number step no player has a number: `run` prints a line that says so, and the
+  engine table of `result.json` has `"number": "none"`. The scorer then counts the numbers of
+  numbered players as wrong.
+- The ball goes to the video and to the radar only. The prediction file has no ball, and the
+  pitch position of a ball in the air is wrong (it is mapped as if it were on the grass).
+- The clip runs are tool runs: they stay out of the results branch until the owner decides on
+  the tool run files (`docs/DECISIONS.md`, last list). Each part passes the size rule of the
+  guard (measured: 37.9 bytes per detection; a part of 26 detections on each of 750 frames is
+  738,558 bytes, and the guard passed on it).
+
+Measurement, fixed before any run (rule 7):
+
+1. Gate G2 on the same frames as the people step: the experiment file
+   `configs/experiments/people_probe_rfdetr_medium.yaml` (the default detector) next to the four
+   files of section 3, with `tool-job`, `tools/run_tool.py` and `tool-score` as in section 3. The
+   detector engine adds no box: its boxes are those of the tool, kept by the same score limit,
+   so G2 measures the boxes of the engine. Compare only with the people probe of the same frames.
+2. End to end on the dev clips with the same scorer: run every clip of the group `dev` with
+   the commands above, each engine with its own `--tracker` name, then `eval` for each tracker
+   (section 5) on the same clips. Compare GS-HOTA, DetA and AssA clip by clip, and the role and
+   team-side accuracy of gate G5b. The settings of both runs are fixed before the first clip.
+
+## 12 Plan: a detector trained on soccer (not done; no download, no training yet)
+
+The weights of the everyday classes (COCO) know `person` and `sports ball`: they do not tell a
+player from a referee, and they miss small and blurred balls. A detector trained on soccer
+frames gives the classes `player`, `goalkeeper`, `referee` and `ball`. Nothing of this plan was
+run; it needs the owner's go-ahead, a GPU machine and its own budget line.
+
+Data:
+
+- SoccerNet-GSR train split (the same source as the valid split of this project): clips of
+  30 s with boxes and roles (`player`, `goalkeeper`, `referee`, `other`); the ball has
+  annotations with the role `ball` that `labels.py` skips (to confirm on a label file). The
+  labels are on Hugging Face (`SoccerNet/SN-GSR-2025`, tagged `gpl-3.0`, not gated); the footage
+  is broadcast video for research. Treat the data and every weight file trained on it as
+  research-only until the owner has read the terms (open owner decision).
+- Not used: the Roboflow football datasets (licence page not readable, unverified) and the
+  SoccerNet tracking video (behind an NDA).
+- The valid split (probe, dev, reserve groups) and the test split are never training data.
+
+Steps (the converter is not built):
+
+```bash
+# 1. Download the train split into the data folder (its size is not known here; check the free disk first).
+python -m pitchvlm.cli data --root ~/pitchvlm-data --split train \
+    --manifest configs/splits.json --seed 20261113
+
+# 2. To build: a converter that writes the COCO layout that RF-DETR trains on, with links to the
+#    frame images (no copy): ~/pitchvlm-data/finetune/coco/{train,valid}/_annotations.coco.json.
+#    Classes: 0 player, 1 goalkeeper, 2 referee, 3 ball; "other" is left out. Every 5th frame of
+#    each train clip; 10% of the train clips (by clip, never by frame) as its valid folder.
+
+# 3. Training on the GPU machine, in the RF-DETR environment (API of rfdetr 1.12.1).
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python -c '
+from rfdetr import RFDETRMedium
+RFDETRMedium().train(dataset_dir="<home>/pitchvlm-data/finetune/coco", epochs=50, batch_size=8,
+                     grad_accum_steps=2, lr=1e-4, output_dir="<home>/pitchvlm-data/weights/rfdetr-soccer")'
+```
+
+- Weights live in `~/pitchvlm-data/weights/rfdetr-soccer` on the machine that trains, and are
+  copied to the run machine by hand. Never into the repository, never into the results branch.
+- Before the engine can use them, three things are built: a key in the detector settings that
+  names the weight file (its SHA-256 goes into the facts of the run), the load of that file in
+  `tools/run_tool.py` (the source of rfdetr 1.12.1 says how a model class takes its own
+  weights; to confirm), and the class names of the trained weights in `fallbacks/rfdetr.py`
+  (`player`, `goalkeeper`, `referee` give a role; `ball` is a ball candidate).
+- Measure the trained detector like the others: gate G2 on the probe frames, then end to end on
+  the dev clips (section 11). Ultralytics weights are not an option for this repository: their
+  code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time
+  detector engine next to the model engine" of 2026-11-22).

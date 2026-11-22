@@ -1,8 +1,12 @@
 """Run an external tool on the frames of a job file and write the run file.
 
 The package writes the job file (``python -m pitchvlm.cli tool-job``) and measures the run file
-(``python -m pitchvlm.cli tool-score``). Both formats are described in
-``src/pitchvlm/fallbacks/runs.py``. The answer of a tool for one frame is a payload in the
+(``python -m pitchvlm.cli tool-score``). For the engines of the pipeline it writes a clip job
+of every frame of one clip (``python -m pitchvlm.cli clip-job``), and ``run`` reads the clip
+run (``--detections``, ``--calibration``). The four formats are described in
+``src/pitchvlm/fallbacks/runs.py``. The script tells a clip job by its format name; it writes
+the clip run in parts of at most ``CLIP_RUN_PART_MAX_BYTES`` bytes, with the compact rows of
+the detector. The answer of a tool for one frame is a payload in the
 format of its adapter module: ``src/pitchvlm/fallbacks/rfdetr.py`` for the detector and
 ``src/pitchvlm/fallbacks/pnlcalib.py`` for the calibration.
 
@@ -21,10 +25,11 @@ Exit code 0 means that the run file was written. Exit code 2 means that the scri
 run; its last line on the standard error stream then starts with ``error:``. A wrong command
 line also gives the exit code 2, and its last line is the ``error:`` line of the argument parser.
 
-The script takes the variable ``GEMINI_API_KEY`` out of its environment before it loads a
-tool: the tools are code of other projects, and they must not see the key of the model API.
-Code of the tool environment runs before that line (the start-up code of a package, and
-NumPy), so start the script without the variable: ``env -u GEMINI_API_KEY python ...``.
+The script takes the variables ``GEMINI_API_KEY`` and ``OPENROUTER_API_KEY`` out of its
+environment before it loads a tool (``KEY_VARIABLES``): the tools are code of other
+projects, and they must not see a key of a model API. Code of the tool environment runs
+before that line (the start-up code of a package, and NumPy), so start the script without
+the variables: ``env -u GEMINI_API_KEY -u OPENROUTER_API_KEY python ...``.
 
 What each tool gets, and what the script takes from it:
 
@@ -79,6 +84,14 @@ except ModuleNotFoundError:
 #: Format names of the job file and the run file: those of ``pitchvlm.fallbacks.runs``.
 JOB_FORMAT = "pitchvlm-tool-job-1"
 RUN_FORMAT = "pitchvlm-tool-run-1"
+#: Format names of the clip job and the clip run: those of ``pitchvlm.fallbacks.runs``.
+CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"
+CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"
+#: Largest size of one part of a clip run, bytes: that of ``pitchvlm.fallbacks.runs``.
+CLIP_RUN_PART_MAX_BYTES = 1_000_000
+#: Rounding of a compact detection row: the box to 0.1 pixel, the score to 0.0001.
+BOX_DECIMALS = 1
+SCORE_DECIMALS = 4
 #: Keys of the tool section of a job, by tool.
 TOOL_KEYS = {
     "rfdetr": frozenset({"name", "model", "min_score", "antialias"}),
@@ -96,8 +109,9 @@ PNLCALIB_PACKAGES = ("model", "utils")
 PNLCALIB_INPUT = (960, 540)
 #: Pitch convention that a calibration payload states.
 PITCH_ORIGIN = "centre"
-#: Variable that holds the key of the model API on the run machine: the one of ``pitchvlm.cli``.
-KEY_VARIABLE = "GEMINI_API_KEY"
+#: Variables that hold a key of a model API on the run machine: the Gemini key of ``pitchvlm.cli``
+#: and the key of the OpenRouter provider.
+KEY_VARIABLES = ("GEMINI_API_KEY", "OPENROUTER_API_KEY")
 EXIT_OK = 0
 EXIT_ERROR = 2
 #: What to do when a package or a module of a tool is missing.
@@ -115,11 +129,15 @@ class RunnerError(Exception):
 
 
 def read_job(path: Path, tool: str) -> dict[str, Any]:
-    """Read a job file and check that it is a job for ``tool``. Wrong content raises ``RunnerError``.
+    """Read a job file or a clip job and check that it is a job for ``tool``. Wrong content raises ``RunnerError``.
 
-    The job must have the format name of this script, the tool section of ``tool`` with exactly
-    its keys, and at least one frame. The image of a frame must be a path below the data
-    folder: no absolute path and no step to a parent folder.
+    The job must have one of the two job format names of this script, the tool section of
+    ``tool`` with exactly its keys, and at least one frame. The image of a frame must be a
+    path below the data folder: no absolute path and no step to a parent folder.
+
+    A clip job names its clip and the image of every frame (``images``). The job that is
+    returned then also holds ``frames`` in the form of a job file, frame ``i`` with the
+    image ``images[i]``, and the name of the clip as its ``name``.
     """
     try:
         job = json.loads(path.read_text(encoding="utf-8"))
@@ -127,8 +145,13 @@ def read_job(path: Path, tool: str) -> dict[str, Any]:
         raise RunnerError(f"the job file {path} cannot be read: {error}") from error
     except ValueError as error:
         raise RunnerError(f"the job file {path} holds no JSON: {error}") from error
-    if not isinstance(job, dict) or job.get("format") != JOB_FORMAT:
-        raise RunnerError(f"the job file {path} is not in the format {JOB_FORMAT}: write it with the tool-job command")
+    if not isinstance(job, dict) or job.get("format") not in (JOB_FORMAT, CLIP_JOB_FORMAT):
+        raise RunnerError(
+            f"the job file {path} is not in the format {JOB_FORMAT} or {CLIP_JOB_FORMAT}: "
+            "write it with the tool-job or the clip-job command"
+        )
+    if job["format"] == CLIP_JOB_FORMAT:
+        job = _clip_job_frames(job, path)
     if not isinstance(job.get("name"), str) or not job["name"]:
         raise RunnerError(f"the job file {path} has no name")
     settings = job.get("tool")
@@ -145,6 +168,21 @@ def read_job(path: Path, tool: str) -> dict[str, Any]:
     for position, entry in enumerate(frames):
         _check_job_frame(entry, f"the job file {path}, frames[{position}]")
     return job
+
+
+def _clip_job_frames(job: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Return a clip job with the frames of a job file: frame ``i`` reads ``images[i]``.
+
+    ``RunnerError`` is raised for a clip job without the name of its clip, and for one whose
+    ``images`` is not a list of at least one path.
+    """
+    clip, images = job.get("clip"), job.get("images")
+    if not isinstance(clip, str) or not clip:
+        raise RunnerError(f"the clip job {path} has no clip")
+    if not isinstance(images, list) or not images:
+        raise RunnerError(f"the clip job {path} names no frame")
+    frames = [{"clip": clip, "frame": index, "image": image} for index, image in enumerate(images)]
+    return {**job, "name": clip, "frames": frames}
 
 
 def _check_job_frame(entry: Any, where: str) -> None:
@@ -235,6 +273,97 @@ def write_run(
     path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def compact_detections(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Turn the payload of the detector into the compact payload of a clip run.
+
+    ``labels`` lists the class names of the frame in the order in which they first come, and
+    each detection becomes one row: the box rounded to ``BOX_DECIMALS`` decimals, the score
+    rounded to ``SCORE_DECIMALS`` decimals and the place of its class name in ``labels``. A
+    score at or above a threshold with at most 4 decimals stays at or above it.
+    """
+    labels: list[str] = []
+    rows: list[list[float | int]] = []
+    for detection in payload["detections"]:
+        label = detection["label"]
+        if label not in labels:
+            labels.append(label)
+        box = [round(value, BOX_DECIMALS) for value in detection["box_xyxy"]]
+        rows.append([*box, round(detection["score"], SCORE_DECIMALS), labels.index(label)])
+    return {"labels": labels, "rows": rows}
+
+
+def clip_run_part_path(first: Path, part: int) -> Path:
+    """Return the file of one part of a clip run: ``first`` for part 1, ``<stem>-<part:04d><suffix>`` after it."""
+    return first if part == 1 else first.with_name(f"{first.stem}-{part:04d}{first.suffix}")
+
+
+def later_parts(first: Path) -> list[Path]:
+    """Return the files next to ``first`` that have the name of a later part of a clip run, sorted."""
+    pattern = f"{first.stem}-[0-9][0-9][0-9][0-9]{first.suffix}"
+    return sorted(path for path in first.parent.glob(pattern) if int(path.stem[-4:]) >= 2)
+
+
+def clip_run_texts(head: Mapping[str, Any], entries: Sequence[Sequence[Any]]) -> list[str]:
+    """Return the text of each part of a clip run, each one at most ``CLIP_RUN_PART_MAX_BYTES`` bytes.
+
+    ``head`` holds the keys that every part repeats; ``entries`` holds ``[frame, seconds,
+    payload]`` per frame, in frame order. A part takes frames until the next one would pass
+    the limit. One frame that does not fit into a part alone raises ``RunnerError``, and a
+    value that JSON does not have (NaN, infinity) raises ``ValueError``.
+    """
+    compact = {"separators": (",", ":"), "allow_nan": False}
+    texts = [json.dumps(list(entry), **compact) for entry in entries]
+    widest_head = json.dumps({**head, "part": 9999, "parts": 9999}, **compact)
+    room = CLIP_RUN_PART_MAX_BYTES - len(widest_head.encode()) - len(',"frames":[]}\n')
+    groups: list[list[str]] = [[]]
+    used = 0
+    for text in texts:
+        size = len(text.encode())
+        if size > room:
+            raise RunnerError(f"the answer of one frame has {size} bytes: it does not fit into a part of the clip run")
+        if groups[-1] and used + 1 + size > room:
+            groups.append([])
+            used = 0
+        used += size + (1 if groups[-1] else 0)
+        groups[-1].append(text)
+    return [
+        json.dumps({**head, "part": number, "parts": len(groups)}, **compact)[:-1]
+        + ',"frames":['
+        + ",".join(group)
+        + "]}\n"
+        for number, group in enumerate(groups, start=1)
+    ]
+
+
+def write_clip_run(
+    path: Path, job: Mapping[str, Any], job_sha256: str, runner: Mapping[str, Any], frames: Sequence[Mapping[str, Any]]
+) -> list[Path]:
+    """Write the clip run of a clip job in parts, and return the part files in order.
+
+    The answers of the detector are stored as compact rows (``compact_detections``), those of
+    the calibration as they are.
+    """
+    head = {
+        "format": CLIP_RUN_FORMAT,
+        "clip": job["clip"],
+        "tool": job["tool"],
+        "n_frames": len(job["frames"]),
+        "job_sha256": job_sha256,
+        "runner": dict(runner),
+    }
+    detector = job["tool"]["name"] == "rfdetr"
+    entries = [
+        [entry["frame"], entry["seconds"], compact_detections(entry["payload"]) if detector else entry["payload"]]
+        for entry in frames
+    ]
+    paths = []
+    for number, text in enumerate(clip_run_texts(head, entries), start=1):
+        part = clip_run_part_path(path, number)
+        part.write_text(text, encoding="utf-8")
+        paths.append(part)
+    return paths
+
+
 def check_out_place(out: Path, job: Path) -> None:
     """Make the folder of the run file and raise ``RunnerError`` when the run file cannot be written there.
 
@@ -247,6 +376,20 @@ def check_out_place(out: Path, job: Path) -> None:
         raise RunnerError(f"the run file {out} cannot be written: it is a folder, or its place has no write access")
     if out.exists() and out.samefile(job):
         raise RunnerError(f"--out names the job file ({out}): the script would replace its input")
+
+
+def check_no_later_parts(out: Path) -> None:
+    """Raise ``RunnerError`` when files with the names of later parts of a clip run lie next to ``out``.
+
+    A clip run of fewer parts would leave them there, and the package would refuse the
+    run as a mix of two runs. They are not removed here: the script deletes nothing.
+    """
+    found = later_parts(out)
+    if found:
+        raise RunnerError(
+            f"{len(found)} files with the names of later parts of a clip run lie next to {out} (for example "
+            f"{found[0].name}): remove them, or write the run to another place"
+        )
 
 
 def machine_facts(device: str) -> dict[str, Any]:
@@ -561,9 +704,17 @@ def build_parser() -> argparse.ArgumentParser:
     tools = parser.add_subparsers(dest="tool", metavar="TOOL", required=True)
     for name, text in (("rfdetr", "the RF-DETR detector"), ("pnlcalib", "the PnLCalib calibration")):
         tool = tools.add_parser(name, help=text)
-        tool.add_argument("--job", type=_path, required=True, metavar="FILE", help="job file of the tool-job command")
+        tool.add_argument(
+            "--job", type=_path, required=True, metavar="FILE", help="job file of the tool-job or the clip-job command"
+        )
         tool.add_argument("--root", type=_path, required=True, metavar="DIR", help="data folder")
-        tool.add_argument("--out", type=_path, required=True, metavar="FILE", help="run file to write (JSON)")
+        tool.add_argument(
+            "--out",
+            type=_path,
+            required=True,
+            metavar="FILE",
+            help="run file to write (JSON); the first part of a clip run",
+        )
         tool.add_argument(
             "--device", required=True, metavar="NAME", help="device name of PyTorch, for example mps, cpu or cuda:0"
         )
@@ -583,20 +734,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the script and return the exit code. ``argv`` defaults to the arguments of the process."""
     args = build_parser().parse_args(argv)
-    # The tools are code of other projects. They get no key of the model API.
-    os.environ.pop(KEY_VARIABLE, None)
+    # The tools are code of other projects. They get no key of a model API.
+    for variable in KEY_VARIABLES:
+        os.environ.pop(variable, None)
     try:
         if sys.version_info < (3, 10):
             raise RunnerError(f"this script needs Python 3.10 or newer, and this is Python {platform.python_version()}")
         job = read_job(args.job, args.tool)
+        clip_job = job["format"] == CLIP_JOB_FORMAT
         check_out_place(args.out, args.job)
+        if clip_job:
+            check_no_later_parts(args.out)
+        job_sha256 = file_sha256(args.job)
         machine = machine_facts(args.device)
         if args.tool == "rfdetr":
             facts, answer = rfdetr_engine(job["tool"], args.device)
         else:
             facts, answer = pnlcalib_engine(job["tool"], args.device, args.repo, args.weights_kp, args.weights_lines)
         frames = answer_frames(job, args.root, answer)
-        write_run(args.out, job, {**machine, **facts}, frames)
+        if clip_job:
+            written = write_clip_run(args.out, job, job_sha256, {**machine, **facts}, frames)
+        else:
+            write_run(args.out, job, {**machine, **facts}, frames)
+            written = [args.out]
     except (RunnerError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR
@@ -609,7 +769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{args.tool}: {len(frames)} frames of the job {job['name']}, "
         f"median time per frame {median:.3f} s on {args.device}"
     )
-    print(f"run file: {args.out}")
+    print(f"run file: {args.out}" + (f" and {len(written) - 1} more parts" if len(written) > 1 else ""))
     return EXIT_OK
 
 
