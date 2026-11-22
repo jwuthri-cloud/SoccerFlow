@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from pitchvlm.pitch import LANDMARKS, inside_pitch, landmark_xy
+from pitchvlm.pitch import LANDMARKS, inside_pitch, landmark_xy, pitch_polylines
 from pitchvlm.schemas import FrameLandmarks, HomographyRecord
 
 #: A homography has 8 free values, so a fit needs at least 4 point pairs.
@@ -34,6 +34,32 @@ MIN_NEAR_SHARE = 0.4
 SINGULAR_RATIO = 1e-12
 #: The image centre must map into the pitch enlarged by this margin, metres.
 CENTRE_MARGIN_M = 30.0
+
+# Paint alignment (``paint_alignment``). Sizes in pixels are given as a share of the image
+# width or height, so that they hold for every image size. The values were chosen on the
+# synthetic clip (``docs/DECISIONS.md``, entry "Paint alignment of pitch mappings, and hard
+# cuts" of 2026-11-22); real broadcast frames may need others.
+
+#: Side of the square of the white top-hat that finds the paint, as a share of the image
+#: width (17 pixels at 1280). A line that is thinner than the square is kept; a wide bright
+#: area (a white advertising board, a sunny stripe of grass) is not.
+PAINT_TOPHAT_PER_WIDTH = 0.0125
+#: A paint pixel is at least this much brighter than its surroundings, in grey levels of the
+#: darkest colour channel. White paint is bright in all three channels, grass is not. The
+#: dark marks of the synthetic grass make ridges of 55 levels between them; the synthetic
+#: lines stand 185 levels above the grass.
+PAINT_MIN_CONTRAST = 80
+#: A projected line pixel lies on the paint when the nearest paint pixel is at most this far,
+#: as a share of the image width (7.7 pixels at 1280).
+PAINT_TOLERANCE_PER_WIDTH = 0.006
+#: A frame shows too little paint to judge a mapping below this share of paint pixels.
+PAINT_MIN_SHARE = 0.002
+#: A frame shows too much white to judge a mapping when this share of the image or more lies
+#: within the tolerance of some paint: a line placed anywhere would then hit paint.
+PAINT_MAX_CHANCE = 0.5
+#: The hits of a mapping are spread well when their root mean square distance to their best
+#: straight line is at least this share of the image height (58 pixels at 720).
+PAINT_SPREAD_PER_HEIGHT = 0.08
 
 _KNOWN_LANDMARK_IDS = frozenset(landmark.id for landmark in LANDMARKS)
 
@@ -426,3 +452,224 @@ def check_homography(
     if feet_xy is not None:
         problems.extend(_foot_problems(matrix, feet_xy, pitch_margin_m, min_inside_fraction))
     return problems
+
+
+# --- Paint alignment -------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PaintAlignment:
+    """How well the pitch lines that a mapping projects into a frame lie on the white paint of the frame.
+
+    ``score`` is in 0 to 1, or None when the frame cannot judge the mapping;
+    ``reason`` then says why. The other values are the parts of the score.
+    """
+
+    #: ``precision_above_chance * spread``, or None when the frame cannot judge a mapping.
+    score: float | None
+    #: Why the frame cannot judge a mapping, or None when it can.
+    reason: str | None
+    #: Share of the image pixels that are paint.
+    paint_share: float
+    #: Share of the image pixels that lie within the tolerance of some paint: the precision of
+    #: lines placed by chance.
+    chance: float
+    #: Number of image pixels that the projected pitch lines cover.
+    n_model_px: int
+    #: Share of these pixels that lie on paint, or None when the lines miss the image.
+    precision: float | None
+    #: Spread of the pixels that lie on paint, 0 to 1 (``PAINT_SPREAD_PER_HEIGHT``).
+    spread: float
+
+
+def _pitch_segments() -> np.ndarray:
+    """Return every straight piece of the pitch markings as rows ``[x0, y0, x1, y1]`` in metres."""
+    pieces: list[np.ndarray] = []
+    for line in pitch_polylines():
+        ends = np.roll(line.points, -1, axis=0) if line.closed else line.points[1:]
+        pieces.append(np.hstack([line.points[: len(ends)], ends]))
+    return np.vstack(pieces)
+
+
+_PITCH_SEGMENTS = _pitch_segments()
+
+
+def _odd_size(pixels: float) -> int:
+    """Return the odd whole number of at least 3 that is nearest to ``pixels``."""
+    size = max(3, round(pixels))
+    return size if size % 2 == 1 else size + 1
+
+
+def paint_mask(image: np.ndarray) -> np.ndarray:
+    """Return the white paint of a frame as a ``uint8`` mask of shape (height, width): 1 for paint.
+
+    ``image`` is a BGR ``uint8`` frame. Paint is a thin bright ridge on
+    grass: the white top-hat of the darkest colour channel, with a square of
+    ``PAINT_TOPHAT_PER_WIDTH`` of the width, is at least
+    ``PAINT_MIN_CONTRAST``, and the pixel lies on grass or within that square
+    of grass. A grass pixel is greener than it is red and blue. So white kits
+    on the grass count as paint, but the crowd, the sky and the boards do not.
+    """
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"the frame must be a BGR uint8 image of shape (height, width, 3), got {image.shape}")
+    size = _odd_size(PAINT_TOPHAT_PER_WIDTH * image.shape[1])
+    square = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
+    ridges = cv2.morphologyEx(image.min(axis=2), cv2.MORPH_TOPHAT, square)
+    blue, green, red = (image[:, :, channel].astype(np.int16) for channel in range(3))
+    near_grass = cv2.dilate(((green > red) & (green > blue)).astype(np.uint8), square)
+    return ((ridges >= PAINT_MIN_CONTRAST) & (near_grass > 0)).astype(np.uint8)
+
+
+def _clip_to_front(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Cut a segment of homogeneous image points to the part with a positive third coordinate.
+
+    The third coordinate changes linearly along the segment, so this part is
+    one piece. The answer is None when no part of the segment is in front.
+    """
+    w_start, w_end = start[2], end[2]
+    if w_start <= 0.0 and w_end <= 0.0:
+        return None
+    floor = 1e-9 * max(abs(w_start), abs(w_end))
+    if w_start < floor:
+        start = start + (floor - w_start) / (w_end - w_start) * (end - start)
+    elif w_end < floor:
+        end = end + (floor - w_end) / (w_start - w_end) * (start - end)
+    return start, end
+
+
+def _clip_to_image(
+    start: np.ndarray, end: np.ndarray, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Cut an image segment to the pixel centres of the image (Liang-Barsky). None means outside."""
+    step = end - start
+    low, high = 0.0, 1.0
+    for direction, room in (
+        (-step[0], start[0]),
+        (step[0], width - 1 - start[0]),
+        (-step[1], start[1]),
+        (step[1], height - 1 - start[1]),
+    ):
+        if direction == 0.0:
+            if room < 0.0:
+                return None
+            continue
+        limit = room / direction
+        if direction < 0.0:
+            low = max(low, limit)
+        else:
+            high = min(high, limit)
+    if low > high:
+        return None
+    return start + low * step, start + high * step
+
+
+def projected_line_pixels(H: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
+    """Return the image pixels that the pitch lines cover under an image-to-pitch mapping.
+
+    ``image_size`` is ``(width, height)``. The answer holds whole pixel
+    coordinates ``(x, y)``, shape (n, 2), each pixel once. Every straight
+    piece of ``pitch.pitch_polylines`` (the circle and the arcs as short
+    chords) is projected into the image, cut to the part in front of the
+    camera and to the image, and sampled once per pixel of its length. The
+    spots are not used.
+
+    In front of the camera is the side of the horizon on which the pitch
+    point lies that the mapping gives for the bottom centre of the image: a
+    main camera sees the grass at the bottom of its picture. A mapping without
+    a usable inverse raises ``ValueError``.
+    """
+    matrix = _as_matrix(H)
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"image_size must be (width, height) with positive values, got {image_size}")
+    to_image = invert_homography(matrix)
+    if to_image is None:
+        raise ValueError("the mapping has no usable inverse")
+    bottom = matrix @ np.array([width / 2.0, height - 1.0, 1.0])
+    if bottom[2] < 0.0:
+        to_image = -to_image
+    ones = np.ones((len(_PITCH_SEGMENTS), 1))
+    starts = np.hstack([_PITCH_SEGMENTS[:, :2], ones]) @ to_image.T
+    ends = np.hstack([_PITCH_SEGMENTS[:, 2:], ones]) @ to_image.T
+    samples: list[np.ndarray] = []
+    for start, end in zip(starts, ends, strict=True):
+        in_front = _clip_to_front(start, end)
+        if in_front is None:
+            continue
+        front_start, front_end = in_front
+        inside = _clip_to_image(front_start[:2] / front_start[2], front_end[:2] / front_end[2], width, height)
+        if inside is None:
+            continue
+        first, last = inside
+        count = math.ceil(float(np.linalg.norm(last - first))) + 1
+        samples.append(first + np.linspace(0.0, 1.0, count)[:, None] * (last - first))
+    if not samples:
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.unique(np.round(np.vstack(samples)).astype(np.int64), axis=0)
+
+
+def _line_spread(points: np.ndarray) -> float:
+    """Return the root mean square distance of points to their best straight line. Fewer than 3 points give 0."""
+    if len(points) < 3:
+        return 0.0
+    singular_values = np.linalg.svd(points - points.mean(axis=0), compute_uv=False)
+    return float(singular_values[1] / math.sqrt(len(points)))
+
+
+def paint_alignment(image: np.ndarray, H: np.ndarray) -> PaintAlignment:
+    """Measure how well the pitch lines of an image-to-pitch mapping lie on the white paint of a frame.
+
+    ``image`` is the BGR ``uint8`` frame and ``H`` maps its pixels to pitch
+    metres. The paint is ``paint_mask``; the projected lines are
+    ``projected_line_pixels``. A projected pixel hits the paint when a paint
+    pixel lies within ``PAINT_TOLERANCE_PER_WIDTH`` of the width.
+
+    - ``precision`` is the share of the projected pixels that hit. ``chance``
+      is the share of all image pixels that would hit; the precision is
+      counted above it: ``(precision - chance) / (1 - chance)``, at least 0.
+    - ``spread`` is the root mean square distance of the hits to their best
+      straight line, divided by ``PAINT_SPREAD_PER_HEIGHT`` of the height, at
+      most 1. Hits on one line, or in one corner, have a small spread: one
+      line does not fix a mapping.
+    - ``score`` is the product of the two, from 0 to 1. Lines that miss the
+      image score 0 in a frame that shows paint.
+
+    The frame cannot judge a mapping, and ``score`` is None, when less than
+    ``PAINT_MIN_SHARE`` of it is paint (a close-up, a view of the crowd, a
+    frame without lines), and when ``PAINT_MAX_CHANCE`` or more of it lies
+    within the tolerance of paint. Such a frame says nothing about the
+    mapping, so it gets no low score.
+
+    The pitch markings are symmetric: a mapping that swaps the two halves or
+    the two sides of the pitch projects the same lines and gets the same
+    score. ``check_homography`` finds such a mapping. The value is a
+    diagnostic, not a rule of the pipeline (``docs/DECISIONS.md``).
+    """
+    height, width = image.shape[:2]
+    mask = paint_mask(image)
+    distance = cv2.distanceTransform((1 - mask).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    near_paint = distance <= PAINT_TOLERANCE_PER_WIDTH * width
+    paint_share = float(mask.mean())
+    chance = float(near_paint.mean())
+    pixels = projected_line_pixels(H, (width, height))
+    hits = near_paint[pixels[:, 1], pixels[:, 0]]
+    precision = float(hits.mean()) if len(pixels) else None
+    spread = min(1.0, _line_spread(pixels[hits].astype(np.float64)) / (PAINT_SPREAD_PER_HEIGHT * height))
+    reason: str | None = None
+    if paint_share < PAINT_MIN_SHARE:
+        reason = f"too little paint: {paint_share:.2%} of the frame, the minimum is {PAINT_MIN_SHARE:.2%}"
+    elif chance >= PAINT_MAX_CHANCE:
+        reason = f"too much white: {chance:.0%} of the frame is near paint, the limit is {PAINT_MAX_CHANCE:.0%}"
+    score: float | None = None
+    if reason is None:
+        above_chance = 0.0 if precision is None else max(0.0, (precision - chance) / (1.0 - chance))
+        score = above_chance * spread
+    return PaintAlignment(
+        score=score,
+        reason=reason,
+        paint_share=paint_share,
+        chance=chance,
+        n_model_px=len(pixels),
+        precision=precision,
+        spread=spread,
+    )

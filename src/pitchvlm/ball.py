@@ -73,13 +73,16 @@ def track_ball(
     fps: float,
     warp: MotionWarp,
     max_gap_frames: int,
+    cuts: Sequence[int] = (),
 ) -> BallTrack:
     """Choose at most one ball candidate per frame, and fill the frames between the sightings of a run.
 
-    ``candidates`` maps a frame to its candidates; a frame that is not in it has none. A
+    ``candidates`` maps a frame to its candidates; a frame that is not in it has none.
+    ``cuts`` holds the frames that start a new shot (``MotionField.cuts``), in increasing
+    order: a run ends at a cut, so no sighting links and no frame is filled across it. A
     candidate of a frame outside the clip, a candidate stored under another frame than its
-    own, ``fps`` that is not a finite number above 0 and a negative ``max_gap_frames`` raise
-    ``ValueError``.
+    own, ``fps`` that is not a finite number above 0, a negative ``max_gap_frames`` and cuts
+    that are not increasing frames of the clip raise ``ValueError``.
     """
     if not 0.0 < fps < float("inf"):
         raise ValueError(f"fps must be a finite number above 0, got {fps}")
@@ -88,7 +91,9 @@ def track_ball(
     for frame, found in candidates.items():
         if not 0 <= frame < n_frames or any(candidate.frame != frame for candidate in found):
             raise ValueError(f"the candidates of frame {frame} do not belong to frame {frame} of a clip of {n_frames}")
-    runs = _runs(candidates, n_frames, fps, warp, max_gap_frames)
+    if any(not 0 < cut < n_frames for cut in cuts) or any(b <= a for a, b in zip(cuts, cuts[1:], strict=False)):
+        raise ValueError(f"cuts must be increasing frames from 1 to {n_frames - 1}, got {list(cuts)}")
+    runs = _runs(candidates, n_frames, fps, warp, max_gap_frames, frozenset(cuts))
     kept = [run for run in runs if len(run) >= MIN_RUN_SIGHTINGS]
     boxes: dict[int, Box] = {}
     observed: set[int] = set()
@@ -127,13 +132,20 @@ def _runs(
     fps: float,
     warp: MotionWarp,
     max_gap_frames: int,
+    cuts: frozenset[int],
 ) -> list[list[tuple[int, Box]]]:
-    """Follow the ball through the clip and return its runs: lists of (frame, box) in frame order."""
+    """Follow the ball through the clip and return its runs: lists of (frame, box) in frame order.
+
+    A run ends at a cut: the first frame of a new shot can only start a new run.
+    """
     runs: list[list[tuple[int, Box]]] = []
     run: list[tuple[int, Box]] = []
     velocity = np.zeros(2)  # pixels per frame, in the image of the last sighting
     for frame in range(n_frames):
         found = candidates.get(frame, ())
+        if run and frame in cuts:
+            runs.append(run)
+            run = []
         if run:
             last_frame, last_box = run[-1]
             gap = frame - last_frame

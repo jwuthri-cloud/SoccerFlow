@@ -111,6 +111,27 @@ def test_warp_without_an_answer_ends_the_run_and_fills_nothing() -> None:
     assert sorted(track.boxes) == [0, 1, 2, 3, 6, 7, 8, 9]
 
 
+def test_cut_ends_the_run_and_nothing_is_filled_across_it() -> None:
+    """The gap of frames 8 to 11 is short enough to fill, but frame 10 starts a new shot."""
+    candidates = rolling([*range(0, 8), *range(12, 20)])
+    assert sorted(track_ball(candidates, 20, fps=FPS, warp=still, max_gap_frames=12).boxes) == list(range(20))
+    track = track_ball(candidates, 20, fps=FPS, warp=still, max_gap_frames=12, cuts=(10,))
+    assert sorted(track.boxes) == [*range(0, 8), *range(12, 20)]
+
+
+def test_sightings_on_both_sides_of_a_cut_do_not_make_one_run() -> None:
+    """Two sightings before the cut and two after it: each run is too short to keep."""
+    candidates = rolling(range(8, 12))
+    assert len(track_ball(candidates, 20, fps=FPS, warp=still, max_gap_frames=5).boxes) == 4
+    assert track_ball(candidates, 20, fps=FPS, warp=still, max_gap_frames=5, cuts=(10,)).boxes == {}
+
+
+@pytest.mark.parametrize("cuts", [(0,), (20,), (12, 12), (12, 8)])
+def test_wrong_cuts_are_refused(cuts: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="cuts"):
+        track_ball({}, 20, fps=FPS, warp=still, max_gap_frames=5, cuts=cuts)
+
+
 @pytest.mark.parametrize(
     ("candidates", "fps", "gap"),
     [

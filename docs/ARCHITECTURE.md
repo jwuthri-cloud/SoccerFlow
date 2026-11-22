@@ -70,7 +70,7 @@ a calibration tool on every frame. A tool runs in its own environment through
 
 - `schemas.py` — `Record` (base class), `ShirtNumber`, `Box`, `PersonDet`, `FramePeople`,
   `LandmarkObs`, `FrameLandmarks`, `KitLegend`, `NumberReading`, `HomographyRecord`, `TrackObs`,
-  `Track`, `PlayerState`, `FrameState`, `ClipInfo`, `ClipResult`.
+  `Track`, `PlayerState`, `FrameState`, `ClipInfo`, `ClipResult`, `PaintCheck`.
   - `KitLegend.prompt_text()` leaves the `uncertain` notes out, so that they do not change the
     prompt hash of the later requests.
 - `pitch.py` — `LANDMARKS` (35 real marks, ids 1..35), `landmark_xy`, `landmark_legend_text`,
@@ -211,6 +211,41 @@ def check_homography(H, image_size: tuple[int, int], feet_xy: np.ndarray | None 
   points inside the pitch plus margin. A negative or NaN `pitch_margin_m` and a
   `min_inside_fraction` outside 0 to 1 raise `ValueError`.
 
+Paint alignment (2026-11-22, a diagnostic, not a rule of the pipeline):
+
+```python
+@dataclass(frozen=True)
+class PaintAlignment:
+    score: float | None       # 0..1; None = the frame cannot judge a mapping
+    reason: str | None        # why it cannot judge; None when it can
+    paint_share: float        # share of the image that is paint
+    chance: float             # share of the image within the tolerance of paint
+    n_model_px: int           # image pixels that the projected pitch lines cover
+    precision: float | None   # share of them on paint; None when the lines miss the image
+    spread: float             # 0..1, spread of the hits
+
+def paint_mask(image: np.ndarray) -> np.ndarray                                   # uint8 (H, W), 1 = paint
+def projected_line_pixels(H: np.ndarray, image_size: tuple[int, int]) -> np.ndarray  # int64 (n, 2), unique (x, y)
+def paint_alignment(image: np.ndarray, H: np.ndarray) -> PaintAlignment
+```
+
+- `paint_mask`: white top-hat of the darkest colour channel (square of 1.25% of the width) at
+  least 80 grey levels, on grass or within that square of grass (a grass pixel is greener than
+  it is red and blue). A non-BGR or non-`uint8` frame raises `ValueError`.
+- `projected_line_pixels`: every straight piece of `pitch.pitch_polylines` projected into the
+  image, cut to the side of the horizon that holds the pitch point of the bottom centre of the
+  image, cut to the image, sampled once per pixel. Spots are not used. A mapping without a usable
+  inverse raises `ValueError`.
+- `paint_alignment`: a projected pixel hits when paint lies within 0.6% of the width.
+  `score = max(0, (precision - chance) / (1 - chance)) * spread`; `spread` is the root mean
+  square distance of the hits to their best line over 8% of the height, at most 1. Lines that
+  miss the image score 0 in a frame with paint. `score` is None (cannot judge) when less than
+  0.2% of the frame is paint, or when 50% or more of it lies within the tolerance of paint. The
+  pitch markings are symmetric, so a mapping that swaps the halves or the sides of the pitch gets
+  the same score; `check_homography` finds it. Deterministic, numpy and `cv2` only, about 12 ms
+  for 1280 x 720 on the build machine. The constants (`PAINT_*` in `geometry.py`) were chosen on
+  the synthetic clip only.
+
 ### `motion.py` — camera motion between frames
 
 ```python
@@ -218,8 +253,11 @@ def estimate_motion(prev: np.ndarray, nxt: np.ndarray, *, mask: np.ndarray | Non
                     ransac_px: float = 3.0, min_matches: int = 30) -> np.ndarray | None   # 3x3: prev px -> nxt px
 
 class MotionField:
-    def __init__(self, steps: Sequence[np.ndarray | None])    # steps[i]: frame i px -> frame i+1 px
+    def __init__(self, steps: Sequence[np.ndarray | None], cuts: Sequence[int] = ())  # steps[i]: frame i px -> frame i+1 px
     n_frames: int                                              # len(steps) + 1
+    cuts: tuple[int, ...]                                      # frames that start a new shot
+    def shot_of(self, frame: int) -> int                       # 0 before the first cut, 1 after it, ...
+    def same_shot(self, first: int, second: int) -> bool
     def between(self, src: int, dst: int) -> np.ndarray | None # 3x3 src px -> dst px, both directions
     def warp(self, src: int, dst: int, xy: np.ndarray) -> np.ndarray | None
     @classmethod
@@ -231,6 +269,8 @@ def compute_motion_field(source: FrameSource, *, people: Mapping[int, Sequence[B
                          downscale: float = 0.5) -> MotionField
 def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: MotionField, n_frames: int,
                            *, max_gap_frames: int = 75) -> list[HomographyRecord]
+def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None
+def is_cut(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> bool
 ```
 
 - `estimate_motion` follows corners with sparse optical flow and fits one homography with RANSAC.
@@ -249,6 +289,29 @@ def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: Mot
   keeps it (`source="landmarks"`). Any other frame takes the nearest keyframe fit within
   `max_gap_frames` whose motion chain exists: `H_t = H_k @ M(t -> k)`, `source="propagated"`.
   Otherwise `source="none"`.
+
+Hard cuts (2026-11-22):
+
+- A cut is a frame that starts a new shot. `MotionField.cuts` holds them in increasing order; the
+  step into a cut must be missing (`ValueError` otherwise), so a cut breaks every chain. A
+  missing step without a cut is a break inside one shot. `to_json` writes `cuts`, and
+  `from_json` needs it.
+- `shot_correlation` shrinks both images to 160 pixels wide (`CUT_TEST_WIDTH`), moves `prev` with
+  the identity and with each given motion (`prev` px -> `nxt` px), and takes the median of the
+  Pearson correlations over a 4 x 4 grid of blocks (`CUT_TEST_GRID`). A block counts when the
+  moved image covers half of it and both images have contrast there; a motion counts with 4
+  blocks or more. The answer is the best median, or None when no motion counts. The median of
+  blocks keeps a static score graphic from making two shots look alike.
+- `is_cut` is True when the correlation is below 0.5 (`MIN_SHOT_CORRELATION`) or None. A pan
+  that is too fast for the optical flow (above about 100 px per frame at 1280 px on the
+  synthetic clip) therefore counts as a cut. A jump in time that one camera motion explains (the
+  same camera, a pose that the optical flow can reach) is not found: the test compares the
+  picture of the camera, not the people.
+- `compute_motion_field` tests every pair of neighbouring frames with the measured motion and
+  the last measured motion of the same shot. A cut gets a missing step, also when a motion was
+  measured, and goes into `MotionField.cuts`.
+- `bridged_warp` returns None across a cut, so no track link and no box warp cross it.
+  `propagate_homographies` carries no mapping across it, because its step is missing.
 
 ### `tracking.py` — tracks, votes, team side, numbers
 
@@ -351,7 +414,7 @@ that is not valid YAML or JSON. The same shirt number on both sides is allowed.
 ```python
 def dense_frame_states(tracks: Sequence[Track], homographies: Sequence[HomographyRecord], n_frames: int,
                        *, warp: MotionWarp, image_size: tuple[int, int], max_fill_gap_frames: int,
-                       pitch_margin_m: float = 3.0) -> list[FrameState]
+                       pitch_margin_m: float = 3.0, cuts: Sequence[int] = ()) -> list[FrameState]
 ```
 
 One `FrameState` per frame. For each track: pitch position at every observation whose frame has
@@ -373,6 +436,9 @@ observation without a pitch position. The argument is a number of frames and has
 `pipeline.run_clip` passes `round(config.tracking.max_stitch_gap_s * fps)`, so the dense output
 uses the time limit of `stitch_fragments`. Reason: in GS-HOTA a prediction at a wrong place costs
 more than a missing one.
+
+Cuts: no frame is filled between two observations that a cut separates (`cuts`, the frames that
+start a new shot). `pipeline.run_clip` passes `MotionField.cuts`.
 
 ### `vlm/coords.py`
 
@@ -685,6 +751,11 @@ class SyntheticScene:
     def gsr_labels(self) -> dict                               # content of a Labels-GameState.json
 class SyntheticSource:   # FrameSource over a scene
     def __init__(self, scene: SyntheticScene)
+class RetimedScene(SyntheticScene):   # frame k shows scene frame scene_frames[k]: a jump is a cut
+    def __init__(self, scene_frames: Sequence[int], *, fps: float = 25.0, width: int = 1280,
+                 height: int = 720, seed: int = 0)
+class ScoreGraphicSource:   # FrameSource with a static score graphic in the top left corner
+    def __init__(self, scene: SyntheticScene)
 
 class FakeBackend:       # implements Backend, answers from the scene's ground truth
     def __init__(self, scene: SyntheticScene, *, miss_rate: float = 0.0, box_noise_px: float = 0.0,
@@ -947,6 +1018,19 @@ sends its requests with `httpx2`.
   logged when no keyframe of a clip has a mapping.
 - The tracking and the dense output get `motion.bridged_warp(field, homographies)`, so people
   are followed across a missing motion step through the pitch mappings of the two frames.
+- Cuts (2026-11-22): nothing is carried across a cut of the motion field. No mapping (the step
+  is missing), no warp (`bridged_warp`), no filled state (`dense_frame_states(cuts=...)`), and
+  `associate` and `stitch_fragments` run on each shot on its own; the track ids are then 0..n-1
+  in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
+  shirt number of one team. `ClipResult.cuts` names the cuts.
+- Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
+  `geometry.paint_alignment` on its keyframe (with the pitch engine `calibration`, the camera
+  of the tool at each keyframe, also before its check), in `ClipResult.paint` (`schemas.PaintCheck`:
+  frame, score or reason). It decides nothing. `demo` and `run` print the cuts and the median
+  score; the demo summary holds `cuts` and `paint_alignment`. The pitch probe and `tool-score`
+  report `paint_alignment` (`probes.paint_report`): counts, the score distribution, the AUROC of
+  mappings with a median error of at most 2 m against those above 3 m with its standard error
+  (Hanley and McNeil), and one entry per valid mapping (clip, frame, score, median error).
 - `crop_choice` chooses the crops of a number request from the frames and boxes of one person.
   The tallest boxes are taken first, each at least `MIN_CROP_GAP_S` (1 s) away from the others,
   at most `max_crops`. When this leaves one box and the person has more sightings, the sighting
@@ -1220,7 +1304,7 @@ class BallCandidate(Record): frame: int; box: Box; score: float          # 0 to 
 @dataclass(frozen=True)
 class BallTrack: boxes: Mapping[int, Box]; observed: frozenset[int]
 def track_ball(candidates: Mapping[int, Sequence[BallCandidate]], n_frames: int, *, fps: float,
-               warp: MotionWarp, max_gap_frames: int) -> BallTrack
+               warp: MotionWarp, max_gap_frames: int, cuts: Sequence[int] = ()) -> BallTrack
 def gate_px(box: Box, frames: int, fps: float) -> float
 
 # timing.py
@@ -1256,7 +1340,8 @@ def load_clip_run(first: Path) -> ClipRun
   different features keeps `none` for everyone and logs a warning. Tracks: `tracking.associate`
   with `every_frame_tracking` (the same time for a missed person as in the keyframe design: 4
   keyframes of 0.48 s become 48 frames at 25 fps), then `kitcolour.kit_roles`, then
-  `tracking.stitch_fragments`. `tracking.py` is used as it is.
+  `tracking.stitch_fragments`, on each shot on its own as in the model engine (no track crosses
+  a cut; ids 0..n-1 in the order of the shots). `tracking.py` is used as it is.
 - `kit_roles`: a track whose observations are mostly `none` by box height is a goalkeeper when
   its mean pitch position lies in a goal zone (`tracking.goal_side`) with `|y|` at most the half
   width of the penalty area (20.16 m), and a referee otherwise (a linesman stands near a
@@ -1265,23 +1350,26 @@ def load_clip_run(first: Path) -> ClipRun
   cluster: it is not the team of a kit legend, so a number request of this engine names no team.
 - Shirt numbers: only with the number engine `model`, as for the model engine (one request per
   track, crops by `crop_choice`). With `none` no track has a number.
-- Ball: `ball.track_ball` on the candidates of `ToolAnswers.balls` with the warp of the pipeline
-  and `BALL_MAX_GAP_S`. A frame state gets a `BallState`; its pitch position is the foot point of
+- Ball: `ball.track_ball` on the candidates of `ToolAnswers.balls` with the warp of the pipeline,
+  `BALL_MAX_GAP_S` and the cuts of the motion field: a run ends at a cut, and nothing is filled
+  across it. A frame state gets a `BallState`; its pitch position is the foot point of
   the box and is left out where the frame has no mapping or the point lies more than
   `pitch_margin_m` outside the pitch. The export writes no ball.
 - Pitch engine `calibration` (`_camera_mapping`): each camera of the tool is checked with
   `fit_problems` and the people of its frame who are not `other`; a tool record has no inlier
   count, so the strict share rule holds. A refused camera is dropped (log line); frames without a
   camera take the nearest kept camera within `max_gap_frames`, moved with the camera motion
-  (`propagate_homographies`). A warning is logged when no frame keeps a camera.
+  (`propagate_homographies`, which carries nothing across a cut). A warning is logged when no
+  frame keeps a camera. The camera of each keyframe gets its paint-alignment score in
+  `ClipResult.paint`, like a landmark fit, so both pitch engines are scored on the same frames.
 - `ClipResult.engines` names `kit_legend`, `people`, `team_role`, `landmarks`, `number`, `ball`,
   `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<tool>:<model class>`,
   `tool:<tool>`, `code`, `code:kit-colour`, `code:ball-tracker`, or `none` for a step that does
   not run. `<model>` is `config.model_label` of the step: the bare name for Gemini,
   `openrouter:<slug>` for OpenRouter.
 - `clock` (`timing.StageClock`) gets the time of each stage that runs: `kit_legend`,
-  `model_people_landmarks`, `motion`, `pitch_mapping`, `kit_colour`, `tracks`, `number`,
-  `votes_fill`, `ball`. `report(n_frames)` gives seconds, milliseconds per frame and frames per
+  `model_people_landmarks`, `motion`, `pitch_mapping`, `paint`, `kit_colour`, `tracks`,
+  `number`, `votes_fill`, `ball`. `report(n_frames)` gives seconds, milliseconds per frame and frames per
   second of each, and `total` (their sum).
 
 Clip job and clip run (`fallbacks/runs.py` describes both): the clip job names the image of every

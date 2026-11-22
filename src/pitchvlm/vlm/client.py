@@ -926,7 +926,7 @@ class LazySdkClient:
 # --- OpenRouter ------------------------------------------------------------------
 #
 # How a request is sent (documentation pages read on 2026-11-22; the list of pages is in
-# docs/DECISIONS.md, entry of 2026-11-22):
+# docs/DECISIONS.md, entry "Image models through OpenRouter" of 2026-11-22, item 4):
 #
 # - One POST to the chat completions endpoint per attempt, with the standard library only: the
 #   module needs no SDK for OpenRouter, so rule 4 keeps its meaning (only this module talks to a

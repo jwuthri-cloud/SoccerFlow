@@ -7,11 +7,17 @@ frames, chains it over longer ranges, and uses it to carry the pitch mapping
 of a keyframe to the frames around it. Where the chain is broken, the pitch
 mappings of two frames give the motion between them (``bridged_warp``).
 
+A hard cut starts a new shot: another camera, a replay or a close-up. No camera
+motion explains the change between the two frames of a cut, so the motion chain
+is broken there, and nothing is carried across it (``MotionField.cuts``).
+
 All matrices are 3x3 ``float64`` arrays between the pixel grids of two frames.
 """
 
 from __future__ import annotations
 
+import bisect
+import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from numbers import Integral
@@ -29,6 +35,8 @@ from pitchvlm.geometry import (
     matrix_to_rows,
 )
 from pitchvlm.schemas import Box, HomographyRecord
+
+logger = logging.getLogger(__name__)
 
 #: Moves image points from a source frame into a destination frame: ``(src, dst, xy) -> xy``.
 #: The answer is None when the motion chain between the two frames is broken.
@@ -52,6 +60,25 @@ FLOW_STOP = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
 ROUND_TRIP_MAX_PX = 1.0
 #: People boxes are made this much wider and taller before they are masked.
 BOX_GROWTH = 1.1
+#: Width of the grey images on which a cut is tested, pixels. Small images ignore noise and
+#: the small errors of a measured motion.
+CUT_TEST_WIDTH = 160
+#: The cut test splits the small images into this many columns and rows of blocks and takes the
+#: median of the block correlations. So a static graphic (a score box) that covers one or two
+#: blocks cannot make two shots look alike.
+CUT_TEST_GRID = 4
+#: Two neighbouring frames belong to one shot when a camera motion moves the first one onto
+#: the second with a median block correlation of at least this. Measured on the synthetic clip:
+#: at least 0.88 inside a shot, also for a pan of 83 pixels per frame at 1280 pixels and with a
+#: static score graphic; at most 0.06 across a cut (``docs/DECISIONS.md``, entry "Paint
+#: alignment of pitch mappings, and hard cuts" of 2026-11-22, item 6).
+MIN_SHOT_CORRELATION = 0.5
+#: A block counts when the moved image covers at least this share of it.
+MIN_CUT_TEST_BLOCK_COVER = 0.5
+#: A block counts when both images have at least this standard deviation in it, in grey levels.
+MIN_CUT_TEST_STD = 1.0
+#: A motion counts when at least this many blocks count.
+MIN_CUT_TEST_BLOCKS = 4
 
 
 def _to_grey(image: np.ndarray) -> np.ndarray:
@@ -139,6 +166,82 @@ def estimate_motion(
     return np.asarray(matrix, dtype=np.float64)
 
 
+def _block_correlation(moved: np.ndarray, target: np.ndarray) -> float | None:
+    """Return the median Pearson correlation of two images over the blocks of ``CUT_TEST_GRID``.
+
+    ``moved`` is NaN where it covers nothing. A block counts when ``moved``
+    covers ``MIN_CUT_TEST_BLOCK_COVER`` of it and both images have contrast
+    there (``MIN_CUT_TEST_STD``). The answer is None when fewer than
+    ``MIN_CUT_TEST_BLOCKS`` blocks count.
+    """
+    height, width = target.shape
+    values: list[float] = []
+    for row in range(CUT_TEST_GRID):
+        rows = slice(row * height // CUT_TEST_GRID, (row + 1) * height // CUT_TEST_GRID)
+        for column in range(CUT_TEST_GRID):
+            columns = slice(column * width // CUT_TEST_GRID, (column + 1) * width // CUT_TEST_GRID)
+            block = moved[rows, columns]
+            covered = np.isfinite(block)
+            if covered.mean() < MIN_CUT_TEST_BLOCK_COVER:
+                continue
+            first = block[covered]
+            second = target[rows, columns][covered]
+            if first.std() < MIN_CUT_TEST_STD or second.std() < MIN_CUT_TEST_STD:
+                continue
+            first = first - first.mean()
+            second = second - second.mean()
+            scale = math.sqrt(float((first * first).sum()) * float((second * second).sum()))
+            values.append(float((first * second).sum()) / scale)
+    if len(values) < MIN_CUT_TEST_BLOCKS:
+        return None
+    return float(np.median(values))
+
+
+def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None:
+    """Return how well a camera motion explains the change from one image to the next.
+
+    ``prev`` and ``nxt`` are BGR or grey ``uint8`` images of the same size.
+    ``motions`` are 3x3 matrices that map pixels of ``prev`` to pixels of
+    ``nxt``, for example the measured motion and the motion of the step
+    before; the identity is always tried as well. Both images are shrunk to
+    ``CUT_TEST_WIDTH`` pixels wide. ``prev`` is moved with each motion, and the
+    median of the block correlations with ``nxt`` is taken
+    (``_block_correlation``). The answer is the highest median, or None when
+    no motion can be counted: the moved image covers too little, or the
+    images have too little contrast.
+    """
+    prev_grey = _to_grey(prev)
+    next_grey = _to_grey(nxt)
+    if prev_grey.shape != next_grey.shape:
+        raise ValueError(f"the two images differ in size: {prev_grey.shape} and {next_grey.shape}")
+    full_size = (prev_grey.shape[1], prev_grey.shape[0])
+    test_size = (CUT_TEST_WIDTH, max(1, round(CUT_TEST_WIDTH * full_size[1] / full_size[0])))
+    to_test = _to_small_matrix(full_size, test_size)
+    from_test = np.linalg.inv(to_test)
+    first = cv2.resize(prev_grey, test_size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    second = cv2.resize(next_grey, test_size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    best: float | None = None
+    for motion in [np.eye(3), *motions]:
+        matrix = to_test @ np.asarray(motion, dtype=np.float64) @ from_test
+        moved = cv2.warpPerspective(first, matrix, test_size, flags=cv2.INTER_LINEAR, borderValue=np.nan)
+        value = _block_correlation(moved, second)
+        if value is not None and (best is None or value > best):
+            best = value
+    return best
+
+
+def is_cut(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> bool:
+    """Tell whether a hard cut lies between two neighbouring frames.
+
+    It does when no camera motion moves ``prev`` onto ``nxt`` with a
+    correlation of at least ``MIN_SHOT_CORRELATION`` (``shot_correlation``),
+    and also when the correlation is not defined: nothing then links the two
+    frames. A pan that is too fast to follow therefore counts as a cut.
+    """
+    correlation = shot_correlation(prev, nxt, motions)
+    return correlation is None or correlation < MIN_SHOT_CORRELATION
+
+
 def _checked_step(index: int, step: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return a copy of a motion step and its inverse. A step that is not a usable matrix raises ``ValueError``."""
     matrix = np.array(step, dtype=np.float64)
@@ -150,15 +253,37 @@ def _checked_step(index: int, step: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return matrix, inverse
 
 
+def _checked_cuts(cuts: Sequence[int], steps: Sequence[np.ndarray | None]) -> tuple[int, ...]:
+    """Return the cut frames as a tuple. Cuts that are not strictly increasing frames with a missing step raise."""
+    checked: list[int] = []
+    for cut in cuts:
+        if isinstance(cut, bool) or not isinstance(cut, Integral):
+            raise TypeError(f"a cut must be a frame index, got {cut!r}")
+        if not 1 <= cut <= len(steps):
+            raise ValueError(f"cut {cut} is not a frame after the first one (frames 1 to {len(steps)})")
+        if checked and cut <= checked[-1]:
+            raise ValueError("the cuts must be strictly increasing")
+        if steps[cut - 1] is not None:
+            raise ValueError(f"the motion step into the cut at frame {cut} must be missing")
+        checked.append(int(cut))
+    return tuple(checked)
+
+
 class MotionField:
     """Camera motion of a whole clip.
 
     ``steps[i]`` is the 3x3 matrix that maps pixels of frame ``i`` to pixels of
     frame ``i + 1``. A step is None when the motion between these two frames is
     not known. Such a step breaks every chain that crosses it.
+
+    ``cuts`` holds the frames that start a new shot, in increasing order. The
+    step into a cut is always missing: a cut breaks every chain. A missing
+    step without a cut is a break inside one shot (the camera was too fast,
+    or the frame had too few corners); the camera still stands at the same
+    place there.
     """
 
-    def __init__(self, steps: Sequence[np.ndarray | None]) -> None:
+    def __init__(self, steps: Sequence[np.ndarray | None], cuts: Sequence[int] = ()) -> None:
         forward: list[np.ndarray | None] = []
         backward: list[np.ndarray | None] = []
         for index, step in enumerate(steps):
@@ -173,6 +298,8 @@ class MotionField:
         self._backward = tuple(backward)
         #: Number of frames of the clip: one more than the number of steps.
         self.n_frames: int = len(forward) + 1
+        #: The frames that start a new shot, in increasing order.
+        self.cuts: tuple[int, ...] = _checked_cuts(cuts, steps)
 
     def _check_frame(self, frame: int) -> None:
         """Raise when ``frame`` is not a frame of the clip.
@@ -215,6 +342,15 @@ class MotionField:
             return None
         return apply_homography(matrix, xy)
 
+    def shot_of(self, frame: int) -> int:
+        """Return the number of the shot that holds a frame: 0 before the first cut, 1 after it, and so on."""
+        self._check_frame(frame)
+        return bisect.bisect_right(self.cuts, frame)
+
+    def same_shot(self, first: int, second: int) -> bool:
+        """Tell whether no cut lies between two frames."""
+        return self.shot_of(first) == self.shot_of(second)
+
     @classmethod
     def identity(cls, n_frames: int) -> Self:
         """Return the motion field of a camera that does not move."""
@@ -227,12 +363,14 @@ class MotionField:
         return {
             "n_frames": self.n_frames,
             "steps": [None if step is None else step.tolist() for step in self._forward],
+            "cuts": list(self.cuts),
         }
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Self:
         """Build a field from the data that ``to_json`` returned."""
-        field = cls([None if rows is None else np.array(rows, dtype=np.float64) for rows in data["steps"]])
+        steps = [None if rows is None else np.array(rows, dtype=np.float64) for rows in data["steps"]]
+        field = cls(steps, data["cuts"])
         if data["n_frames"] != field.n_frames:
             raise ValueError(f"the data names {data['n_frames']} frames but holds steps for {field.n_frames} frames")
         return field
@@ -249,7 +387,9 @@ def bridged_warp(motion: MotionField, homographies: Sequence[HomographyRecord]) 
     motion of every point, also of a point above the grass. It is only as
     exact as the two pitch mappings, so the chain is used whenever it exists.
     The answer is None when the chain is broken and one of the two frames has
-    no pitch mapping.
+    no pitch mapping, and when a cut lies between the two frames: another
+    shot may show another camera or another moment, so its people are not
+    the people at the same pitch place before the cut.
 
     ``homographies`` holds at most one record per frame, for example the
     result of ``propagate_homographies``. A record whose matrix has no usable
@@ -275,7 +415,7 @@ def bridged_warp(motion: MotionField, homographies: Sequence[HomographyRecord]) 
         moved = motion.warp(src, dst, xy)
         if moved is not None:
             return moved
-        if src not in to_pitch or dst not in to_image:
+        if not motion.same_shot(src, dst) or src not in to_pitch or dst not in to_image:
             return None
         return apply_homography(to_image[dst] @ to_pitch[src], xy)
 
@@ -351,6 +491,11 @@ def compute_motion_field(
     in that frame, in full-size pixels. For a pair of frames, the boxes of both
     frames are grown by 10% and no corner is taken inside them. A pair whose
     motion cannot be measured gives a missing step.
+
+    Each pair is also tested for a hard cut (``is_cut``) with the measured
+    motion and the last measured motion of the same shot. A cut gives a
+    missing step, also when a motion was measured: static broadcast graphics
+    can give a motion across a cut. The cuts are in ``MotionField.cuts``.
     """
     if not 0.0 < downscale <= 1.0:
         raise ValueError("downscale must be above 0 and at most 1")
@@ -362,14 +507,23 @@ def compute_motion_field(
     boxes: Mapping[int, Sequence[Box]] = {} if people is None else people
 
     steps: list[np.ndarray | None] = []
+    cuts: list[int] = []
+    last_step: np.ndarray | None = None
     previous = _small_grey(source.read(0), full_size, small_size)
     for frame in range(1, info.n_frames):
         current = _small_grey(source.read(frame), full_size, small_size)
         mask = _people_mask(small_size, [*boxes.get(frame - 1, ()), *boxes.get(frame, ())], to_small)
         step = estimate_motion(previous, current, mask=mask)
-        steps.append(None if step is None else to_full @ step @ to_small)
+        if is_cut(previous, current, [motion for motion in (step, last_step) if motion is not None]):
+            logger.info("clip %s: frame %d starts a new shot", info.clip_id, frame)
+            cuts.append(frame)
+            steps.append(None)
+            last_step = None
+        else:
+            steps.append(None if step is None else to_full @ step @ to_small)
+            last_step = step if step is not None else last_step
         previous = current
-    return MotionField(steps)
+    return MotionField(steps, cuts)
 
 
 def _propagated_record(

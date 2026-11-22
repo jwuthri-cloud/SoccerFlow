@@ -467,6 +467,45 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   the PnLCalib clone when it runs. The repository is public since 2026-11-14, and the check of
   what that means is not done: it is an open owner decision (`docs/DECISIONS.md`, last list).
 
+### Paint alignment of the pitch mappings (free)
+
+Every metrics file of the pitch probe and of `tool-score` for PnLCalib has the key
+`paint_alignment` (`docs/DECISIONS.md`, entry "Paint alignment of pitch mappings, and hard
+cuts" of 2026-11-22): a score from 0 to 1 per valid mapping, how well the projected pitch
+lines lie on the white paint of the frame, and how well the score separates the mappings with
+a median position error above 3 m from those at or below 2 m. It is a diagnostic: no rule uses
+it yet. The measurement needs no model call. It runs on the frames
+of the group `probe` of the split list, which are valid clips only; never run it on test clips.
+
+When the pitch probe ran before this code was there, replay it from the stored answers (free):
+
+```bash
+python -m pitchvlm.cli probe pitch --experiment configs/experiments/pitch_probe.yaml \
+    --root ~/pitchvlm-data --replay --out ../pitchvlm-results/results/metrics/pitch_probe_paint.json
+python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_pnlcalib.yaml \
+    --root ~/pitchvlm-data --run ../pitchvlm-results/results/tools/pitch_probe_pnlcalib.json \
+    --out ../pitchvlm-results/results/metrics/pitch_probe_pnlcalib_paint.json
+```
+
+- Read `paint_alignment.separation` of each file: `auroc`, `auroc_standard_error`, `n_good`,
+  `n_bad`, `score_good` and `score_bad`. Also read `n_cannot_judge` and `cannot_judge_reasons`:
+  a frame with too little paint, or with too much white, gets no score.
+- Write the numbers of both engines into `docs/DECISIONS.md` with the date. The rule that would
+  follow from them is in that file (entry "Paint alignment of pitch mappings, and hard cuts",
+  item 4); it needs an entry of its own.
+- `paint_alignment.frames` holds one entry per mapping: clip, frame, score and median position
+  error. They are text and go back with the metrics file.
+- The constants of the score were chosen on synthetic frames only. Before the numbers are read,
+  check three things on the first clip: `n_cannot_judge` is small (a large count means that the
+  paint mask misses the lines of real frames), the median score of the good mappings is high,
+  and the score of a frame does not depend on the run (it is deterministic).
+
+`demo` and `run` print the hard cuts of a clip and the median paint score of its keyframe
+mappings (the landmark fits of the pitch engine `model`, or the cameras of the pitch engine
+`calibration`), and the result file of `run` holds both (`cuts`, `paint`). The clips of SoccerNet GSR have no
+cut, so no gate measures the cut test: it guards the demo clip and other broadcast footage. A
+cut that `run` names on a dataset clip is a false cut: tell the owner.
+
 ## 4 First video
 
 ```bash
@@ -1086,7 +1125,8 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
 - Another OpenRouter model: add its price to `configs/openrouter_prices.yaml` from its model page
   (the highest price of its providers, with the day as `valid_from`), commit, and run its doctor
   first.
-- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
+- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of
+  2026-11-22, item 7).
 
 What was never tested before this machine, for OpenRouter:
 
@@ -1101,10 +1141,10 @@ What was never tested before this machine, for OpenRouter:
 ## 11 Detector engine (owner decision of 2026-11-22)
 
 The pipeline has a second engine for the people step and for the pitch mapping
-(`docs/DECISIONS.md`, entry "A real-time detector engine" of 2026-11-22). The people engine
-`detector` takes the people and the ball of every frame from a detector run, gives each person
-a team key and a role from the kit colours, and follows the ball. The pitch engine `calibration` takes the camera of every frame
-from a PnLCalib run. With the settings file `configs/engines/detector_calibration.yaml` no step
+(`docs/DECISIONS.md`, entry "A real-time detector engine next to the model engine" of
+2026-11-22). The people engine `detector` takes the people and the ball of every frame from a
+detector run, gives each person a team key and a role from the kit colours, and follows the
+ball. The pitch engine `calibration` takes the camera of every frame from a PnLCalib run. With the settings file `configs/engines/detector_calibration.yaml` no step
 calls a model, so the run is free. `configs/engines/detector_calibration_numbers.yaml` adds the
 paid shirt-number step (one kit legend request and one number request per track): it prints its
 estimate like every paid run and needs the owner's go-ahead.
@@ -1229,4 +1269,4 @@ RFDETRMedium().train(dataset_dir="<home>/pitchvlm-data/finetune/coco", epochs=50
 - Measure the trained detector like the others: gate G2 on the probe frames, then end to end on
   the dev clips (section 11). Ultralytics weights are not an option for this repository: their
   code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time
-  detector engine" of 2026-11-22).
+  detector engine next to the model engine" of 2026-11-22).

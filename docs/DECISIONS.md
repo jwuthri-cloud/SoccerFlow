@@ -844,6 +844,91 @@ Items 5 and 6 come from the checks of the change of item 4.
     the guard of the tracked files and the demo. Not verified: anything against the real
     OpenRouter API; the answers of the tests were written by hand from the pages of item 4.
 
+## 2026-11-22 — Paint alignment of pitch mappings, and hard cuts
+
+1. **Source of the idea** (owner decision of 2026-11-22, point 2: take the ideas of a classic
+   detector stack). A public repository of such a stack claims that residual checks pass
+   confidently wrong pitch mappings, and checks a mapping against the white lines of the frame
+   instead. Its licence file reserves all rights, so only the idea is taken: no code, no
+   configuration text and no threshold of it. Every value below comes from our own tests.
+2. **Paint alignment, what it is** (`geometry.paint_alignment`, contract in
+   `docs/ARCHITECTURE.md`). The pitch lines of `pitch.py` are projected through the mapping
+   into the frame. A projected pixel hits when white paint (a thin bright ridge of the darkest
+   colour channel, on grass) lies within 0.6% of the image width. The score is the hit share
+   above chance, times a spread factor (the hits must not lie on one line or in one corner), from
+   0 to 1. A frame with less than 0.2% paint, or with 50% or more of the image near paint, cannot
+   judge a mapping: the score is None with a reason, not a low score. The score cannot see a
+   mapping that swaps the halves or the sides of the pitch (the markings are symmetric);
+   `check_homography` finds that. The constants were chosen on the synthetic clip only.
+3. **Where it is reported.** Every landmark fit of `run` and `demo` (`ClipResult.paint`, before
+   the plausibility check; with the pitch engine `calibration`, the camera of each keyframe:
+   entry "A real-time detector engine next to the model engine", item 5), every valid mapping of the pitch probe and every PnLCalib mapping of
+   `tool-score` (`paint_alignment` in the metrics file: counts, score distribution, separation,
+   one number per frame). It is a diagnostic. No rule of the pipeline uses it (rule 7).
+4. **Which result makes it a rule.** The run-machine measurement (`docs/RUNBOOK.md`, section 3,
+   "Paint alignment of the pitch mappings"): the cached answers of the pitch probe, group
+   `probe` (valid clips only, never test clips), replayed for free, and the PnLCalib run file
+   scored again. The score becomes a rule of `geometry.check_homography` for an engine only when
+   all of this holds for that engine, in a new dated entry of this file before G3 is frozen:
+   - at least 20 good mappings (median error at most 2 m) and 20 bad ones (above 3 m);
+   - AUROC at least 0.85, and AUROC minus 1.96 standard errors at least 0.75;
+   - a score limit, chosen on these frames, that refuses at least half of the bad mappings and
+     at most 5% of the good ones, checked once on 3 clips of the group `dev` before it is written;
+   - a frame that cannot judge never refuses a mapping.
+   With fewer than 20 bad mappings the result is inconclusive and the score stays a diagnostic.
+5. **Measured, synthetic** (`PYTHONPATH=src python tools/synthetic_diagnostics.py`, build
+   machine, synthetic clip of 250 frames, seed 0, every 5th frame: 50 frames, noise seed 7).
+   Not broadcast frames: no number here says how the score works on real footage.
+   - Median score of the true mapping shifted on the pitch in 8 directions (n 400 per row, 50
+     for 0 m): 0 m 1.000; 0.5 m 0.920; 1 m 0.650; 2 m 0.508; 3 m 0.436; 5 m 0.238; 10 m 0.055.
+   - Separation of good (at most 2 m) against bad (above 3 m) mappings: shifted mappings AUROC
+     0.948, standard error 0.005 (n good 1,250, n bad 800); landmark fits from the true landmarks
+     with Gaussian noise of 2, 4, 8 and 16 px AUROC 0.987, standard error 0.007 (n good 145, n
+     bad 30). The standard errors count every mapping as independent; the mappings share 50
+     frames, so the real uncertainty is larger. Noise 2, 4, 8, 16 px gave a median error of
+     0.20, 0.60, 1.28, 3.10 m and a median score of 1.000, 0.887, 0.622, 0.323.
+   - Wrong mappings (median over 50 frames): the picture mirrored left to right 0.106 (up to
+     0.994 when the view is symmetric about the halfway line), top to bottom 0.000; the sign of
+     one matrix entry changed: H[1,1] and H[1,2] 0.000, H[2,1] and H[2,2] 0.093, H[1,0] 0.273,
+     H[0,0] 0.402, H[0,2] 0.403, H[0,1] 0.621 (a small entry). The pitch mirrored: 1.000, the
+     same as the right mapping.
+   - Time: about 12 ms per frame of 1280 x 720 on the build machine.
+6. **Hard cuts** (`motion.is_cut`, `MotionField.cuts`). A pair of neighbouring frames is a cut
+   when no camera motion (the identity, the measured motion, the last measured motion of the
+   shot) moves the first frame onto the second with a median block correlation of at least 0.5
+   (4 x 4 blocks of an image 160 px wide). The median of blocks keeps a static score graphic
+   from joining two shots. Measured on synthetic clips (same tool): the lowest value inside a
+   shot 0.881 (n 448 pairs, with a pan of up to 83 px per frame at 1280 px, with and without a
+   score graphic); the highest value across a cut 0.055 (n 8 cuts of 1 to 10 s, with and
+   without the graphic). Known misses: a jump in time that one camera motion explains, for
+   example 0.4 s with a slow camera (0.918), or the same camera pose 6 s later. A pan faster
+   than about 100 px per frame counts as a cut. The clips of SoccerNet GSR have no cut, so no
+   gate measures the cut test; it guards the demo clip and other broadcast footage.
+7. **Nothing crosses a cut.** Before this change, on the synthetic clip with a cut at frame 54
+   (`tests/test_shot_cuts.py`, run on the code of `main` f7d788e): the referee track, which has
+   no shirt number, was linked across the cut by its pitch position (`bridged_warp` and the
+   joins); with a static score graphic the camera motion was measured across the cut and the
+   pitch mapping of frame 54 was carried from the shot before, 47.8 m off at a foot point; and
+   the frames 49 to 53 were filled across the cut. 5 of the 8 tests failed. Now the motion step
+   into a cut is missing, `bridged_warp` gives None across it, `associate` and
+   `stitch_fragments` run per shot (in `pipeline.py`; `tracking.py` is unchanged), and the dense
+   output fills nothing across it. Only `finalize_tracks` may join two tracks across a cut, by
+   one shown shirt number of one team: that is identity, not position. Cost: the frames between
+   the last keyframe before a cut and the first keyframe after it get no state (less than one
+   keyframe interval, 0.48 s, per cut).
+8. **Proposal, not built: a shot type in the landmark answer.** One more field in the landmarks
+   request (main camera, close-up, replay, other) would let the pipeline drop the landmarks of a
+   frame that is not a main-camera view, and would name the shot of a cut. It changes a paid
+   prompt and therefore the cache keys of every stored landmarks answer, and no label of
+   SoccerNet GSR measures it. Recommendation: decide after G3, with the cut counts of the demo
+   clip.
+9. **Open owner decisions of this entry** (also in the last list of this file). (a) The rule of
+   item 4, after the measurement. (b) The proposal of item 8. (c) Whether a shown shirt number may
+   join tracks across a cut (it does now). (d) Whether the frames before a cut stay without a state
+   (they do now) or get the last position. (e) `tools/synthetic_diagnostics.py` is a new file in
+   `tools/`, which holds the scripts of the specialist tools; it is a measurement script of this
+   entry.
+
 ## 2026-11-22 — A real-time detector engine next to the model engine
 
 1. **The decision** (owner, 2026-11-22). (1) Any image or video LLM must work through
@@ -937,6 +1022,17 @@ Items 5 and 6 come from the checks of the change of item 4.
      frame, kit colour 3.40 ms, tracks 0.67 ms, all package stages 13.50 ms (74 frames per
      second). This is no claim of real time: it holds no detector, no calibration, no decoding
      of real frames and not the run machine.
+   - Hard cuts and paint alignment (added when the entry "Paint alignment of pitch mappings,
+     and hard cuts" came in): the detector engine tracks each shot on its own, as the model
+     engine does, so no track crosses a cut; the ball tracker ends a run at a cut and fills
+     nothing across it (`track_ball(..., cuts=)`); the calibration cannot carry a camera across
+     a cut, because the motion step into it is missing. The camera of the calibration at each
+     keyframe gets its paint-alignment score before the plausibility check, like a landmark
+     fit, so both pitch engines are scored on the same frames (`ClipResult.paint`, stage
+     `paint` of the timing). Measured on the synthetic clip with a cut at frame 54 (detector
+     and calibration stand-ins, seed 3): without the tracking per shot 3 of 31 tracks crossed
+     the cut; with it 0 of 33. The paint scores of the 10 exact stand-in cameras were 0.996 to
+     1.000.
    - The engine table of every result names each step: `model:<model>`, `detector:rfdetr:<class>`,
      `tool:pnlcalib`, `code`, `code:kit-colour`, `code:ball-tracker` or `none`. A model step is
      written as the command line reads it: the bare name for Gemini, `openrouter:<slug>` for
@@ -980,6 +1076,9 @@ Items 5 and 6 come from the checks of the change of item 4.
 - Share of real clips where the team-side rule is right, and the right value for its 3 m limit?
 - Largest output of a real answer, and the limit on output tokens that follows from it?
 - Does a broadcast graphic disturb the measured camera motion on real footage?
+- Does the paint-alignment score separate good from bad pitch mappings on real frames (AUROC,
+  per engine), and how many real frames cannot judge a mapping?
+- How many hard cuts does the cut test find in the demo clip, and how many does it miss?
 - Right value of the two-people margin (6 m) and of the limit for a repeated box (0.6) on real
   answers (RUNBOOK section 8, facts 13 and 15)?
 - Do two crops that are less than one second apart agree on a wrong number, and does the model
@@ -1078,9 +1177,10 @@ Decisions for the owner that are open, each with its recommendation:
   of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
   the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
   of the gate and needs its own entry here (rule 7).
-- **OpenRouter: rule text** (entry "Image models through OpenRouter", item 9). Accept, change or refuse the proposed
-  text of the first paragraph and of rules 4 and 5 of `CLAUDE.md`. Recommendation: accept; the
-  code already keeps it, and the doctor line `data policy` checks it.
+- **OpenRouter: rule text** (entry "Image models through OpenRouter" of 2026-11-22, item 9).
+  Accept, change or refuse the proposed text of the first paragraph and of rules 4 and 5 of
+  `CLAUDE.md`. Recommendation: accept; the code already keeps it, and the doctor line `data policy`
+  checks it.
 - **OpenRouter: price table on the estimate side.** The table holds the highest published price
   of any provider of a model. Recommendation: keep it so until the first doctor names the
   provider that the routing settings choose, then keep the highest price anyway: a later request
@@ -1093,9 +1193,23 @@ Decisions for the owner that are open, each with its recommendation:
   guess `xy_1000`), Qwen2.5-VL 72B and Gemini 2.5 Flash through OpenRouter (`yx_1000`).
   Recommendation: one doctor of Qwen3-VL first (about 0.02 USD, estimated), then the people
   probe of the model that passes, on the frames of the Gemini people probe.
+- **Paint alignment: the rule** (entry "Paint alignment of pitch mappings, and hard cuts" of
+  2026-11-22, item 4). Recommendation: run the free measurement of the RUNBOOK (section 3) on
+  the cached answers of the pitch probe and on the PnLCalib run file, and make the score a rule
+  of `check_homography` only for an engine that meets every condition of item 4.
+- **Shot type in the landmark answer** (same entry, item 8). Recommendation: decide after G3,
+  with the cut counts of the demo clip; the field changes a paid prompt and every cache key of
+  the landmarks step.
+- **Tracks and states at a cut** (same entry, item 9, points c and d). A shown shirt number of
+  one team joins two tracks across a cut, and the frames between the last keyframe before a cut
+  and the cut get no state. Recommendation: keep both: a number is identity, and a position
+  carried into another shot is a guess.
+- **Measurement script in `tools/`** (same entry, item 9, point e). `tools/synthetic_diagnostics.py`
+  sits beside the scripts of the specialist tools. Recommendation: keep it there; it imports
+  only the package and runs offline.
 - **Rule 8 for two first-class engines** (entry "A real-time detector engine next to the model
-  engine", item 7). Recommendation: apply the proposed text after the first G2 and dev values of
-  both engines exist. It assumes the proposed rules 4 and 5 of the OpenRouter entry (item
+  engine" of 2026-11-22, item 7). Recommendation: apply the proposed text after the first G2 and
+  dev values of both engines exist. It assumes the proposed rules 4 and 5 of the OpenRouter entry (item
   "OpenRouter: rule text" above); the first paragraph of `CLAUDE.md` then also names the tools.
 - **Size of the detector.** Recommendation: take the smallest RF-DETR size that passes G2 on
   the probe frames, and RF-DETR Medium until then.

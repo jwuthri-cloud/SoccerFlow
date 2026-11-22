@@ -41,6 +41,7 @@ from pitchvlm.geometry import (
     fit_from_landmarks,
     landmark_pairs,
     matrix_from_record,
+    paint_alignment,
 )
 from pitchvlm.kitcolour import fit_kit_clusters, kit_roles, torso_feature
 from pitchvlm.motion import MotionField, MotionWarp, bridged_warp, compute_motion_field, propagate_homographies
@@ -58,6 +59,7 @@ from pitchvlm.schemas import (
     HomographyRecord,
     KitLegend,
     NumberReading,
+    PaintCheck,
     PersonDet,
     TeamKey,
     Track,
@@ -147,12 +149,15 @@ def run_clip(
        people answer repeats, also with a small shift for the same role and team key, is dropped.
     4. Camera motion between all frames. ``motion`` is used when it is given
        (for example a stored field). Else the motion is measured from the frames.
+       The motion step into a hard cut is missing, and the cuts are in the result.
     5. Pitch mapping: a landmark fit per keyframe, rejected when it is not
-       plausible, then carried to the other frames with the camera motion.
+       plausible, then carried to the other frames with the camera motion. Every landmark
+       fit gets the paint-alignment score of its keyframe (``geometry.paint_alignment``), a
+       diagnostic that decides nothing.
     6. People who map too far outside the pitch are dropped.
-    7. Tracks: the people of the keyframes are linked, and broken tracks are joined. Across a
-       missing step of the camera motion the people are followed through the pitch mappings
-       of the two frames (``motion.bridged_warp``).
+    7. Tracks: the people of the keyframes are linked, and broken tracks are joined, in each
+       shot on its own. Across a missing step of the camera motion inside a shot the people
+       are followed through the pitch mappings of the two frames (``motion.bridged_warp``).
     8. Shirt numbers: one model request per track of a player or a goalkeeper. No request
        is sent when no frame of the clip has a pitch mapping.
     9. Votes: role, team, team side, shirt number and roster name of each track. Tracks of
@@ -161,7 +166,11 @@ def run_clip(
        (``tracking.finalize_tracks``).
     10. Dense output: the state of every person in every frame. A track has no state
         inside a gap between two of its positions that is longer than
-        ``config.tracking.max_stitch_gap_s``, the limit of the joins of step 7.
+        ``config.tracking.max_stitch_gap_s``, the limit of the joins of step 7, and no
+        state is filled across a cut.
+
+    Nothing is carried across a cut: no pitch mapping, no track link by position or image
+    motion, no filled state. Only a shown shirt number joins two tracks across a cut (step 9).
 
     The people engine ``detector`` changes steps 2, 3, 7 and 8 and adds a ball:
 
@@ -177,11 +186,14 @@ def run_clip(
       team: a kit cluster is no team of the kit legend. Without it no track has a number.
     - Ball: the ball candidates of the detector are followed by the ball tracker
       (``ball.track_ball``), and each frame state gets the ball when it has one.
+    - As in the model engine, each shot is tracked on its own, and no run of the ball
+      crosses a cut.
 
     The pitch engine ``calibration`` replaces steps 4 and 5: no landmark request; the camera
     of every frame comes from the calibration tool, a camera that is not plausible with the
     people of its frame (``fit_problems``) is refused, and a frame without a camera takes
-    the camera of the nearest frame that has one, moved with the camera motion.
+    the camera of the nearest frame that has one, moved with the camera motion (never across
+    a cut). The camera of every keyframe gets its paint-alignment score, as a landmark fit does.
 
     ``roster`` gives the player names by team side and shirt number. All model
     requests carry ``config.repeat``. A request that fails and an answer that
@@ -216,10 +228,18 @@ def run_clip(
         field = motion if motion is not None else _measured_motion(source, people)
     with clock.stage("pitch_mapping"):
         if engines.pitch_mapping == "model":
+            landmark_fits = [
+                fit_from_landmarks(frame_landmarks, ransac_px=config.ransac_px) for frame_landmarks in landmarks
+            ]
             by_frame = {frame_people.frame: frame_people for frame_people in people}
-            homographies = _pitch_mapping(landmarks, [by_frame[frame] for frame in keyframes], field, info, config)
+            keyframe_people = [by_frame[frame] for frame in keyframes]
+            homographies = _pitch_mapping(landmarks, landmark_fits, keyframe_people, field, info, config)
         else:
-            homographies = _camera_mapping(tools.cameras or (), people, field, info, config)
+            cameras = tools.cameras or ()
+            landmark_fits = [cameras[frame] for frame in keyframes]
+            homographies = _camera_mapping(cameras, people, field, info, config)
+    with clock.stage("paint"):
+        paint = _paint_checks(source, landmark_fits)
     to_pitch = _pitch_map(homographies)
     warp = bridged_warp(field, homographies)
     on_pitch = [_people_on_pitch(frame_people, to_pitch, config.pitch_margin_m) for frame_people in people]
@@ -227,10 +247,12 @@ def run_clip(
         with clock.stage("kit_colour"):
             on_pitch = _kit_team_keys(source, on_pitch)
         with clock.stage("tracks"):
-            tracks = _detector_tracks(on_pitch, warp, to_pitch, info.fps, every_frame_tracking(config, info.fps))
+            tracks = _detector_tracks(
+                on_pitch, warp, to_pitch, info.fps, every_frame_tracking(config, info.fps), field
+            )
     else:
         with clock.stage("tracks"):
-            tracks = _tracks(on_pitch, warp, to_pitch, info.fps, config.tracking)
+            tracks = _tracks(on_pitch, warp, to_pitch, info.fps, config.tracking, field)
     # Without any pitch mapping no track gets a state, so a shirt number would be paid for nothing.
     has_mapping = any(record.valid for record in homographies)
     readings: dict[int, NumberReading] = {}
@@ -255,16 +277,21 @@ def run_clip(
             image_size=(info.width, info.height),
             max_fill_gap_frames=round(config.tracking.max_stitch_gap_s * info.fps),
             pitch_margin_m=config.pitch_margin_m,
+            cuts=field.cuts,
         )
     if detector:
         with clock.stage("ball"):
-            frames = _with_ball(frames, tools.balls or {}, warp, to_pitch, info.fps, config.pitch_margin_m)
+            frames = _with_ball(
+                frames, tools.balls or {}, warp, to_pitch, info.fps, config.pitch_margin_m, cuts=field.cuts
+            )
     return ClipResult(
         info=info,
         frames=tuple(frames),
         tracks=tuple(decided),
         homographies=tuple(homographies),
         engines=_engines(config),
+        cuts=field.cuts,
+        paint=tuple(paint),
     )
 
 
@@ -600,11 +627,29 @@ def fit_problems(
     return check_homography(matrix, image_size, feet_xy, pitch_margin_m=pitch_margin_m)
 
 
-def _keyframe_fits(
-    landmarks: Sequence[FrameLandmarks], people: Sequence[FramePeople], info: ClipInfo, config: PipelineConfig
-) -> tuple[dict[int, HomographyRecord], set[int]]:
-    """Fit the pitch mapping of every keyframe from its landmarks, and reject the fits that are not plausible.
+def _paint_checks(source: FrameSource, landmark_fits: Sequence[HomographyRecord]) -> list[PaintCheck]:
+    """Score the mapping of every keyframe with the paint alignment of its frame (``geometry.paint_alignment``).
 
+    ``landmark_fits`` holds the mapping of each keyframe before the plausibility check: the
+    landmark fit of the pitch engine ``model``, or the camera of the calibration tool for the
+    pitch engine ``calibration``. So both engines are scored on the same frames, and a
+    refused mapping has a score too. A keyframe without a mapping has no entry. The score is
+    a diagnostic: it decides nothing.
+    """
+    checks: list[PaintCheck] = []
+    for record in landmark_fits:
+        if record.valid:
+            alignment = paint_alignment(_read_frame(source, record.frame), matrix_from_record(record))
+            checks.append(PaintCheck(frame=record.frame, score=alignment.score, reason=alignment.reason))
+    return checks
+
+
+def _keyframe_fits(
+    landmark_fits: Sequence[HomographyRecord], people: Sequence[FramePeople], info: ClipInfo, config: PipelineConfig
+) -> tuple[dict[int, HomographyRecord], set[int]]:
+    """Reject the landmark fits of the keyframes that are not plausible.
+
+    ``landmark_fits`` holds the landmark fit of every keyframe, in keyframe order.
     The result is the record of every keyframe and the frames whose fit is
     well supported. A rejected fit gives a record without a matrix, like a
     keyframe without any fit. A warning says so when no keyframe of the clip
@@ -614,8 +659,7 @@ def _keyframe_fits(
     fits: dict[int, HomographyRecord] = {}
     strong_frames: set[int] = set()
     n_rejected = 0
-    for frame_landmarks, frame_people in zip(landmarks, people, strict=True):
-        record = fit_from_landmarks(frame_landmarks, ransac_px=config.ransac_px)
+    for record, frame_people in zip(landmark_fits, people, strict=True):
         if record.valid:
             feet = _feet([person for person in frame_people.people if person.role != _ROLE_NEXT_TO_PITCH])
             problems = fit_problems(record, feet, (info.width, info.height), pitch_margin_m=config.pitch_margin_m)
@@ -625,7 +669,7 @@ def _keyframe_fits(
                 record = HomographyRecord(frame=record.frame)
             elif _well_supported(record):
                 strong_frames.add(record.frame)
-        fits[frame_landmarks.frame] = record
+        fits[frame_people.frame] = record
     if not any(record.valid for record in fits.values()):
         logger.warning(
             "no keyframe of clip %s has a pitch mapping, so the clip gets no pitch position and no shirt-number "
@@ -654,6 +698,7 @@ def _landmarks_agree(landmarks: FrameLandmarks, record: HomographyRecord, ransac
 
 def _pitch_mapping(
     landmarks: Sequence[FrameLandmarks],
+    landmark_fits: Sequence[HomographyRecord],
     people: Sequence[FramePeople],
     motion: MotionField,
     info: ClipInfo,
@@ -677,9 +722,10 @@ def _pitch_mapping(
     keeps what it has.
 
     Every other frame takes the mapping of a keyframe near it, moved with the
-    camera motion. The result has one record per frame.
+    camera motion. The result has one record per frame. No mapping is carried
+    across a cut, because the motion step into a cut is missing.
     """
-    fits, strong_frames = _keyframe_fits(landmarks, people, info, config)
+    fits, strong_frames = _keyframe_fits(landmark_fits, people, info, config)
     strong_fits = {frame: fits[frame] for frame in strong_frames}
     carried = propagate_homographies(strong_fits, motion, info.n_frames, max_gap_frames=config.max_gap_frames)
     key_fits: dict[int, HomographyRecord] = {}
@@ -783,15 +829,30 @@ def _people_on_pitch(people: FramePeople, to_pitch: PitchMap, margin_m: float) -
 
 
 def _tracks(
-    people: Sequence[FramePeople], warp: MotionWarp, to_pitch: PitchMap, fps: float, config: TrackingConfig
+    people: Sequence[FramePeople],
+    warp: MotionWarp,
+    to_pitch: PitchMap,
+    fps: float,
+    config: TrackingConfig,
+    motion: MotionField,
 ) -> list[Track]:
     """Link the people of the keyframes into tracks, then drop short tracks and join broken ones.
 
     ``warp`` moves image points from one frame into another. Where it gives no
     answer, the tracks end and the joins of ``stitch_fragments`` connect them again.
+    Each shot of ``motion`` is tracked on its own, so no position links two people
+    across a cut. The ids are 0..n-1 in the order of the shots and, inside a shot,
+    in the order of the first frame.
     """
-    fragments = associate(people, fps=fps, warp=warp, to_pitch=to_pitch, config=config)
-    return stitch_fragments(fragments, fps=fps, to_pitch=to_pitch, config=config)
+    shots: dict[int, list[FramePeople]] = {}
+    for frame_people in people:
+        shots.setdefault(motion.shot_of(frame_people.frame), []).append(frame_people)
+    tracks: list[Track] = []
+    for shot in sorted(shots):
+        fragments = associate(shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config)
+        for track in stitch_fragments(fragments, fps=fps, to_pitch=to_pitch, config=config):
+            tracks.append(track.model_copy(update={"track_id": len(tracks)}))
+    return tracks
 
 
 def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[FramePeople]:
@@ -831,16 +892,31 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
 
 
 def _detector_tracks(
-    people: Sequence[FramePeople], warp: MotionWarp, to_pitch: PitchMap, fps: float, config: TrackingConfig
+    people: Sequence[FramePeople],
+    warp: MotionWarp,
+    to_pitch: PitchMap,
+    fps: float,
+    config: TrackingConfig,
+    motion: MotionField,
 ) -> list[Track]:
     """Link the people of every frame into tracks, give the tracks of outlier kits their role, then join broken tracks.
 
     The roles come before the joins: ``stitch_fragments`` joins only tracks with the same
-    role and team key, so a goalkeeper must already be one.
+    role and team key, so a goalkeeper must already be one. Each shot of ``motion`` is
+    tracked on its own, as in ``_tracks``, so no position links two people across a cut.
+    The ids are 0..n-1 in the order of the shots and, inside a shot, in the order of the
+    first frame.
     """
-    fragments = associate(people, fps=fps, warp=warp, to_pitch=to_pitch, config=config)
-    with_roles = kit_roles(fragments, _mean_positions(fragments, to_pitch))
-    return stitch_fragments(with_roles, fps=fps, to_pitch=to_pitch, config=config)
+    shots: dict[int, list[FramePeople]] = {}
+    for frame_people in people:
+        shots.setdefault(motion.shot_of(frame_people.frame), []).append(frame_people)
+    tracks: list[Track] = []
+    for shot in sorted(shots):
+        fragments = associate(shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config)
+        with_roles = kit_roles(fragments, _mean_positions(fragments, to_pitch))
+        for track in stitch_fragments(with_roles, fps=fps, to_pitch=to_pitch, config=config):
+            tracks.append(track.model_copy(update={"track_id": len(tracks)}))
+    return tracks
 
 
 def _mean_positions(tracks: Sequence[Track], to_pitch: PitchMap) -> dict[int, tuple[float, float]]:
@@ -1066,14 +1142,18 @@ def _with_ball(
     to_pitch: PitchMap,
     fps: float,
     margin_m: float,
+    *,
+    cuts: Sequence[int],
 ) -> list[FrameState]:
     """Follow the ball (``ball.track_ball``) and give each frame state the ball of its frame.
 
-    The pitch position of the ball is the foot point of its box. It is left out where the
+    No run of the ball crosses a cut (``cuts``, the frames that start a new shot). The pitch position of the ball is the foot point of its box. It is left out where the
     frame has no mapping, and where it lies more than ``margin_m`` outside the pitch: a ball
     in the air maps far beyond where it is.
     """
-    track = track_ball(candidates, len(frames), fps=fps, warp=warp, max_gap_frames=round(BALL_MAX_GAP_S * fps))
+    track = track_ball(
+        candidates, len(frames), fps=fps, warp=warp, max_gap_frames=round(BALL_MAX_GAP_S * fps), cuts=cuts
+    )
     result: list[FrameState] = []
     for state in frames:
         box = track.boxes.get(state.frame)

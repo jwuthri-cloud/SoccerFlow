@@ -25,11 +25,12 @@ from pitchvlm.config import EngineSettings, PipelineConfig, load_config
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.export_gsr import check_predictions, prediction_items
 from pitchvlm.fallbacks.fake import fake_ball_position, fake_calibration_answers, fake_detector_answers
+from pitchvlm.frames import keyframe_indices
 from pitchvlm.geometry import matrix_to_rows
 from pitchvlm.pipeline import ToolAnswers, every_frame_tracking, run_clip
 from pitchvlm.render import RadarRenderer, draw_ball
 from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, HomographyRecord
-from pitchvlm.synth import SyntheticScene, SyntheticSource
+from pitchvlm.synth import RetimedScene, SyntheticScene, SyntheticSource
 from pitchvlm.timing import StageClock
 from pitchvlm.vlm.fake import FakeBackend
 from pitchvlm.vlm.types import TextPart, VLMRequest, VLMResponse
@@ -169,10 +170,55 @@ def test_prediction_file_of_the_detector_engine_is_valid_and_has_no_ball(
 def test_every_stage_of_the_detector_engine_is_timed(detector_result: tuple[ClipResult, StageClock]) -> None:
     _, clock = detector_result
     report = clock.report(N_FRAMES)
-    assert set(report) == {"motion", "pitch_mapping", "kit_colour", "tracks", "votes_fill", "ball", "total"}
+    assert set(report) == {"motion", "pitch_mapping", "paint", "kit_colour", "tracks", "votes_fill", "ball", "total"}
     assert report["total"]["seconds"] == pytest.approx(
         sum(report[stage]["seconds"] for stage in report if stage != "total")
     )
+
+
+# --- Hard cuts -----------------------------------------------------------------------
+
+#: The clip frame that starts the second shot of the clip with a cut: scene frames 0 to 53, then 154 to 207.
+CUT = 54
+
+
+@pytest.fixture(scope="module")
+def cut_scene() -> RetimedScene:
+    return RetimedScene([*range(0, CUT), *range(CUT + 100, 2 * CUT + 100)], seed=3)
+
+
+@pytest.fixture(scope="module")
+def cut_result(cut_scene: RetimedScene) -> ClipResult:
+    """The detector engine on the clip with a cut. The ball candidates of frames 52 to 56 are taken out."""
+    tools = tools_of(cut_scene, DETECTOR_ONLY)
+    assert tools.balls is not None
+    balls = {frame: found for frame, found in tools.balls.items() if not CUT - 2 <= frame <= CUT + 2}
+    tools = ToolAnswers(people=tools.people, balls=balls, cameras=tools.cameras)
+    return run_clip(SyntheticSource(cut_scene), None, PipelineConfig(engines=DETECTOR_ONLY), tools=tools)
+
+
+def test_no_track_of_the_detector_engine_crosses_a_cut(cut_result: ClipResult) -> None:
+    """Without the tracking per shot, 3 tracks of this clip cross the cut (measured)."""
+    assert cut_result.cuts == (CUT,)
+    assert [track.track_id for track in cut_result.tracks if track.first_frame < CUT <= track.last_frame] == []
+    assert [track.track_id for track in cut_result.tracks] == list(range(len(cut_result.tracks)))
+
+
+def test_ball_is_not_filled_across_a_cut(cut_result: ClipResult) -> None:
+    """The gap of 5 frames around the cut is shorter than the fill limit, but it holds the cut."""
+    with_ball = {state.frame for state in cut_result.frames if state.ball is not None}
+    assert with_ball.isdisjoint(range(CUT - 2, CUT + 3))
+    # The ball is followed again in both shots.
+    assert {CUT - 3, CUT + 5} <= with_ball
+
+
+def test_cameras_of_the_calibration_get_the_paint_alignment_of_the_keyframes(
+    cut_scene: RetimedScene, cut_result: ClipResult
+) -> None:
+    keyframes = keyframe_indices(cut_scene.info.n_frames, cut_scene.info.fps, PipelineConfig().keyframe_interval_s)
+    assert [check.frame for check in cut_result.paint] == keyframes
+    # The cameras of the stand-in are exact, so their lines lie on the painted lines.
+    assert all(check.score is not None and check.score > 0.9 for check in cut_result.paint)
 
 
 def test_model_engine_has_no_ball(scene: SyntheticScene) -> None:
