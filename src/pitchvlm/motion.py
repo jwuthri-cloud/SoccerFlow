@@ -70,7 +70,8 @@ CUT_TEST_GRID = 4
 #: Two neighbouring frames belong to one shot when a camera motion moves the first one onto
 #: the second with a median block correlation of at least this. Measured on the synthetic clip:
 #: at least 0.88 inside a shot, also for a pan of 83 pixels per frame at 1280 pixels and with a
-#: static score graphic; at most 0.06 across a cut (``docs/DECISIONS.md``, 2026-11-22).
+#: static score graphic; at most 0.06 across a cut (``docs/DECISIONS.md``, entry "Paint
+#: alignment of pitch mappings, and hard cuts" of 2026-11-22, item 6).
 MIN_SHOT_CORRELATION = 0.5
 #: A block counts when the moved image covers at least this share of it.
 MIN_CUT_TEST_BLOCK_COVER = 0.5

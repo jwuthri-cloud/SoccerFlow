@@ -447,7 +447,7 @@ def test_wrong_boxes_off_the_pitch_are_counted_next_to_the_wrong_boxes() -> None
 
     def people_of(clip_id: str, frame: int) -> FramePeople:
         boxes = [*exact_boxes(), *(wrong_box(spot) for spot in wrong[frame])]
-        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT)
+        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     model = run_people_probe([people_clip()], StubBackend({"kit_legend": legend_answer, "people": answers}))
     tool = score_people([people_clip()], people_of=people_of)
@@ -474,7 +474,7 @@ def test_right_box_off_the_pitch_is_not_counted_as_a_wrong_box_off_the_pitch() -
     boxes = [*(model_box(box_of(athlete)) for athlete in layout), nobody]
 
     def people_of(clip_id: str, frame: int) -> FramePeople:
-        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT)
+        return steps.parse_people(json.dumps(people_answer(boxes)), frame=frame, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     result = score_people([clip], people_of=people_of)
 
@@ -1015,7 +1015,7 @@ CAMERA_Y_MIRRORED = ((0.1, 0.0, -64.0), (0.0, -0.125, 45.0), (0.0, 0.0, 1.0))
 def tool_people(clip_id: str, frame: int) -> FramePeople:
     """The people that a tool found in one frame of the people clip: the boxes of the stub model."""
     answer = people_answer_of_frame(frame)
-    return steps.parse_people(json.dumps(answer), frame=frame, width=WIDTH, height=HEIGHT)
+    return steps.parse_people(json.dumps(answer), frame=frame, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
 
 def tool_mapping(matrix: tuple[tuple[float, float, float], ...] | None) -> Callable[[str, int], HomographyRecord]:
@@ -1185,7 +1185,7 @@ def test_tool_mappings_are_measured_like_the_fits_of_the_model() -> None:
         answer = pitch_answer_of_frame(frame)
         if isinstance(answer, str):
             return HomographyRecord(frame=frame)
-        landmarks = steps.parse_landmarks(json.dumps(answer), frame=frame, width=WIDTH, height=HEIGHT)
+        landmarks = steps.parse_landmarks(json.dumps(answer), frame=frame, width=WIDTH, height=HEIGHT, coords="yx_1000")
         return fit_from_landmarks(landmarks, ransac_px=8.0)
 
     tool = score_pitch_mappings([pitch_clip()], mapping_of, CALIBRATION, frames_per_clip=10, seed=0)

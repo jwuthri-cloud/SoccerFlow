@@ -93,7 +93,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, get_args
 
 import numpy as np
 import pydantic
@@ -101,7 +101,7 @@ import yaml
 from pydantic import Field, model_validator
 
 from pitchvlm import __version__, doctor, probes
-from pitchvlm.config import DEFAULT_MODEL, PipelineConfig, StepSettings, load_config
+from pitchvlm.config import DEFAULT_MODEL, PipelineConfig, StepSettings, load_config, model_label, model_ref
 from pitchvlm.datasets import (
     LABEL_FILE_NAME,
     SPLITS,
@@ -148,11 +148,16 @@ from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
     FLEX_TIMEOUT_S,
+    OPENROUTER_KEY_VARIABLE,
     STANDARD_TIMEOUT_S,
     GeminiBackend,
-    build_sdk_client,
+    LazySdkClient,
+    OpenRouterBackend,
+    ProviderBackend,
+    UrllibTransport,
     installed_sdk_version,
 )
+from pitchvlm.vlm.coords import COORD_CONVENTIONS, GEMINI_CONVENTION
 from pitchvlm.vlm.cost import (
     DEFAULT_TOKEN_ESTIMATES,
     BudgetExceeded,
@@ -160,13 +165,24 @@ from pitchvlm.vlm.cost import (
     Ledger,
     billed_usd,
     estimate_usd,
+    Price,
     has_flex_tier,
     ledger_file_number,
+    load_price_table,
 )
 from pitchvlm.vlm.fake import FakeBackend
 from pitchvlm.vlm.prompts import PROMPT_NAMES
 from pitchvlm.vlm.steps import ParseError
-from pitchvlm.vlm.types import Backend, BackendError, BilledAnswerError, RequestMeta, VLMRequest, VLMResponse
+from pitchvlm.vlm.types import (
+    Backend,
+    BackendError,
+    BilledAnswerError,
+    Provider,
+    RequestMeta,
+    ThinkingLevel,
+    VLMRequest,
+    VLMResponse,
+)
 
 EXIT_OK = 0
 #: A check or a gate failed. The output files are written.
@@ -176,6 +192,12 @@ EXIT_ERROR = 2
 
 #: Environment variable that holds the API key on the run machine.
 KEY_VARIABLE = "GEMINI_API_KEY"
+#: Environment variable of the key of each provider. A program of another project (the scorer)
+#: gets none of them.
+PROVIDER_KEY_VARIABLES: dict[Provider, str] = {"gemini": KEY_VARIABLE, "openrouter": OPENROUTER_KEY_VARIABLE}
+KEY_VARIABLES = tuple(PROVIDER_KEY_VARIABLES.values())
+#: Price table of the models of OpenRouter, relative to the top folder of the repository.
+PRICE_TABLE_FILE = Path("configs") / "openrouter_prices.yaml"
 #: Data folder of the run machine. It lies outside the repository.
 DATA_DIR = Path("~/pitchvlm-data")
 #: Files of the repository, relative to its folder.
@@ -476,12 +498,23 @@ def usd(value: float) -> str:
     return f"{value:.3f} USD"
 
 
+def openrouter_prices() -> tuple[Price, ...]:
+    """Read the price table of the OpenRouter models (``PRICE_TABLE_FILE``). Wrong content raises ``CliError``."""
+    path = repository_root() / PRICE_TABLE_FILE
+    try:
+        return load_price_table(path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        raise CliError(f"the price table {PRICE_TABLE_FILE.as_posix()} cannot be read: {error}") from error
+
+
 def estimated_usd(clip_id: str, plan: Sequence[PlannedCalls]) -> float:
     """Return the expected cost of planned model calls in USD, at the prices of today (UTC).
 
     The estimate uses the default token counts per step of ``vlm.cost``. Each planned
     call becomes a request without text and images, because the estimate reads only the
-    step, the model and the service tier. These requests are never sent.
+    step, the provider, the model and the service tier. These requests are never sent.
+    A Gemini model takes the price table of ``vlm.cost``, an OpenRouter model the price
+    table ``PRICE_TABLE_FILE``.
 
     ``CliError`` is raised for a model without a price, and for a step that asks for the
     flex tier of a model that has none: such a call would fail, and its half price
@@ -495,6 +528,7 @@ def estimated_usd(clip_id: str, plan: Sequence[PlannedCalls]) -> float:
             )
     requests = [
         VLMRequest(
+            provider=settings.provider,
             model=settings.model,
             thinking_level=settings.thinking_level,
             parts=(),
@@ -507,7 +541,12 @@ def estimated_usd(clip_id: str, plan: Sequence[PlannedCalls]) -> float:
         for _ in range(count)
     ]
     try:
-        return estimate_usd(requests, DEFAULT_TOKEN_ESTIMATES, datetime.now(UTC).date())
+        return estimate_usd(
+            requests,
+            DEFAULT_TOKEN_ESTIMATES,
+            datetime.now(UTC).date(),
+            openrouter_prices=openrouter_prices() if any(r.provider != "gemini" for r in requests) else (),
+        )
     except KeyError as error:
         raise CliError(f"the cost cannot be estimated: {error.args[0]}") from error
 
@@ -848,27 +887,44 @@ def print_measured(cost: Mapping[str, Any]) -> None:
         )
 
 
-def gemini_backend(max_usd_per_10_min: float) -> Backend:
-    """Return the real model backend. The key and the SDK are needed only when a request is sent.
+def model_backend(max_usd_per_10_min: float) -> Backend:
+    """Return the real model backend: each request goes to the backend of its provider.
 
-    The backend sends no request and no new attempt after a stop signal (``STOP_REQUESTED``).
+    The key of a provider, and for Gemini the SDK, are needed only when a request of that
+    provider is sent. Each provider has its own spend window of ``max_usd_per_10_min``.
+    The backends send no request and no new attempt after a stop signal (``STOP_REQUESTED``).
     """
-    return GeminiBackend(api_key_env=KEY_VARIABLE, max_usd_per_10_min=max_usd_per_10_min, stop=STOP_REQUESTED)
+    gemini = GeminiBackend(api_key_env=KEY_VARIABLE, max_usd_per_10_min=max_usd_per_10_min, stop=STOP_REQUESTED)
+    openrouter = OpenRouterBackend(
+        prices=openrouter_prices(),
+        api_key_env=OPENROUTER_KEY_VARIABLE,
+        max_usd_per_10_min=max_usd_per_10_min,
+        stop=STOP_REQUESTED,
+    )
+    return ProviderBackend({"gemini": gemini, "openrouter": openrouter})
 
 
-def recording_backend(max_usd_per_10_min: float) -> tuple[Backend, doctor.RecordingClient]:
-    """Return the real model backend on top of an SDK client that records the raw facts of every call.
+def recording_backend(max_usd_per_10_min: float) -> tuple[Backend, doctor.CallRecorder]:
+    """Return the real model backend on top of layers that record the raw facts of every call.
 
-    The SDK client is built with the longest timeout of any call. The backend gives
-    every call the timeout of its service tier: a flex request can wait in a queue of the
-    provider, so it gets the longer one. The backend sends no request and no new attempt
-    after a stop signal (``STOP_REQUESTED``).
+    Gemini: the SDK client is built on the first Gemini call, with the longest timeout of
+    any call. The backend gives every call the timeout of its service tier: a flex request
+    can wait in a queue of the provider, so it gets the longer one. OpenRouter: the HTTP
+    layer records every answer with a success status. Both record into one recorder. The
+    backends send no request and no new attempt after a stop signal (``STOP_REQUESTED``).
     """
-    recorder = doctor.RecordingClient(build_sdk_client(KEY_VARIABLE, max(STANDARD_TIMEOUT_S, FLEX_TIMEOUT_S)))
-    backend = GeminiBackend(
+    recorder = doctor.RecordingClient(LazySdkClient(KEY_VARIABLE, max(STANDARD_TIMEOUT_S, FLEX_TIMEOUT_S)))
+    gemini = GeminiBackend(
         api_key_env=KEY_VARIABLE, max_usd_per_10_min=max_usd_per_10_min, stop=STOP_REQUESTED, client=recorder
     )
-    return backend, recorder
+    openrouter = OpenRouterBackend(
+        prices=openrouter_prices(),
+        api_key_env=OPENROUTER_KEY_VARIABLE,
+        max_usd_per_10_min=max_usd_per_10_min,
+        stop=STOP_REQUESTED,
+        transport=doctor.RecordingTransport(UrllibTransport(), recorder),
+    )
+    return ProviderBackend({"gemini": gemini, "openrouter": openrouter}), recorder
 
 
 @dataclass(frozen=True)
@@ -922,7 +978,7 @@ def open_session(
         return ModelSession(backend=backend, run_id=run_id, estimate_usd=estimate, meter=None)
     budget = budget_limits(load_gates())
     meter = start_meter(cache_dir, budget, run_id, estimate, over_budget=over_budget)
-    cached = CachedBackend(store, gemini_backend(budget.max_usd_per_10_min), on_new_answer=meter.on_new_answer)
+    cached = CachedBackend(store, model_backend(budget.max_usd_per_10_min), on_new_answer=meter.on_new_answer)
     return ModelSession(backend=SessionBackend(store, cached, meter), run_id=run_id, estimate_usd=estimate, meter=meter)
 
 
@@ -1460,7 +1516,7 @@ def contract_limits(gates: Mapping[str, Any]) -> doctor.ContractLimits:
 
 
 def contract_stage(
-    models: Sequence[str],
+    models: Sequence[StepSettings],
     gates: Mapping[str, Any],
     cache_dir: Path,
     *,
@@ -1468,6 +1524,9 @@ def contract_stage(
     over_budget: bool = False,
 ) -> tuple[dict[str, doctor.ContractResult], dict[str, Any], BudgetExceeded | None]:
     """Run the contract checks of gate G0 for every model with the real backend.
+
+    ``models`` are the step settings of the models: provider, model, coordinate
+    convention and thinking level. The result is keyed by ``model_label``.
 
     The cost estimate is printed before the first call and the measured cost after the
     last one. The result holds the checks of each model, the cost record, and the
@@ -1485,7 +1544,7 @@ def contract_stage(
     budget = budget_limits(gates)
     limits = contract_limits(gates)
     scene = doctor.contract_scene()
-    plan = [calls for model in models for calls in doctor.contract_plan(StepSettings(model=model))]
+    plan = [calls for settings in models for calls in doctor.contract_plan(settings)]
     estimate = estimated_usd(scene.info.clip_id, plan)
     print_estimate(estimate, plan)
     meter = start_meter(
@@ -1500,12 +1559,16 @@ def contract_stage(
     metered = MeteredBackend(backend, meter)
     results: dict[str, doctor.ContractResult] = {}
     stopped: BudgetExceeded | None = None
+    prices = openrouter_prices() if any(settings.provider != "gemini" for settings in models) else ()
     try:
-        for model in models:
-            results[model] = doctor.contract_checks(
-                metered, scene, StepSettings(model=model), limits, recorder=recorder
+        for settings in models:
+            label = model_label(settings.provider, settings.model)
+            results[label] = doctor.contract_checks(
+                metered, scene, settings, limits, recorder=recorder, openrouter_prices=prices
             )
-            print_checks(f"contract checks of gate G0, model {model}", results[model].checks)
+            print_checks(
+                f"contract checks of gate G0, model {label} (coordinates {settings.coords})", results[label].checks
+            )
     except BudgetExceeded as error:
         stopped = error
     finally:
@@ -1514,13 +1577,40 @@ def contract_stage(
     return results, cost, stopped
 
 
+def doctor_models(args: argparse.Namespace) -> list[StepSettings]:
+    """Return the step settings of the models of ``doctor``: ``--models`` with ``--coords`` and ``--thinking-level``.
+
+    A Gemini model is checked in the Gemini convention, whatever ``--coords`` says, so a
+    run can check a Gemini model next to an OpenRouter model. Settings that a provider
+    cannot take, for example a free OpenRouter model, raise ``CliError``.
+    """
+    models: list[StepSettings] = []
+    for text in args.models:
+        provider, model = model_ref(text)
+        coords = args.coords if provider == "openrouter" else GEMINI_CONVENTION
+        try:
+            models.append(
+                StepSettings(provider=provider, model=model, coords=coords, thinking_level=args.thinking_level)
+            )
+        except pydantic.ValidationError as error:
+            reasons = "; ".join(str(problem["msg"]) for problem in error.errors())
+            raise CliError(f"--models {text}: {reasons}") from error
+    return models
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """Check the machine and, unless ``--no-api`` is given, the contract of the model API (gate G0)."""
     call_api = not args.no_api
     if args.out is not None and not call_api:
         raise CliError("--out holds the report of the contract checks, so it cannot be used with --no-api")
+    models = doctor_models(args)
+    providers = [settings.provider for settings in models] if call_api else list(PROVIDER_KEY_VARIABLES)
     environment = doctor.environment_checks(
-        repository_root(), key_variable=KEY_VARIABLE, data_dir=DATA_DIR.expanduser(), api=call_api
+        repository_root(),
+        key_variables=[PROVIDER_KEY_VARIABLES[provider] for provider in dict.fromkeys(providers)],
+        data_dir=DATA_DIR.expanduser(),
+        api=call_api,
+        needs_sdk="gemini" in providers,
     )
     print_checks("environment", environment)
     if not call_api:
@@ -1537,7 +1627,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"{GATES_FILE.as_posix()}: {G0_SECTION}.spend_usd_max must be a number above 0, found {spend_limit!r}"
         )
     contract, cost, stopped = contract_stage(
-        args.models, gates, _cache_dir(args), spend_limit_usd=spend_limit, over_budget=args.start_over_budget
+        models, gates, _cache_dir(args), spend_limit_usd=spend_limit, over_budget=args.start_over_budget
     )
     spend = doctor.check_spend(cost["measured_usd"], spend_limit)
     print_checks("cost", [spend])
@@ -1562,6 +1652,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "sdk_version": installed_sdk_version(),
             "prompts": {step: PROMPT_NAMES[step] for step in ("people", "landmarks")},
             "models": list(args.models),
+            "coords": args.coords,
+            "thinking_level": args.thinking_level,
             "cost": cost,
         }
         write_metrics(args.out, report, provenance=provenance)
@@ -1793,7 +1885,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
             tracker=tracker,
             clips=clips,
             output_dir=args.out / SCORER_FOLDER / tracker,
-            drop_env=(KEY_VARIABLE,),
+            drop_env=KEY_VARIABLES,
         )
         for variant, tracker in ORACLE_TRACKERS.items()
     }
@@ -2413,7 +2505,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         tracker=args.tracker,
         clips=args.clips,
         output_dir=args.out,
-        drop_env=(KEY_VARIABLE,),
+        drop_env=KEY_VARIABLES,
     )
     width = max(len(name) for name in scores)
     print(f"{'clip':<{width}}  GS-HOTA    DetA    AssA")
@@ -2672,10 +2764,15 @@ def _frame_rate(text: str) -> float:
 
 
 def _model_list(text: str) -> list[str]:
-    """Read model names that are separated by commas. Each name may be given one time."""
+    """Read models that are separated by commas: a Gemini name, or ``openrouter:<slug>``. Each one time."""
     models = [name.strip() for name in text.split(",")]
     if not all(models) or len(set(models)) != len(models):
-        raise argparse.ArgumentTypeError("give model names separated by commas, each name one time")
+        raise argparse.ArgumentTypeError("give models separated by commas, each one time")
+    for name in models:
+        try:
+            model_ref(name)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(str(error)) from error
     return models
 
 
@@ -2832,7 +2929,25 @@ def _add_doctor(commands: Any) -> None:
         type=_model_list,
         default=[DEFAULT_MODEL],
         metavar="M1,M2",
-        help=f"models of the contract checks, separated by commas (default: {DEFAULT_MODEL})",
+        help=(
+            "models of the contract checks, separated by commas: a Gemini model name, or openrouter:<slug> "
+            f"for a model of OpenRouter (default: {DEFAULT_MODEL})"
+        ),
+    )
+    parser.add_argument(
+        "--coords",
+        choices=COORD_CONVENTIONS,
+        default=GEMINI_CONVENTION,
+        help=(
+            "coordinate convention that the prompts ask the OpenRouter models for; a Gemini model always uses "
+            f"{GEMINI_CONVENTION} (default: {GEMINI_CONVENTION})"
+        ),
+    )
+    parser.add_argument(
+        "--thinking-level",
+        choices=get_args(ThinkingLevel),
+        default="low",
+        help="thinking level of the models; model_default sends none, for OpenRouter only (default: low)",
     )
     parser.add_argument(
         "--out", type=_path, metavar="FILE", help="write the report of the contract checks to this file (JSON)"

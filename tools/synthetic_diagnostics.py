@@ -1,8 +1,9 @@
 """Measure the paint-alignment score and the cut test on synthetic clips, and print the numbers.
 
-This is the measurement behind the synthetic numbers of ``docs/DECISIONS.md`` (2026-11-22). It
-runs offline on the build machine: no model, no footage, no network. Every number it prints is
-synthetic, not a result on broadcast frames. Run it from the top folder of the repository:
+This is the measurement behind the synthetic numbers of ``docs/DECISIONS.md`` (entry "Paint
+alignment of pitch mappings, and hard cuts" of 2026-11-22, items 5 and 6). It runs offline on
+the build machine: no model, no footage, no network. Every number it prints is synthetic, not a
+result on broadcast frames. Run it from the top folder of the repository:
 
     PYTHONPATH=src python tools/synthetic_diagnostics.py
 

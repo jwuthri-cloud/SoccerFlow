@@ -3,13 +3,15 @@
 Two groups of checks live here.
 
 - The environment checks describe the machine: versions, the model SDK, the
-  key variable, the guard hooks, the deny-list of the guard and the free disk
+  key variables, the guard hooks, the deny-list of the guard and the free disk
   space.
 - The contract checks are gate G0. They send requests for frames of a
   synthetic scene, whose truth is known exactly, and compare the answers with
-  that truth. They take any backend, so the tests run them with the fake
-  backend. With the real backend, a recording SDK client also keeps the raw
-  facts of every call (the ``store`` flag, the service tier, the token counts).
+  that truth. They take any backend and any provider and model, so the tests run
+  them with the fake backend. With the real backend, a recording SDK client
+  (Gemini) or a recording HTTP layer (OpenRouter) also keeps the raw facts of
+  every call: the ``store`` flag or the routing settings, the service tier or the
+  provider that served the call, the token counts and the reported cost.
 
 The contract checks give two kinds of results for the boxes and the landmarks.
 A contract verdict (``BOXES``, ``LANDMARKS``) fails for a fault of the client:
@@ -26,6 +28,7 @@ of the key, so a report can go to the results branch.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import os
 import platform
@@ -33,8 +36,9 @@ import shutil
 import subprocess
 import threading
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -53,13 +57,16 @@ from pitchvlm.synth import SyntheticScene
 from pitchvlm.vlm import steps
 from pitchvlm.vlm.client import (
     SDK_DISTRIBUTION,
+    HttpAnswer,
+    HttpTransport,
     InteractionsClient,
-    build_interaction_kwargs,
     installed_sdk_version,
+    keeps_inputs_private,
     normalize_usage,
+    routing_keeps_inputs_private,
     usage_accounting,
 )
-from pitchvlm.vlm.cost import has_flex_tier
+from pitchvlm.vlm.cost import Price, has_flex_tier, price_for
 from pitchvlm.vlm.types import Backend, BackendError, FlexBusyError, VLMRequest, VLMResponse
 
 #: ``ok`` and ``fail`` are verdicts. ``info`` is a fact without a verdict.
@@ -83,6 +90,9 @@ STORE = "store flag"
 USAGE = "token sum"
 SERVED_TIER = "served tier"
 SPEND = "spend"
+DATA_POLICY = "data policy"
+SERVED_BY = "served by"
+REPORTED_COST = "reported cost"
 
 # --- Environment ---------------------------------------------------------------------
 
@@ -170,13 +180,18 @@ def home_relative(path: Path) -> str:
     return "~" if relative == Path(".") else f"~/{relative.as_posix()}"
 
 
-def environment_checks(repo: Path, *, key_variable: str, data_dir: Path, api: bool) -> list[CheckResult]:
-    """Describe the machine: versions, the model SDK, the key variable, the guard and the free disk space.
+def environment_checks(
+    repo: Path, *, key_variables: Sequence[str], data_dir: Path, api: bool, needs_sdk: bool = True
+) -> list[CheckResult]:
+    """Describe the machine: versions, the model SDK, the key variables, the guard and the free disk space.
 
     ``repo`` is the folder of the repository. ``data_dir`` is the data folder; the free
     disk space is read there, or in the home folder when the data folder does not exist.
+    ``key_variables`` are the variables of the keys of the providers that the caller
+    uses. ``needs_sdk`` says whether one of them is Gemini, whose client needs the SDK;
+    the OpenRouter client needs none.
 
-    ``api`` says whether the caller will call the model. The SDK and the key are needed
+    ``api`` says whether the caller will call the model. The SDK and the keys are needed
     only then: without them, or with an SDK of another major version, the check fails
     when ``api`` is true, and it is a fact without a verdict when ``api`` is false. The
     guard hooks always fail when git does not run the guard and the secret scan before
@@ -187,8 +202,8 @@ def environment_checks(repo: Path, *, key_variable: str, data_dir: Path, api: bo
     return [
         _python_check(),
         _packages_check(),
-        _sdk_check(api),
-        _key_check(key_variable, api),
+        _sdk_check(api and needs_sdk),
+        _key_check(key_variables, api),
         _hook_check(repo),
         _deny_check(repo),
         _disk_check(data_dir),
@@ -235,11 +250,25 @@ def _sdk_check(api: bool) -> CheckResult:
     )
 
 
-def _key_check(key_variable: str, api: bool) -> CheckResult:
-    """Tell whether the key variable is set. The value is not read into the result."""
-    if os.environ.get(key_variable, "").strip():
-        return CheckResult(KEY, "ok", f"the variable {key_variable} is set")
-    return CheckResult(KEY, "fail" if api else "info", f"the variable {key_variable} is not set")
+def _key_check(key_variables: Sequence[str], api: bool) -> CheckResult:
+    """Tell whether every key variable is set. No value is read into the result."""
+    if not key_variables:
+        raise ValueError("the key check needs at least one variable")
+    missing = [name for name in key_variables if not os.environ.get(name, "").strip()]
+    present = [name for name in key_variables if name not in missing]
+    if not missing:
+        return CheckResult(KEY, "ok", _variables_text(present, "set"))
+    detail = _variables_text(missing, "not set")
+    if present:
+        detail += f"; {_variables_text(present, 'set')}"
+    return CheckResult(KEY, "fail" if api else "info", detail)
+
+
+def _variables_text(names: Sequence[str], state: str) -> str:
+    """Say that one or more variables are in a state, for example "the variable X is set"."""
+    if len(names) == 1:
+        return f"the variable {names[0]} is {state}"
+    return f"the variables {', '.join(names)} are {state}"
 
 
 def _hook_check(repo: Path) -> CheckResult:
@@ -425,7 +454,11 @@ def _disk_check(data_dir: Path) -> CheckResult:
 
 @dataclass(frozen=True)
 class RawCall:
-    """The raw facts of one call of the SDK client: what was sent and what came back, without text and images."""
+    """The raw facts of one call: what was sent and what came back, without text and images.
+
+    A Gemini call fills the ``store`` flag and the tiers. An OpenRouter call fills the
+    routing settings, the provider that served it and the reported cost.
+    """
 
     #: Value of the ``store`` argument of the call. None means that the call had no such argument.
     store: Any
@@ -440,6 +473,14 @@ class RawCall:
     output_tokens: int | None
     thought_tokens: int | None
     total_tokens: int | None
+    #: The ``provider`` object of an OpenRouter body: the routing settings. None for a Gemini call.
+    routing: Any = None
+    #: The provider that served an OpenRouter call, as its answer names it.
+    served_by: str | None = None
+    #: The cost that an OpenRouter answer reports, or None when it reports no number.
+    reported_usd: float | None = None
+    #: The model of an OpenRouter call. None for a Gemini call.
+    model: str | None = None
 
 
 def _text(value: Any) -> str | None:
@@ -457,19 +498,31 @@ def _count(usage: Any, name: str) -> int | None:
     return value
 
 
-class RecordingClient:
-    """An SDK client that passes every call on and keeps its raw facts.
+class CallRecorder:
+    """Keeps the raw facts of the calls of the real backends. One instance can be used from several threads."""
 
-    It wraps anything with ``.interactions.create``, for example the client of
-    ``client.build_sdk_client``. Give it to ``GeminiBackend(client=...)``. A call that
-    raises is not recorded. One instance can be used from several threads.
-    """
-
-    def __init__(self, inner: InteractionsClient) -> None:
-        self._inner = inner
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         #: The recorded calls, in the order in which their answers came back.
         self.calls: list[RawCall] = []
+
+    def add(self, call: RawCall) -> None:
+        """Keep the facts of one call."""
+        with self._lock:
+            self.calls.append(call)
+
+
+class RecordingClient(CallRecorder):
+    """An SDK client that passes every call on and keeps its raw facts.
+
+    It wraps anything with ``.interactions.create``, for example the client of
+    ``client.build_sdk_client`` or a ``client.LazySdkClient``. Give it to
+    ``GeminiBackend(client=...)``. A call that raises is not recorded.
+    """
+
+    def __init__(self, inner: InteractionsClient) -> None:
+        super().__init__()
+        self._inner = inner
 
     @property
     def interactions(self) -> RecordingClient:
@@ -490,9 +543,78 @@ class RecordingClient:
             thought_tokens=_count(usage, "total_thought_tokens"),
             total_tokens=_count(usage, "total_tokens"),
         )
-        with self._lock:
-            self.calls.append(call)
+        self.add(call)
         return interaction
+
+
+def _number_or_none(value: Any) -> float | None:
+    """Return a JSON value as a float when it is a finite number from 0, else None."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    """Return a JSON value when it is an object, else an empty mapping."""
+    return value if isinstance(value, dict) else {}
+
+
+def _whole(value: Any) -> int | None:
+    """Return a JSON value when it is a whole number from 0, else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _json_mapping(body: bytes) -> dict[str, Any]:
+    """Read a body as a JSON object. Anything else gives an empty mapping."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+class RecordingTransport:
+    """An HTTP layer for the OpenRouter backend that passes every request on and keeps the raw facts of its answer.
+
+    It wraps anything with ``post`` (``client.HttpTransport``) and adds the facts of every
+    answer with a success status to ``recorder``. Give it to
+    ``OpenRouterBackend(transport=...)``. A request that raises, and an answer with an
+    error status, are not recorded. No header goes into a record, so the key does not.
+    """
+
+    def __init__(self, inner: HttpTransport, recorder: CallRecorder) -> None:
+        self._inner = inner
+        self._recorder = recorder
+
+    def post(self, url: str, headers: Mapping[str, str], body: bytes, timeout_s: float) -> HttpAnswer:
+        """Send one request through the wrapped layer, record the facts of a success and return the answer unchanged."""
+        answer = self._inner.post(url, headers, body, timeout_s)
+        if not 200 <= answer.status <= 299:
+            return answer
+        sent, data = _json_mapping(body), _json_mapping(answer.body)
+        usage = _mapping(data.get("usage"))
+        choices = data.get("choices")
+        first = _mapping(choices[0]) if isinstance(choices, list) and choices else {}
+        served_by = data.get("provider")
+        self._recorder.add(
+            RawCall(
+                store=None,
+                sent_tier=None,
+                status=_text(first.get("finish_reason")),
+                served_tier=None,
+                input_tokens=_whole(usage.get("prompt_tokens")),
+                output_tokens=_whole(usage.get("completion_tokens")),
+                thought_tokens=_whole(_mapping(usage.get("completion_tokens_details")).get("reasoning_tokens")),
+                total_tokens=_whole(usage.get("total_tokens")),
+                routing=sent.get("provider"),
+                served_by=served_by if isinstance(served_by, str) else None,
+                reported_usd=_number_or_none(usage.get("cost")),
+                model=_text(sent.get("model")),
+            )
+        )
+        return answer
 
 
 class AnswerLog:
@@ -552,14 +674,14 @@ def contract_scene() -> SyntheticScene:
     )
 
 
+def _has_flex_tier(settings: StepSettings) -> bool:
+    """Tell whether the model of the settings has a flex tier: only some Gemini models have one."""
+    return settings.provider == "gemini" and has_flex_tier(settings.model)
+
+
 def flex_settings(settings: StepSettings) -> StepSettings:
     """Return the same step settings with the flex service tier."""
-    return StepSettings(
-        model=settings.model,
-        thinking_level=settings.thinking_level,
-        resolution=settings.resolution,
-        service_tier="flex",
-    )
+    return settings.model_copy(update={"service_tier": "flex"})
 
 
 def contract_plan(
@@ -571,7 +693,7 @@ def contract_plan(
     (``cost.FLEX_TIER_MODELS``).
     """
     plan = [("people", settings, len(frames)), ("landmarks", settings, len(frames))]
-    if has_flex_tier(settings.model):
+    if _has_flex_tier(settings):
         plan.append(("people", flex_settings(settings), len(frames[:FLEX_REQUESTS])))
     return plan
 
@@ -582,12 +704,16 @@ def contract_checks(
     settings: StepSettings,
     limits: ContractLimits,
     *,
-    recorder: RecordingClient | None = None,
+    recorder: CallRecorder | None = None,
     frames: Sequence[int] = CONTRACT_FRAMES,
+    openrouter_prices: Sequence[Price] = (),
 ) -> ContractResult:
     """Run the contract checks of gate G0 for one model, with requests for frames of a synthetic scene.
 
-    ``settings`` names the model. The checks are:
+    ``settings`` names the provider, the model and its coordinate convention. The
+    prompts ask for that convention, and the boxes and landmarks checks read the
+    answers in it: so these two checks prove the convention of the model. The checks
+    are:
 
     - boxes and box accuracy: the people step against the true boxes (``check_boxes``);
     - landmarks and landmark accuracy: the landmarks step against the true points
@@ -596,10 +722,14 @@ def contract_checks(
       (``check_flex``). A model without a flex tier gets no such request, and the check
       is a fact without a verdict. It is one too when the flex tier had no capacity for
       any of the requests: a busy flex tier is no fault of the client;
-    - store flag: no request is stored by the provider (``check_store_flag``);
-    - token sum and served tier: read from the raw calls (``check_usage_sums``,
+    - Gemini: store flag: no request is stored by the provider (``check_store_flag``);
+      token sum and served tier: read from the raw calls (``check_usage_sums``,
       ``check_served_tiers``). The served tier is checked for every call, also for the
-      calls with the standard tier.
+      calls with the standard tier;
+    - OpenRouter: data policy: every request and every recorded call carries the routing
+      settings that keep the inputs private (``check_data_policy``); token sum; the
+      providers that served the calls (``check_served_by``); the reported cost of every
+      call, next to the price table ``openrouter_prices`` (``check_reported_cost``).
 
     The boxes check and the landmarks check are contract verdicts: they fail for a wrong
     order or a wrong scale of the coordinates. The two accuracy values are facts
@@ -624,21 +754,27 @@ def contract_checks(
             ),
         ),
     ]
-    if has_flex_tier(settings.model):
+    if _has_flex_tier(settings):
         checks.append(
             check_flex(
                 log, scene, settings, frames[:FLEX_REQUESTS], min_valid_rate=limits.flex_valid_answer_rate_min
             )
         )
     else:
-        detail = f"not checked: the model {settings.model} has no flex tier, so no request used it"
+        owner = "OpenRouter" if settings.provider == "openrouter" else f"the model {settings.model}"
+        detail = f"not checked: {owner} has no flex tier, so no request used it"
         checks.append(CheckResult(FLEX, "info", detail))
     calls = [] if recorder is None else recorder.calls[first_call:]
-    checks += [
-        check_store_flag(log.requests, calls),
-        check_usage_sums(calls, tolerance=limits.usage_sum_tolerance),
-        check_served_tiers(calls),
-    ]
+    usage_sums = check_usage_sums(calls, tolerance=limits.usage_sum_tolerance)
+    if settings.provider == "openrouter":
+        checks += [
+            check_data_policy(log.requests, calls),
+            usage_sums,
+            check_served_by(calls),
+            check_reported_cost(calls, openrouter_prices),
+        ]
+    else:
+        checks += [check_store_flag(log.requests, calls), usage_sums, check_served_tiers(calls)]
     answers = tuple(_answer_record(request, response) for request, response in log.exchanges)
     return ContractResult(checks=tuple(checks), answers=answers)
 
@@ -669,6 +805,8 @@ def _answer_record(request: VLMRequest, response: VLMResponse) -> dict[str, Any]
         "usage": response.usage.model_dump(),
         "latency_s": response.latency_s,
         "attempts": response.attempts,
+        "reported_usd": response.reported_usd,
+        "served_by": response.served_by,
     }
 
 
@@ -709,7 +847,9 @@ def check_boxes(
         request = steps.build_people_request(
             scene.image(frame), legend, clip_id=info.clip_id, frame=frame, settings=settings
         )
-        answer = steps.parse_people(backend.generate(request).text, frame=frame, width=info.width, height=info.height)
+        answer = steps.parse_people(
+            backend.generate(request).text, frame=frame, width=info.width, height=info.height, coords=settings.coords
+        )
         answered = [person.box for person in answer.people]
         true_boxes = [person.box for person in scene.people(frame).people]
         pairs = match_boxes(answered, true_boxes, MATCH_MIN_IOU)  # (index in answered, index in true_boxes)
@@ -789,7 +929,7 @@ def check_landmarks(
             scene.image(frame), clip_id=info.clip_id, frame=frame, settings=settings
         )
         answer = steps.parse_landmarks(
-            backend.generate(request).text, frame=frame, width=info.width, height=info.height
+            backend.generate(request).text, frame=frame, width=info.width, height=info.height, coords=settings.coords
         )
         if not answer.landmarks:
             return [CheckResult(LANDMARKS, "fail", f"frame {frame}: the answer names no known landmark")]
@@ -856,7 +996,7 @@ def check_flex(
         try:
             response = backend.generate(request)
             latencies_s.append(response.latency_s)
-            steps.parse_people(response.text, frame=frame, width=info.width, height=info.height)
+            steps.parse_people(response.text, frame=frame, width=info.width, height=info.height, coords=flex.coords)
         except FlexBusyError as error:
             without_capacity.append(f"frame {frame}: {error}")
         except (BackendError, steps.ParseError) as error:
@@ -895,7 +1035,7 @@ def check_store_flag(requests: Sequence[VLMRequest], calls: Sequence[RawCall]) -
     and every recorded call must have been sent with ``store=False``. Without recorded
     calls only the first part is checked, and the detail text says so.
     """
-    built_wrong = sum(1 for request in requests if build_interaction_kwargs(request).get("store") is not False)
+    built_wrong = sum(1 for request in requests if not keeps_inputs_private(request))
     sent_wrong = sum(1 for call in calls if call.store is not False)
     if built_wrong or sent_wrong:
         return CheckResult(
@@ -990,3 +1130,82 @@ def check_spend(measured_usd: float, max_usd: float) -> CheckResult:
     status: Status = "ok" if measured_usd <= max_usd else "fail"
     detail = f"the contract checks cost {measured_usd:.3f} USD (limit: at most {max_usd:g} USD)"
     return CheckResult(SPEND, status, detail, value=measured_usd, limit=max_usd)
+
+
+def check_data_policy(requests: Sequence[VLMRequest], calls: Sequence[RawCall]) -> CheckResult:
+    """Check that every OpenRouter request keeps its inputs private (rule 5).
+
+    Every request must give a body with the routing settings of
+    ``client.OPENROUTER_ROUTING`` (zero data retention, no data collection, every
+    parameter supported, no fallback), and every recorded call must have been sent with
+    them. Without recorded calls only the first part is checked, and the detail text
+    says so.
+    """
+    built_wrong = sum(1 for request in requests if not keeps_inputs_private(request))
+    sent_wrong = sum(1 for call in calls if not routing_keeps_inputs_private(call.routing))
+    if built_wrong or sent_wrong:
+        return CheckResult(
+            DATA_POLICY,
+            "fail",
+            f"{built_wrong} of {len(requests)} requests give a body without the private routing settings; "
+            f"{sent_wrong} of {len(calls)} recorded calls were sent without them",
+        )
+    sent = f"{len(calls)} recorded calls were sent with them" if calls else "no raw call was recorded"
+    return CheckResult(
+        DATA_POLICY,
+        "ok",
+        f"{len(requests)} requests give a body with zero data retention, no data collection, every parameter "
+        f"supported and no fallback; {sent}",
+    )
+
+
+def check_served_by(calls: Sequence[RawCall]) -> CheckResult:
+    """Name the providers behind OpenRouter that served the recorded calls. A fact without a verdict."""
+    if not calls:
+        return CheckResult(SERVED_BY, "info", "not checked: no raw call was recorded")
+    counted = Counter(call.served_by or "not named" for call in calls)
+    listed = ", ".join(f"{name} ({count} calls)" for name, count in sorted(counted.items()))
+    return CheckResult(SERVED_BY, "info", f"{len(calls)} calls were served by: {listed}")
+
+
+def check_reported_cost(calls: Sequence[RawCall], prices: Sequence[Price], *, on: date | None = None) -> CheckResult:
+    """Check that every recorded OpenRouter answer reports its cost, and compare it with the price table.
+
+    The cost ledger takes the reported cost of each answer, so an answer without one
+    makes the check fail. The value is the sum of the reported costs. The detail text
+    also gives, for the calls of a model with a price in ``prices`` (on the day ``on``,
+    today in UTC when None), the share of the reported cost in the cost at the table
+    price: above 1 means that the table price is lower than the price that was billed,
+    so the estimates of the model are too low. Without recorded calls the result is a
+    fact without a verdict.
+    """
+    if not calls:
+        return CheckResult(REPORTED_COST, "info", "not checked: no raw call was recorded")
+    missing = sum(1 for call in calls if call.reported_usd is None)
+    if missing:
+        return CheckResult(
+            REPORTED_COST, "fail", f"{missing} of {len(calls)} answers report no cost, so the ledger cannot price them"
+        )
+    total = math.fsum(call.reported_usd or 0.0 for call in calls)
+    day = datetime.now(UTC).date() if on is None else on
+    shares: list[float] = []
+    for call in calls:
+        try:
+            price = price_for(call.model or "", day, prices)
+        except KeyError:
+            continue
+        table_usd = (
+            (call.input_tokens or 0) * price.input_usd_per_million
+            + (call.output_tokens or 0) * price.output_usd_per_million
+        ) / 1e6
+        if table_usd > 0:
+            shares.append((call.reported_usd or 0.0) / table_usd)
+    detail = f"{len(calls)} answers report a cost, {total:.5f} USD in total"
+    if shares:
+        detail += (
+            f"; reported cost / cost at the table price: {min(shares):.2f} to {max(shares):.2f} "
+            f"over {len(shares)} calls (above 1: the table price is too low, so the estimates are too low)"
+        )
+    else:
+        detail += "; no call has a model with a price in the table, so no comparison"
+    return CheckResult(REPORTED_COST, "ok", detail, value=total)

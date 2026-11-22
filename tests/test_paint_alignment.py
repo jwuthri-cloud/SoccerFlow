@@ -13,14 +13,17 @@ import cv2
 import numpy as np
 import pytest
 
+from pitchvlm.config import PipelineConfig, StepSettings
 from pitchvlm.geometry import (
     PAINT_MIN_SHARE,
     paint_alignment,
     paint_mask,
     projected_line_pixels,
 )
+from pitchvlm.pipeline import run_clip
 from pitchvlm.probes import auroc
-from pitchvlm.synth import GRASS_BGR, LINE_BGR, MARK_BGR, SyntheticScene
+from pitchvlm.synth import GRASS_BGR, LINE_BGR, MARK_BGR, SyntheticScene, SyntheticSource
+from pitchvlm.vlm.fake import FakeBackend
 
 FRAMES = (0, 40, 75, 110, 150)
 
@@ -230,3 +233,29 @@ def test_the_score_separates_good_from_bad_mappings_on_the_synthetic_clip(scene:
             good.extend(score(image, shifted(truth, distance_m, angle)) for distance_m in (0.0, 1.0, 2.0))
             bad.extend(score(image, shifted(truth, distance_m, angle)) for distance_m in (5.0, 10.0))
     assert auroc(good, bad) > 0.9
+
+
+# --- the pipeline reports it for every provider ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        StepSettings(),
+        StepSettings(
+            provider="openrouter",
+            model="qwen/qwen3-vl-235b-a22b-instruct",
+            thinking_level="model_default",
+            coords="xy_pixel",
+        ),
+    ],
+    ids=["gemini", "openrouter"],
+)
+def test_the_pipeline_scores_the_landmark_fits_of_every_provider(step: StepSettings) -> None:
+    # The score reads the fitted mapping, not the answer, so the coordinate convention of the
+    # model step must not change it: every keyframe of the clip gets a score.
+    clip = SyntheticScene(n_frames=40, seed=0)
+    config = PipelineConfig(people=step, landmarks=step)
+    result = run_clip(SyntheticSource(clip), FakeBackend(clip, coords=step.coords), config)
+    assert [check.frame for check in result.paint] == [0, 12, 24, 36, 39]
+    assert all(check.score is not None and check.score > 0.9 for check in result.paint)

@@ -236,7 +236,7 @@ class GatedBackend:
         return truth.generate(request)
 
 
-cli.gemini_backend = lambda max_usd_per_10_min: GatedBackend()
+cli.model_backend = lambda max_usd_per_10_min: GatedBackend()
 cli.render_clip = lambda source, result, out_path: out_path
 sys.exit(cli.main(sys.argv[2:]))
 """
@@ -487,7 +487,7 @@ def use_fake_model(monkeypatch: pytest.MonkeyPatch, scene: SyntheticScene) -> Co
     """
     backend = CountingBackend(FakeBackend(scene))
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: backend)
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: backend)
     return backend
 
 
@@ -665,7 +665,7 @@ def set_up_doctor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def environment_check(repo: Path, name: str, *, api: bool = False) -> doctor.CheckResult:
     """Return one check of the machine for a repository folder."""
-    checks = doctor.environment_checks(repo, key_variable=cli.KEY_VARIABLE, data_dir=repo / "none", api=api)
+    checks = doctor.environment_checks(repo, key_variables=[cli.KEY_VARIABLE], data_dir=repo / "none", api=api)
     return by_name(checks)[name]
 
 
@@ -1612,7 +1612,7 @@ def test_store_flag_fails_for_a_request_that_gives_a_call_without_store_false(
     )
     assert doctor.check_store_flag([request], []).status == "ok"
 
-    monkeypatch.setattr(doctor, "build_interaction_kwargs", lambda request: {"store": True})
+    monkeypatch.setattr("pitchvlm.vlm.client.build_interaction_kwargs", lambda request: {"store": True})
 
     check = doctor.check_store_flag([request], [])
     assert check.status == "fail"
@@ -1707,11 +1707,11 @@ def test_environment_checks_fail_without_the_guard_hook(
     make_repository(repo)
 
     before = by_name(
-        doctor.environment_checks(repo, key_variable=cli.KEY_VARIABLE, data_dir=tmp_path / "none", api=False)
+        doctor.environment_checks(repo, key_variables=[cli.KEY_VARIABLE], data_dir=tmp_path / "none", api=False)
     )
     install_hooks(repo)
     after = by_name(
-        doctor.environment_checks(repo, key_variable=cli.KEY_VARIABLE, data_dir=tmp_path / "none", api=False)
+        doctor.environment_checks(repo, key_variables=[cli.KEY_VARIABLE], data_dir=tmp_path / "none", api=False)
     )
 
     assert before[doctor.HOOK].status == "fail"
@@ -1963,7 +1963,7 @@ def test_environment_checks_never_show_the_value_of_the_key(tmp_path: Path, monk
     hidden = "value-" + "that-must-stay-hidden"
     monkeypatch.setenv(cli.KEY_VARIABLE, hidden)
 
-    checks = doctor.environment_checks(tmp_path, key_variable=cli.KEY_VARIABLE, data_dir=tmp_path, api=True)
+    checks = doctor.environment_checks(tmp_path, key_variables=[cli.KEY_VARIABLE], data_dir=tmp_path, api=True)
 
     assert by_name(checks)[doctor.KEY].status == "ok"
     assert cli.KEY_VARIABLE in by_name(checks)[doctor.KEY].detail
@@ -1973,7 +1973,7 @@ def test_environment_checks_never_show_the_value_of_the_key(tmp_path: Path, monk
 def test_environment_checks_need_the_key_for_model_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(cli.KEY_VARIABLE, raising=False)
 
-    checks = doctor.environment_checks(tmp_path, key_variable=cli.KEY_VARIABLE, data_dir=tmp_path, api=True)
+    checks = doctor.environment_checks(tmp_path, key_variables=[cli.KEY_VARIABLE], data_dir=tmp_path, api=True)
 
     assert by_name(checks)[doctor.KEY].status == "fail"
 
@@ -2539,7 +2539,7 @@ def test_run_with_a_fake_model_and_then_from_the_cache(
         return out_path
 
     monkeypatch.setattr(cli, "render_clip", keep_video_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: FakeBackend(scene))
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: FakeBackend(scene))
     arguments = [
         "run",
         "--clip",
@@ -2587,7 +2587,7 @@ def test_run_with_a_fake_model_and_then_from_the_cache(
     def no_model(max_usd_per_10_min: float) -> FakeBackend:
         raise AssertionError("a replay must not build the model backend")
 
-    monkeypatch.setattr(cli, "gemini_backend", no_model)
+    monkeypatch.setattr(cli, "model_backend", no_model)
 
     assert cli.main([*arguments, "--replay"]) == 0
 
@@ -3058,14 +3058,14 @@ def test_spend_rate_limit_of_the_gate_file_reaches_the_model_backend(
             made.append(options)
 
     monkeypatch.setattr(cli, "GeminiBackend", StandIn)
-    cli.gemini_backend(3.5)
+    cli.model_backend(3.5)
     # The backend also gets the event that a stop signal sets, so that it sends nothing after the signal.
     assert made == [{"api_key_env": "GEMINI_API_KEY", "max_usd_per_10_min": 3.5, "stop": cli.STOP_REQUESTED}]
 
     gates = gates_with(budget={"max_usd_per_10_min": 2.5})
     monkeypatch.setattr(cli, "load_gates", lambda: gates)
     limits: list[float] = []
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: limits.append(max_usd_per_10_min))
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: limits.append(max_usd_per_10_min))
     plan = [("people", StepSettings(), 1)]
     cli.open_session("run", "clip", plan, cache_dir=tmp_path / "cache", replay=False, repeat=0)
     assert limits == [2.5]
@@ -3074,10 +3074,13 @@ def test_spend_rate_limit_of_the_gate_file_reaches_the_model_backend(
 def test_recording_backend_builds_the_sdk_client_with_the_longest_timeout_of_any_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The doctor sends one request through the flex tier, which can wait in a queue for minutes."""
+    """The doctor sends one request through the flex tier, which can wait in a queue for minutes.
+
+    The SDK client is built on the first Gemini call, so a doctor of OpenRouter models needs no Gemini key.
+    """
     built: list[tuple[str, float]] = []
     made: list[dict[str, Any]] = []
-    sdk_client = SimpleNamespace(interactions=None)
+    sdk_client = SimpleNamespace(interactions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace()))
 
     def build(api_key_env: str, timeout_s: float) -> SimpleNamespace:
         built.append((api_key_env, timeout_s))
@@ -3089,14 +3092,16 @@ def test_recording_backend_builds_the_sdk_client_with_the_longest_timeout_of_any
         def __init__(self, **options: Any) -> None:
             made.append(options)
 
-    monkeypatch.setattr(cli, "build_sdk_client", build)
+    monkeypatch.setattr(client_module, "build_sdk_client", build)
     monkeypatch.setattr(cli, "GeminiBackend", StandIn)
 
     backend, recorder = cli.recording_backend(2.5)
 
+    assert built == []
+    recorder.create(model="m", store=False)
     assert built == [("GEMINI_API_KEY", 900.0)]
     assert cli.FLEX_TIMEOUT_S == 900.0 > cli.STANDARD_TIMEOUT_S
-    assert isinstance(backend, StandIn) and isinstance(recorder, doctor.RecordingClient)
+    assert isinstance(backend, client_module.ProviderBackend) and isinstance(recorder, doctor.RecordingClient)
     # The backend gets no timeout of its own: it gives every call the timeout of its service tier.
     # It gets the event that a stop signal sets.
     assert made == [
@@ -3122,7 +3127,7 @@ def test_calls_of_the_recording_backend_get_the_timeout_of_their_service_tier(
         )
 
     sdk_client = SimpleNamespace(interactions=SimpleNamespace(create=create))
-    monkeypatch.setattr(cli, "build_sdk_client", lambda api_key_env, timeout_s: sdk_client)
+    monkeypatch.setattr(client_module, "build_sdk_client", lambda api_key_env, timeout_s: sdk_client)
     backend, recorder = cli.recording_backend(8.0)
     legend, info = contract_scene.kit_legend(), contract_scene.info
     for settings in (StepSettings(), doctor.flex_settings(StepSettings())):
@@ -3680,7 +3685,7 @@ def test_run_ends_with_code_1_when_the_clip_gives_no_result(
     clip_dir = root / "SoccerNetGS-valid" / CLIP_ID
     backend = EditedAnswersBackend(FakeBackend(scene), without_landmarks)
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: backend)
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: backend)
     source = ["--labels", str(clip_dir / LABEL_NAME)] if labelled else ["--fps", "25"]
 
     code = cli.main(run_arguments(clip_dir, tmp_path, *source))
@@ -3943,7 +3948,7 @@ def test_answers_in_flight_are_stored_and_recorded_when_a_run_is_stopped_by_a_si
             return response
 
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: StoppedBackend())
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: StoppedBackend())
 
     code = cli.main(run_arguments(clip_dir, tmp_path, "--fps", "25"))
 
@@ -4017,7 +4022,7 @@ def test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_
 
     monkeypatch.setattr(pipeline, "ThreadPoolExecutor", WatchedPool)
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: StoppedTwiceBackend())
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: StoppedTwiceBackend())
 
     with caplog.at_level(logging.WARNING, logger="pitchvlm.pipeline"):
         code = cli.main(run_arguments(root / "SoccerNetGS-valid" / CLIP_ID, tmp_path, "--fps", "25"))
@@ -4051,7 +4056,7 @@ def test_kit_legend_call_in_flight_is_stored_and_recorded_when_a_run_is_stopped_
     scene, root = clip_on_disk
     backend = SignallingBackend(FakeBackend(scene), at_request=1)
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: backend)
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: backend)
 
     code = cli.main(run_arguments(root / "SoccerNetGS-valid" / CLIP_ID, tmp_path, "--fps", "25"))
 
@@ -4083,7 +4088,7 @@ def test_call_in_flight_of_a_probe_is_stored_and_recorded_when_the_probe_is_stop
     manifest = tmp_path / "splits.json"
     manifest.write_text(json.dumps({"seed": 7, "valid": {"probe": [CLIP_ID]}}), encoding="utf-8")
     backend = SignallingBackend(FakeBackend(scene), at_request=3)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: backend)
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: backend)
     metrics, cache = tmp_path / "people_probe.json", tmp_path / "cache"
     arguments = ["probe", "people", "--experiment", str(EXPERIMENTS / "people_probe.yaml"), "--root", str(root)]
     arguments += ["--manifest", str(manifest), "--out", str(metrics), "--cache", str(cache), "--allow-dirty"]
@@ -4124,7 +4129,7 @@ def test_second_stop_signal_does_not_cut_a_call_in_flight_off(
             return FakeBackend(scene).generate(request)
 
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: StoppedTwice())
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: StoppedTwice())
 
     code = cli.main(run_arguments(root / "SoccerNetGS-valid" / CLIP_ID, tmp_path, "--fps", "25"))
 
@@ -4509,7 +4514,7 @@ def test_run_ends_with_code_2_when_a_model_answer_cannot_be_parsed(
     """The error names the answer in one line. The answer was paid, so its cost is recorded and printed."""
     scene, root = clip_on_disk
     out, cache = tmp_path / "runs", tmp_path / "cache"
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: NotJsonBackend(FakeBackend(scene)))
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: NotJsonBackend(FakeBackend(scene)))
 
     code = cli.main(
         [
@@ -4549,7 +4554,7 @@ def test_run_records_the_cost_of_an_answer_that_was_billed_and_then_rejected(
     scene, root = clip_on_disk
     out, cache = tmp_path / "runs", tmp_path / "cache"
     monkeypatch.setattr(
-        cli, "gemini_backend", lambda max_usd_per_10_min: RejectedAnswerBackend(FakeBackend(scene), "kit_legend")
+        cli, "model_backend", lambda max_usd_per_10_min: RejectedAnswerBackend(FakeBackend(scene), "kit_legend")
     )
 
     code = cli.main(
@@ -4746,7 +4751,7 @@ def test_probe_people_with_a_fake_model_and_then_from_the_cache(
     scene, root = clip_on_disk
     manifest = tmp_path / "splits.json"
     manifest.write_text(json.dumps({"seed": 7, "valid": {"probe": [CLIP_ID]}}), encoding="utf-8")
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: FakeBackend(scene))
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: FakeBackend(scene))
     metrics = tmp_path / "metrics" / "people_probe.json"
     arguments = [
         "probe",
@@ -4802,7 +4807,7 @@ def test_probe_pitch_and_number_with_a_fake_model(
     scene, root = clip_on_disk
     manifest = tmp_path / "splits.json"
     manifest.write_text(json.dumps({"seed": 7, "valid": {"probe": [CLIP_ID]}}), encoding="utf-8")
-    monkeypatch.setattr(cli, "gemini_backend", lambda max_usd_per_10_min: FakeBackend(scene))
+    monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: FakeBackend(scene))
     metrics = tmp_path / f"{kind}_probe.json"
     arguments = [
         "probe",
@@ -4850,7 +4855,7 @@ def test_probe_records_the_cost_of_an_answer_that_was_billed_and_then_rejected(
     manifest = tmp_path / "splits.json"
     manifest.write_text(json.dumps({"seed": 7, "valid": {"probe": [CLIP_ID]}}), encoding="utf-8")
     monkeypatch.setattr(
-        cli, "gemini_backend", lambda max_usd_per_10_min: RejectedAnswerBackend(FakeBackend(scene), "people")
+        cli, "model_backend", lambda max_usd_per_10_min: RejectedAnswerBackend(FakeBackend(scene), "people")
     )
     metrics, cache = tmp_path / "people_probe.json", tmp_path / "cache"
 
@@ -5795,3 +5800,168 @@ def test_sync_refuses_a_folder_outside_git(
     assert cli.main(["sync", "--results", str(results)]) == 2
 
     assert "not inside a git work tree" in capsys.readouterr().err
+
+
+# --- OpenRouter models in the doctor ---------------------------------------------------------------
+
+OPENROUTER_MODEL = "qwen/qwen3-vl-235b-a22b-instruct"
+
+
+def openrouter_settings(coords: str = "xy_1000") -> StepSettings:
+    return StepSettings(provider="openrouter", model=OPENROUTER_MODEL, thinking_level="model_default", coords=coords)
+
+
+@pytest.mark.parametrize("coords", ["yx_1000", "xy_1000", "xy_unit", "xy_pixel"])
+def test_contract_checks_pass_for_a_model_that_answers_in_the_convention_of_its_settings(
+    contract_scene: SyntheticScene, coords: str
+) -> None:
+    result = doctor.contract_checks(FakeBackend(contract_scene, coords=coords), contract_scene, openrouter_settings(coords), LIMITS)
+    checks = by_name(result.checks)
+    assert checks[doctor.BOXES].status == "ok"
+    assert checks[doctor.LANDMARKS].status == "ok"
+    assert checks[doctor.FLEX].status == "info" and "OpenRouter has no flex tier" in checks[doctor.FLEX].detail
+    assert checks[doctor.DATA_POLICY].status == "ok"
+    assert doctor.STORE not in checks and doctor.SERVED_TIER not in checks
+    assert all(answer["reported_usd"] is not None for answer in result.answers)
+
+
+@pytest.mark.parametrize(("answered", "asked"), [("yx_1000", "xy_1000"), ("xy_pixel", "xy_1000"), ("xy_unit", "xy_pixel")])
+def test_contract_checks_fail_for_a_model_that_answers_in_another_convention(
+    contract_scene: SyntheticScene, answered: str, asked: str
+) -> None:
+    """The doctor is the proof of the convention of a model: a wrong one lands no box on a true box."""
+    result = doctor.contract_checks(
+        FakeBackend(contract_scene, coords=answered), contract_scene, openrouter_settings(asked), LIMITS
+    )
+    checks = by_name(result.checks)
+    assert checks[doctor.BOXES].status == "fail"
+    assert checks[doctor.LANDMARKS].status == "fail"
+
+
+def openrouter_http_answer(body: dict[str, Any]) -> client_module.HttpAnswer:
+    return client_module.HttpAnswer(200, json.dumps(body).encode("utf-8"))
+
+
+def test_recording_transport_keeps_the_routing_the_usage_and_the_reported_cost() -> None:
+    answer = {
+        "provider": "Parasail",
+        "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+        "usage": {
+            "prompt_tokens": 1500,
+            "completion_tokens": 400,
+            "total_tokens": 1900,
+            "cost": 0.0011,
+            "completion_tokens_details": {"reasoning_tokens": 100},
+        },
+    }
+    inner = SimpleNamespace(post=lambda url, headers, body, timeout_s: openrouter_http_answer(answer))
+    recorder = doctor.CallRecorder()
+    transport = doctor.RecordingTransport(inner, recorder)
+    sent = {"model": OPENROUTER_MODEL, "provider": dict(client_module.OPENROUTER_ROUTING)}
+
+    transport.post("url", {"Authorization": "Bearer hidden"}, json.dumps(sent).encode("utf-8"), 1.0)
+
+    (call,) = recorder.calls
+    assert call == doctor.RawCall(
+        store=None,
+        sent_tier=None,
+        status="stop",
+        served_tier=None,
+        input_tokens=1500,
+        output_tokens=400,
+        thought_tokens=100,
+        total_tokens=1900,
+        routing=dict(client_module.OPENROUTER_ROUTING),
+        served_by="Parasail",
+        reported_usd=0.0011,
+        model=OPENROUTER_MODEL,
+    )
+    assert "hidden" not in repr(call)
+    usage = doctor.check_usage_sums([call], tolerance=0.01)
+    assert usage.status == "ok" and "1 included" in usage.detail
+    prices = (cli.Price(OPENROUTER_MODEL, datetime(2026, 11, 1).date(), 0.21, 1.90),)
+    cost = doctor.check_reported_cost([call], prices)
+    assert cost.status == "ok" and cost.value == pytest.approx(0.0011)
+    assert "reported cost / cost at the table price" in cost.detail
+    # An answer with an error status is not recorded.
+    failing = SimpleNamespace(post=lambda url, headers, body, timeout_s: client_module.HttpAnswer(503, b"{}"))
+    doctor.RecordingTransport(failing, recorder).post("url", {}, json.dumps(sent).encode("utf-8"), 1.0)
+    assert len(recorder.calls) == 1
+
+
+def test_data_policy_and_reported_cost_fail_for_a_call_that_breaks_them() -> None:
+    call = doctor.RawCall(
+        store=None, sent_tier=None, status="stop", served_tier=None, input_tokens=1, output_tokens=1,
+        thought_tokens=0, total_tokens=2, routing={"zdr": True}, reported_usd=None, model=OPENROUTER_MODEL,
+    )
+    policy = doctor.check_data_policy([], [call])
+    assert policy.status == "fail" and "1 of 1 recorded calls were sent without them" in policy.detail
+    cost = doctor.check_reported_cost([call], ())
+    assert cost.status == "fail" and "1 of 1 answers report no cost" in cost.detail
+
+
+def test_doctor_checks_an_openrouter_model_without_the_gemini_key_and_sdk(
+    private_git: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    contract_scene: SyntheticScene,
+) -> None:
+    repo = set_up_doctor(tmp_path, monkeypatch)
+    shutil.copy(REPO / cli.PRICE_TABLE_FILE, repo / cli.PRICE_TABLE_FILE)
+    monkeypatch.delenv(cli.KEY_VARIABLE)
+    monkeypatch.setenv(client_module.OPENROUTER_KEY_VARIABLE, "not-a-real-value")
+    monkeypatch.setattr(doctor, "installed_sdk_version", lambda: None)
+    recorder = doctor.CallRecorder()
+    backend = FakeBackend(contract_scene, coords="xy_pixel")
+    monkeypatch.setattr(cli, "recording_backend", lambda max_usd_per_10_min: (backend, recorder))
+    report_path = tmp_path / "doctor.json"
+    label = f"openrouter:{OPENROUTER_MODEL}"
+
+    code = cli.main(
+        [
+            "doctor", "--allow-dirty", "--cache", str(tmp_path / "cache"), "--out", str(report_path),
+            "--models", label, "--coords", "xy_pixel", "--thinking-level", "model_default",
+        ]
+    )
+
+    assert code == 0, capsys.readouterr()
+    report = read_json(report_path)
+    assert report["passed"] is True
+    checks = {check["name"]: check["status"] for check in report["contract"][label]["checks"]}
+    assert checks[doctor.BOXES] == checks[doctor.LANDMARKS] == checks[doctor.DATA_POLICY] == "ok"
+    assert len(report["contract"][label]["answers"]) == 6
+    environment = {check["name"]: check for check in report["environment"]}
+    assert environment[doctor.KEY]["status"] == "ok" and "OPENROUTER_API_KEY" in environment[doctor.KEY]["detail"]
+    assert environment[doctor.SDK]["status"] == "info"
+    assert report["provenance"]["coords"] == "xy_pixel"
+    # The ledger prices each answer at the cost that it reports.
+    lines = [json.loads(line) for line in (tmp_path / "cache" / "ledger.jsonl").read_text().splitlines()]
+    assert {line["provider"] for line in lines} == {"openrouter"} and len(lines) == 6
+    assert report["provenance"]["cost"]["measured_usd"] == pytest.approx(sum(line["usd"] for line in lines))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "words"),
+    [
+        (["--models", f"openrouter:{OPENROUTER_MODEL}:free"], "free model"),
+        (["--models", "gemini-4-argon", "--thinking-level", "model_default"], "model_default"),
+        (["--models", "openrouter:not-a-slug"], "slug author/name"),
+    ],
+)
+def test_doctor_refuses_models_that_a_provider_cannot_take(
+    arguments: list[str], words: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["doctor", "--no-api", *arguments]) == 2
+    assert words in capsys.readouterr().err
+
+
+def test_doctor_without_the_api_names_the_keys_of_both_providers(
+    private_git: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_up_doctor(tmp_path, monkeypatch)
+    monkeypatch.delenv(client_module.OPENROUTER_KEY_VARIABLE, raising=False)
+    cli.main(["doctor", "--no-api"])
+    line = next(line for line in capsys.readouterr().out.splitlines() if "API key" in line)
+    assert "[info]" in line
+    assert "the variable OPENROUTER_API_KEY is not set; the variable GEMINI_API_KEY is set" in line

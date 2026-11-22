@@ -37,7 +37,8 @@ CENTRE_MARGIN_M = 30.0
 
 # Paint alignment (``paint_alignment``). Sizes in pixels are given as a share of the image
 # width or height, so that they hold for every image size. The values were chosen on the
-# synthetic clip (``docs/DECISIONS.md``, 2026-11-22); real broadcast frames may need others.
+# synthetic clip (``docs/DECISIONS.md``, entry "Paint alignment of pitch mappings, and hard
+# cuts" of 2026-11-22); real broadcast frames may need others.
 
 #: Side of the square of the white top-hat that finds the paint, as a share of the image
 #: width (17 pixels at 1280). A line that is thinner than the square is kept; a wide bright

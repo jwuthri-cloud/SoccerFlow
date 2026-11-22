@@ -359,13 +359,21 @@ def _people_and_landmarks(
         keyframes, pairs, answers[0::2], answers[1::2], strict=True
     ):
         with _answer_of(people_request):
-            answered = parse_people(people_answer.text, frame=frame, width=info.width, height=info.height)
+            answered = parse_people(
+                people_answer.text, frame=frame, width=info.width, height=info.height, coords=config.people.coords
+            )
         kept = _without_repeated_boxes(answered)
         n_repeated += len(answered.people) - len(kept.people)
         people.append(kept)
         with _answer_of(landmarks_request):
             landmarks.append(
-                parse_landmarks(landmarks_answer.text, frame=frame, width=info.width, height=info.height)
+                parse_landmarks(
+                    landmarks_answer.text,
+                    frame=frame,
+                    width=info.width,
+                    height=info.height,
+                    coords=config.landmarks.coords,
+                )
             )
     if n_repeated:
         logger.warning(
