@@ -1054,6 +1054,12 @@ def test_demo_writes_predictions_summary_and_video(tmp_path: Path, capsys: pytes
     assert summary["checker"] == {"valid": True, "problems": []}
     assert (summary["scored_frames"], summary["scored_frames_without_prediction"]) == (N_FRAMES, 0)
     assert summary["provenance"]["command"] == "demo"
+    # The demo clip has no cut, and every landmark fit lies on the painted lines (diagnostics only).
+    assert summary["cuts"] == []
+    paint = summary["paint_alignment"]
+    assert paint["n_fits"] >= 2
+    assert paint["n_cannot_judge"] == 0
+    assert paint["score"]["median"] > 0.9
 
     if not can_write_video:
         pytest.skip("the installed OpenCV build cannot write the codec mp4v, so the video was not checked")

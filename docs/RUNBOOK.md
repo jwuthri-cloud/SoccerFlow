@@ -468,6 +468,42 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   the PnLCalib clone when it runs. The repository is public since 2026-11-14, and the check of
   what that means is not done: it is an open owner decision (`docs/DECISIONS.md`, last list).
 
+### Paint alignment of the pitch mappings (free)
+
+Every metrics file of the pitch probe and of `tool-score` for PnLCalib has the key
+`paint_alignment` (`docs/DECISIONS.md`, entry "Paint alignment of pitch mappings, and hard cuts" of 2026-11-22): a score from 0 to 1 per valid mapping, how
+well the projected pitch lines lie on the white paint of the frame, and how well the score
+separates the mappings with a median position error above 3 m from those at or below 2 m. It is
+a diagnostic: no rule uses it yet. The measurement needs no model call. It runs on the frames
+of the group `probe` of the split list, which are valid clips only; never run it on test clips.
+
+When the pitch probe ran before this code was there, replay it from the stored answers (free):
+
+```bash
+python -m pitchvlm.cli probe pitch --experiment configs/experiments/pitch_probe.yaml \
+    --root ~/pitchvlm-data --replay --out ../pitchvlm-results/results/metrics/pitch_probe_paint.json
+python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_pnlcalib.yaml \
+    --root ~/pitchvlm-data --run ../pitchvlm-results/results/tools/pitch_probe_pnlcalib.json \
+    --out ../pitchvlm-results/results/metrics/pitch_probe_pnlcalib_paint.json
+```
+
+- Read `paint_alignment.separation` of each file: `auroc`, `auroc_standard_error`, `n_good`,
+  `n_bad`, `score_good` and `score_bad`. Also read `n_cannot_judge` and `cannot_judge_reasons`:
+  a frame with too little paint, or with too much white, gets no score.
+- Write the numbers of both engines into `docs/DECISIONS.md` with the date. The rule that would
+  follow from them is in that file (2026-11-22, item 4); it needs an entry of its own.
+- `paint_alignment.frames` holds one entry per mapping: clip, frame, score and median position
+  error. They are text and go back with the metrics file.
+- The constants of the score were chosen on synthetic frames only. Before the numbers are read,
+  check three things on the first clip: `n_cannot_judge` is small (a large count means that the
+  paint mask misses the lines of real frames), the median score of the good mappings is high,
+  and the score of a frame does not depend on the run (it is deterministic).
+
+`demo` and `run` print the hard cuts of a clip and the median paint score of its landmark fits,
+and the result file of `run` holds both (`cuts`, `paint`). The clips of SoccerNet GSR have no
+cut, so no gate measures the cut test: it guards the demo clip and other broadcast footage. A
+cut that `run` names on a dataset clip is a false cut: tell the owner.
+
 ## 4 First video
 
 ```bash
@@ -985,7 +1021,7 @@ What the guard does not see:
 ## 10 Image models through OpenRouter
 
 Every model step can use an image model of OpenRouter in the place of Gemini
-(`docs/DECISIONS.md`, entry of 2026-11-22). A step names its provider, its model and the
+(`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22). A step names its provider, its model and the
 coordinate convention of that model (`provider`, `model`, `coords` in `configs/default.yaml` and
 in the `step` section of an experiment file). Nothing here ran against the real API before this
 machine: the first check of each model is its doctor run.
@@ -1087,7 +1123,7 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
 - Another OpenRouter model: add its price to `configs/openrouter_prices.yaml` from its model page
   (the highest price of its providers, with the day as `valid_from`), commit, and run its doctor
   first.
-- Video input is not built (`docs/DECISIONS.md`, entry of 2026-11-22).
+- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22, item 7).
 
 What was never tested before this machine, for OpenRouter:
 

@@ -280,6 +280,23 @@ class ClipInfo(Record):
     height: int = Field(gt=0)
 
 
+class PaintCheck(Record):
+    """The paint-alignment score of the landmark fit of one keyframe (``geometry.paint_alignment``).
+
+    ``score`` is in 0 to 1, or None when the frame cannot judge a mapping; ``reason`` then says why.
+    """
+
+    frame: int = Field(ge=0)
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _check_reason(self) -> PaintCheck:
+        if (self.score is None) == (self.reason is None):
+            raise ValueError("a paint check has either a score or a reason why the frame cannot judge")
+        return self
+
+
 class ClipResult(Record):
     """Everything the pipeline produced for one clip."""
 
@@ -290,3 +307,7 @@ class ClipResult(Record):
     #: Which engine did each step, e.g. {"people": "model:gemini-4-argon", "tracks": "code"}.
     #: A dict can be changed in place although the record is frozen: read it, do not edit it.
     engines: dict[str, str] = Field(default_factory=dict)
+    #: The frames that start a new shot (hard cuts), in increasing order.
+    cuts: tuple[int, ...] = ()
+    #: The paint-alignment score of every landmark fit, in keyframe order. A diagnostic only.
+    paint: tuple[PaintCheck, ...] = ()
