@@ -333,7 +333,7 @@ def parse_exact_people(scene: SyntheticScene, frame: int) -> tuple[PersonDet, ..
         scene.image(frame), scene.kit_legend(), clip_id=scene.info.clip_id, frame=frame, settings=StepSettings()
     )
     answer = FakeBackend(scene).generate(request).text
-    return pipeline.parse_people(answer, frame=frame, width=scene.info.width, height=scene.info.height).people
+    return pipeline.parse_people(answer, frame=frame, width=scene.info.width, height=scene.info.height, coords="yx_1000").people
 
 
 def images_of(request: VLMRequest) -> list[ImagePart]:

@@ -1,0 +1,32 @@
+# Prices of the models that the pipeline may call through OpenRouter, in USD per million tokens.
+# They give the cost estimate before a run (src/pitchvlm/vlm/cost.py, load_price_table). The cost of a
+# call that was made is the cost that the API reports, and the cost ledger takes that one.
+# A model that is not in this file has no estimate, so a run that uses it does not start.
+# Only paid models: a price must be above 0, and a slug with the suffix ":free" is refused.
+#
+# A model can have several providers behind OpenRouter, each with its own price, and the routing
+# settings choose one of them (zero data retention, no data collection, no fallback). So each entry is
+# the highest price that the model page showed for any of its providers, on the day of valid_from
+# (published, not measured). Add a new entry with a new valid_from when a price changes; never edit
+# an old entry. Compare with the reported cost after the first doctor check (docs/RUNBOOK.md, section 10).
+models:
+  # Page https://openrouter.ai/qwen/qwen3-vl-235b-a22b-instruct, read on 2026-11-22: 0.20 / 0.88,
+  # 0.21 / 1.90 and 0.21 / 1.90 for its three providers.
+  - model: qwen/qwen3-vl-235b-a22b-instruct
+    prices:
+      - valid_from: 2026-11-22
+        input_usd_per_million: 0.21
+        output_usd_per_million: 1.90
+  # Page https://openrouter.ai/qwen/qwen2.5-vl-72b-instruct, read on 2026-11-22: 0.80 / 1.00, one provider.
+  - model: qwen/qwen2.5-vl-72b-instruct
+    prices:
+      - valid_from: 2026-11-22
+        input_usd_per_million: 0.80
+        output_usd_per_million: 1.00
+  # Page https://openrouter.ai/google/gemini-2.5-flash, read on 2026-11-22: 0.15 / 1.25, 0.30 / 2.50 and
+  # 0.54 / 4.50 for its endpoints.
+  - model: google/gemini-2.5-flash
+    prices:
+      - valid_from: 2026-11-22
+        input_usd_per_million: 0.54
+        output_usd_per_million: 4.50

@@ -33,6 +33,9 @@ policies.google.com
 cloud.google.com
 docs.cloud.google.com
 
+# OpenRouter: its API and its documentation
+openrouter.ai
+
 # Documentation
 docs.astral.sh
 docs.opencv.org

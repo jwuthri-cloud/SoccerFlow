@@ -1,0 +1,16 @@
+# The people probe of gate G2 with an image model through OpenRouter, on the frames of people_probe.yaml
+# (same group, same seed, same frames per clip). Run it only after the doctor check of this model passed
+# with the same coordinate convention (docs/RUNBOOK.md, section 10).
+name: people_probe_openrouter
+probe: people
+group: probe
+frames_per_clip: 5
+seed: 20261113
+repeat: 0
+step:
+  provider: openrouter
+  model: qwen/qwen3-vl-235b-a22b-instruct
+  thinking_level: model_default
+  resolution: high
+  service_tier: standard
+  coords: xy_1000
