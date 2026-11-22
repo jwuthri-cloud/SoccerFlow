@@ -396,7 +396,35 @@ def test_identity_scores_of_the_truth_itself_are_perfect() -> None:
 
     scores = identity_scores(truth, truth)
 
-    assert (scores.coverage, scores.switches, scores.track_ratio) == (1.0, 0, 1.0)
+    assert (scores.coverage, scores.switches, scores.track_ratio, scores.purity) == (1.0, 0, 1.0, 1.0)
+
+
+def test_identity_purity_is_the_mean_share_of_a_predicted_id_that_one_true_track_covers() -> None:
+    pred, truth = identity_case()
+
+    scores = identity_scores(pred, truth)
+
+    # Ids 5, 6 and 7 follow one true track each; id 8 is matched in no frame and does not count.
+    assert scores.purity == 1.0
+
+
+def test_identity_purity_sees_a_predicted_id_that_follows_two_people_one_after_the_other() -> None:
+    # True person 1 is seen in frames 0 to 2, true person 2 in frames 3 and 4. One predicted id
+    # follows both: a wrong join. Coverage, switches and track ratio do not see it.
+    truth = [state(frame, (1, 0.0, 0.0)) for frame in range(3)] + [state(frame, (2, 30.0, 0.0)) for frame in (3, 4)]
+    pred = [state(frame, (5, 0.0, 0.0)) for frame in range(3)] + [state(frame, (5, 30.0, 0.0)) for frame in (3, 4)]
+
+    scores = identity_scores(pred, truth)
+
+    assert (scores.coverage, scores.switches, scores.track_ratio) == (1.0, 0, 0.5)
+    assert scores.purity == pytest.approx(3 / 5)
+
+
+def test_identity_purity_without_a_matched_prediction_is_nan() -> None:
+    truth = [state(0, (1, 0.0, 0.0))]
+    pred = [state(0, (5, 40.0, 30.0))]
+
+    assert math.isnan(identity_scores(pred, truth).purity)
 
 
 def test_identity_scores_do_not_depend_on_the_order_of_the_predicted_people() -> None:

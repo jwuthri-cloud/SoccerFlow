@@ -83,6 +83,33 @@ def test_default_tracking_limits() -> None:
     assert tracking.max_stitch_gap_s == 3.0
     assert tracking.stitch_speed_mps == 4.0
     assert tracking.min_observations == 2
+    # The two track repairs are arms of gate G4: off until G4 has measured them.
+    assert tracking.split_team_swaps is False
+    assert tracking.team_slots is False
+
+
+ARMS_FOLDER = Path(__file__).resolve().parents[1] / "configs" / "arms"
+
+
+@pytest.mark.parametrize(
+    ("name", "split_team_swaps", "team_slots"),
+    [
+        ("g4_split_team_swaps.yaml", True, False),
+        ("g4_team_slots.yaml", False, True),
+        ("g4_both_repairs.yaml", True, True),
+    ],
+)
+def test_each_arm_of_gate_g4_changes_only_its_track_repairs(name: str, split_team_swaps: bool, team_slots: bool) -> None:
+    """An arm file is the default settings with its repairs switched on, and nothing else."""
+    config = load_config(ARMS_FOLDER / name)
+    repairs = {"split_team_swaps": split_team_swaps, "team_slots": team_slots}
+    expected = PipelineConfig().model_copy(update={"tracking": TrackingConfig(**repairs)})
+    assert config == expected
+
+
+def test_the_arms_folder_holds_the_three_arms_of_gate_g4() -> None:
+    names = sorted(path.name for path in ARMS_FOLDER.iterdir())
+    assert names == ["g4_both_repairs.yaml", "g4_split_team_swaps.yaml", "g4_team_slots.yaml"]
 
 
 def test_default_interval_gives_64_keyframes_for_a_30_second_clip() -> None:

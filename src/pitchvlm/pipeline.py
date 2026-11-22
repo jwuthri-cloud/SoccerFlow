@@ -53,7 +53,14 @@ from pitchvlm.schemas import (
     Track,
     TrackObs,
 )
-from pitchvlm.tracking import PitchMap, associate, finalize_tracks, stitch_fragments, vote_role_team
+from pitchvlm.tracking import (
+    PitchMap,
+    associate,
+    finalize_tracks,
+    split_team_swaps,
+    stitch_fragments,
+    vote_role_team,
+)
 from pitchvlm.vlm.steps import (
     ParseError,
     build_kit_legend_request,
@@ -166,6 +173,7 @@ def run_clip(
         to_pitch=to_pitch,
         config=config.tracking,
         roster=roster,
+        cuts=field.cuts,
     )
     frames = dense_frame_states(
         decided,
@@ -641,7 +649,9 @@ def _tracks(
     answer, the tracks end and the joins of ``stitch_fragments`` connect them again.
     Each shot of ``motion`` is tracked on its own, so no position links two people
     across a cut. The ids are 0..n-1 in the order of the shots and, inside a shot,
-    in the order of the first frame.
+    in the order of the first frame. With ``config.split_team_swaps`` a track is first
+    cut where it took over a person of the other team (``tracking.split_team_swaps``),
+    and the joins of its shot link the pieces.
     """
     shots: dict[int, list[FramePeople]] = {}
     for frame_people in people:
@@ -649,6 +659,8 @@ def _tracks(
     tracks: list[Track] = []
     for shot in sorted(shots):
         fragments = associate(shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config)
+        if config.split_team_swaps:
+            fragments = split_team_swaps(fragments)
         for track in stitch_fragments(fragments, fps=fps, to_pitch=to_pitch, config=config):
             tracks.append(track.model_copy(update={"track_id": len(tracks)}))
     return tracks

@@ -318,7 +318,8 @@ def goal_side(mean_x: float | None) -> TeamSide | None   # the goal zone that a 
 def decide_number(reading: NumberReading | None, frame_numbers: Sequence[int | None]) -> tuple[int | None, int | None]
 def finalize_tracks(tracks: Sequence[Track], *, readings: Mapping[int, NumberReading],
                     mean_pitch_x: Mapping[int, float], fps: float, to_pitch: PitchMap,
-                    config: TrackingConfig = TrackingConfig(), roster: Roster | None = None) -> list[Track]
+                    config: TrackingConfig = TrackingConfig(), roster: Roster | None = None,
+                    cuts: Sequence[int] = ()) -> list[Track]
 ```
 
 - `associate`: Hungarian matching (`scipy.optimize.linear_sum_assignment`) between consecutive
@@ -387,6 +388,71 @@ def finalize_tracks(tracks: Sequence[Track], *, readings: Mapping[int, NumberRea
   one track when they have the same role and both pitch positions are known: one person who
   was out of the image. The track has the id and the place of the earliest fragment. So the
   result can have fewer tracks than the input.
+
+Track repairs (2026-11-22). Both are arms of gate G4 and are off by default
+(`TrackingConfig.split_team_swaps`, `TrackingConfig.team_slots`, both `False`); the default
+behaviour above does not change until G4 has measured them (`docs/DECISIONS.md`, 2026-11-22).
+
+```python
+SWAP_MIN_VOTES = 4                 # votes for its own key that a run of one team key needs (estimate)
+SWAP_CONTACT_BOX_HEIGHTS = 1.0     # contact at a team-key change, foot points in box heights (estimate)
+TEAM_SLOTS = {"player": 10, "goalkeeper": 1}   # people of one team side and role in a clip
+@dataclass(frozen=True)
+class TeamRun: team_key: TeamKey; start: int; stop: int    # observations[start:stop]
+def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]
+def split_team_swaps(tracks: Sequence[Track]) -> list[Track]
+def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
+                    config: TrackingConfig = TrackingConfig(), cuts: Sequence[int] = ()) -> list[Track]
+```
+
+- `team_key_runs`: the observations with the key `A` or `B` vote; votes in a row with one key
+  are a run, and the strength of a run is its number of votes for its own key. While a run is
+  weaker than `SWAP_MIN_VOTES`, the weakest run (the first in a tie) takes the key of its
+  neighbours and joins them. So each change between two runs left is a change of the team key
+  that held for 4 votes on both sides. One run left gets the key of most votes (`A` in a tie).
+  A run starts at the first vote of its key; the first run starts at observation 0 and the last
+  ends at the last observation; `none` belongs to the run it lies in. No vote gives `[]`.
+- `split_team_swaps` (before `stitch_fragments`, in `pipeline._tracks` when
+  `split_team_swaps` is on, in each shot on its own like `associate` and `stitch_fragments`): a track of a player or a goalkeeper is cut at the first vote of a
+  run when, at that change, a person of the other team was in contact with it. The change spans
+  the observations from the last vote of the run before to the first vote of the run after.
+  Contact: in the frame of one of them, an observation of another track at most
+  `SWAP_CONTACT_BOX_HEIGHTS` box heights away (foot points, mean height of the two boxes), whose
+  run has the other key than the run of this track there. The pieces are fragments with ids
+  0..n-1 in the order of the first frame; the joins of `stitch_fragments` link each with the
+  tracks of its own team. Limits: a swap of two teammates shows no change; a change with fewer
+  than 4 votes on a side (a swap just before a track ends) is not seen; a model that names the
+  wrong team for seconds next to an opponent gives a wrong cut, and the two pieces are not joined
+  again.
+- `link_team_slots` (at the end of `finalize_tracks` when `team_slots` is on; the tracks need
+  their votes, side and numbers): the tracks of a player or a goalkeeper with a team side form
+  one group per (side, role). The rule holds over the whole clip, not per frame, because the
+  camera shows a part of the pitch: a group with `n` tracks and `s` slots holds at least `n - s`
+  later parts of other tracks of the group. Two tracks can be linked when the earlier one ends
+  before the later one starts, they show no different displayed numbers and no different most
+  frequent per-frame numbers, both pitch positions (end of the earlier, start of the later) are
+  known, and their distance is at most `max_speed_mps * dt + reach_margin_m`. The links are
+  taken by distance (then time gap, then ids), each track with at most one earlier and one
+  later link, until the group holds `s` tracks or no link is left; a group with `s` tracks or
+  fewer does not change. A chain becomes one track with the id and place of its earliest track,
+  all observations, the team key voted over them, and the numbers of its longest track with a
+  displayed number (else of its longest track); the name is set later. Limits: the distance is
+  the only evidence, so two players who come back where the other one left are linked the wrong
+  way; a substitution or a red card adds people to a side. The slots are not used in
+  `stitch_fragments`: the joins run before the shirt numbers are read, and a slot link there
+  could weld two players whose numbers `finalize_tracks` would tell apart. Hard cuts (`cuts`,
+  the frames that start a new shot; `finalize_tracks` passes them on, `run_clip` gives
+  `MotionField.cuts`): no slot link crosses a cut (the later track must start in the shot where
+  the earlier one ends), and the count holds per shot: `n` is the number of tracks of the group
+  with an observation in that shot, and a shot gets at most `n - s` links. Without a cut the
+  clip is one shot. Cuts out of order raise `ValueError`.
+- `stitch_fragments` was reviewed against the failure "a wide gate welds two players" with two
+  cases (`tests/test_tracking.py`, section "Stitching gates"): two teammates who cross while both
+  are hidden are not welded (the rival rule refuses both joins, also when one comes back a
+  keyframe later); a teammate who enters where a player left is joined when the player does
+  not come back within the stitch time and nothing else tells them apart (a limit of the data,
+  no gate change), and is not joined when the player comes back while the teammate is in view
+  or when the numbers differ. No gate was tightened.
 
 ### `roster.py`
 
@@ -830,7 +896,7 @@ def detection_scores(pred: Sequence[FramePeople], truth: Sequence[FramePeople], 
 def foot_errors_m(pred, truth, to_pitch: PitchMap, *, iou_threshold: float = 0.5) -> np.ndarray
 def position_errors_m(pred: Sequence[FrameState], truth: Sequence[FrameState], *, max_match_m: float = 10.0) -> np.ndarray
 @dataclass(frozen=True)
-class IdentityScores: coverage: float; switches: int; track_ratio: float
+class IdentityScores: coverage: float; switches: int; track_ratio: float; purity: float
 def identity_scores(pred: Sequence[FrameState], truth: Sequence[FrameState], *, max_match_m: float = 5.0) -> IdentityScores
 def number_exact_match(pred: Mapping[int, int | None], truth: Mapping[int, int | None]) -> float
 def summarize(values: np.ndarray) -> dict[str, float]       # n, median, p90, mean
@@ -868,6 +934,10 @@ def run_trackeval(...same arguments..., output_dir: Path,
 - `identity_scores`: `coverage` = mean over truth tracks of the largest share of the track covered
   by one predicted id; `switches` = id changes along truth tracks; `track_ratio` = predicted
   tracks / truth tracks.
+- `identity_scores` also gives `purity` (2026-11-22): the mean over the predicted ids that are
+  matched in a frame of the largest share of their matched frames that one truth track covers.
+  The three values of gate G4 do not see a predicted id that follows two people one after the
+  other (a wrong join); `purity` does. No gate uses it.
 - `t_interval` raises `ValueError` for an empty sequence, for a value that is not finite and for
   a confidence outside 0 to 1.
 - `resample_states` keeps the truth at `keyframes` and interpolates linearly in pitch space
@@ -914,6 +984,51 @@ def run_trackeval(...same arguments..., output_dir: Path,
   path that is typed in another letter case gives the commit too.
 - The wrapper was never run with the real evaluator. The points above were read in the source
   of `sn-trackeval`; the first `oracle` run on the run machine confirms them (RUNBOOK, section 8).
+
+`evalx/diagnostics.py` and `evalx/trackbench.py` (2026-11-22):
+
+```python
+# diagnostics.py: tracking values without labels; no gate uses them
+BORDER_BOX_HEIGHTS = 1.0
+@dataclass(frozen=True)
+class TeamCounts: ids: int; max_alive: int; max_seen: int; keyframes_over_slots: int
+@dataclass(frozen=True)
+class TrackDiagnostics: tracks: int; births_inside: int; ends_inside: int; steps: int
+                        impossible_steps: int; max_speed_mps: float; top_speed_mps: dict[str, float]
+                        team_changes: int; tracks_with_team_change: int; teams: dict[str, TeamCounts]
+                        alive_per_keyframe: tuple[tuple[int, int, int], ...]
+    def as_dict(self) -> dict[str, object]
+    def lines(self) -> list[str]
+def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagnostics
+
+# trackbench.py: synthetic bench of the track repairs (python -m pitchvlm.evalx.trackbench)
+FAULTS = ("none", "swap", "team_noise", "occlusion", "mixed")
+ARMS = {"current": ..., "swaps": ..., "slots": ..., "both": ...}   # TrackingConfig per arm
+@dataclass(frozen=True)
+class CaseResult: fault: str; seed: int; arm: str; scores: IdentityScores; tracks: int; swaps: int
+def run_case(fault: str, seed: int, *, n_frames: int = 750) -> list[CaseResult]
+def table_lines(results: Sequence[CaseResult]) -> list[str]
+```
+
+- `track_diagnostics` reads a `ClipResult` only. A birth (an end) inside is a track that starts
+  after the first (ends before the last) observation of its shot (`ClipResult.cuts`) with its box more than one box
+  height from every image border. A step is the way between two `observed` states of one track
+  (keyframes, not filled frames) inside one shot, in metres per second; steps above `max_speed_mps` (the
+  tracking setting) are counted, and `top_speed_mps` summarises the top speed of each track
+  (`summarize`). Team-key changes are counted with `tracking.team_key_runs` on the tracks of
+  players and goalkeepers. Per team key `A` and `B`: the ids, the most tracks alive (between
+  their first and last observation) and seen at one keyframe, and the keyframes with more alive
+  than 11; `alive_per_keyframe` is the series. `max_speed_mps` must be a finite number above 0.
+- `run` writes the values into `result.json` under `diagnostics` and prints `lines()`; `demo`
+  writes them into `summary.json` under `diagnostics` and prints them.
+- `run_case` runs every arm on one synthetic case: exact answers without per-frame numbers,
+  true camera motion and pitch mappings, a confident number reading for the people of a random
+  half of the scene, and one fault: `none`, `swap` (the tracks of two players of different teams
+  at most one box height apart exchange their later observations, up to two per clip, after
+  `associate`), `team_noise` (10 % of the answers of players and goalkeepers name the other
+  team, 10 % no team), `occlusion` (4 players missing for 2.4 to 4.8 s each), `mixed` (all).
+  The seed fixes the scene and the faults. `table_lines` gives the means per fault and arm and
+  the paired differences against `current` with 95 % t intervals.
 
 ### `render.py`
 
@@ -1076,6 +1191,9 @@ Output files of the command line:
 - `demo` writes `summary.json` with the position error, the identity values (coverage, switches,
   track ratio), the verdict of the format checker and the same two frame counts. It follows the
   same rule for the exit code 1.
+- `run` and `demo` also write and print the tracking values without labels
+  (`evalx.diagnostics`): `result.json` and `summary.json` hold them under `diagnostics`
+  (2026-11-22). The identity values of `summary.json` hold `purity` too.
 - `oracle` writes `oracle.json`. Its part `team_side_rule` holds the share of clips where the
   rule of the pipeline is right (the value of gate G1), the share where the players alone are
   right, the clips that the goalkeepers decided, and the `TeamSideFacts` of every clip.

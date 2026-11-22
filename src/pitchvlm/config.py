@@ -143,6 +143,12 @@ class TrackingConfig(Record):
     stitch_speed_mps: float = Field(default=4.0, gt=0, allow_inf_nan=False)
     #: Tracks with fewer observations are dropped before fragments are joined.
     min_observations: int = Field(default=2, ge=1)
+    #: Arm of gate G4: split a track where its team key flips and stays flipped next to a person of
+    #: the other team, before fragments are joined (``tracking.split_team_swaps``). Off until G4 has measured it.
+    split_team_swaps: bool = False
+    #: Arm of gate G4: link the tracks of a team side when the clip has more of them than a team has
+    #: people (``tracking.TEAM_SLOTS``), in ``tracking.finalize_tracks``. Off until G4 has measured it.
+    team_slots: bool = False
 
 
 class PipelineConfig(Record):

@@ -163,6 +163,8 @@ class IdentityScores:
     switches: int
     #: Number of predicted tracks divided by the number of true tracks.
     track_ratio: float
+    #: Mean over the predicted ids of the largest share of their matched frames that one true track covers.
+    purity: float
 
 
 def identity_scores(
@@ -181,6 +183,12 @@ def identity_scores(
       skipped, so a gap alone is not a switch.
     - ``track_ratio``: the number of predicted ids seen in the true frames,
       divided by the number of true tracks.
+    - ``purity``: for each predicted id that is matched in at least one frame,
+      the largest number of its matched frames that one true track covers,
+      divided by the number of its matched frames; then the mean over these
+      ids. The three values above do not see a predicted id that follows two
+      people one after the other (a wrong join): this value does. No gate
+      uses it.
 
     ``max_match_m`` must be a finite number of 0 or more, else ``ValueError`` is raised.
     """
@@ -189,6 +197,8 @@ def identity_scores(
     truth_by_frame = _by_frame(truth, "truth")
     #: True track id -> predicted id in each frame of the track, in frame order.
     followed: dict[int, list[int | None]] = {}
+    #: Predicted id -> true id in each frame in which the predicted id is matched.
+    covered: dict[int, list[int]] = {}
     pred_ids: set[int] = set()
     for frame in sorted(truth_by_frame):
         true_players = truth_by_frame[frame].players
@@ -198,11 +208,15 @@ def identity_scores(
         partner = {true_index: pred_players[pred_index].track_id for pred_index, true_index, _ in pairs}
         for true_index, player in enumerate(true_players):
             followed.setdefault(player.track_id, []).append(partner.get(true_index))
+        for pred_index, true_index, _ in pairs:
+            covered.setdefault(pred_players[pred_index].track_id, []).append(true_players[true_index].track_id)
     shares = [_largest_share(ids) for ids in followed.values()]
+    purities = [_largest_share(ids) for ids in covered.values()]
     return IdentityScores(
         coverage=sum(shares) / len(shares) if shares else math.nan,
         switches=sum(_switches(ids) for ids in followed.values()),
         track_ratio=_share(len(pred_ids), len(followed)),
+        purity=sum(purities) / len(purities) if purities else math.nan,
     )
 
 
@@ -307,7 +321,7 @@ def _match_positions(
 
 
 def _largest_share(ids: Sequence[int | None]) -> float:
-    """Return the share of the frames of a true track that its most frequent predicted id covers."""
+    """Return the share of the frames of a track that its most frequent partner id covers. None is no id."""
     counts = Counter(track_id for track_id in ids if track_id is not None)
     return max(counts.values(), default=0) / len(ids)
 

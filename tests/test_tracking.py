@@ -38,6 +38,9 @@ from pitchvlm.schemas import (
 from pitchvlm.synth import SyntheticScene
 from pitchvlm.tracking import (
     GOAL_ZONE_MIN_X_M,
+    SWAP_CONTACT_BOX_HEIGHTS,
+    SWAP_MIN_VOTES,
+    TEAM_SLOTS,
     TWO_PEOPLE_MARGIN_M,
     PitchMap,
     assign_team_sides,
@@ -45,7 +48,10 @@ from pitchvlm.tracking import (
     decide_number,
     finalize_tracks,
     goal_side,
+    link_team_slots,
+    split_team_swaps,
     stitch_fragments,
+    team_key_runs,
     vote_role_team,
 )
 
@@ -1980,3 +1986,465 @@ def test_long_clip_gives_one_id_per_person_within_the_identity_gate() -> None:
     assert all(player.number_display is not None for player in team_states)
     # No state for a person whose box is outside the image: at most a handful more states than the truth has.
     assert sum(len(state.players) for state in states) <= sum(len(state.players) for state in truth)
+
+
+# --- Stitching gates: two people of one team -----------------------------------------
+
+
+def moving_track(
+    track_id: int, keyframes: Sequence[int], x: float, step_px: float, *, y: float = 400.0, team_key: TeamKey = "A"
+) -> Track:
+    """Make a track of a player who moves ``step_px`` pixels along x per keyframe, from the image point (x, y)."""
+    first = keyframes[0]
+    observations = tuple(
+        TrackObs(frame=k * STEP, box=person(x + step_px * (k - first), y).box, role="player", team_key=team_key)
+        for k in keyframes
+    )
+    return Track(track_id=track_id, observations=observations)
+
+
+@pytest.mark.parametrize("second_return", [9, 10])
+def test_stitch_does_not_weld_two_teammates_who_cross_while_both_are_hidden(second_return: int) -> None:
+    # Two players of team A run towards each other, 1 m per keyframe, and are both lost where they
+    # meet (frame 48). They are seen again 2.4 s later, each on the far side of the meeting point.
+    # Both later fragments are in the reach of both earlier ones. A gate of reach alone would weld
+    # each earlier fragment to the nearest later one; the rival rule makes no join, because the two
+    # later fragments are in the image at the same time, also when one comes back a keyframe later.
+    first = moving_track(0, range(0, 5), 300.0, 20.0)
+    second = moving_track(1, range(0, 5), 460.0, -20.0, y=410.0)
+    first_back = moving_track(2, range(9, 14), 460.0, 20.0)
+    second_back = moving_track(3, range(second_return, second_return + 5), 300.0, -20.0, y=410.0)
+
+    tracks = stitch_fragments([first, second, first_back, second_back], **ON_THE_FLAT_PITCH)
+
+    assert len(tracks) == 4
+
+
+def test_a_teammate_who_enters_where_a_player_left_is_joined_when_nothing_tells_them_apart() -> None:
+    # A limit, not a wanted result. A player leaves the image at the right border (frame 48), and a
+    # teammate enters there 1.44 s later. Role, team, place and time all fit one person who stepped
+    # out and came back, so the join is made: the data of the tracks cannot tell the two cases apart.
+    leaving = moving_track(0, range(0, 5), 1190.0, 20.0)
+    entering = moving_track(1, range(7, 12), 1265.0, -20.0)
+
+    tracks = stitch_fragments([leaving, entering], **ON_THE_FLAT_PITCH)
+
+    assert len(tracks) == 1
+
+
+def test_a_teammate_who_enters_where_a_player_left_is_not_joined_when_the_player_comes_back() -> None:
+    # As above, but the player comes back 2 s after leaving, while the teammate is still in the
+    # image: two candidates at the same time are two people, so neither is joined.
+    leaving = moving_track(0, range(0, 5), 1190.0, 20.0)
+    entering = moving_track(1, range(7, 12), 1265.0, -20.0)
+    back = moving_track(2, range(9, 13), 1268.0, -20.0)
+
+    tracks = stitch_fragments([leaving, entering, back], **ON_THE_FLAT_PITCH)
+
+    assert len(tracks) == 3
+
+
+def test_a_teammate_who_enters_where_a_player_left_is_not_joined_when_the_numbers_differ() -> None:
+    leaving = still_track(0, [0, 12, 24], 1250.0, number=7)
+    entering = still_track(1, [48, 60, 72], 1255.0, number=11)
+
+    assert len(stitch_fragments([leaving, entering], **ON_THE_FLAT_PITCH)) == 2
+
+
+# --- Team-key runs ------------------------------------------------------------------------
+
+
+def keyed_observations(keys: str) -> tuple[TrackObs, ...]:
+    """Make the observations of a still player whose team keys are the letters of ``keys``: a, b or . (none)."""
+    names: dict[str, TeamKey] = {"a": "A", "b": "B", ".": "none"}
+    box = person(400.0, 400.0).box
+    return tuple(
+        TrackObs(frame=index * STEP, box=box, role="player", team_key=names[letter])
+        for index, letter in enumerate(keys)
+    )
+
+
+def runs_of(keys: str) -> list[tuple[TeamKey, int, int]]:
+    """Return the runs of the team keys ``keys`` as (team key, start, stop)."""
+    return [(run.team_key, run.start, run.stop) for run in team_key_runs(keyed_observations(keys))]
+
+
+def test_swap_needs_four_votes_on_each_side() -> None:
+    assert SWAP_MIN_VOTES == 4
+
+
+@pytest.mark.parametrize(
+    ("keys", "runs"),
+    [
+        ("aaaaaa", [("A", 0, 6)]),
+        ("....", []),
+        ("aaaaaabaaaaaa", [("A", 0, 13)]),  # one wrong answer is no change
+        ("aaaaabbbb", [("A", 0, 5), ("B", 5, 9)]),  # four votes after the change are enough
+        ("aaaaabbb", [("A", 0, 8)]),  # three are not
+        ("aaaabbbbaaaa", [("A", 0, 4), ("B", 4, 8), ("A", 8, 12)]),  # a swap and a swap back
+        (".aaaa.bbbb.", [("A", 0, 6), ("B", 6, 11)]),  # "none" lies in the run it is in
+        ("baaaaaabbbbb", [("A", 0, 7), ("B", 7, 12)]),  # a wrong first answer joins the first run
+        ("aaaabaabbbb", [("A", 0, 7), ("B", 7, 11)]),  # the change is at the first vote of the last run
+        ("abababab", [("A", 0, 8)]),  # no key holds: one run, with the first key of a tie
+        ("bbbbbbaababbbbbb", [("B", 0, 16)]),  # a run of three a with one b inside is not four votes
+    ],
+)
+def test_team_key_runs_drop_the_wrong_answers_of_the_model(keys: str, runs: list[tuple[TeamKey, int, int]]) -> None:
+    assert runs_of(keys) == runs
+
+
+def test_team_key_runs_cover_every_observation_once() -> None:
+    keys = ".aa.aab.bbbb..abb.aaaa"
+    runs = runs_of(keys)
+    assert runs[0][1] == 0
+    assert runs[-1][2] == len(keys)
+    assert all(earlier[2] == later[1] for earlier, later in zip(runs, runs[1:]))
+
+
+# --- Split of team swaps ------------------------------------------------------------------
+
+
+def track_of(track_id: int, observations: Sequence[TrackObs]) -> Track:
+    """Make a track of some observations."""
+    return Track(track_id=track_id, observations=tuple(observations))
+
+
+def walker(frames: Sequence[int], x: float, step_px: float, team_key: TeamKey, *, y: float = 400.0) -> list[TrackObs]:
+    """Return the observations of a player who moves ``step_px`` along x per keyframe from (x, y), in ``frames``."""
+    return [
+        TrackObs(frame=frame, box=person(x + step_px * index, y).box, role="player", team_key=team_key)
+        for index, frame in enumerate(frames)
+    ]
+
+
+def crossing_swap() -> tuple[Track, Track]:
+    """Return the two tracks of a player of team A and one of team B that meet at keyframe 4 and swap there.
+
+    The player of team A runs to the right on the row y = 400, the player of
+    team B to the left on the row y = 420, 2 m per keyframe each. At keyframe
+    4 both are at x = 460, 20 px apart (half a box height). From there on the
+    first track follows the player of team B and the second the player of A.
+    """
+    frames = [k * STEP for k in range(9)]
+    player_a = walker(frames, 300.0, 40.0, "A")
+    player_b = walker(frames, 620.0, -40.0, "B", y=420.0)
+    return track_of(0, player_a[:4] + player_b[4:]), track_of(1, player_b[:4] + player_a[4:])
+
+
+def test_a_track_that_took_over_a_person_of_the_other_team_is_cut_at_the_change() -> None:
+    first, second = crossing_swap()
+
+    pieces = split_team_swaps([first, second])
+
+    assert [frames_of(piece) for piece in pieces] == [
+        [0, 12, 24, 36],
+        [0, 12, 24, 36],
+        [48, 60, 72, 84, 96],
+        [48, 60, 72, 84, 96],
+    ]
+    assert [vote_role_team(piece)[1] for piece in pieces] == ["A", "B", "B", "A"]
+    assert [piece.track_id for piece in pieces] == [0, 1, 2, 3]
+
+
+def test_the_joins_link_the_pieces_of_a_swap_with_their_own_team() -> None:
+    first, second = crossing_swap()
+
+    as_before = stitch_fragments([first, second], **ON_THE_FLAT_PITCH)
+    repaired = stitch_fragments(split_team_swaps([first, second]), **ON_THE_FLAT_PITCH)
+
+    # Without the cut each track holds two people; with it, each track holds one runner.
+    assert [feet_x_of(track) for track in as_before] == [
+        [300.0, 340.0, 380.0, 420.0, 460.0, 420.0, 380.0, 340.0, 300.0],
+        [620.0, 580.0, 540.0, 500.0, 460.0, 500.0, 540.0, 580.0, 620.0],
+    ]
+    assert [feet_x_of(track) for track in repaired] == [
+        [300.0, 340.0, 380.0, 420.0, 460.0, 500.0, 540.0, 580.0, 620.0],
+        [620.0, 580.0, 540.0, 500.0, 460.0, 420.0, 380.0, 340.0, 300.0],
+    ]
+    assert [vote_role_team(track)[1] for track in repaired] == ["A", "B"]
+
+
+def test_a_change_of_the_team_key_without_a_person_of_the_other_team_nearby_is_no_swap() -> None:
+    # The model names the other team for five keyframes in a row, but nobody is near the track.
+    frames = [k * STEP for k in range(10)]
+    track = track_of(0, walker(frames[:5], 300.0, 10.0, "A") + walker(frames[5:], 350.0, 10.0, "B"))
+    far_away = track_of(1, walker(frames, 900.0, 0.0, "B"))
+
+    assert [frames_of(piece) for piece in split_team_swaps([track, far_away])] == [frames, frames]
+
+
+def test_contact_is_one_box_height_between_the_foot_points() -> None:
+    assert SWAP_CONTACT_BOX_HEIGHTS == 1.0
+    frames = [k * STEP for k in range(10)]
+    track = track_of(0, walker(frames[:5], 300.0, 0.0, "A") + walker(frames[5:], 300.0, 0.0, "B"))
+    for gap_px, cut in ((BOX_HEIGHT, True), (BOX_HEIGHT + 1.0, False)):
+        other = track_of(1, walker(frames, 300.0 + gap_px, 0.0, "B"))
+        assert len(split_team_swaps([track, other])) == (3 if cut else 2)
+
+
+def test_contact_needs_a_person_of_the_other_team_than_the_track_has_there() -> None:
+    # Next to the change stands a player whose key is the key that the track has before the change
+    # (A) at the frame of the first vote after it, and the key it has after (B) before it. Neither is
+    # a person of the other team at that frame.
+    frames = [k * STEP for k in range(10)]
+    track = track_of(0, walker(frames[:5], 300.0, 0.0, "A") + walker(frames[5:], 300.0, 0.0, "B"))
+    teammate_before = track_of(1, walker(frames[4:5], 320.0, 0.0, "A") + walker(frames[6:9], 900.0, 0.0, "A"))
+    teammate_after = track_of(2, walker(frames[5:6], 320.0, 0.0, "B") + walker(frames[6:9], 950.0, 0.0, "B"))
+
+    pieces = split_team_swaps([track, teammate_before, teammate_after])
+
+    assert len(pieces) == 3
+
+
+def test_contact_reads_the_key_of_the_run_of_the_other_track_not_its_single_answer() -> None:
+    # The player of team B next to the change has one wrong answer (A) at that keyframe. Its run says B.
+    frames = [k * STEP for k in range(10)]
+    track = track_of(0, walker(frames[:5], 300.0, 0.0, "A") + walker(frames[5:], 300.0, 0.0, "B"))
+    other = walker(frames, 320.0, 0.0, "B")
+    other[4] = other[4].model_copy(update={"team_key": "A"})
+    other[5] = other[5].model_copy(update={"team_key": "A"})
+
+    assert len(split_team_swaps([track, track_of(1, other)])) == 3
+
+
+def test_a_short_change_before_the_end_of_a_track_is_not_cut() -> None:
+    first, second = crossing_swap()
+    shortened = [track_of(track.track_id, track.observations[:7]) for track in (first, second)]
+
+    assert len(split_team_swaps(shortened)) == 2
+
+
+def test_a_referee_track_is_never_cut() -> None:
+    frames = [k * STEP for k in range(10)]
+    referee = [observation.model_copy(update={"role": "referee"}) for observation in walker(frames, 300.0, 0.0, "A")]
+    for observation_index in range(5, 10):
+        referee[observation_index] = referee[observation_index].model_copy(update={"team_key": "B"})
+    other = track_of(1, walker(frames, 320.0, 0.0, "B"))
+
+    assert len(split_team_swaps([track_of(0, referee), other])) == 2
+
+
+def test_split_without_tracks_gives_no_tracks() -> None:
+    assert split_team_swaps([]) == []
+
+
+# --- Team slots -----------------------------------------------------------------------------
+
+
+def decided_track(
+    track_id: int,
+    frames: Sequence[int],
+    x: float,
+    *,
+    role: Role = "player",
+    side: str = "left",
+    display: int | None = None,
+    export: int | None = None,
+    team_key: TeamKey = "A",
+) -> Track:
+    """Make a track whose votes are done: a person who stands at (x, 400) in the given frames."""
+    track = still_track(track_id, frames, x, role=role, team_key=team_key)
+    return track.model_copy(
+        update={
+            "role": role,
+            "team_key": team_key,
+            "team_side": side,
+            "number_display": display,
+            "number_export": display if export is None else export,
+        }
+    )
+
+
+def ten_players(frames: Sequence[int]) -> list[Track]:
+    """Return ten players of the left side who stand at x = 100, 200, ..., 1000 in the given frames."""
+    return [decided_track(index, frames, 100.0 * (index + 1)) for index in range(10)]
+
+
+def test_team_slots_are_ten_players_and_one_goalkeeper() -> None:
+    assert dict(TEAM_SLOTS) == {"player": 10, "goalkeeper": 1}
+
+
+def test_an_eleventh_player_track_of_a_side_is_linked_to_the_nearest_end() -> None:
+    # Ten players are seen up to frame 96. A player of the same side comes back at frame 300 near
+    # where player 3 (x = 400) left. A side has ten players: the track is a later part of one of them.
+    players = ten_players(range(0, 97, 12))
+    returning = decided_track(10, [300, 312, 324], 410.0)
+
+    linked = link_team_slots([*players, returning], **ON_THE_FLAT_PITCH)
+
+    assert [track.track_id for track in linked] == list(range(10))
+    assert frames_of(linked[3]) == [*range(0, 97, 12), 300, 312, 324]
+    assert all(frames_of(track) == list(range(0, 97, 12)) for track in linked if track.track_id != 3)
+
+
+def test_a_side_with_no_more_tracks_than_slots_does_not_change() -> None:
+    players = ten_players(range(0, 49, 12))[:9]
+    later = decided_track(9, [300, 312], 410.0)
+
+    assert link_team_slots([*players, later], **ON_THE_FLAT_PITCH) == [*players, later]
+
+
+def test_team_slots_make_no_more_links_than_the_slots_need() -> None:
+    # One goalkeeper slot, three fragments: two links. Four player fragments that could all be
+    # linked, next to nine long players: three links leave ten players, not fewer.
+    keepers = [
+        decided_track(20 + index, [index * 100, index * 100 + 12], 640.0, role="goalkeeper") for index in range(3)
+    ]
+    players = ten_players(range(0, 400, 12))[:9]
+    fragments = [decided_track(30 + index, [400 + index * 60, 412 + index * 60], 1100.0) for index in range(4)]
+
+    linked = link_team_slots([*keepers, *players, *fragments], **ON_THE_FLAT_PITCH)
+
+    assert sum(1 for track in linked if track.role == "goalkeeper") == 1
+    assert sum(1 for track in linked if track.role == "player") == 10
+
+
+def test_team_slots_count_each_side_and_role_apart() -> None:
+    left = ten_players(range(0, 49, 12))
+    right = [
+        decided_track(10 + index, [100, 112], 100.0 * (index + 1), side="right", team_key="B") for index in range(10)
+    ]
+    keeper = decided_track(30, [0, 12], 640.0, role="goalkeeper")
+    referee = decided_track(31, [0, 12], 640.0, role="referee").model_copy(update={"team_side": None})
+
+    tracks = [*left, *right, keeper, referee]
+
+    assert link_team_slots(tracks, **ON_THE_FLAT_PITCH) == tracks
+
+
+def test_team_slots_do_not_link_tracks_that_show_different_numbers() -> None:
+    players = ten_players(range(0, 97, 12))
+    players[3] = players[3].model_copy(update={"number_display": 4, "number_export": 4})
+    returning = decided_track(10, [300, 312], 400.0, display=8)
+
+    linked = link_team_slots([*players, returning], **ON_THE_FLAT_PITCH)
+
+    # The nearest end shows another number, so the next nearest end (x = 300 or 500) takes the track.
+    assert len(linked) == 10
+    assert frames_of(next(track for track in linked if track.track_id == 3)) == list(range(0, 97, 12))
+
+
+def test_team_slots_do_not_link_tracks_with_different_per_frame_numbers() -> None:
+    keepers = [
+        decided_track(track_id, frames, 400.0, role="goalkeeper").model_copy(
+            update={"observations": tuple(TrackObs(frame=frame, box=person(400.0, 400.0).box, role="goalkeeper",
+                                                   team_key="A", number=number) for frame in frames)}
+        )
+        for track_id, frames, number in ((0, [0, 12], 4), (1, [300, 312], 9))
+    ]
+
+    assert len(link_team_slots(keepers, **ON_THE_FLAT_PITCH)) == 2
+
+
+def test_team_slots_do_not_link_out_of_reach() -> None:
+    # 0.48 s after the first goalkeeper track ends, the second starts 300 px = 15 m away: further
+    # than 9 m/s * 0.48 s + 2 m.
+    keepers = [
+        decided_track(0, [0, 12], 300.0, role="goalkeeper"),
+        decided_track(1, [24, 36], 600.0, role="goalkeeper"),
+    ]
+
+    assert len(link_team_slots(keepers, **ON_THE_FLAT_PITCH)) == 2
+
+
+def test_team_slots_do_not_link_without_pitch_positions() -> None:
+    keepers = [
+        decided_track(0, [0, 12], 300.0, role="goalkeeper"),
+        decided_track(1, [300, 312], 300.0, role="goalkeeper"),
+    ]
+
+    assert len(link_team_slots(keepers, fps=FPS, to_pitch=no_pitch)) == 2
+
+
+def test_team_slots_do_not_link_tracks_that_overlap_in_time() -> None:
+    keepers = [
+        decided_track(0, [0, 12, 24], 300.0, role="goalkeeper"),
+        decided_track(1, [24, 36], 300.0, role="goalkeeper"),
+    ]
+
+    assert len(link_team_slots(keepers, **ON_THE_FLAT_PITCH)) == 2
+
+
+def test_a_slot_link_keeps_the_earliest_id_votes_the_team_again_and_takes_the_displayed_number() -> None:
+    early = decided_track(5, [0, 12], 300.0, role="goalkeeper", export=1)
+    late = decided_track(2, [300, 312, 324], 300.0, role="goalkeeper", display=1, team_key="none")
+    late = late.model_copy(update={"name": "Some Name"})
+
+    (linked,) = link_team_slots([late, early], **ON_THE_FLAT_PITCH)
+
+    assert linked.track_id == 5
+    assert frames_of(linked) == [0, 12, 300, 312, 324]
+    assert linked.team_key == "A"
+    assert (linked.number_export, linked.number_display, linked.name) == (1, 1, None)
+
+
+def test_finalize_links_team_slots_only_in_the_arm() -> None:
+    # Two goalkeeper fragments of the left goal, without a shirt number.
+    keepers = [still_track(0, [0, 12], 100.0, role="goalkeeper"), still_track(1, [300, 312], 105.0, role="goalkeeper")]
+    mean_x = {0: -50.0, 1: -50.0}
+
+    current = finalize_tracks(keepers, readings={}, mean_pitch_x=mean_x, **ON_THE_FLAT_PITCH)
+    with_slots = finalize_tracks(
+        keepers, readings={}, mean_pitch_x=mean_x, config=TrackingConfig(team_slots=True), **ON_THE_FLAT_PITCH
+    )
+
+    assert len(current) == 2
+    assert [frames_of(track) for track in with_slots] == [[0, 12, 300, 312]]
+    assert with_slots[0].team_side == "left"
+
+
+def test_team_slots_do_not_link_across_a_cut() -> None:
+    # The same two goalkeeper fragments as above are linked in one shot, and not when a cut
+    # (frame 200) lies between them: a position before a cut says nothing about one after it.
+    keepers = [
+        decided_track(0, [0, 12], 300.0, role="goalkeeper"),
+        decided_track(1, [300, 312], 300.0, role="goalkeeper"),
+    ]
+
+    assert len(link_team_slots(keepers, **ON_THE_FLAT_PITCH)) == 1
+    assert len(link_team_slots(keepers, cuts=(200,), **ON_THE_FLAT_PITCH)) == 2
+
+
+def test_team_slots_count_the_slots_in_each_shot() -> None:
+    # Shot 0 (frames 0 to 96) shows ten players. Shot 1 starts at the cut at frame 200 and shows
+    # ten other tracks of the same side at the same places, and one more fragment: player 19 left
+    # at x = 1000 and comes back there. Over the clip 21 tracks would ask for 11 links, and the
+    # tracks of shot 0 would be linked to those of shot 1. Per shot, shot 1 needs one link.
+    shot_0 = ten_players(range(0, 97, 12))
+    shot_1 = [
+        decided_track(10 + index, range(200, 297, 12), 100.0 * (index + 1)) for index in range(9)
+    ]
+    leaves = decided_track(19, [200, 212, 224], 1000.0)
+    returns = decided_track(20, [272, 284, 296], 1005.0)
+
+    linked = link_team_slots([*shot_0, *shot_1, leaves, returns], cuts=(200,), **ON_THE_FLAT_PITCH)
+
+    assert [track.track_id for track in linked] == list(range(20))
+    assert frames_of(linked[19]) == [200, 212, 224, 272, 284, 296]
+    assert not any(track.first_frame < 200 <= track.last_frame for track in linked)
+
+
+def test_team_slots_refuse_cuts_out_of_order() -> None:
+    with pytest.raises(ValueError, match="cuts"):
+        link_team_slots([], cuts=(200, 100), **ON_THE_FLAT_PITCH)
+
+
+def test_finalize_gives_the_cuts_to_the_team_slots() -> None:
+    keepers = [still_track(0, [0, 12], 100.0, role="goalkeeper"), still_track(1, [300, 312], 105.0, role="goalkeeper")]
+    mean_x = {0: -50.0, 1: -50.0}
+
+    with_cut = finalize_tracks(
+        keepers,
+        readings={},
+        mean_pitch_x=mean_x,
+        config=TrackingConfig(team_slots=True),
+        cuts=(200,),
+        **ON_THE_FLAT_PITCH,
+    )
+
+    assert [frames_of(track) for track in with_cut] == [[0, 12], [300, 312]]
+
+
+def test_team_slots_refuse_a_wrong_frame_rate() -> None:
+    with pytest.raises(ValueError, match="fps"):
+        link_team_slots([], fps=0.0, to_pitch=flat_pitch)

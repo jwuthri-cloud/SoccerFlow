@@ -14,11 +14,13 @@ from collections.abc import Sequence
 import numpy as np
 import pytest
 
-from pitchvlm.config import PipelineConfig
+from pitchvlm import pipeline
+from pitchvlm.config import PipelineConfig, TrackingConfig
 from pitchvlm.geometry import apply_homography, matrix_from_record
 from pitchvlm.pipeline import run_clip
 from pitchvlm.schemas import Box, ClipResult, Track
 from pitchvlm.synth import RetimedScene, ScoreGraphicSource, SyntheticSource
+from pitchvlm.tracking import split_team_swaps
 from pitchvlm.vlm.fake import FakeBackend
 
 #: The clip frame that starts the second shot.
@@ -141,3 +143,43 @@ def test_the_result_names_the_cut_and_scores_the_landmark_fits(
     keyframes = [frame for frame in range(0, result.info.n_frames, 12)] + [result.info.n_frames - 1]
     assert [check.frame for check in result.paint] == keyframes
     assert all(check.score is not None and check.score > 0.9 for check in result.paint)
+
+
+# --- The track repairs (arms of gate G4) keep the rule of the cuts ---------------------------------
+
+#: Both track repairs on: the split of team swaps in each shot and the team slots over the clip.
+BOTH_REPAIRS = PipelineConfig(tracking=TrackingConfig(split_team_swaps=True, team_slots=True))
+
+
+@pytest.fixture(scope="module")
+def repaired(scene: RetimedScene) -> ClipResult:
+    return run_clip(SyntheticSource(scene), FakeBackend(scene), BOTH_REPAIRS)
+
+
+def test_the_split_of_team_swaps_runs_in_each_shot_on_its_own(
+    scene: RetimedScene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shots_of_calls: list[set[bool]] = []
+
+    def watched(tracks: Sequence[Track]) -> list[Track]:
+        shots_of_calls.append({obs.frame >= CUT for track in tracks for obs in track.observations})
+        return split_team_swaps(tracks)
+
+    monkeypatch.setattr(pipeline, "split_team_swaps", watched)
+    run_clip(SyntheticSource(scene), FakeBackend(scene), BOTH_REPAIRS)
+
+    # One call per shot, and the fragments of a call lie in one shot.
+    assert shots_of_calls == [{False}, {True}]
+
+
+def test_with_both_repairs_only_a_shown_shirt_number_joins_tracks_across_a_cut(
+    scene: RetimedScene, plain: ClipResult, repaired: ClipResult
+) -> None:
+    assert repaired.cuts == (CUT,)
+    crossing = _tracks_across_the_cut(repaired)
+    assert [track.track_id for track in crossing if track.number_display is None] == []
+    assert [pair for pair in _people_across_the_cut(scene, repaired) if pair[0] != pair[1]] == []
+    # The team slots link no track across the cut: the tracks across it are those of the
+    # shirt numbers, as without the repairs.
+    assert len(crossing) == len(_tracks_across_the_cut(plain))
+

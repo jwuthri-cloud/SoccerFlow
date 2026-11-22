@@ -99,6 +99,10 @@ tracking:
   stitch_speed_mps: 4.0
   # Tracks with fewer observations are dropped before fragments are joined.
   min_observations: 2
+  # Arm of gate G4: split a track where its team key flips and stays flipped next to a person of the other team.
+  split_team_swaps: false
+  # Arm of gate G4: link the tracks of a team side when the clip has more of them than a team has people.
+  team_slots: false
 
 # Largest number of model requests in flight at the same time, from 1 to 8.
 max_parallel: 4

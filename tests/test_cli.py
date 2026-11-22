@@ -1047,10 +1047,17 @@ def test_demo_writes_predictions_summary_and_video(tmp_path: Path, capsys: pytes
     assert summary["position_error_m"]["n"] > 300
     # The identity values see what the median position error does not: a person who gets another track id.
     identity = summary["identity"]
-    assert set(identity) == {"coverage", "switches", "track_ratio"}
+    assert set(identity) == {"coverage", "switches", "track_ratio", "purity"}
     assert identity["coverage"] > 0.8
     assert identity["switches"] <= 2
     assert 0.8 <= identity["track_ratio"] <= 1.3
+    assert identity["purity"] > 0.9
+    # The tracking values without labels are written and printed.
+    diagnostics = summary["diagnostics"]
+    assert diagnostics["tracks"] == summary["n_tracks"]
+    assert diagnostics["impossible_steps"] == 0
+    assert set(diagnostics["teams"]) == {"A", "B"}
+    assert "tracking values without labels (no gate uses them):" in capsys.readouterr().out
     assert summary["checker"] == {"valid": True, "problems": []}
     assert (summary["scored_frames"], summary["scored_frames_without_prediction"]) == (N_FRAMES, 0)
     assert summary["provenance"]["command"] == "demo"
@@ -3696,6 +3703,10 @@ def test_run_ends_with_code_1_when_the_clip_gives_no_result(
     assert all(state["players"] == [] for state in result["result"]["frames"])
     # No shirt number is paid for a clip without a pitch mapping: no track of it gets a state.
     assert result["provenance"]["cost"]["requests"] == {"kit_legend": 1, "landmarks": 6, "people": 6}
+    # The tracking values without labels are written also for a clip without positions: no step, no speed.
+    assert result["diagnostics"]["steps"] == 0
+    assert result["diagnostics"]["top_speed_mps"]["median"] is None
+    assert "tracking values without labels (no gate uses them):" in output
     prediction_file = tmp_path / "runs" / "predictions" / "SoccerNetGS-valid" / "pitchvlm" / f"{CLIP_ID}.json"
     if labelled:
         assert "format checker: the prediction file is valid" in output
