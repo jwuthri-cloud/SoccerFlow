@@ -697,6 +697,121 @@ Items 5 and 6 come from the checks of the change of item 4.
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
 
+## 2026-11-22 — A real-time detector engine next to the model engine
+
+1. **The decision** (owner, 2026-11-22). (1) Any image or video LLM must work through
+   OpenRouter, not only Gemini (built in its own change). (2) Take the ideas of a classic
+   detector stack that a public repository shows (`Mhmdwael77/ai-football-analytics`): ideas
+   only. Its licence file reserves all rights (its README badge says MIT; the file wins), and
+   its detector is an Ultralytics model (AGPL-3.0). No code, no config text and no weights of it
+   are used; every threshold here is new. (3) A real-time detector is a first-class engine next
+   to the model engine. This entry records point 3 and the two ideas of point 2 that belong to
+   it: team and role from kit colours, and a separate ball tracker.
+2. **Detectors: published values, not measured here.** Read on 2026-11-22 from the pages and
+   licence files of each project by an agent of this session (one reader). AP is COCO val2017
+   AP50:95. Latency is batch 1 on an NVIDIA T4.
+
+   | Family (pip package) | Sizes: COCO AP | Latency, ms | Code licence | Weights licence | Source |
+   |---|---|---|---|---|---|
+   | RF-DETR (`rfdetr`, 1.12.1 of 2026-11-12) | N 48.4, S 53.0, M 54.7, L 56.5 | 2.3, 3.5, 4.4, 6.8 (TensorRT, FP16) | Apache-2.0 | Apache-2.0 | README and LICENSE of https://github.com/roboflow/rf-detr at tag 1.12.1 |
+   | RF-DETR XL, 2XL (`rfdetr[plus]`) | 58.6, 60.1 | 11.5, 17.2 (TensorRT, FP16) | Apache-2.0 | Roboflow Platform Model License 1.0 | same |
+   | Ultralytics YOLO26 (`ultralytics` 8.4.216) | n 40.9, s 48.6, m 53.1, l 55.0, x 57.5 | 1.7, 2.5, 4.7, 6.2, 11.8 (TensorRT 10; precision not stated) | AGPL-3.0 or paid licence | AGPL-3.0; the licence page says every trained model is AGPL-3.0 | Ultralytics documentation, pages of YOLO26 and of the licence |
+   | Ultralytics YOLO11 | n 39.5, s 47.0, m 51.5, l 53.4, x 54.7 | 1.5, 2.5, 4.7, 6.2, 11.3 (as above) | AGPL-3.0 or paid licence | AGPL-3.0 | Ultralytics documentation, page of YOLO11 |
+   | RT-DETRv2 (no package; in Hugging Face transformers) | S 48.1, M 51.9, L 53.4, X 54.3 | 4.6, 6.9, 9.3, 13.5 (FP16, TensorRT; given as frames per second, converted by the reader) | Apache-2.0 | Apache-2.0 | https://github.com/lyuwenyu/RT-DETR |
+   | D-FINE (no package; in transformers) | COCO only: N 42.8, S 48.5, M 52.3, L 54.0, X 55.8; with Objects365: S 50.7 to X 59.3 | 2.12, 3.49, 5.62, 8.07, 12.89 (FP16, TensorRT 10.4) | Apache-2.0 | Apache-2.0; the README warns that the Objects365 weights may carry the terms of Objects365 | https://github.com/Peterande/D-FINE |
+   | DEIM (no package) | N 43.0 to X 56.5 | 2.12 to 12.89 (conditions not stated) | Apache-2.0 | Apache-2.0 | https://github.com/ShihuaHuang95/DEIM |
+   | DEIMv2 | S 50.9 to X 57.8 | 1.10 to 13.75 (conditions not stated) | non-commercial licence since 2026-08-24 | non-commercial | https://github.com/Intellindust-AI-Lab/DEIMv2 |
+   | RT-DETRv4 | S 49.8 to X 57.0 | 3.66 to 12.90 (precision not stated) | Apache-2.0 | not stated | https://github.com/RT-DETRs/RT-DETRv4 |
+   | LW-DETR | T 42.6 to X 58.3 | 2.0 to 19.1 (conditions not stated) | Apache-2.0 | Apache-2.0 (Objects365 pretraining) | https://github.com/Atten4Vis/LW-DETR |
+
+   Soccer-trained weights: none was found with a clear licence for both the weights and their
+   training data. The Roboflow `sports` repository trains Ultralytics YOLOv8 (AGPL-3.0). A
+   RF-DETR Large model on Hugging Face (`julianzu9612/RFDETR-Soccernet`, tagged Apache-2.0,
+   claims 49.8 mAP on SoccerNet tracking; third-party, unverified) is trained on SoccerNet data
+   whose terms are research-only as far as read. The licence page of the Roboflow football
+   dataset could not be read.
+3. **Recommendation: RF-DETR, size by gate G2.** It is the only candidate with an Apache-2.0
+   licence for code and weights, a pip package, a documented fine-tune, and an adapter and four
+   experiment files in this repository already. Its published speed on a T4 with TensorRT is
+   2.3 to 6.8 ms per frame; the script uses plain `predict` without TensorRT, so the speed on
+   the run machine must be measured. The default of the detector engine is RF-DETR Medium
+   (`configs/default.yaml`, section `detector`), the middle of the two sizes that the probe
+   measures; one more experiment file measures it on the frames of the people probe
+   (`people_probe_rfdetr_medium.yaml`). The owner sets the size that passes G2 (Small, Medium or
+   Large; XL and 2XL are not Apache-2.0). No second family is added now. The candidate with a
+   clear licence path is D-FINE with its COCO-only weights through the Apache-2.0 code of
+   Hugging Face transformers; it is added only after the licence of each weight file is read.
+   Ultralytics YOLO is not taken: its code and every model trained with it are AGPL-3.0.
+4. **Licence, said plainly.** This repository is public and has no licence file. Code under the
+   AGPL or the GPL may run only inside the environment of its tool, started by
+   `tools/run_tool.py`, as PnLCalib (GPL-2.0-or-later) does now; the package never imports a
+   tool (rule 4). What the AGPL or the GPL means for the script itself, which imports such code
+   when it runs, is not settled: it is an open owner decision, together with the licence of the
+   repository (last list of this file).
+5. **What was built** (build machine, offline, stand-ins only):
+   - Settings: `engines` names the engine of the people step (`model`, `detector`), of the pitch
+     mapping (`model`, `calibration`) and of the shirt numbers (`model`, `none`); `detector` and
+     `calibration` hold the tool settings that a clip run must have. Two settings files:
+     `configs/engines/detector_calibration.yaml` (no model step, free) and
+     `detector_calibration_numbers.yaml` (adds the paid number step).
+   - Clip job and clip run (`fallbacks/runs.py`): a tool runs on every frame of one clip. The
+     run is cut into parts of at most 1,000,000 bytes, named like the ledger, with compact rows
+     for the detector. Measured with the part writer of the script on random boxes: 37.9 bytes
+     per detection; 750 frames with 26 detections each give one part of 738,558 bytes, and the
+     guard passed on that part. The format of the probe runs (about 140 bytes per detection)
+     would give about 2.7 MB for the same clip. What may go back into the repository does not
+     change: clip runs are tool runs, held back until the owner decides on tool run files.
+   - `tools/run_tool.py` reads a clip job, writes the parts, refuses to start when later parts
+     of an older run lie next to its output, and takes `GEMINI_API_KEY` and
+     `OPENROUTER_API_KEY` out of its environment.
+   - Command `clip-job`; `run --detections --calibration`; `demo --engine detector`. A run
+     whose engines call no model opens no model session and costs nothing.
+   - People engine `detector` (`pipeline.py`): people of every frame, kit-colour team keys
+     (`kitcolour.py`: torso histogram, 2-cluster k-means in numpy, outliers beyond the median
+     plus 3 scaled median absolute deviations), tracks on every frame with the time limits of
+     the keyframe design, goalkeeper or referee for tracks of outlier kits by their mean pitch
+     position (a goal zone and inside the width of the penalty area), then the joins of
+     `tracking.py`, which is used unchanged. The team side comes from `assign_team_sides`.
+   - Shirt numbers stay the optional paid number step on track crops. Its request names no
+     team, because a kit cluster is not a team of the kit legend. Without it no player has a
+     number, and `run` says so.
+   - Ball (`ball.py`): the class `sports ball` of the detector, a tracker that takes the camera
+     motion out and gates by the speed limit of a ball (40 m/s, an estimate) at the scale of
+     its box (0.22 m), fills gaps up to 0.5 s and drops runs of fewer than 3 sightings. The
+     record types take it cleanly: `FrameState.ball` (`BallState`, optional, default None). It
+     goes to the video and the radar. The prediction file has no ball, and `docs/PLAN.md` keeps
+     the ball out of the scored result.
+   - Pitch engine `calibration`: the camera of every frame from PnLCalib, checked with
+     `fit_problems` and the people of the frame, gaps filled through the camera motion.
+   - Timing: `run` and `demo` write the measured time of each stage (milliseconds per frame,
+     frames per second) and print it; the stages `detector` and `calibration` are the times
+     that the script measured per frame. Measured on the build machine, synthetic clip of 100
+     frames of 1280 x 720 pixels, detector demo with stand-ins (n = 1 run): motion 9.18 ms per
+     frame, kit colour 3.40 ms, tracks 0.67 ms, all package stages 13.50 ms (74 frames per
+     second). This is no claim of real time: it holds no detector, no calibration, no decoding
+     of real frames and not the run machine.
+   - The engine table of every result names each step: `model:<id>`, `detector:rfdetr:<class>`,
+     `tool:pnlcalib`, `code`, `code:kit-colour`, `code:ball-tracker` or `none`.
+6. **Measurement, fixed before any run** (RUNBOOK, section 10): gate G2 for the detector on the
+   frames of the people probe (the five RF-DETR files), and end to end on the dev clips with the
+   same scorer, each engine with its own tracker name, compared clip by clip together with the
+   role and team-side accuracy of G5b. The plan for a detector trained on soccer is RUNBOOK
+   section 11; nothing was downloaded or trained.
+7. **Proposed new text of rule 8 of `CLAUDE.md`** (not applied; the owner decides):
+   "8. Two engines are first-class for the people step and for the pitch mapping: the model
+   (`model`) and a specialist tool (`detector`, `calibration`). The shirt numbers come from the
+   model or from no step (`none`). The settings of a run name the engine of each step, and every
+   result file and report names the engine of every step. A comparison of two engines counts
+   only on the same frames, against the same gate of `configs/gates.yaml`, with the same scorer.
+   A tool runs only through `tools/run_tool.py` in its own environment (rule 4); code under the
+   AGPL or the GPL runs nowhere else."
+   Until the owner applies it, rule 8 stands: the docstring of `fallbacks/__init__.py` and
+   section 3 of the RUNBOOK still describe the tools as fallbacks.
+8. **Not verified.** No real detector, no real calibration, no real footage and no timing on
+   the run machine. The script was tested with stand-ins of the tools; the kit colours with flat
+   synthetic kits; the ball with a stand-in ball that the synthetic picture does not show. The
+   values of the table above were read by one agent and not checked by a second reader.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
@@ -722,6 +837,11 @@ Items 5 and 6 come from the checks of the change of item 4.
   weights on the frames of the people probe, and their time per frame on the run machine?
 - Position error and share of frames with a camera of PnLCalib on the frames of the pitch
   probe? Do the GPU and the CPU of the run machine give the same values for both tools?
+- Detector engine (2026-11-22): G2 values of RF-DETR Medium; time per frame of each tool and of
+  each stage of the package on a full clip of the run machine; role and team-side accuracy of
+  the kit colours on real kits (stripes, similar colours, a goalkeeper kit near a team kit);
+  share of frames with a ball and its error; GS-HOTA of the detector engine against the model
+  engine on the dev clips; do the GSR label files hold ball boxes?
 
 Decisions for the owner that are open, each with its recommendation:
 
@@ -768,6 +888,8 @@ Decisions for the owner that are open, each with its recommendation:
   switch only for a step whose Gemini gate failed and whose tool passed (rule 8). When G3 fails
   and PnLCalib passes, the switch is small, because a camera matrix needs no other step. When G2
   fails and RF-DETR passes, plan the step for role and team first, with its cost.
+  Built on 2026-11-22 after the owner decision of that day (entry "A real-time detector engine
+  next to the model engine"); what stays open is listed at the end of this list.
 - **Frames of gate G3.** `docs/PLAN.md` and `configs/gates.yaml` name the frames of the people
   probe plus 3 of the dev clips. Both pitch experiment files (the model step and PnLCalib)
   measure the group `probe` only, and the RUNBOOK has no command for the 3 dev clips.
@@ -796,3 +918,19 @@ Decisions for the owner that are open, each with its recommendation:
   of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
   the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
   of the gate and needs its own entry here (rule 7).
+- **Rule 8 for two first-class engines** (entry of 2026-11-22, item 7). Recommendation: apply
+  the proposed text after the first G2 and dev values of both engines exist, together with the
+  sentence of `CLAUDE.md` about one vision language model.
+- **Size of the detector.** Recommendation: take the smallest RF-DETR size that passes G2 on
+  the probe frames, and RF-DETR Medium until then.
+- **What the AGPL or the GPL means for `tools/run_tool.py`.** Recommendation: decide it with the
+  licence of the repository, before an AGPL tool is added; until then add only tools whose code
+  and weights are Apache-2.0, MIT or BSD, besides PnLCalib.
+- **Soccer-trained detector** (RUNBOOK, section 11). Recommendation: read the terms of the
+  SoccerNet-GSR train data first; build the converter and train only with a budget line for the
+  GPU time and a decision that research-only weights may drive the demo.
+- **Video files for the detector engine.** A clip job reads frame images; no command writes the
+  frames of a video file as images. Recommendation: build it before the demo clip (a video) runs
+  through the detector engine.
+- **Clip runs on the results branch.** They are tool runs (item "Run files of the tools on the
+  results branch" above). Recommendation: decide both together; each part passes the guard.

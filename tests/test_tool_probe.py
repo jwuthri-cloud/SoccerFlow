@@ -39,10 +39,12 @@ from pitchvlm.synth import SyntheticScene
 REPO = Path(__file__).resolve().parents[1]
 EXPERIMENTS = REPO / "configs" / "experiments"
 DETECTOR_FILE = EXPERIMENTS / "people_probe_rfdetr_small.yaml"
-#: The experiment files of the detector: two model classes, each with the resize of the tool and with antialiasing.
+#: The experiment files of the detector: two model classes, each with the resize of the tool and with antialiasing,
+#: and the default detector of the detector engine (RF-DETR Medium) with the resize of the tool.
 DETECTOR_FILES = {
     ("RFDETRSmall", False): DETECTOR_FILE,
     ("RFDETRSmall", True): EXPERIMENTS / "people_probe_rfdetr_small_antialias.yaml",
+    ("RFDETRMedium", False): EXPERIMENTS / "people_probe_rfdetr_medium.yaml",
     ("RFDETRLarge", False): EXPERIMENTS / "people_probe_rfdetr_large.yaml",
     ("RFDETRLarge", True): EXPERIMENTS / "people_probe_rfdetr_large_antialias.yaml",
 }
@@ -200,7 +202,7 @@ def test_tool_experiment_files_name_the_settings_of_each_tool() -> None:
     # The thresholds of the script inference.py of the tool, with its line refinement.
     assert calibration == PnlcalibSettings(name="pnlcalib", kp_threshold=0.3434, line_threshold=0.7867, pnl_refine=True)
     assert cli.TOOL_PROBES == {"rfdetr": "people", "pnlcalib": "pitch"}
-    # Every experiment file of a tool is one of these five.
+    # Every experiment file of a tool is one of these six.
     tool_files = sorted(path.name for path in EXPERIMENTS.glob("*.yaml") if "tool:" in path.read_text(encoding="utf-8"))
     assert tool_files == sorted(path.name for path in (*DETECTOR_FILES.values(), CALIBRATION_FILE))
 

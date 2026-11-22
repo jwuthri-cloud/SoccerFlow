@@ -1442,22 +1442,24 @@ def test_tools_do_not_get_the_key_of_the_model_api(
     tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The terminal of the run machine holds the key. A tool is code of another project and must not see it."""
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, str | None]] = []
 
     def find(image: np.ndarray) -> list[Any]:
-        seen.append(os.environ.get("GEMINI_API_KEY"))
+        seen.append((os.environ.get("GEMINI_API_KEY"), os.environ.get("OPENROUTER_API_KEY")))
         return []
 
     monkeypatch.setattr(detector, "find", staticmethod(find))
     monkeypatch.setenv("GEMINI_API_KEY", "a-made-up-value")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "made-up-2")
 
     code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
 
     assert code == 0
-    assert seen == [None] * 4
+    assert seen == [(None, None)] * 4
     assert "GEMINI_API_KEY" not in os.environ
-    # The script names the variable of the package.
-    assert run_tool.KEY_VARIABLE == cli.KEY_VARIABLE == "GEMINI_API_KEY"
+    assert "OPENROUTER_API_KEY" not in os.environ
+    # The script names the variable of the package and the variable of the OpenRouter provider.
+    assert run_tool.KEY_VARIABLES == (cli.KEY_VARIABLE, "OPENROUTER_API_KEY")
 
 
 def test_interpreter_without_numpy_gets_one_line_and_the_code_2(tmp_path: Path) -> None:
@@ -1658,3 +1660,163 @@ def test_error_of_the_operating_system_inside_a_tool_keeps_its_traceback(
     assert lines[1].startswith("Traceback")
     assert lines[-1] == "error: [Errno 28] No space left on device"
     assert not out.exists()
+
+
+# --- Clip jobs: every frame of one clip, compact rows, parts ---------------------------
+
+
+def clip_job_of(settings: dict[str, Any], frames: list[dict[str, Any]], clip: str = "CLIP-A") -> dict[str, Any]:
+    """Return a clip job as data: the images of the frame entries, in their order."""
+    return {
+        "format": runs.CLIP_JOB_FORMAT,
+        "clip": clip,
+        "tool": dict(settings),
+        "images": [entry["image"] for entry in frames],
+    }
+
+
+def run_clip_job(tmp_path: Path, job: dict[str, Any]) -> tuple[int, Path]:
+    """Run the script for a clip job of the detector. Return the exit code and the first part file."""
+    out = tmp_path / "runs" / "detections.json"
+    arguments = ["rfdetr", "--job", str(write_json(tmp_path / "clip_job.json", job)), "--root", str(tmp_path / "data")]
+    return run_tool.main([*arguments, "--out", str(out), "--device", "cpu"]), out
+
+
+def test_clip_job_gives_a_clip_run_that_the_package_reads(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = [([1.04, 2.0, 11.0, 32.0], 0.75, "person"), ([5.0, 5.0, 7.0, 7.0], 0.5000004, "sports ball")]
+    monkeypatch.setattr(detector, "find", staticmethod(lambda image: found))
+    job = clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data", count=4))
+
+    code, out = run_clip_job(tmp_path, job)
+
+    assert code == 0
+    part = read_json(out)
+    assert (part["format"], part["clip"], part["n_frames"], part["part"], part["parts"]) == (
+        runs.CLIP_RUN_FORMAT,
+        "CLIP-A",
+        4,
+        1,
+        1,
+    )
+    assert part["job_sha256"] == hashlib.sha256((tmp_path / "clip_job.json").read_bytes()).hexdigest()
+    assert part["frames"][0][2] == {
+        "labels": ["person", "sports ball"],
+        "rows": [[1.0, 2.0, 11.0, 32.0, 0.75, 0], [5.0, 5.0, 7.0, 7.0, 0.5, 1]],
+    }
+    run = runs.load_clip_run(out)
+    assert [answer.frame for answer in run.frames] == [0, 1, 2, 3]
+    assert run.runner["script_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    # Each frame went to the detector once, plus the first frame once more before the timed calls.
+    assert len(Detector.made[0].calls) == 5
+
+
+def test_clip_run_is_cut_into_parts_below_the_size_limit(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(detector, "find", staticmethod(lambda image: [([1.0, 2.0, 11.0, 32.0], 0.75, "person")] * 30))
+    monkeypatch.setattr(run_tool, "CLIP_RUN_PART_MAX_BYTES", 3_000)
+    job = clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data", count=6))
+
+    code, out = run_clip_job(tmp_path, job)
+
+    assert code == 0
+    parts = sorted(out.parent.glob("detections*.json"))
+    assert len(parts) > 1
+    assert all(len(path.read_bytes()) <= 3_000 for path in parts)
+    assert {read_json(path)["parts"] for path in parts} == {len(parts)}
+    assert [answer.frame for answer in runs.load_clip_run(out).frames] == list(range(6))
+
+
+def test_frame_that_does_not_fit_into_a_part_stops_the_run(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(detector, "find", staticmethod(lambda image: [([1.0, 2.0, 11.0, 32.0], 0.75, "person")] * 100))
+    monkeypatch.setattr(run_tool, "CLIP_RUN_PART_MAX_BYTES", 1_000)
+    code, out = run_clip_job(tmp_path, clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data", count=2)))
+    assert code == 2
+    assert "it does not fit into a part of the clip run" in error_line(capsys)
+    assert not out.exists()
+
+
+def test_later_part_of_an_older_run_is_refused_before_the_tool_is_built(
+    tmp_path: Path, detector: type[Detector], capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = tmp_path / "runs" / "detections-0002.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    code, _ = run_clip_job(tmp_path, clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+    assert code == 2
+    line = error_line(capsys)
+    assert "lie next to" in line and "detections-0002.json" in line
+    assert Detector.made == []
+
+
+@pytest.mark.parametrize(
+    ("change", "words"),
+    [
+        (lambda job: job.pop("clip"), "has no clip"),
+        (lambda job: job.update(clip=""), "has no clip"),
+        (lambda job: job.update(images=[]), "names no frame"),
+        (lambda job: job.update(images="000001.png"), "names no frame"),
+        (lambda job: job["images"].append("/etc/hosts"), "'image' must be a path below the data folder"),
+        (lambda job: job["tool"].pop("antialias"), "it has ['min_score', 'model', 'name']"),
+    ],
+)
+def test_clip_job_with_wrong_content_is_refused_before_the_tool_is_built(
+    tmp_path: Path, detector: type[Detector], capsys: pytest.CaptureFixture[str], change: Any, words: str
+) -> None:
+    job = clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data"))
+    change(job)
+    code, out = run_clip_job(tmp_path, job)
+    assert code == 2
+    assert words in error_line(capsys)
+    assert Detector.made == [] and not out.exists()
+
+
+def test_compact_rows_keep_a_score_at_its_threshold_and_round_the_box() -> None:
+    payload = {
+        "detections": [
+            {"box_xyxy": [1.04, 2.05, 3.96, 4.0], "score": 0.50004, "label": "person"},
+            {"box_xyxy": [5.0, 6.0, 7.0, 8.0], "score": 0.123456, "label": "sports ball"},
+            {"box_xyxy": [9.0, 9.0, 10.0, 10.0], "score": 0.9, "label": "person"},
+        ]
+    }
+    compact = run_tool.compact_detections(payload)
+    assert compact["labels"] == ["person", "sports ball"]
+    assert compact["rows"][0][:5] == [1.0, round(2.05, 1), 4.0, 4.0, 0.5]
+    assert [row[5] for row in compact["rows"]] == [0, 1, 0]
+    assert compact["rows"][0][4] >= 0.5
+
+
+def test_script_and_package_agree_on_the_clip_formats() -> None:
+    assert (run_tool.CLIP_JOB_FORMAT, run_tool.CLIP_RUN_FORMAT) == (runs.CLIP_JOB_FORMAT, runs.CLIP_RUN_FORMAT)
+    assert run_tool.CLIP_RUN_PART_MAX_BYTES == runs.CLIP_RUN_PART_MAX_BYTES
+    first = Path("folder") / "detections.json"
+    assert all(run_tool.clip_run_part_path(first, part) == runs.clip_run_part_path(first, part) for part in (1, 2, 37))
+
+
+def test_clip_run_of_30_seconds_with_25_people_fits_one_part() -> None:
+    """The size of the compact rows, measured with the part writer: about 38 bytes per detection."""
+    rng = np.random.default_rng(0)
+    entries = []
+    for frame in range(750):
+        boxes = rng.uniform(0.0, 1900.0, size=(26, 4)) + np.array([0.0, 0.0, 20.0, 60.0])
+        detections = [
+            {"box_xyxy": [float(value) for value in box], "score": float(rng.uniform(0.5, 1.0)), "label": "person"}
+            for box in boxes
+        ]
+        entries.append([frame, 0.021, run_tool.compact_detections({"detections": detections})])
+    head = {
+        "format": runs.CLIP_RUN_FORMAT,
+        "clip": "SNGS-021",
+        "tool": DETECTOR_SETTINGS,
+        "n_frames": 750,
+        "job_sha256": "a" * 64,
+        "runner": {"device": "cuda:0"},
+    }
+    texts = run_tool.clip_run_texts(head, entries)
+    size = len(texts[0].encode())
+    assert len(texts) == 1
+    assert size / (750 * 26) < 45

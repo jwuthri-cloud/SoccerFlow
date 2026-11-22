@@ -508,11 +508,14 @@ def test_team_a_defends_the_left_goal(result: ClipResult) -> None:
 
 
 def test_engines_name_every_step(result: ClipResult) -> None:
-    assert set(result.engines) == {*MODEL_STEPS, *CODE_STEPS}
+    assert set(result.engines) == {*MODEL_STEPS, *CODE_STEPS, "team_role", "ball"}
     for step in MODEL_STEPS:
         assert result.engines[step] == f"model:{DEFAULT_MODEL}"
     for step in CODE_STEPS:
         assert result.engines[step] == "code"
+    # The model engine gives the role and the team key with the people, and follows no ball.
+    assert result.engines["team_role"] == f"model:{DEFAULT_MODEL}"
+    assert result.engines["ball"] == "none"
 
 
 def test_far_side_is_negative_y_and_left_goal_is_negative_x(result: ClipResult) -> None:
@@ -1275,7 +1278,8 @@ def test_tracking_settings_and_the_frame_rate_reach_both_tracking_steps(monkeypa
 def test_crops_of_a_clip_at_another_frame_rate_are_one_second_apart() -> None:
     """At 12.5 frames per second, one second is 12.5 frames: frame 13 is far enough from frame 0, frame 12 is not."""
     track = track_with_boxes([(0, 60.0), (12, 55.0), (13, 50.0)])
-    assert [observation.frame for observation in pipeline._crop_plans([track], 12.5, 8)[0].observations] == [0, 13]
+    plan = pipeline._crop_plans([track], 12.5, 8, name_team=True)[0]
+    assert [observation.frame for observation in plan.observations] == [0, 13]
 
 
 def test_gap_limit_of_the_settings_reaches_the_pitch_mapping(
@@ -1547,6 +1551,8 @@ def test_engine_table_names_the_model_of_each_step() -> None:
         "people": "model:gemini-3.8-flash",
         "landmarks": "model:gemini-4-hydrogen",
         "number": "model:gemini-robotics-er-2-preview",
+        "team_role": "model:gemini-3.8-flash",
+        "ball": "none",
         "motion": "code",
         "pitch_mapping": "code",
         "tracks": "code",

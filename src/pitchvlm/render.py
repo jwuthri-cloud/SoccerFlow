@@ -21,7 +21,7 @@ import numpy as np
 
 from pitchvlm.frames import FrameSource
 from pitchvlm.pitch import PitchCanvas
-from pitchvlm.schemas import Box, ClipResult, FrameState, PlayerState, TeamKey
+from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, PlayerState, TeamKey
 
 Colour = tuple[int, int, int]
 
@@ -37,6 +37,9 @@ _NUMBER_BGR: Colour = (255, 255, 255)
 #: Radar sizes in metres, so that they follow the radar scale.
 _DOT_RADIUS_M = 0.8
 _TRAIL_WIDTH_M = 0.3
+#: Radius of the ball on the radar, metres, and its smallest circle on the frame, pixels.
+_BALL_RADIUS_M = 0.6
+_BALL_MIN_RADIUS_PX = 4
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,8 @@ class RenderStyle:
     radar_scale: float = 10.0
     #: Font scale of the labels and of the radar numbers.
     font_scale: float = 0.6
+    #: The ball (detector engine): a ring on the frame and a dot on the radar.
+    ball_bgr: Colour = (255, 255, 255)
 
     def __post_init__(self) -> None:
         if self.trail_seconds < 0:
@@ -178,6 +183,21 @@ def draw_overlay(image: np.ndarray, players: Sequence[PlayerState], style: Rende
     return canvas
 
 
+def draw_ball(image: np.ndarray, ball: BallState, style: RenderStyle = RenderStyle()) -> np.ndarray:
+    """Return a copy of the frame with a ring around the ball.
+
+    A ball that the tracker filled in (``observed`` False) gets a thinner ring. The image
+    is not changed.
+    """
+    _check_image(image)
+    canvas = image.copy()
+    centre_x, centre_y = ball.box.center
+    radius = max(_BALL_MIN_RADIUS_PX, round(max(ball.box.width, ball.box.height)))
+    thickness = _BOX_THICKNESS if ball.observed else 1
+    cv2.circle(canvas, (round(centre_x), round(centre_y)), radius, style.ball_bgr, thickness, cv2.LINE_AA)
+    return canvas
+
+
 def _mix(colour: Colour, background: Colour, weight: float) -> Colour:
     """Blend a colour with a background. Weight 1 gives the colour and weight 0 gives the background."""
     channels = zip(colour, background, strict=True)
@@ -229,6 +249,11 @@ class RadarRenderer:
         self._draw_trails(image, state.frame)
         image[self._markings] = self._pitch[self._markings]
         self._draw_players(image, state.players)
+        if state.ball is not None and state.ball.pitch_x is not None and state.ball.pitch_y is not None:
+            radius = max(2, round(_BALL_RADIUS_M * self._style.radar_scale))
+            (centre,) = self._to_pixels([(state.ball.pitch_x, state.ball.pitch_y)])
+            cv2.circle(image, centre, radius, self._style.ball_bgr, thickness=cv2.FILLED, lineType=cv2.LINE_AA)
+            cv2.circle(image, centre, radius, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
         return image
 
     def trail(self, track_id: int) -> np.ndarray:
@@ -395,6 +420,8 @@ def _video_frames(source: FrameSource, states: Sequence[FrameState], style: Rend
     radar = RadarRenderer(source.info.fps, style)
     for state in states:
         overlay = draw_overlay(source.read(state.frame), state.players, style)
+        if state.ball is not None:
+            overlay = draw_ball(overlay, state.ball, style)
         yield _crop_to_even(compose(overlay, radar.draw(state)))
 
 

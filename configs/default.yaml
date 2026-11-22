@@ -89,3 +89,34 @@ max_parallel: 4
 
 # Repeat index of the run. A repeat run uses 1, 2, ... so that the cache does not answer it.
 repeat: 0
+
+# Engine of each step that has more than one; a tool engine reads the clip run file of its tool (run --detections, run --calibration).
+engines:
+  # People step: model (people requests at the keyframes) or detector (a detector on every frame; team, role and ball from code).
+  people: model
+  # Pitch mapping: model (landmark requests at the keyframes) or calibration (a calibration tool on every frame).
+  pitch_mapping: model
+  # Shirt numbers: model (one paid number request per track) or none (no player has a number).
+  number: model
+
+# The detector of the people engine "detector"; its clip run file must have exactly these settings.
+detector:
+  # The tool: rfdetr.
+  name: rfdetr
+  # Model class with weights under Apache-2.0: RFDETRNano, RFDETRSmall, RFDETRMedium or RFDETRLarge.
+  model: RFDETRMedium
+  # A detection counts when its score is at least this value; the tool gets it as its threshold.
+  min_score: 0.5
+  # True when the tool makes the frame smaller with antialiasing.
+  antialias: false
+
+# The calibration of the pitch engine "calibration"; its clip run file must have exactly these settings.
+calibration:
+  # The tool: pnlcalib.
+  name: pnlcalib
+  # Score from which the tool uses a keypoint of its keypoint model.
+  kp_threshold: 0.3434
+  # Score from which the tool uses a line of its line model.
+  line_threshold: 0.7867
+  # True when the tool refines the camera with the lines.
+  pnl_refine: true

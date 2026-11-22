@@ -1,0 +1,6 @@
+# Settings of run for the detector engine with the paid shirt-number step: as detector_calibration.yaml, plus
+# one kit legend request per clip and one number request per track of a player or a goalkeeper.
+engines:
+  people: detector
+  pitch_mapping: calibration
+  number: model

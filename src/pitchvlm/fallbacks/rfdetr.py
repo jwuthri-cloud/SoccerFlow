@@ -24,10 +24,18 @@ Payload format (one frame)::
 The payload holds class names, not class numbers, and boxes in pixels of the full frame, also
 when the detector worked on a smaller image. The detector gives both in this form.
 
-A detector does not know roles, teams or shirt numbers. So every person gets the role
-``player``, the team key ``none`` and no number. No step of the package assigns these
-attributes to detector boxes yet, and the pipeline does not read this adapter: it is used to
-measure the detector (command ``tool-score``).
+A detector with weights for the everyday classes does not know roles, teams or shirt
+numbers. So every person gets the role ``player``, the team key ``none`` and no number. The
+detector engine of the pipeline gives them a team key and a role from the kit colours
+(``kitcolour``), and the command ``tool-score`` measures the boxes alone.
+
+The class ``sports ball`` gives the ball candidates of a frame (``ball_candidates``).
+
+The run of a tool on every frame of a clip stores a compact payload (``fallbacks.runs``)::
+
+    {"labels": ["person", "sports ball"], "rows": [[x1, y1, x2, y2, score, label_index]]}
+
+``expand_rows`` turns it into the payload above.
 """
 
 from __future__ import annotations
@@ -35,13 +43,18 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from pitchvlm.ball import BallCandidate
 from pitchvlm.fallbacks import payload_field, payload_number
 from pitchvlm.schemas import Box, FramePeople, PersonDet
 
 #: Label of a person in the payload. A detection with another label is not a person.
 PERSON_LABEL = "person"
+#: Label of the ball in the payload: the class name of the everyday classes (COCO).
+BALL_LABEL = "sports ball"
 #: Number of values of a box: x1, y1, x2, y2.
 _BOX_VALUES = 4
+#: Number of values of a compact row: the box, the score and the place of the label.
+_ROW_VALUES = 6
 
 
 def people_from_detections(payload: dict[str, Any], *, frame: int, min_score: float) -> FramePeople:
@@ -56,22 +69,71 @@ def people_from_detections(payload: dict[str, Any], *, frame: int, min_score: fl
     docstring (a missing key, a wrong type, a box without 4 numbers, a score outside 0-1) and
     for a ``min_score`` outside 0-1.
     """
+    kept = _kept(payload, PERSON_LABEL, min_score)
+    people = tuple(PersonDet(box=box, role="player", team_key="none") for box, _ in kept)
+    return FramePeople(frame=frame, people=people)
+
+
+def ball_candidates(payload: dict[str, Any], *, frame: int, min_score: float) -> tuple[BallCandidate, ...]:
+    """Return the ball candidates of one frame: the detections with the label ``sports ball``.
+
+    A candidate is kept under the same rules as a person (``people_from_detections``): its
+    score is at least ``min_score`` and its box is valid. The candidates keep the order of the
+    payload. ``ValueError`` is raised for the same faults as there.
+    """
+    kept = _kept(payload, BALL_LABEL, min_score)
+    return tuple(BallCandidate(frame=frame, box=box, score=score) for box, score in kept)
+
+
+def expand_rows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Turn the compact payload of a clip run into the payload of this module.
+
+    ``ValueError`` is raised when ``labels`` is not a list of text, when ``rows`` is not a
+    list, and for a row that is not 5 numbers and a whole number that names a place in
+    ``labels``. The values themselves are checked by the functions that read the result.
+    """
+    labels = payload_field(payload, "labels", "payload")
+    if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+        raise ValueError(f"payload: 'labels' must be a list of class names, got {labels!r}")
+    rows = payload_field(payload, "rows", "payload")
+    if not isinstance(rows, list):
+        raise ValueError(f"payload: 'rows' must be a list, got {type(rows).__name__}")
+    detections = []
+    for position, row in enumerate(rows):
+        where = f"rows[{position}]"
+        if not isinstance(row, list) or len(row) != _ROW_VALUES:
+            raise ValueError(f"{where}: a row must be [x1, y1, x2, y2, score, label index], got {row!r}")
+        index = row[-1]
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(labels):
+            raise ValueError(
+                f"{where}: the label index must be a place in 'labels' (0 to {len(labels) - 1}), got {index!r}"
+            )
+        detections.append({"box_xyxy": row[:_BOX_VALUES], "score": row[_BOX_VALUES], "label": labels[index]})
+    return {"detections": detections}
+
+
+def _kept(payload: dict[str, Any], label: str, min_score: float) -> list[tuple[Box, float]]:
+    """Return the box and the score of every detection with ``label`` that is kept, in payload order.
+
+    Every detection of the payload is read, also those with another label.
+    """
     if not 0.0 <= min_score <= 1.0:
         raise ValueError(f"min_score must be from 0 to 1, got {min_score}")
     detections = payload_field(payload, "detections", "payload")
     if not isinstance(detections, (list, tuple)):
         raise ValueError(f"payload: 'detections' must be a list, got {type(detections).__name__}")
-    boxes = [
-        _person_box(detection, f"detections[{position}]", min_score) for position, detection in enumerate(detections)
+    found = [_detection(detection, f"detections[{position}]") for position, detection in enumerate(detections)]
+    return [
+        (box, score)
+        for found_label, score, box in found
+        if found_label == label and score >= min_score and box is not None
     ]
-    people = tuple(PersonDet(box=box, role="player", team_key="none") for box in boxes if box is not None)
-    return FramePeople(frame=frame, people=people)
 
 
-def _person_box(detection: Any, where: str, min_score: float) -> Box | None:
-    """Return the box of one detection, or None when the detection is not kept.
+def _detection(detection: Any, where: str) -> tuple[str, float, Box | None]:
+    """Read one detection: its label, its score and its box, or None for a box that is not valid.
 
-    The detection is read in full first. So a detection that does not follow the payload format
+    The detection is read in full. So a detection that does not follow the payload format
     raises ``ValueError`` even when its label or its score would drop it.
     """
     label = payload_field(detection, "label", where)
@@ -84,8 +146,6 @@ def _person_box(detection: Any, where: str, min_score: float) -> Box | None:
     if not isinstance(values, (list, tuple)) or len(values) != _BOX_VALUES:
         raise ValueError(f"{where}: 'box_xyxy' must be a list of 4 numbers [x1, y1, x2, y2], got {values!r}")
     x1, y1, x2, y2 = (payload_number(value, f"{where}: 'box_xyxy'") for value in values)
-    if label != PERSON_LABEL or score < min_score:
-        return None
     if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or x2 <= x1 or y2 <= y1:
-        return None
-    return Box(x1=x1, y1=y1, x2=x2, y2=y2)
+        return label, score, None
+    return label, score, Box(x1=x1, y1=y1, x2=x2, y2=y2)

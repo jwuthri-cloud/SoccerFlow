@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import Field, model_validator
 
+from pitchvlm.fallbacks.runs import PnlcalibSettings, RfdetrSettings
 from pitchvlm.schemas import Record
 from pitchvlm.vlm.types import Resolution, ServiceTier, ThinkingLevel
 
@@ -81,6 +82,34 @@ class TrackingConfig(Record):
     min_observations: int = Field(default=2, ge=1)
 
 
+#: Engine of the people step: the people requests of the model at the keyframes, or a detector on every frame.
+PeopleEngine = Literal["model", "detector"]
+#: Engine of the pitch mapping: the landmark requests of the model at the keyframes, or a calibration on every frame.
+PitchEngine = Literal["model", "calibration"]
+#: Engine of the shirt numbers: the number requests of the model on track crops, or none.
+NumberEngine = Literal["model", "none"]
+
+
+class EngineSettings(Record):
+    """Which engine does each step that has more than one.
+
+    ``detector`` and ``calibration`` read the clip run file of an external tool (``run
+    --detections``, ``run --calibration``): the package never imports a tool. With the
+    people engine ``detector`` the team key and the role come from the kit colours
+    (``kitcolour``), and the shirt numbers only from the number engine ``model``.
+    """
+
+    people: PeopleEngine = "model"
+    pitch_mapping: PitchEngine = "model"
+    number: NumberEngine = "model"
+
+
+#: The detector of the people engine ``detector`` by default: RF-DETR Medium with its own threshold.
+DEFAULT_DETECTOR = RfdetrSettings(name="rfdetr", model="RFDETRMedium", min_score=0.5, antialias=False)
+#: The calibration of the pitch engine ``calibration`` by default: the settings of the pitch probe of PnLCalib.
+DEFAULT_CALIBRATION = PnlcalibSettings(name="pnlcalib", kp_threshold=0.3434, line_threshold=0.7867, pnl_refine=True)
+
+
 class PipelineConfig(Record):
     #: Time between keyframes in seconds (0.48 s is 12 frames at 25 fps).
     keyframe_interval_s: float = Field(default=0.48, gt=0)
@@ -103,6 +132,12 @@ class PipelineConfig(Record):
     max_parallel: int = Field(default=4, ge=1, le=MAX_PARALLEL_LIMIT)
     #: Repeat index of the run. Repeat runs use 1, 2, ... to bypass the cache.
     repeat: int = Field(default=0, ge=0)
+    #: Engine of the people step, of the pitch mapping and of the shirt numbers.
+    engines: EngineSettings = EngineSettings()
+    #: Settings of the detector; the clip run file of the people engine ``detector`` must have them.
+    detector: RfdetrSettings = DEFAULT_DETECTOR
+    #: Settings of the calibration; the clip run file of the pitch engine ``calibration`` must have them.
+    calibration: PnlcalibSettings = DEFAULT_CALIBRATION
 
 
 def _laid_over(defaults: dict[str, Any], changes: dict[Any, Any]) -> dict[Any, Any]:

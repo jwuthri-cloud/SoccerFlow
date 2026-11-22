@@ -1,0 +1,6 @@
+# Settings of run for the detector engine without any model step: RF-DETR on every frame (people and ball),
+# team and role from the kit colours, PnLCalib on every frame, no shirt numbers. It makes no model call.
+engines:
+  people: detector
+  pitch_mapping: calibration
+  number: none
