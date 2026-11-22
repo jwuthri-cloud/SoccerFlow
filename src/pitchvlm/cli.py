@@ -121,6 +121,7 @@ from pitchvlm.datasets import (
     make_split_manifest,
     save_manifest,
 )
+from pitchvlm.evalx.diagnostics import track_diagnostics
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.evalx.oracle import (
     TeamSideFacts,
@@ -1389,6 +1390,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     errors = summarize(position_errors_m(result.frames, truth))
     identity = identity_scores(result.frames, truth)
     timing = clock.report(info.n_frames)
+    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
     summary = {
         "clip_id": info.clip_id,
         "engine": args.engine,
@@ -1399,6 +1401,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "position_error_m": errors,
         "identity": dataclasses.asdict(identity),
         "frames_with_ball": sum(state.ball is not None for state in result.frames),
+        "diagnostics": diagnostics.as_dict(),
         "checker": {"valid": not problems, "problems": problems},
         "scored_frames": scored_frames,
         "scored_frames_without_prediction": empty_frames,
@@ -1421,6 +1424,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             "(a stand-in ball that the picture does not show)"
         )
     print_shots_and_paint(result)
+    print_diagnostics(diagnostics.lines())
     print_timing(timing)
     print(f"prediction file: {predictions}")
     print_problems(problems)
@@ -1450,6 +1454,13 @@ def print_timing(timing: Mapping[str, Mapping[str, float | None]]) -> None:
 
 
 # --- run -----------------------------------------------------------------------------
+
+
+def print_diagnostics(lines: Sequence[str]) -> None:
+    """Print the tracking values that need no labels (``evalx.diagnostics``)."""
+    print("tracking values without labels (no gate uses them):")
+    for line in lines:
+        print(f"  {line}")
 
 
 def require_enough_keyframes(n_keyframes: int, config: PipelineConfig) -> None:
@@ -1674,11 +1685,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print_empty_result(empty)
     timing = clock.report(info.n_frames)
     print_engines(result.engines)
+    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
+    print_diagnostics(diagnostics.lines())
     print_timing(timing)
     document = {
         "provenance": provenance,
         "prediction_file": prediction_file,
         "timing": timing,
+        "diagnostics": diagnostics.as_dict(),
         "result": result.model_dump(mode="json"),
     }
     write_json(clip_dir / RESULT_NAME, document)

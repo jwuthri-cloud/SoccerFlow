@@ -627,6 +627,91 @@ Money:
   November price, 0.66 USD from 1 December 2026), and the run stops. So this is the largest
   cost of one call on that model. Section 8 says how the cost pilot settles a limit.
 
+### The track repairs against gate G4 (arms)
+
+Two track repairs are arms of gate G4, off by default: the split of team swaps and the team slots
+(`docs/ARCHITECTURE.md`, `tracking.py`; `docs/DECISIONS.md`, 2026-11-22). Each arm is a settings
+file in `configs/arms`. Measure them on the 6 clips of the group `dev` after the runs of the
+current behaviour above (`--out ~/pitchvlm-data/runs/dev`), with the same cache folder. For each
+clip of the group:
+
+```bash
+# Team slots: they act after the shirt numbers, so every answer is stored. Free.
+python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
+    --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
+    --config configs/arms/g4_team_slots.yaml --out ~/pitchvlm-data/runs/g4-team-slots --replay
+
+# Split of team swaps: a track that is cut gets new crops, so its number request is new. First the
+# dry run: it stops at the first answer that is not stored. Then the paid run.
+python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
+    --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
+    --config configs/arms/g4_split_team_swaps.yaml --out ~/pitchvlm-data/runs/g4-split-swaps --replay
+python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
+    --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
+    --config configs/arms/g4_split_team_swaps.yaml --out ~/pitchvlm-data/runs/g4-split-swaps
+
+# Both repairs: the tracks before the votes are those of the split arm, so every answer is stored. Free.
+python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
+    --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
+    --config configs/arms/g4_both_repairs.yaml --out ~/pitchvlm-data/runs/g4-both --replay
+```
+
+- Money: the estimate line of the paid run counts every request of the clip (about 2.3 USD), but
+  the stored answers cost nothing. Only the number requests of the tracks that the split changed
+  are new: about 0.009 USD each with the default token estimates (an estimate, not measured).
+  The run limit of 1.3 times the estimate does not stop such a run. Run one clip at a time.
+- Each run prints the tracking values without labels (births inside the image, steps faster than
+  9 m/s, team-key changes, tracks per team) and writes them into `result.json` under
+  `diagnostics`. No gate uses them.
+
+The G4 values of each arm, per clip and over the group. Put the clip names of the group `dev`
+into the list (`configs/splits.json`, split `valid`, group `dev`):
+
+```python
+import json
+from pathlib import Path
+
+import yaml
+
+from pitchvlm.evalx.metrics import identity_scores
+from pitchvlm.labels import gsr_frame_states, load_gsr_labels
+from pitchvlm.schemas import ClipResult
+
+data = Path("~/pitchvlm-data").expanduser()
+clips = json.loads(Path("configs/splits.json").read_text(encoding="utf-8"))["valid"]["dev"]
+gate = yaml.safe_load(Path("configs/gates.yaml").read_text(encoding="utf-8"))["g4_identity"]
+arms = {"current": "dev", "team slots": "g4-team-slots", "split swaps": "g4-split-swaps", "both": "g4-both"}
+for arm, folder in arms.items():
+    scores = {}
+    for clip in clips:
+        document = json.loads((data / "runs" / folder / clip / "result.json").read_text(encoding="utf-8"))
+        result = ClipResult.model_validate(document["result"])
+        truth = gsr_frame_states(load_gsr_labels(data / "SoccerNetGS-valid" / clip / "Labels-GameState.json"))
+        scores[clip] = identity_scores(result.frames, truth)
+        print(arm, clip, scores[clip])
+    coverage = sum(one.coverage for one in scores.values()) / len(scores)
+    worst = min(one.coverage for one in scores.values())
+    switches = max(one.switches for one in scores.values())
+    ratio = max(one.track_ratio for one in scores.values())
+    passes = (
+        coverage >= gate["coverage_min"]
+        and worst >= gate["coverage_worst_clip_min"]
+        and switches <= gate["switches_per_clip_max"]
+        and ratio <= gate["track_ratio_max"]
+    )
+    print(f"{arm}: coverage {coverage:.3f} (worst clip {worst:.3f}), most switches {switches}, "
+          f"largest track ratio {ratio:.2f}, G4 {'passes' if passes else 'fails'} on {len(scores)} clips")
+```
+
+- The script reads the track ratio limit per clip (the largest ratio of the group). The gate file
+  does not say whether the limit is per clip or over the group: the owner decides before the run.
+- The G4 values do not see a wrong join: a track that follows two people one after the other.
+  `purity` (printed with the values) does, and so does AssA of `eval`. Score each arm with `eval`
+  (section 5, `--pred ~/pitchvlm-data/runs/<folder>/predictions`, a new `--out` per arm) and
+  compare AssA with the arm `current` on the same clips before a repair becomes the default.
+- A repair becomes the default only with a decision entry in `docs/DECISIONS.md` that names its
+  G4 values and AssA against the current behaviour on the same 6 clips.
+
 ## 5 Scoring
 
 ```bash
@@ -1144,10 +1229,17 @@ The pipeline has a second engine for the people step and for the pitch mapping
 (`docs/DECISIONS.md`, entry "A real-time detector engine next to the model engine" of
 2026-11-22). The people engine `detector` takes the people and the ball of every frame from a
 detector run, gives each person a team key and a role from the kit colours, and follows the
-ball. The pitch engine `calibration` takes the camera of every frame from a PnLCalib run. With the settings file `configs/engines/detector_calibration.yaml` no step
-calls a model, so the run is free. `configs/engines/detector_calibration_numbers.yaml` adds the
-paid shirt-number step (one kit legend request and one number request per track): it prints its
-estimate like every paid run and needs the owner's go-ahead.
+ball. The pitch engine `calibration` takes the camera of every frame from a PnLCalib run. With
+the settings file `configs/engines/detector_calibration.yaml` no step calls a model, so the run
+is free. `configs/engines/detector_calibration_numbers.yaml` adds the paid shirt-number step (one
+kit legend request and one number request per track): it prints its estimate like every paid run
+and needs the owner's go-ahead.
+
+The track repairs of section 4 ("The track repairs against gate G4") work with this engine too.
+`run` reads one settings file, so an arm of the detector engine needs a file with the `engines`
+section of `configs/engines/detector_calibration.yaml` and the `tracking` section of the arm.
+Commit that file before the run (rule 7). The tracking values without labels of a detector run
+count every observed frame, not keyframes: do not compare them with those of the model engine.
 
 The tools run as in section 3, in their own environments, through `tools/run_tool.py`. The
 package never imports a tool. Three commands per clip: write the clip job, run the tool on every

@@ -12,6 +12,7 @@ import importlib.util
 import json
 import sys
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -21,7 +22,7 @@ import numpy as np
 import pytest
 
 from pitchvlm import cli, pipeline
-from pitchvlm.config import EngineSettings, PipelineConfig, load_config
+from pitchvlm.config import EngineSettings, PipelineConfig, TrackingConfig, load_config
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.export_gsr import check_predictions, prediction_items
 from pitchvlm.fallbacks.fake import fake_ball_position, fake_calibration_answers, fake_detector_answers
@@ -29,9 +30,10 @@ from pitchvlm.frames import keyframe_indices
 from pitchvlm.geometry import matrix_to_rows
 from pitchvlm.pipeline import ToolAnswers, every_frame_tracking, run_clip
 from pitchvlm.render import RadarRenderer, draw_ball
-from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, HomographyRecord
+from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, HomographyRecord, Track
 from pitchvlm.synth import RetimedScene, SyntheticScene, SyntheticSource
 from pitchvlm.timing import StageClock
+from pitchvlm.tracking import finalize_tracks, split_team_swaps
 from pitchvlm.vlm.fake import FakeBackend
 from pitchvlm.vlm.types import TextPart, VLMRequest, VLMResponse
 
@@ -219,6 +221,79 @@ def test_cameras_of_the_calibration_get_the_paint_alignment_of_the_keyframes(
     assert [check.frame for check in cut_result.paint] == keyframes
     # The cameras of the stand-in are exact, so their lines lie on the painted lines.
     assert all(check.score is not None and check.score > 0.9 for check in cut_result.paint)
+
+
+# --- Track repairs (arms of gate G4) ----------------------------------------------------
+
+#: The detector and the calibration with both track repairs on.
+DETECTOR_REPAIRS = PipelineConfig(
+    engines=DETECTOR_ONLY, tracking=TrackingConfig(split_team_swaps=True, team_slots=True)
+)
+
+
+def test_split_of_team_swaps_runs_per_shot_after_the_kit_roles(
+    cut_scene: RetimedScene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The split gets the fragments of one shot, whose goalkeepers and referees have no team key."""
+    calls: list[tuple[set[bool], set[tuple[str, str]]]] = []
+
+    def watched(tracks: Sequence[Track]) -> list[Track]:
+        shots = {obs.frame >= CUT for track in tracks for obs in track.observations}
+        roles = {(obs.role, obs.team_key) for track in tracks for obs in track.observations}
+        calls.append((shots, roles))
+        return split_team_swaps(tracks)
+
+    monkeypatch.setattr(pipeline, "split_team_swaps", watched)
+    tools = tools_of(cut_scene, DETECTOR_ONLY)
+    run_clip(SyntheticSource(cut_scene), None, PipelineConfig(engines=DETECTOR_ONLY), tools=tools)
+    assert calls == []
+    repaired = run_clip(SyntheticSource(cut_scene), None, DETECTOR_REPAIRS, tools=tools)
+    assert [shots for shots, _ in calls] == [{False}, {True}]
+    # kit_roles ran first: a goalkeeper carries the team key none, so the split never cuts it.
+    roles = set().union(*(roles for _, roles in calls))
+    assert ("goalkeeper", "none") in roles
+    assert ("goalkeeper", "A") not in roles and ("goalkeeper", "B") not in roles
+    assert [track.track_id for track in repaired.tracks if track.first_frame < CUT <= track.last_frame] == []
+
+
+def test_team_slots_link_the_fragments_of_the_detector_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On 250 frames the plain detector engine breaks 4 people into two tracks; the slots link them right."""
+    long_scene = SyntheticScene(n_frames=250, seed=3)
+    tools = tools_of(long_scene, DETECTOR_ONLY)
+    seen_cuts: list[tuple[int, ...]] = []
+
+    def watched(*args: Any, **kwargs: Any) -> list[Track]:
+        seen_cuts.append(tuple(kwargs["cuts"]))
+        return finalize_tracks(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "finalize_tracks", watched)
+    plain = run_clip(SyntheticSource(long_scene), None, PipelineConfig(engines=DETECTOR_ONLY), tools=tools)
+    slots = PipelineConfig(engines=DETECTOR_ONLY, tracking=TrackingConfig(team_slots=True))
+    linked = run_clip(SyntheticSource(long_scene), None, slots, tools=tools)
+    assert seen_cuts == [(), ()]
+    players = Counter(track.team_side for track in linked.tracks if track.role == "player")
+    assert set(players.values()) == {10}
+    before = identity_scores(plain.frames, truth(long_scene))
+    after = identity_scores(linked.frames, truth(long_scene))
+    assert (before.switches, after.switches) == (4, 0)
+    assert after.track_ratio == pytest.approx(1.0)
+    assert before.track_ratio > 1.1
+
+
+def test_team_slots_link_no_track_of_the_detector_engine_across_a_cut(cut_scene: RetimedScene) -> None:
+    repaired = run_clip(SyntheticSource(cut_scene), None, DETECTOR_REPAIRS, tools=tools_of(cut_scene, DETECTOR_ONLY))
+    assert repaired.cuts == (CUT,)
+    assert [track.track_id for track in repaired.tracks if track.first_frame < CUT <= track.last_frame] == []
+
+
+def test_detector_run_writes_and_prints_the_tracking_values_without_labels(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["demo", "--engine", "detector", "--frames", "50", "--out", str(tmp_path)]) == 0
+    printed = capsys.readouterr().out
+    assert "tracking values without labels (no gate uses them):" in printed
+    summary = json.loads((tmp_path / cli.SUMMARY_NAME).read_text(encoding="utf-8"))
+    assert summary["diagnostics"]["tracks"] == summary["n_tracks"]
 
 
 def test_model_engine_has_no_ball(scene: SyntheticScene) -> None:

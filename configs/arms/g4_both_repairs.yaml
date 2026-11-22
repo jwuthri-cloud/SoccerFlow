@@ -1,0 +1,5 @@
+# Arm of gate G4: the pipeline settings of configs/default.yaml with both track repairs: the split of team
+# swaps and the team slots. Pass it to "run" with --config. docs/RUNBOOK.md, section 4, says how it is measured.
+tracking:
+  split_team_swaps: true
+  team_slots: true
