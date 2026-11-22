@@ -88,6 +88,14 @@ cached, replays for free, and can use the half-price tier.
   pretrained weights and without training (owner decision, 14 Nov 2026). It costs no API money.
   So the decision of 24 Nov has measured values of both tools next to those of the two model
   steps, and the time per frame of each tool on the run machine.
+- Providers (owner decision, 22 Nov 2026): each model step can use Gemini or any paid image model
+  through OpenRouter (`provider`, `model` and `coords` of the step in the settings). Only
+  `vlm/client.py` talks to a model service; the OpenRouter requests go out with the standard
+  library, keep the inputs private (zero data retention, no data collection, no fallback) and
+  are priced at the cost that the API reports, in the same ledger and under the same stops. The
+  contract checks of `doctor` (G0) prove each model and its coordinate convention before it
+  sees footage. First check: one doctor of an OpenRouter model, then its people probe on the
+  frames of the Gemini people probe (`docs/RUNBOOK.md`, section 10). Video input is not built.
 
 ## Gates (numbers fixed before each run, kept in `configs/gates.yaml`)
 
@@ -307,3 +315,5 @@ be tested on the build machine; `doctor` is its first real test.
 - SN-GSR paper: https://arxiv.org/abs/2404.11335 — data: https://huggingface.co/datasets/SoccerNet/SN-GSR-2025
 - Scorer: https://github.com/SoccerNet/sn-trackeval
 - Gemini docs: https://aistudio.google.com/docs/image-understanding , https://aistudio.google.com/docs/pricing
+- OpenRouter docs: https://openrouter.ai/docs/api-reference/overview , https://openrouter.ai/docs/features/provider-routing
+  (all pages that the client relies on: `docs/DECISIONS.md`, entry of 2026-11-22)

@@ -13,6 +13,6 @@ Rules:
 - Report a landmark only when the mark itself is visible inside image 2: the line crossing, the line end, the spot or the base of the goal post.
 - Never extrapolate. Do not report a landmark that is outside the picture, that is hidden by a person or a graphic, or whose position you can only guess from other lines.
 - "id": the id of the landmark from the list. Use each id one time at most.
-- "point": the position of the landmark in image 2. Format: [y, x]. Each value is an integer from 0 to 1000, normalised to image 2: y goes from 0 at the top edge to 1000 at the bottom edge, and x goes from 0 at the left edge to 1000 at the right edge.
+- "point": the position of the landmark in image 2. {point_format}
 - "view": the part of the pitch that image 2 shows: "left" for the side of the left goal, "centre" for the area around the halfway line, "right" for the side of the right goal.
 - When you see no landmark, give an empty "landmarks" list.

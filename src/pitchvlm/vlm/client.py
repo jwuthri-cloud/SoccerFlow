@@ -1,8 +1,14 @@
-"""The real model backend: Gemini through the Interactions API.
+"""The real model backends: Gemini through the Interactions API, and OpenRouter.
 
-This is the only module that may import the model SDK (``google-genai``). The
-import is lazy: it runs when the first request needs a client. So this module
-imports, and its pure helpers work, on a machine that has no SDK.
+This is the only module that talks to a model service, and the only module that
+may import the model SDK (``google-genai``). The import is lazy: it runs when the
+first Gemini request needs a client. So this module imports, and its pure helpers
+work, on a machine that has no SDK. The OpenRouter backend needs no SDK: it sends
+its requests with the standard library (``OpenRouterBackend``, at the end of this
+module, with its own notes). ``ProviderBackend`` sends each request to the backend
+of its provider.
+
+Gemini:
 
 How a request is sent (API pages and SDK source read again on 2026-11-14, SDK 3.3.0):
 
@@ -75,25 +81,34 @@ from __future__ import annotations
 
 import base64
 import copy
+import http.client
 import importlib.metadata
+import json
 import logging
 import math
 import os
 import random
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from types import MappingProxyType
 from typing import Any, Literal, Protocol, get_args
 
-from pitchvlm.vlm.cost import HIGHEST_PRICE_TIER, cost_usd, has_flex_tier, price_for
+from pitchvlm.vlm.cost import FREE_MODEL_SUFFIX, HIGHEST_PRICE_TIER, Price, cost_usd, has_flex_tier, price_for
 from pitchvlm.vlm.types import (
+    Backend,
     BackendError,
     BilledAnswerError,
     BilledTier,
     FlexBusyError,
+    OPENROUTER_RESOLUTIONS,
     ImagePart,
+    Provider,
     ServiceTier,
     TextPart,
     UnconfirmedCallError,
@@ -454,7 +469,11 @@ def backoff_delay_s(retry_index: int, rng: random.Random) -> float:
 
 def _error_text(error: BaseException, secret: str) -> str:
     """Describe an error in one short text that never contains the key value."""
-    text = f"{type(error).__name__}: {error}"
+    return _clean_text(f"{type(error).__name__}: {error}", secret)
+
+
+def _clean_text(text: str, secret: str) -> str:
+    """Return a text for a log line or an error message: without the key value, and cut to ``MAX_ERROR_CHARS``."""
     if secret:
         text = text.replace(secret, "[key removed]")
     if len(text) > MAX_ERROR_CHARS:
@@ -791,7 +810,7 @@ class GeminiBackend:
         could not be read, the error is an ``UnconfirmedCallError``, and a
         warning is logged, so that every such call is in the log.
 
-        No attempt is sent while the stop event is set (``_refuse_when_stopped``).
+        No attempt is sent while the stop event is set (``refuse_when_stopped``).
         """
         timeout_s = self._timeouts_s[tier]
         attempt = 0
@@ -799,7 +818,7 @@ class GeminiBackend:
         first_started: float | None = None
         while True:
             self._limiter.wait_for_room(self._stop)
-            self._refuse_when_stopped(label, attempt)
+            refuse_when_stopped(self._stop, label, attempt)
             attempt += 1
             started = self._clock()
             if first_started is None:
@@ -860,21 +879,525 @@ class GeminiBackend:
             else:
                 return interaction, attempt, self._clock() - started
 
-    def _refuse_when_stopped(self, label: str, attempts_made: int) -> None:
-        """Raise ``BackendError`` when the stop event is set, so that no attempt is sent after a stop request.
 
-        ``attempts_made`` is the number of attempts that the request has made so
-        far. A warning is logged, because nobody may read the error: after an
-        interruption the thread pool drops the errors of its requests.
+def refuse_when_stopped(stop: threading.Event, label: str, attempts_made: int) -> None:
+    """Raise ``BackendError`` when the stop event is set, so that no attempt is sent after a stop request.
+
+    ``attempts_made`` is the number of attempts that the request has made so
+    far. A warning is logged, because nobody may read the error: after an
+    interruption the thread pool drops the errors of its requests.
+    """
+    if not stop.is_set():
+        return
+    if attempts_made == 0:
+        message = f"{label}: a stop was requested before this request was sent, so it was not sent"
+    else:
+        message = (
+            f"{label}: a stop was requested after attempt {attempts_made} failed, "
+            "so no further attempt was sent"
+        )
+    logger.warning("%s", message)
+    raise BackendError(message)
+
+
+class LazySdkClient:
+    """The SDK client, built with ``build_sdk_client`` on the first access of ``interactions``.
+
+    A wrapper around the SDK client, for example the recording client of ``doctor``,
+    can be built before the key is read: a run that never sends a Gemini request then
+    needs neither the Gemini key nor the SDK. Safe to use from several threads.
+    """
+
+    def __init__(self, api_key_env: str, timeout_s: float) -> None:
+        self._api_key_env = api_key_env
+        self._timeout_s = timeout_s
+        self._client: InteractionsClient | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def interactions(self) -> InteractionsApi:
+        """Return the ``interactions`` part of the SDK client, which is built on the first call."""
+        with self._lock:
+            if self._client is None:
+                self._client = build_sdk_client(self._api_key_env, self._timeout_s)
+            return self._client.interactions
+
+
+# --- OpenRouter ------------------------------------------------------------------
+#
+# How a request is sent (documentation pages read on 2026-11-22; the list of pages is in
+# docs/DECISIONS.md, entry of 2026-11-22):
+#
+# - One POST to the chat completions endpoint per attempt, with the standard library only: the
+#   module needs no SDK for OpenRouter, so rule 4 keeps its meaning (only this module talks to a
+#   model service).
+# - One user message: the prompt text, then each image as a base64 data URL with its ``detail``.
+# - The answer must follow the JSON schema of the request (``response_format`` of the type
+#   ``json_schema``, strict). Each object of the schema gets ``additionalProperties: false``, as
+#   the strict mode of several providers requires.
+# - The routing settings (``OPENROUTER_ROUTING``) keep the inputs private and the answer exact:
+#   only endpoints with zero data retention, no provider that collects data, only providers that
+#   support every parameter of the request, and no fallback to another provider. When no provider
+#   meets them, the request fails; it never goes to a provider that does not meet them.
+# - No sampling parameter, no limit on the output tokens. The thinking level is sent as the
+#   reasoning effort; ``model_default`` sends none.
+# - The answer reports its cost (``usage.cost``). The documentation calls it credits; one credit
+#   is one USD of the account. The ledger takes it as it is.
+# - Errors: a status code with an error body, or the status 200 with an error in the body (an
+#   error during the generation). A 200 answer without a usage or a cost is a call whose cost is
+#   unknown (``UnconfirmedCallError``).
+
+#: The chat completions endpoint of OpenRouter.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+#: Environment variable that holds the OpenRouter key on the run machine.
+OPENROUTER_KEY_VARIABLE = "OPENROUTER_API_KEY"
+#: The routing settings of every OpenRouter request (the ``provider`` object of the body).
+OPENROUTER_ROUTING: Mapping[str, Any] = MappingProxyType(
+    {"zdr": True, "data_collection": "deny", "require_parameters": True, "allow_fallbacks": False}
+)
+#: The only finish reason of a complete answer.
+OPENROUTER_FINISHED = "stop"
+#: Longest wait that a ``Retry-After`` header of the API can ask for before the next attempt, seconds.
+RETRY_AFTER_CAP_S = 300.0
+#: What a failed request with the status 503 can mean, after the documentation of the errors.
+NO_PROVIDER_NOTE = (
+    "the status 503 also means that no provider of the model meets the routing settings: zero data retention, "
+    "no data collection and support of every request parameter"
+)
+
+
+def _strict_schema(schema: Any) -> Any:
+    """Return a copy of a JSON schema in which every object refuses keys that it does not list."""
+    if isinstance(schema, dict):
+        copied = {key: _strict_schema(value) for key, value in schema.items()}
+        if copied.get("type") == "object":
+            copied["additionalProperties"] = False
+        return copied
+    if isinstance(schema, list):
+        return [_strict_schema(value) for value in schema]
+    return copy.deepcopy(schema)
+
+
+def _content_part(part: TextPart | ImagePart) -> dict[str, Any]:
+    """Turn one request part into one content part of a chat message."""
+    if isinstance(part, TextPart):
+        return {"type": "text", "text": part.text}
+    if part.resolution not in OPENROUTER_RESOLUTIONS:
+        raise ValueError(
+            f"an OpenRouter image has no resolution {part.resolution!r}: use {' or '.join(OPENROUTER_RESOLUTIONS)}"
+        )
+    data = base64.b64encode(part.data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{part.mime_type};base64,{data}", "detail": part.resolution}}
+
+
+def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
+    """Turn a request into the JSON body of an OpenRouter chat completion.
+
+    Text and image parts keep their order in one user message. The answer must
+    follow the request's schema. The routing settings are ``OPENROUTER_ROUTING``.
+    No sampling parameter is sent. ``request.context`` is never sent.
+
+    Raises ValueError for a request without parts, for a request of another
+    provider, for a free model (rule 5), for a service tier other than the
+    standard one and for an image resolution without a ``detail``.
+    """
+    if request.provider != "openrouter":
+        raise ValueError(f"an OpenRouter body cannot be built for a {request.provider} request")
+    if not request.parts:
+        raise ValueError("a request needs at least one text or image part")
+    if request.model.endswith(FREE_MODEL_SUFFIX):
+        raise ValueError(f"{request.model} is a free model: only paid models are allowed (rule 5)")
+    if request.service_tier != "standard":
+        raise ValueError(f"an OpenRouter request has no service tier {request.service_tier!r}: use standard")
+    body: dict[str, Any] = {
+        "model": request.model,
+        "messages": [{"role": "user", "content": [_content_part(part) for part in request.parts]}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"{request.meta.step}_answer",
+                "strict": True,
+                "schema": _strict_schema(request.response_schema),
+            },
+        },
+        "provider": dict(OPENROUTER_ROUTING),
+        "stream": False,
+    }
+    if request.thinking_level != "model_default":
+        body["reasoning"] = {"effort": request.thinking_level}
+    return body
+
+
+def keeps_inputs_private(request: VLMRequest) -> bool:
+    """Say whether the call that a request gives keeps its inputs private (rule 5).
+
+    A Gemini call must carry ``store=False``. An OpenRouter call must carry the
+    routing settings of ``OPENROUTER_ROUTING``.
+    """
+    if request.provider == "openrouter":
+        return routing_keeps_inputs_private(build_openrouter_body(request).get("provider"))
+    return build_interaction_kwargs(request).get("store") is False
+
+
+def routing_keeps_inputs_private(routing: Any) -> bool:
+    """Say whether the ``provider`` object of an OpenRouter body holds every setting of ``OPENROUTER_ROUTING``."""
+    return isinstance(routing, dict) and all(routing.get(key) == value for key, value in OPENROUTER_ROUTING.items())
+
+
+@dataclass(frozen=True)
+class HttpAnswer:
+    """The answer of one HTTP request: its status code, its body and the wait that ``Retry-After`` asks for."""
+
+    status: int
+    body: bytes
+    #: Seconds that the server asks the client to wait before the next attempt, or None.
+    retry_after_s: float | None = None
+
+
+class HttpTimeoutError(Exception):
+    """An HTTP request got no complete answer within its timeout."""
+
+
+class HttpConnectionError(Exception):
+    """An HTTP request got no answer: the connection was refused or lost."""
+
+
+class HttpTransport(Protocol):
+    """Anything that sends one POST request: ``UrllibTransport``, or a fake object in tests.
+
+    An answer with an error status is returned, not raised. A request without an
+    answer raises ``HttpTimeoutError`` or ``HttpConnectionError``.
+    """
+
+    def post(self, url: str, headers: Mapping[str, str], body: bytes, timeout_s: float) -> HttpAnswer: ...
+
+
+def _retry_after_s(headers: Any) -> float | None:
+    """Read the ``Retry-After`` header in seconds. A missing header and a date give None."""
+    value = headers.get("Retry-After") if headers is not None else None
+    try:
+        seconds = float(value) if value is not None else None
+    except ValueError:
+        return None
+    return seconds if seconds is not None and math.isfinite(seconds) and seconds >= 0 else None
+
+
+class UrllibTransport:
+    """Sends a POST request with ``urllib`` of the standard library."""
+
+    def post(self, url: str, headers: Mapping[str, str], body: bytes, timeout_s: float) -> HttpAnswer:
+        """Send one POST request and return its answer, also an answer with an error status."""
+        request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+                return HttpAnswer(response.status, response.read(), _retry_after_s(response.headers))
+        except urllib.error.HTTPError as error:
+            with error:
+                return HttpAnswer(error.code, error.read(), _retry_after_s(error.headers))
+        except TimeoutError as error:
+            raise HttpTimeoutError(f"no complete answer within {timeout_s:g} s") from error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise HttpTimeoutError(f"no complete answer within {timeout_s:g} s") from error
+            raise HttpConnectionError(f"the connection failed: {error.reason}") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise HttpConnectionError(f"the connection failed: {type(error).__name__}: {error}") from error
+
+
+def _json_object(body: bytes) -> dict[str, Any] | None:
+    """Read a body as a JSON object, or return None when it is not one."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _error_message(data: dict[str, Any] | None) -> str:
+    """Return the code and the message of an error body of OpenRouter, or a short note when it has none."""
+    error = None if data is None else data.get("error")
+    if not isinstance(error, dict):
+        return "no error message in the body"
+    return f"error code {error.get('code')!r}: {error.get('message')!r}"
+
+
+def _count(container: Any, name: str, label: str, *, required: bool = False) -> int:
+    """Read one token counter of an OpenRouter usage object. A missing counter is 0, unless it is required."""
+    value = container.get(name) if isinstance(container, dict) else None
+    if value is None:
+        if required:
+            raise UnconfirmedCallError(f"{label}: the usage has no {name}, so the cost is unknown [{UNCONFIRMED_NOTE}]")
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UnconfirmedCallError(f"{label}: the usage field {name} is not a token count: {value!r} [{UNCONFIRMED_NOTE}]")
+    return value
+
+
+def read_openrouter_usage(data: dict[str, Any], label: str) -> tuple[Usage, float]:
+    """Read the token usage and the reported cost (USD) of an OpenRouter answer.
+
+    Reasoning tokens are a part of ``completion_tokens`` (the reasoning page of the
+    documentation); ``normalize_usage`` takes them out of the output count. Raises
+    ``UnconfirmedCallError`` when the answer has no usage, no prompt token count or no
+    cost that is a number from 0, and when the call was served with a key of the owner
+    at the provider (``is_byok``): the provider bills such a call itself, so the
+    reported cost is not its whole cost.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        raise UnconfirmedCallError(f"{label}: the answer has no usage, so its cost is unknown [{UNCONFIRMED_NOTE}]")
+    cost = usage.get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, int | float) or not math.isfinite(cost) or cost < 0:
+        raise UnconfirmedCallError(f"{label}: the answer reports no cost: {cost!r} [{UNCONFIRMED_NOTE}]")
+    if usage.get("is_byok") is True:
+        raise UnconfirmedCallError(
+            f"{label}: the call was served with a provider key of the account (BYOK), so the provider bills it "
+            f"directly and the reported cost is not its whole cost. Remove the provider key from the account "
+            f"[{UNCONFIRMED_NOTE}]"
+        )
+    total = usage.get("total_tokens")
+    normalized = normalize_usage(
+        input_tokens=_count(usage, "prompt_tokens", label, required=True),
+        output_tokens=_count(usage, "completion_tokens", label),
+        thought_tokens=_count(usage.get("completion_tokens_details"), "reasoning_tokens", label),
+        cached_tokens=_count(usage.get("prompt_tokens_details"), "cached_tokens", label),
+        total_tokens=_count(usage, "total_tokens", label) if total is not None else None,
+    )
+    return normalized, float(cost)
+
+
+def read_openrouter_text(data: dict[str, Any], billed: VLMResponse, label: str) -> str:
+    """Return the answer text of an OpenRouter answer whose call was billed.
+
+    ``billed`` is the cost record of the call. Raises ``BilledAnswerError`` with that
+    record for an error in the body or in the choice, for a finish reason other than
+    ``stop`` (also ``length``: the answer stopped at the token limit), for a missing
+    or empty text and for a usage without output tokens.
+    """
+    if "error" in data:
+        raise BilledAnswerError(f"{label}: the answer holds an error ({_error_message(data)})", billed)
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise BilledAnswerError(f"{label}: the answer has no choice", billed)
+    choice = choices[0]
+    if isinstance(choice.get("error"), dict):
+        raise BilledAnswerError(f"{label}: the choice holds an error ({_error_message(choice)})", billed)
+    finish = choice.get("finish_reason")
+    if finish != OPENROUTER_FINISHED:
+        raise BilledAnswerError(
+            f"{label}: the answer ended with the finish reason {finish!r} "
+            f"(native {choice.get('native_finish_reason')!r}), expected {OPENROUTER_FINISHED!r}",
+            billed,
+        )
+    message = choice.get("message")
+    text = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise BilledAnswerError(f"{label}: the answer has no text", billed)
+    if billed.usage.output_tokens + billed.usage.thought_tokens == 0:
+        raise BilledAnswerError(f"{label}: the answer has text, but its usage reports no output tokens", billed)
+    return text
+
+
+def _require_openrouter_price(model: str, prices: Sequence[Price], on: date) -> None:
+    """Raise ``BackendError`` when an OpenRouter model has no price in the price table, before any money is spent."""
+    try:
+        price_for(model, on, prices)
+    except KeyError as exc:
+        raise BackendError(
+            f"The OpenRouter model {model!r} has no price on {on.isoformat()}, so its run has no estimate. "
+            "Add its price to configs/openrouter_prices.yaml first."
+        ) from exc
+
+
+class OpenRouterBackend:
+    """Backend that answers requests through the chat completions API of OpenRouter.
+
+    The key is read from the environment variable ``api_key_env`` for every
+    request. It goes into the ``Authorization`` header and nowhere else: this
+    class does not keep it, does not log it and does not put it into an error
+    message.
+
+    ``prices`` is the price table of the OpenRouter models
+    (``cost.load_price_table``). A request for a model without a price on the
+    day is not sent. The cost of an answer is the cost that the API reports.
+
+    A failed call is tried again after the status codes 408, 409, 429 and 5xx
+    and after a lost connection, at most ``max_attempts`` times in total, with a
+    growing random wait, or the longer wait of a ``Retry-After`` header (at most
+    ``RETRY_AFTER_CAP_S``). Any other error ends the request at once, also a
+    timeout. Before every attempt the spend window is checked, as in
+    ``GeminiBackend``. ``stop``, ``clock`` and ``sleep`` work as there.
+
+    ``transport`` replaces the HTTP layer: a fake object in tests, or the
+    recording transport of ``doctor``. One instance can be used from several
+    threads.
+    """
+
+    def __init__(
+        self,
+        *,
+        prices: Sequence[Price],
+        api_key_env: str = OPENROUTER_KEY_VARIABLE,
+        timeout_s: float = STANDARD_TIMEOUT_S,
+        max_attempts: int = 4,
+        max_usd_per_10_min: float = 8.0,
+        stop: threading.Event | None = None,
+        transport: HttpTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], object] | None = None,
+    ) -> None:
+        if not api_key_env:
+            raise ValueError("api_key_env must name an environment variable")
+        if not timeout_s > 0:
+            raise ValueError("timeout_s must be positive")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self._prices = tuple(prices)
+        self._api_key_env = api_key_env
+        self._timeout_s = float(timeout_s)
+        self._max_attempts = max_attempts
+        self._transport: HttpTransport = transport if transport is not None else UrllibTransport()
+        self._clock = clock
+        self._stop = stop if stop is not None else threading.Event()
+        self._sleep: Callable[[float], object] = sleep if sleep is not None else self._stop.wait
+        self._rng = random.Random()
+        self._limiter = SpendRateLimiter(max_usd_per_10_min, clock=clock, sleep=self._sleep)
+
+    def generate(self, request: VLMRequest) -> VLMResponse:
+        """Send one request and return the JSON answer with its usage and its reported cost.
+
+        ``service_tier`` of the response is ``standard``, ``sdk_version`` is None,
+        ``reported_usd`` is the cost that the API reported and ``served_by`` the
+        provider that served the call. The cost goes into the spend window.
+
+        Raises ``ValueError`` for a request that cannot be sent (``build_openrouter_body``).
+        Raises ``BackendError`` when the key is missing, the model has no price, the
+        call fails or the stop event is set before an attempt is sent. Raises
+        ``UnconfirmedCallError`` for a call without an answer that can be read, without
+        a usage or without a reported cost: its cost is unknown. Raises
+        ``BilledAnswerError`` with the cost record when the answer was billed but
+        cannot be used.
         """
-        if not self._stop.is_set():
-            return
-        if attempts_made == 0:
-            message = f"{label}: a stop was requested before this request was sent, so it was not sent"
-        else:
-            message = (
-                f"{label}: a stop was requested after attempt {attempts_made} failed, "
-                "so no further attempt was sent"
+        body = json.dumps(build_openrouter_body(request)).encode("utf-8")
+        label = _request_label(request)
+        _require_openrouter_price(request.model, self._prices, datetime.now(UTC).date())
+        answer, attempts, latency_s = self._post_with_retries(body, label)
+        answered_at = datetime.now(UTC)
+        data = _json_object(answer.body)
+        if data is None:
+            message = f"{label}: status {answer.status}, but the answer is not a JSON object [{UNCONFIRMED_NOTE}]"
+            logger.warning("%s", message)
+            raise UnconfirmedCallError(message)
+        try:
+            usage, reported_usd = read_openrouter_usage(data, label)
+        except UnconfirmedCallError as error:
+            if "error" in data:
+                error = UnconfirmedCallError(f"{error} The answer holds an error: {_error_message(data)}")
+            logger.warning("%s", error)
+            raise error from None
+        self._limiter.record(reported_usd)
+        served_by = data.get("provider")
+        billed = VLMResponse(
+            text="",
+            usage=usage,
+            model=request.model,
+            service_tier="standard",
+            latency_s=latency_s,
+            attempts=attempts,
+            sdk_version=None,
+            created_at=answered_at.isoformat(timespec="seconds"),
+            reported_usd=reported_usd,
+            served_by=served_by if isinstance(served_by, str) else None,
+        )
+        text = read_openrouter_text(data, billed, label)
+        return billed.model_copy(update={"text": text})
+
+    def _headers(self) -> dict[str, str]:
+        """Return the headers of a request, with the key from the environment."""
+        api_key = os.environ.get(self._api_key_env, "").strip()
+        if not api_key:
+            raise BackendError(
+                f"The environment variable {self._api_key_env} is not set or is empty. "
+                "Set it to the OpenRouter key on the machine that calls the model."
             )
-        logger.warning("%s", message)
-        raise BackendError(message)
+        return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    def _post_with_retries(self, body: bytes, label: str) -> tuple[HttpAnswer, int, float]:
+        """Post the body until one attempt gets a success status.
+
+        Returns the answer, the number of attempts and the time of the successful
+        attempt in seconds. An attempt is tried again after a retryable status code
+        and after a lost connection, as long as the request has attempts left. A
+        timeout ends the request with ``UnconfirmedCallError``, any other failure with
+        ``BackendError``. No attempt is sent while the stop event is set.
+        """
+        attempt = 0
+        while True:
+            self._limiter.wait_for_room(self._stop)
+            refuse_when_stopped(self._stop, label, attempt)
+            headers = self._headers()
+            secret = headers["Authorization"].removeprefix("Bearer ")
+            attempt += 1
+            started = self._clock()
+            retry_after_s: float | None = None
+            try:
+                answer = self._transport.post(OPENROUTER_URL, headers, body, self._timeout_s)
+            except HttpTimeoutError as exc:
+                message = (
+                    f"{label}: the call failed on attempt {attempt} of {self._max_attempts} "
+                    f"(no answer within the timeout of {self._timeout_s:g} s): "
+                    f"{_error_text(exc, secret)} [{UNCONFIRMED_NOTE}]"
+                )
+                logger.warning("%s", message)
+                raise UnconfirmedCallError(message) from None
+            except HttpConnectionError as exc:
+                failure = (
+                    f"(no answer from the server, the connection failed): "
+                    f"{_error_text(exc, secret)} [{UNCONFIRMED_NOTE}]"
+                )
+                retryable, unconfirmed = True, True
+            else:
+                if 200 <= answer.status <= 299:
+                    return answer, attempt, self._clock() - started
+                failure = _clean_text(f"(status {answer.status}): {_error_message(_json_object(answer.body))}", secret)
+                if answer.status == 503:
+                    failure += f"; {NO_PROVIDER_NOTE}"
+                retryable, unconfirmed = is_retryable_status(answer.status), False
+                retry_after_s = answer.retry_after_s
+            if attempt >= self._max_attempts or not retryable:
+                message = f"{label}: the call failed on attempt {attempt} of {self._max_attempts} {failure}"
+                if unconfirmed:
+                    logger.warning("%s", message)
+                    raise UnconfirmedCallError(message)
+                raise BackendError(message)
+            delay_s = backoff_delay_s(attempt - 1, self._rng)
+            if retry_after_s is not None:
+                delay_s = max(delay_s, min(retry_after_s, RETRY_AFTER_CAP_S))
+            logger.warning(
+                "%s: attempt %d of %d failed %s. Next attempt in %.1f s.",
+                label,
+                attempt,
+                self._max_attempts,
+                failure,
+                delay_s,
+            )
+            self._sleep(delay_s)
+
+
+class ProviderBackend:
+    """Sends each request to the backend of its provider (``VLMRequest.provider``).
+
+    A run can use several providers, for example Gemini for the kit legend and an
+    OpenRouter model for the people. Every backend keeps its own spend window. A
+    request of a provider without a backend raises ``BackendError``.
+    """
+
+    def __init__(self, backends: Mapping[Provider, Backend]) -> None:
+        self._backends = dict(backends)
+
+    def generate(self, request: VLMRequest) -> VLMResponse:
+        """Answer the request with the backend of its provider."""
+        backend = self._backends.get(request.provider)
+        if backend is None:
+            raise BackendError(f"no backend for the provider {request.provider!r} of the {request.meta.step} request")
+        return backend.generate(request)
