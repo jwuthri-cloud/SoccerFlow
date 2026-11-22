@@ -15,7 +15,12 @@ What a parser does with a bad answer:
 - It turns a shirt number that is not an integer from 0 to 99 into None, also
   inside ``per_crop``, so that the entries stay in the order of the crops. It
   turns a view that is not a known view into None.
-- Coordinates outside 0-1000 are moved to the nearest limit by ``coords.py``.
+- Coordinates outside the image are moved to the nearest edge by ``coords.py``.
+
+Boxes and points follow the coordinate convention of the step settings
+(``StepSettings.coords``): the prompt states it, the answer schema asks for
+integers or, in the ``xy_unit`` convention, for numbers, and the parser reads
+it. A parser must be given the convention of the request whose answer it reads.
 """
 
 from __future__ import annotations
@@ -48,8 +53,8 @@ from pitchvlm.schemas import (
     PitchView,
     TeamKey,
 )
-from pitchvlm.vlm.coords import box_from_model, point_from_model
-from pitchvlm.vlm.prompts import PROMPT_NAMES, render_prompt
+from pitchvlm.vlm.coords import CoordConvention, box_from_answer, point_from_answer
+from pitchvlm.vlm.prompts import PROMPT_NAMES, box_format, point_format, render_prompt
 from pitchvlm.vlm.types import ImagePart, RequestMeta, Resolution, TextPart, VLMRequest
 
 _TEAM_KEYS: tuple[str, ...] = get_args(TeamKey)
@@ -131,10 +136,15 @@ def _kit_legend_schema() -> dict[str, Any]:
     )
 
 
-def _people_schema() -> dict[str, Any]:
+def _coordinate_schema(convention: CoordConvention) -> dict[str, Any]:
+    """Return the schema of one coordinate: a number in the ``xy_unit`` convention, else an integer."""
+    return {"type": "number"} if convention == "xy_unit" else _integer_schema()
+
+
+def _people_schema(convention: CoordConvention) -> dict[str, Any]:
     person = _object_schema(
         {
-            "box_2d": _list_schema(_integer_schema(), length=4),
+            "box_2d": _list_schema(_coordinate_schema(convention), length=4),
             "role": _choice_schema(ROLES),
             "team": _choice_schema(_TEAM_KEYS),
             "number": _integer_or_null_schema(),
@@ -143,8 +153,10 @@ def _people_schema() -> dict[str, Any]:
     return _object_schema({"people": _list_schema(person)})
 
 
-def _landmarks_schema() -> dict[str, Any]:
-    landmark = _object_schema({"id": _integer_schema(), "point": _list_schema(_integer_schema(), length=2)})
+def _landmarks_schema(convention: CoordConvention) -> dict[str, Any]:
+    landmark = _object_schema(
+        {"id": _integer_schema(), "point": _list_schema(_coordinate_schema(convention), length=2)}
+    )
     return _object_schema({"view": _choice_schema(_VIEWS), "landmarks": _list_schema(landmark)})
 
 
@@ -182,6 +194,7 @@ def _request(
 ) -> VLMRequest:
     """Assemble a request: the text part first, then the images in their order."""
     return VLMRequest(
+        provider=settings.provider,
         model=settings.model,
         thinking_level=settings.thinking_level,
         parts=(TextPart(text=text), *images),
@@ -222,12 +235,15 @@ def build_people_request(
     """Build the request for the people in one frame.
 
     ``item`` names a part of the frame, for example one tile, when a frame is
-    sent in several requests.
+    sent in several requests. The prompt asks for the boxes in the coordinate
+    convention of ``settings``.
     """
+    height, width = image.shape[:2]
+    box_text = box_format(settings.coords, image="the image", width=width, height=height)
     return _request(
-        text=render_prompt("people", legend=legend.prompt_text()),
+        text=render_prompt("people", legend=legend.prompt_text(), box_format=box_text),
         images=[_image_part(image, settings.resolution)],
-        schema=_people_schema(),
+        schema=_people_schema(settings.coords),
         meta=RequestMeta(clip_id=clip_id, step="people", frame=frame, item=item, repeat=repeat),
         settings=settings,
         context={},
@@ -240,12 +256,18 @@ def build_landmarks_request(
     """Build the request for the pitch landmarks in one frame.
 
     The request has two images: first the numbered pitch diagram, then the frame.
+    The prompt asks for the points in the coordinate convention of ``settings``.
+    An OpenRouter request sends the diagram at the resolution of the step: the
+    chat completions API has no medium resolution.
     """
-    diagram = ImagePart(data=_diagram_jpeg(), resolution=_DIAGRAM_RESOLUTION)
+    height, width = image.shape[:2]
+    point_text = point_format(settings.coords, image="image 2", width=width, height=height)
+    diagram_resolution = _DIAGRAM_RESOLUTION if settings.provider == "gemini" else settings.resolution
+    diagram = ImagePart(data=_diagram_jpeg(), resolution=diagram_resolution)
     return _request(
-        text=render_prompt("landmarks", landmark_list=pitch.landmark_legend_text()),
+        text=render_prompt("landmarks", landmark_list=pitch.landmark_legend_text(), point_format=point_text),
         images=[diagram, _image_part(image, settings.resolution)],
-        schema=_landmarks_schema(),
+        schema=_landmarks_schema(settings.coords),
         meta=RequestMeta(clip_id=clip_id, step="landmarks", frame=frame, repeat=repeat),
         settings=settings,
         context={},
@@ -435,7 +457,7 @@ def _goalkeeper_kit(item: object) -> GoalkeeperKit | None:
     return GoalkeeperKit(kit=kit, team_key=team)
 
 
-def _person(item: object, width: int, height: int) -> PersonDet | None:
+def _person(item: object, width: int, height: int, coords: CoordConvention) -> PersonDet | None:
     """Build one person, or return None when the box, the role or the team is not usable."""
     if not isinstance(item, dict):
         return None
@@ -443,13 +465,13 @@ def _person(item: object, width: int, height: int) -> PersonDet | None:
     role, team = item.get("role"), item.get("team")
     if coordinates is None or role not in ROLES or team not in _TEAM_KEYS:
         return None
-    box = box_from_model(coordinates, width, height)
+    box = box_from_answer(coordinates, width, height, coords)
     if box is None:
         return None
     return PersonDet(box=box, role=role, team_key=team, number=_shirt_number(item.get("number")))
 
 
-def _landmark(item: object, width: int, height: int) -> LandmarkObs | None:
+def _landmark(item: object, width: int, height: int, coords: CoordConvention) -> LandmarkObs | None:
     """Build one landmark observation, or return None when the id or the point is not usable."""
     if not isinstance(item, dict):
         return None
@@ -457,7 +479,7 @@ def _landmark(item: object, width: int, height: int) -> LandmarkObs | None:
     coordinates = _coordinates(item.get("point"), 2)
     if coordinates is None or not _is_landmark_id(landmark_id):
         return None
-    x, y = point_from_model(coordinates, width, height)
+    x, y = point_from_answer(coordinates, width, height, coords)
     return LandmarkObs(landmark_id=landmark_id, x=x, y=y)
 
 
@@ -482,28 +504,29 @@ def parse_kit_legend(text: str) -> KitLegend:
     )
 
 
-def parse_people(text: str, *, frame: int, width: int, height: int) -> FramePeople:
+def parse_people(text: str, *, frame: int, width: int, height: int, coords: CoordConvention) -> FramePeople:
     """Turn the answer of the people request into a ``FramePeople`` with boxes in pixels.
 
-    ``width`` and ``height`` are the size of the image that was sent. The answer
+    ``width`` and ``height`` are the size of the image that was sent, and
+    ``coords`` is the coordinate convention of its request. The answer
     key ``team`` becomes ``team_key``. A person with a bad box, role or team is
     dropped. A number that is not an integer from 0 to 99 becomes None.
     """
     data = _load_object(text)
-    people = (_person(item, width, height) for item in _list_field(data, "people"))
+    people = (_person(item, width, height, coords) for item in _list_field(data, "people"))
     return FramePeople(frame=frame, people=tuple(person for person in people if person is not None))
 
 
-def parse_landmarks(text: str, *, frame: int, width: int, height: int) -> FrameLandmarks:
+def parse_landmarks(text: str, *, frame: int, width: int, height: int, coords: CoordConvention) -> FrameLandmarks:
     """Turn the answer of the landmarks request into a ``FrameLandmarks`` with points in pixels.
 
     ``width`` and ``height`` are the size of the frame that was sent, not of the
-    diagram. A landmark with an unknown id or a bad point is dropped. A view that
+    diagram, and ``coords`` is the coordinate convention of its request. A landmark with an unknown id or a bad point is dropped. A view that
     is not a known view becomes None.
     """
     data = _load_object(text)
     view = data.get("view")
-    landmarks = (_landmark(item, width, height) for item in _list_field(data, "landmarks"))
+    landmarks = (_landmark(item, width, height, coords) for item in _list_field(data, "landmarks"))
     return FrameLandmarks(
         frame=frame,
         view=view if view in _VIEWS else None,

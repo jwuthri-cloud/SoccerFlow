@@ -1459,7 +1459,7 @@ def test_tools_do_not_get_the_key_of_the_model_api(
     assert "GEMINI_API_KEY" not in os.environ
     assert "OPENROUTER_API_KEY" not in os.environ
     # The script names the variable of the package and the variable of the OpenRouter provider.
-    assert run_tool.KEY_VARIABLES == (cli.KEY_VARIABLE, "OPENROUTER_API_KEY")
+    assert run_tool.KEY_VARIABLES == cli.KEY_VARIABLES
 
 
 def test_interpreter_without_numpy_gets_one_line_and_the_code_2(tmp_path: Path) -> None:

@@ -8,47 +8,63 @@ keyframe_interval_s: 0.48
 
 # Kit legend step: one request per clip that describes the kits of both teams.
 kit_legend:
-  # Model that answers the request.
+  # Model service: gemini, or openrouter for any image model of OpenRouter (docs/RUNBOOK.md, section 10).
+  provider: gemini
+  # Model that answers the request: a Gemini model name, or an OpenRouter model slug (author/name).
   model: gemini-4-argon
-  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  # Thinking effort: low, medium or high for gemini-4-argon (others: THINKING_LEVELS in config.py); OpenRouter: model_default too.
   thinking_level: low
-  # Resolution at which the model reads the images: low, medium, high or ultra_high.
+  # Resolution at which the model reads the images: low, medium, high or ultra_high (OpenRouter: low or high).
   resolution: high
-  # Price tier: standard, or flex (half price, slower).
+  # Price tier: standard, or flex (half price, slower; Gemini only).
   service_tier: standard
+  # Coordinate convention of the model: yx_1000 for Gemini; yx_1000, xy_1000, xy_unit or xy_pixel for OpenRouter.
+  coords: yx_1000
 
 # People step: one request per keyframe that finds every person.
 people:
-  # Model that answers the request.
+  # Model service: gemini, or openrouter for any image model of OpenRouter (docs/RUNBOOK.md, section 10).
+  provider: gemini
+  # Model that answers the request: a Gemini model name, or an OpenRouter model slug (author/name).
   model: gemini-4-argon
-  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  # Thinking effort: low, medium or high for gemini-4-argon (others: THINKING_LEVELS in config.py); OpenRouter: model_default too.
   thinking_level: low
-  # Resolution at which the model reads the image: low, medium, high or ultra_high.
+  # Resolution at which the model reads the image: low, medium, high or ultra_high (OpenRouter: low or high).
   resolution: high
-  # Price tier: standard, or flex (half price, slower).
+  # Price tier: standard, or flex (half price, slower; Gemini only).
   service_tier: standard
+  # Coordinate convention of the model: yx_1000 for Gemini; yx_1000, xy_1000, xy_unit or xy_pixel for OpenRouter.
+  coords: yx_1000
 
 # Landmarks step: one request per keyframe that points at the visible pitch landmarks.
 landmarks:
-  # Model that answers the request.
+  # Model service: gemini, or openrouter for any image model of OpenRouter (docs/RUNBOOK.md, section 10).
+  provider: gemini
+  # Model that answers the request: a Gemini model name, or an OpenRouter model slug (author/name).
   model: gemini-4-argon
-  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  # Thinking effort: low, medium or high for gemini-4-argon (others: THINKING_LEVELS in config.py); OpenRouter: model_default too.
   thinking_level: low
-  # Resolution at which the model reads the frame: low, medium, high or ultra_high.
+  # Resolution at which the model reads the frame: low, medium, high or ultra_high (OpenRouter: low or high).
   resolution: high
-  # Price tier: standard, or flex (half price, slower).
+  # Price tier: standard, or flex (half price, slower; Gemini only).
   service_tier: standard
+  # Coordinate convention of the model: yx_1000 for Gemini; yx_1000, xy_1000, xy_unit or xy_pixel for OpenRouter.
+  coords: yx_1000
 
 # Number step: one request per track that reads the shirt number from enlarged crops.
 number:
-  # Model that answers the request.
+  # Model service: gemini, or openrouter for any image model of OpenRouter (docs/RUNBOOK.md, section 10).
+  provider: gemini
+  # Model that answers the request: a Gemini model name, or an OpenRouter model slug (author/name).
   model: gemini-4-argon
-  # Thinking effort of the model: low, medium or high for gemini-4-argon (other models: THINKING_LEVELS in config.py).
+  # Thinking effort: low, medium or high for gemini-4-argon (others: THINKING_LEVELS in config.py); OpenRouter: model_default too.
   thinking_level: low
-  # Resolution at which the model reads the crops: low, medium, high or ultra_high.
+  # Resolution at which the model reads the crops: low, medium, high or ultra_high (OpenRouter: low or high).
   resolution: low
-  # Price tier: standard, or flex (half price, slower).
+  # Price tier: standard, or flex (half price, slower; Gemini only).
   service_tier: standard
+  # Coordinate convention of the model: yx_1000 for Gemini; yx_1000, xy_1000, xy_unit or xy_pixel for OpenRouter.
+  coords: yx_1000
 
 # Largest number of crops of one track in a number request.
 number_crops: 8

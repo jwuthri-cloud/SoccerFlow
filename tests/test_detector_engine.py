@@ -400,9 +400,21 @@ def run_arguments(root: Path, out: Path, *more: str) -> list[str]:
 
 
 def test_run_reads_the_clip_runs_of_both_tools_and_makes_no_model_call(
-    tmp_path: Path, clip_on_disk: Path, tool_runs: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    clip_on_disk: Path,
+    tool_runs: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     detections, calibration = tool_runs
+    # No key of any provider is needed, and no model backend is built.
+    for variable in cli.KEY_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+
+    def no_backend(max_usd_per_10_min: float) -> None:
+        raise AssertionError("a run without a model step must not build a model backend")
+
+    monkeypatch.setattr(cli, "model_backend", no_backend)
     assert len(list(detections.parent.glob("detections*.json"))) > 1, "the detector run must have several parts"
     out = tmp_path / "out"
     settings = str(ENGINE_FILES / "detector_calibration.yaml")

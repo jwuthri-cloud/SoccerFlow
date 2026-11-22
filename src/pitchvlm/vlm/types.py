@@ -29,7 +29,20 @@ from pydantic import Field, field_validator
 from pitchvlm.schemas import Record
 
 Resolution = Literal["low", "medium", "high", "ultra_high"]
-ThinkingLevel = Literal["minimal", "low", "medium", "high", "xhigh"]
+#: The image resolutions that an OpenRouter request can ask for: the ``detail`` of an image part of
+#: the chat completions API, which has no level between them.
+OPENROUTER_RESOLUTIONS: tuple[Resolution, ...] = ("low", "high")
+#: How much a model thinks before it answers. ``model_default`` sends no thinking setting, so the
+#: model uses its own default. Only an OpenRouter step may use it: a model that has no thinking
+#: setting needs it (``config.StepSettings``).
+ThinkingLevel = Literal["minimal", "low", "medium", "high", "xhigh", "model_default"]
+#: The model services that a request can go to. ``gemini`` is the Interactions API of Google;
+#: ``openrouter`` is the chat completions API of OpenRouter, which reaches the models of many
+#: providers. Only ``vlm/client.py`` talks to them.
+Provider = Literal["gemini", "openrouter"]
+#: The provider of a request that names none. A Gemini request has the cache key that it had
+#: before providers were added (``VLMRequest.cache_key``).
+DEFAULT_PROVIDER: Provider = "gemini"
 #: The service tiers that a request can ask for.
 ServiceTier = Literal["standard", "flex"]
 #: The service tiers that an answer can be billed at. No request asks for ``priority``, but an
@@ -70,6 +83,9 @@ class RequestMeta(Record):
 
 
 class VLMRequest(Record):
+    #: The model service that answers the request.
+    provider: Provider = DEFAULT_PROVIDER
+    #: The name of the model at that service: a Gemini model name, or an OpenRouter model slug.
     model: str
     thinking_level: ThinkingLevel
     parts: tuple[TextPart | ImagePart, ...]
@@ -142,6 +158,12 @@ class VLMRequest(Record):
         The stored answer keeps the image hashes instead, and a hit with other
         image bytes is an error that costs nothing (``vlm.cache``). A replay
         still needs the footage: the requests are built from the frames.
+
+        The key holds the provider and the model. The provider enters the key
+        only when it is not Gemini, so a Gemini request has the same key as
+        before providers were added, and its stored answers stay valid. The
+        coordinate convention of a step is not in the key: it changes the
+        prompt text and the answer schema, and both are in the key.
         """
         identity = {
             "clip_id": self.meta.clip_id,
@@ -158,6 +180,8 @@ class VLMRequest(Record):
             ).hexdigest()[:16],
             "context": self.context,
         }
+        if self.provider != DEFAULT_PROVIDER:
+            identity["provider"] = self.provider
         return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:32]
 
 
@@ -184,6 +208,12 @@ class VLMResponse(Record):
     sdk_version: str | None = None
     #: UTC time of the answer, ISO 8601.
     created_at: str
+    #: The cost of the call in USD as the API reported it, or None when the API reports none.
+    #: OpenRouter reports the cost of every call, and the cost ledger takes it as it is
+    #: (``cost.billed_usd``). Gemini reports tokens only: its cost comes from the price table.
+    reported_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    #: The provider behind OpenRouter that served the call, as the answer names it. None for Gemini.
+    served_by: str | None = None
 
 
 class Backend(Protocol):

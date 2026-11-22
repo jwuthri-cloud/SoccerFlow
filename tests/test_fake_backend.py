@@ -320,7 +320,7 @@ def test_answers_go_through_the_step_parsers(scene: SyntheticScene) -> None:
     assert legend == scene.kit_legend()
 
     people_text = backend.generate(make_request(scene, "people", frame=frame)).text
-    people = steps.parse_people(people_text, frame=frame, width=width, height=height)
+    people = steps.parse_people(people_text, frame=frame, width=width, height=height, coords="yx_1000")
     true_people = scene.people(frame)
     assert people.frame == frame
     assert len(people.people) == len(true_people.people)
@@ -334,7 +334,7 @@ def test_answers_go_through_the_step_parsers(scene: SyntheticScene) -> None:
         assert person.box.y2 == pytest.approx(true_person.box.y2, abs=1.0)
 
     landmarks_text = backend.generate(make_request(scene, "landmarks", frame=frame)).text
-    landmarks = steps.parse_landmarks(landmarks_text, frame=frame, width=width, height=height)
+    landmarks = steps.parse_landmarks(landmarks_text, frame=frame, width=width, height=height, coords="yx_1000")
     true_landmarks = scene.landmarks(frame)
     assert landmarks.view == true_landmarks.view
     assert [seen.landmark_id for seen in landmarks.landmarks] == [seen.landmark_id for seen in true_landmarks.landmarks]

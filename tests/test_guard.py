@@ -38,6 +38,7 @@ OTHER_EMAIL = "someone.else" + "@" + "example.net"
 GOOGLE_KEY = "AI" + "za" + "x" * 35
 NEW_GOOGLE_KEY = "A" + "Q." + "Ab" + "x9Y8" * 12
 SK_KEY = "sk" + "-" + "a1B2" * 6
+OPENROUTER_KEY = "sk" + "-or-v1-" + "0a1b" * 16
 OAUTH_ACCESS = "ya" + "29." + "a0AfB_" * 8
 GITHUB_ACCESS = "gh" + "p_" + "a1B2" * 9
 GITHUB_FINE_ACCESS = "github" + "_pat_" + "a1B2" * 6
@@ -794,6 +795,19 @@ class SecretRuleTest(GuardTestCase):
         expected = "settings.toml:1: secret: key with the sk- prefix (starts with sk-a...)"
         self.assertEqual(lines, [expected])
         self.assert_absent(SK_KEY, result)
+
+    def test_openrouter_key_is_refused_by_name_and_not_printed(self) -> None:
+        content = [
+            "OPENROUTER_API_KEY=" + OPENROUTER_KEY,
+            'curl -H "Authorization: Bearer ' + OPENROUTER_KEY + '"',
+            json.dumps({"detail": "the call failed with the key:\n" + OPENROUTER_KEY}),
+        ]
+        self.stage("notes.txt", "\n".join(content) + "\n")
+        result = self.guard("--staged")
+        lines = self.assert_refused(result, "secret")
+        message = "secret: OpenRouter API key (starts with sk-o...)"
+        self.assertEqual(lines, [f"notes.txt:{number}: {message}" for number in range(1, 4)])
+        self.assert_absent(OPENROUTER_KEY, result)
 
     def test_sk_inside_a_word_passes(self) -> None:
         self.stage("notes.md", "A risk-adjusted-return-on-capital-employed figure.\n")
@@ -1995,6 +2009,8 @@ class HookSettingsTest(GuardTestCase):
             "escape.json": (json.dumps({"detail": detail + NEW_GOOGLE_KEY}), "google-auth-key"),
             "word.txt": ("GEMINI_KEY_" + NEW_GOOGLE_KEY + "\n", "google-auth-key"),
             "sk_escape.json": (json.dumps({"detail": detail + SK_KEY}), "generic-sk-key"),
+            "openrouter.json": (json.dumps({"detail": detail + OPENROUTER_KEY}), "openrouter-key"),
+            "openrouter.env": ("OPENROUTER_API_KEY=" + OPENROUTER_KEY + "\n", "openrouter-key"),
         }
         for name, (content, rule) in cases.items():
             self.stage(f"results/metrics/{name}", content)
@@ -2006,6 +2022,7 @@ class HookSettingsTest(GuardTestCase):
             self.assertIn(f"results/metrics/{name}", found.stdout)
             self.assert_absent(NEW_GOOGLE_KEY, found)
             self.assert_absent(SK_KEY, found)
+            self.assert_absent(OPENROUTER_KEY, found)
             self.git("rm", "--quiet", "--cached", f"results/metrics/{name}")
         # A word in capitals that ends with the letters of the prefix is not a key.
         self.stage("results/metrics/word.txt", "See F" + NEW_GOOGLE_KEY + " for more.\n")

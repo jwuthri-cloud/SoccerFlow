@@ -6,8 +6,9 @@ change a signature or a convention listed here without updating this file and th
 ## 1. What the system does
 
 A short soccer broadcast clip goes in. An annotated video, a 2D pitch radar and a SoccerNet-GSR
-prediction file come out. A vision language model (Gemini) answers four kinds of stateless
-requests. Plain code does everything else.
+prediction file come out. A vision language model (Gemini, or any image model through
+OpenRouter, chosen per step) answers four kinds of stateless requests. Plain code does everything
+else.
 
 | # | Step | Module | Engine |
 |---|---|---|---|
@@ -59,6 +60,11 @@ a calibration tool on every frame. A tool runs in its own environment through
 - **No machine-specific text** in tracked files: no absolute home paths, no user names, no private
   host names, no keys. Use `~` and environment variables.
 - Python 3.12+, type hints on every function, docstrings in plain full sentences, no dead code.
+- **Providers**: a step names `provider` (`gemini` or `openrouter`), `model` and `coords`
+  (`config.StepSettings`). Only `vlm/client.py` talks to a model service: it imports the Gemini
+  SDK and sends OpenRouter requests with the standard library. A model of another convention
+  answers its coordinates in that convention (`xy_1000`, `xy_unit`, `xy_pixel`); the parsers
+  turn them into image pixels through `vlm/coords.py`, so every record holds pixels as above.
 
 ## 3. Existing foundation (already written; read these first)
 
@@ -375,7 +381,20 @@ def box_from_model(box_2d: Sequence[float], width: int, height: int) -> Box | No
 def point_from_model(point: Sequence[float], width: int, height: int) -> tuple[float, float]  # -> (x_px, y_px)
 def box_to_model(box: Box, width: int, height: int) -> list[int]
 def point_to_model(x: float, y: float, width: int, height: int) -> list[int]         # -> [y, x]
+
+CoordConvention = Literal["yx_1000", "xy_1000", "xy_unit", "xy_pixel"]   # GEMINI_CONVENTION = "yx_1000"
+def box_from_answer(values, width, height, convention) -> Box | None       # any convention -> pixels
+def point_from_answer(values, width, height, convention) -> tuple[float, float]
+def box_to_answer(box, width, height, convention) -> list[float | int]     # for the fake backend
+def point_to_answer(x, y, width, height, convention) -> list[float | int]
 ```
+
+`yx_1000`: `[ymin, xmin, ymax, xmax]` and `[y, x]`, integers 0-1000 (Gemini). `xy_1000`: x first,
+integers 0-1000. `xy_unit`: x first, numbers 0-1. `xy_pixel`: x first, integer pixels of the
+image that was sent. The prompts state the convention of the step (`prompts.box_format`,
+`prompts.point_format`; for `yx_1000` the text of before), and `parse_people` and
+`parse_landmarks` take it as the required keyword `coords`. The contract checks of `doctor` prove
+the convention of each model.
 
 ### `vlm/steps.py` and `vlm/prompts/` — the four requests
 
@@ -546,9 +565,18 @@ for a line with a negative cost. `record` still adds its line to the last file, 
 answer never loses its line. `ledger_file_number` is the one place that knows the names of the
 ledger files; the listing of the `sync` command uses it too.
 
+OpenRouter (`provider: openrouter`): a call costs the cost that its answer reports
+(`VLMResponse.reported_usd`; `billed_usd` returns it). The estimate takes the price table
+`configs/openrouter_prices.yaml` (`load_price_table(path) -> tuple[Price, ...]`, passed as
+`estimate_usd(..., openrouter_prices=...)` and to `OpenRouterBackend(prices=...)`); a model without
+a price has no estimate, and its requests are not sent. The table refuses a price of 0 and a
+slug with the suffix `:free` (`FREE_MODEL_SUFFIX`). OpenRouter has only the standard tier.
+`Ledger.record` refuses an OpenRouter answer without a reported cost.
+
 A ledger line holds `time`, `run_id`, `clip_id`, `step`, `frame`, `item`, `repeat`, `request`
 (the cache key of the request), `model`, `service_tier` (the billed tier), `attempts`,
-`input_tokens`, `output_tokens`, `thought_tokens` and `usd`. Two lines with the same `request`
+`input_tokens`, `output_tokens`, `thought_tokens` and `usd`, and after `request` the `provider`
+of the request and `served_by` (the provider behind OpenRouter; null for Gemini). Two lines with the same `request`
 are two payments for the same question. A ledger file whose last line has no line end gets one
 before the next line. `BudgetGuard.start_run` raises `OSError` when the ledger cannot be
 written, so a run whose answers cannot be recorded does not start.
@@ -609,6 +637,38 @@ is not completed, it has no text, or its usage reports no output tokens) raises
 `BilledAnswerError` with the cost record of the call. Its cost is already in the spend-rate
 limiter. The backend itself writes no cost ledger.
 
+OpenRouter backend:
+
+```python
+class OpenRouterBackend:   # implements Backend
+    def __init__(self, *, prices: Sequence[Price], api_key_env: str = "OPENROUTER_API_KEY",
+                 timeout_s: float = 300.0, max_attempts: int = 4, max_usd_per_10_min: float = 8.0,
+                 stop: threading.Event | None = None, transport: HttpTransport | None = None)
+    def generate(self, request: VLMRequest) -> VLMResponse
+class ProviderBackend:     # implements Backend: request.provider -> its backend
+    def __init__(self, backends: Mapping[Provider, Backend])
+def build_openrouter_body(request: VLMRequest) -> dict      # the JSON body; ValueError for a request it cannot send
+def keeps_inputs_private(request: VLMRequest) -> bool       # store=False (Gemini) or OPENROUTER_ROUTING (OpenRouter)
+class UrllibTransport: def post(url, headers, body, timeout_s) -> HttpAnswer   # HttpTimeoutError, HttpConnectionError
+class LazySdkClient       # the Gemini SDK client, built on the first access of .interactions
+```
+
+One POST to `https://openrouter.ai/api/v1/chat/completions` per attempt: one user message with
+the prompt text and the images as base64 data URLs with `detail` (`low` or `high`), the answer
+schema as `response_format` of the type `json_schema` (strict, every object with
+`additionalProperties: false`), the thinking level as `reasoning.effort` (none for
+`model_default`), no sampling parameter, no output limit, and the routing settings
+`OPENROUTER_ROUTING`: `zdr: true`, `data_collection: deny`, `require_parameters: true`,
+`allow_fallbacks: false`. The key comes from the environment at every request and goes into the
+`Authorization` header only. Retries as for Gemini: 408, 409, 429, 5xx and a lost connection,
+with the wait of a `Retry-After` header up to 300 s; a timeout is not tried again
+(`UnconfirmedCallError`). A success answer without a usage, without a cost or with `is_byok`
+raises `UnconfirmedCallError`; one with an error, a finish reason other than `stop` or no text
+raises `BilledAnswerError` with its reported cost. Reasoning tokens are a part of
+`completion_tokens`; `normalize_usage` moves them to `thought_tokens`. The response has
+`service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input is not
+built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
+
 ### `synth.py` and `vlm/fake.py` — test world
 
 ```python
@@ -628,8 +688,11 @@ class SyntheticSource:   # FrameSource over a scene
 
 class FakeBackend:       # implements Backend, answers from the scene's ground truth
     def __init__(self, scene: SyntheticScene, *, miss_rate: float = 0.0, box_noise_px: float = 0.0,
-                 point_noise_px: float = 0.0, seed: int = 0)
+                 point_noise_px: float = 0.0, seed: int = 0, coords: CoordConvention = "yx_1000")
 ```
+
+The fake backend answers boxes and points in `coords`, and an OpenRouter request with a reported
+cost at `FAKE_REPORTED_PRICE` (1 / 4 USD per million tokens).
 
 The scene has two teams of 11 (10 players and a goalkeeper each), one referee, a fixed-position
 camera on the near side that pans and zooms, pitch markings drawn through the camera, and people
@@ -777,7 +840,8 @@ def run_trackeval(...same arguments..., output_dir: Path,
   `FileNotFoundError` when the run wrote no `person_detailed.csv`.
 - The evaluator process gets the environment of the command without the variables that
   `drop_env` names. The evaluator is the code of another project and needs no key, so the
-  commands `oracle` and `eval` pass the name of the model key variable (`cli.KEY_VARIABLE`).
+  commands `oracle` and `eval` pass the names of the key variables of every provider
+  (`cli.KEY_VARIABLES`).
 - The scorer is `sn-trackeval` in a separate environment (Python 3.12, numpy 1.26). The script
   that the wrapper starts belongs to a clone of the scorer repository, and it puts that clone
   first on its Python path. So the code that scores is the code of the clone (the tag `v0.4.1`,
@@ -836,6 +900,16 @@ request and no new attempt is sent after the signal. A model call that runs in t
 (the kit legend request of `run`, every request of `probe` and of the contract checks of
 `doctor`) is not cut off: the signal is held back until the call has ended and its answer is
 stored and recorded (`cli.finish_in_flight`). A second signal during that call is held back too.
+
+Providers in the integration layer: `cli.model_backend` (for `run` and `probe`) and
+`cli.recording_backend` (for `doctor`) build a `ProviderBackend` of a `GeminiBackend` and an
+`OpenRouterBackend`; the recording one records both into one `doctor.CallRecorder` (a
+`RecordingClient` around a `LazySdkClient`, and a `RecordingTransport` around `UrllibTransport`).
+`doctor --models` takes Gemini names and `openrouter:<slug>`, with `--coords` and
+`--thinking-level` for the OpenRouter models; the environment checks ask only for the keys and
+the SDK of the providers of the run. For an OpenRouter model the contract checks replace `store
+flag` and `served tier` by `data policy`, `served by` and `reported cost`, and plan no flex
+request. The scorer gets neither key (`cli.KEY_VARIABLES`).
 
 Output and errors: the standard output of every command is line buffered. So the cost estimate
 and the budget line of a paid command can be read in a pipe or a file before the first model
@@ -1201,9 +1275,10 @@ def load_clip_run(first: Path) -> ClipRun
   camera take the nearest kept camera within `max_gap_frames`, moved with the camera motion
   (`propagate_homographies`). A warning is logged when no frame keeps a camera.
 - `ClipResult.engines` names `kit_legend`, `people`, `team_role`, `landmarks`, `number`, `ball`,
-  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<id>`, `detector:<tool>:<model class>`,
+  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<tool>:<model class>`,
   `tool:<tool>`, `code`, `code:kit-colour`, `code:ball-tracker`, or `none` for a step that does
-  not run.
+  not run. `<model>` is `config.model_label` of the step: the bare name for Gemini,
+  `openrouter:<slug>` for OpenRouter.
 - `clock` (`timing.StageClock`) gets the time of each stage that runs: `kit_legend`,
   `model_people_landmarks`, `motion`, `pitch_mapping`, `kit_colour`, `tracks`, `number`,
   `votes_fill`, `ball`. `report(n_frames)` gives seconds, milliseconds per frame and frames per
@@ -1232,8 +1307,9 @@ Command line:
 - `run --detections FILE --calibration FILE`: each is needed when the settings name its engine,
   and refused otherwise. A clip run with other tool settings than the settings file, or of
   another clip or frame count, is refused. The plan of model calls (`model_plan`) holds only the
-  steps whose engine is `model`. A run without a model step opens no model session, needs no
-  cache folder and prints that it costs nothing; its cost record is `null`. `result.json` gets
+  steps whose engine is `model`, each with its provider. A run without a model step opens no
+  model session, builds no model backend, needs no key of any provider and no cache folder, and
+  prints that it costs nothing; its cost record is `null`. `result.json` gets
   `timing` (the stages of the package, plus `detector` and `calibration`: the sum of the times
   per frame that the script measured) and `provenance.tool_runs` (file, parts, job SHA-256,
   `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the

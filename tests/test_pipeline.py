@@ -28,7 +28,7 @@ import pytest
 import yaml
 
 from pitchvlm import pipeline
-from pitchvlm.config import DEFAULT_MODEL, PipelineConfig, StepSettings, TrackingConfig, load_config
+from pitchvlm.config import DEFAULT_MODEL, EngineSettings, PipelineConfig, StepSettings, TrackingConfig, load_config
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m
 from pitchvlm.frames import keyframe_indices
 from pitchvlm.geometry import apply_homography, matrix_from_record
@@ -333,7 +333,7 @@ def parse_exact_people(scene: SyntheticScene, frame: int) -> tuple[PersonDet, ..
         scene.image(frame), scene.kit_legend(), clip_id=scene.info.clip_id, frame=frame, settings=StepSettings()
     )
     answer = FakeBackend(scene).generate(request).text
-    return pipeline.parse_people(answer, frame=frame, width=scene.info.width, height=scene.info.height).people
+    return pipeline.parse_people(answer, frame=frame, width=scene.info.width, height=scene.info.height, coords="yx_1000").people
 
 
 def images_of(request: VLMRequest) -> list[ImagePart]:
@@ -1558,6 +1558,17 @@ def test_engine_table_names_the_model_of_each_step() -> None:
         "tracks": "code",
         "fill": "code",
     }
+
+
+def test_engine_table_names_the_provider_of_an_openrouter_step() -> None:
+    """A Gemini step keeps the bare model name; an OpenRouter step is written as the command line reads it."""
+    config = PipelineConfig(
+        people=StepSettings(provider="openrouter", model="qwen/qwen3-vl-235b", coords="xy_pixel"),
+        engines=EngineSettings(pitch_mapping="calibration", number="none"),
+    )
+    engines = pipeline._engines(config)
+    assert (engines["people"], engines["team_role"]) == ("model:openrouter:qwen/qwen3-vl-235b",) * 2
+    assert (engines["kit_legend"], engines["landmarks"], engines["number"]) == (f"model:{DEFAULT_MODEL}", "none", "none")
 
 
 # --- Errors ------------------------------------------------------------------------------------

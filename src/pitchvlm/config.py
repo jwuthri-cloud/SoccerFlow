@@ -12,7 +12,16 @@ from pydantic import Field, model_validator
 
 from pitchvlm.fallbacks.runs import PnlcalibSettings, RfdetrSettings
 from pitchvlm.schemas import Record
-from pitchvlm.vlm.types import Resolution, ServiceTier, ThinkingLevel
+from pitchvlm.vlm.coords import GEMINI_CONVENTION, CoordConvention
+from pitchvlm.vlm.cost import FREE_MODEL_SUFFIX
+from pitchvlm.vlm.types import (
+    DEFAULT_PROVIDER,
+    OPENROUTER_RESOLUTIONS,
+    Provider,
+    Resolution,
+    ServiceTier,
+    ThinkingLevel,
+)
 
 DEFAULT_MODEL = "gemini-4-argon"
 #: Largest value of ``PipelineConfig.max_parallel``. A budget stop comes after the answer that
@@ -38,24 +47,79 @@ THINKING_LEVELS: Mapping[str, tuple[ThinkingLevel, ...]] = MappingProxyType(
 class StepSettings(Record):
     """How one model step is called.
 
-    The thinking level must be one that the model has (``THINKING_LEVELS``). A
-    model that is not in that table is not checked.
+    ``provider`` names the model service and ``model`` the model there: a Gemini
+    model name, or an OpenRouter model slug (``author/name``). ``coords`` is the
+    coordinate convention that the prompts ask the model for (``vlm.coords``).
+
+    A Gemini step must use the Gemini convention ``yx_1000``, and its thinking
+    level must be one that the model has (``THINKING_LEVELS``; a model that is not
+    in that table is not checked). An OpenRouter step must name a paid model (no
+    slug with the free suffix), the standard service tier and an image resolution
+    of ``OPENROUTER_RESOLUTIONS``. Its thinking level goes to the model as the
+    reasoning effort; ``model_default`` sends none, for a model without a thinking
+    setting.
     """
 
+    provider: Provider = DEFAULT_PROVIDER
     model: str = DEFAULT_MODEL
     thinking_level: ThinkingLevel = "low"
     resolution: Resolution = "high"
     service_tier: ServiceTier = "standard"
+    coords: CoordConvention = GEMINI_CONVENTION
 
     @model_validator(mode="after")
-    def _check_thinking_level(self) -> StepSettings:
+    def _check_provider_settings(self) -> StepSettings:
+        if self.provider == DEFAULT_PROVIDER:
+            self._check_gemini()
+        else:
+            self._check_openrouter()
+        return self
+
+    def _check_gemini(self) -> None:
+        """Refuse settings that a Gemini model cannot take."""
+        if self.coords != GEMINI_CONVENTION:
+            raise ValueError(f"a Gemini step uses the coordinate convention {GEMINI_CONVENTION}, not {self.coords}")
+        if self.thinking_level == "model_default":
+            raise ValueError("a Gemini step needs a thinking level: model_default is for OpenRouter steps only")
         levels = THINKING_LEVELS.get(self.model)
         if levels is not None and self.thinking_level not in levels:
             raise ValueError(
                 f"the model {self.model} has no thinking level '{self.thinking_level}': "
                 f"its levels are {', '.join(levels)}"
             )
-        return self
+
+    def _check_openrouter(self) -> None:
+        """Refuse settings that an OpenRouter request cannot take, and a free model (rule 5)."""
+        if "/" not in self.model:
+            raise ValueError(f"an OpenRouter model is named by its slug author/name, got {self.model!r}")
+        if self.model.endswith(FREE_MODEL_SUFFIX):
+            raise ValueError(f"{self.model} is a free model: only paid models are allowed (rule 5)")
+        if self.service_tier != "standard":
+            raise ValueError(f"an OpenRouter step has no service tier {self.service_tier}: use standard")
+        if self.resolution not in OPENROUTER_RESOLUTIONS:
+            raise ValueError(
+                f"an OpenRouter step has no image resolution {self.resolution}: "
+                f"use {' or '.join(OPENROUTER_RESOLUTIONS)}"
+            )
+
+
+def model_ref(text: str) -> tuple[Provider, str]:
+    """Read a model of the command line: ``<model>`` for Gemini, or ``openrouter:<slug>``.
+
+    The part before the first colon names the provider only when it is a provider
+    name, so a Gemini model name stays valid as it is. Raises ValueError for an empty
+    model name.
+    """
+    prefix, colon, rest = text.partition(":")
+    provider, model = ("openrouter", rest) if colon and prefix == "openrouter" else (DEFAULT_PROVIDER, text)
+    if not model.strip():
+        raise ValueError(f"no model name in {text!r}")
+    return provider, model
+
+
+def model_label(provider: Provider, model: str) -> str:
+    """Write a model as the command line reads it (``model_ref``): the bare name for Gemini."""
+    return model if provider == DEFAULT_PROVIDER else f"{provider}:{model}"
 
 
 class TrackingConfig(Record):

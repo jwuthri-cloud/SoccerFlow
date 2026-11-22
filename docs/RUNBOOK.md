@@ -268,7 +268,7 @@ only after that step failed its gate and the tool passed the same gate on the sa
 | RF-DETR Large | `configs/experiments/people_probe_rfdetr_large.yaml` | people probe, G2 |
 | RF-DETR Large, antialiased resize | `configs/experiments/people_probe_rfdetr_large_antialias.yaml` | people probe, G2 |
 | PnLCalib | `configs/experiments/pitch_probe_pnlcalib.yaml` | pitch probe, G3 |
-| RF-DETR Medium, the default detector of the detector engine (section 10) | `configs/experiments/people_probe_rfdetr_medium.yaml` | people probe, G2 |
+| RF-DETR Medium, the default detector of the detector engine (section 11) | `configs/experiments/people_probe_rfdetr_medium.yaml` | people probe, G2 |
 
 Each tool gets its own environment, because its packages do not fit the environment of the
 package. Ask the owner before the install: it downloads packages and about 1 GB of weights.
@@ -342,7 +342,7 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
 - First run: add `--max-clips 2` to `tool-job` and to `tool-score`, and do the first check of
   section 8 (row "Tool script") before the full run. The script never ran with a real tool.
 - These commands measure a tool on the probe frames. They do not switch it on: the settings
-  of `run` name the engine of each step, and section 10 runs the tools on every frame of a clip
+  of `run` name the engine of each step, and section 11 runs the tools on every frame of a clip
   for the detector engine.
 - The two tools are the code of other projects. The two commands above start the script without
   the variable `GEMINI_API_KEY` (`env -u`), and the script also takes the variable out of its
@@ -981,12 +981,129 @@ What the guard does not see:
   the push sends no new commit or when it is not the first branch of the push: the hook runner
   gives the guard one such name, for the first branch with new commits.
 
-## 10 Detector engine (owner decision of 2026-11-22)
+## 10 Image models through OpenRouter
+
+Every model step can use an image model of OpenRouter in the place of Gemini
+(`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22). A step names
+its provider, its model and the coordinate convention of that model (`provider`, `model`,
+`coords` in `configs/default.yaml` and in the `step` section of an experiment file). Nothing here
+ran against the real API before this machine: the first check of each model is its doctor run.
+
+| Setting | Gemini | OpenRouter |
+|---|---|---|
+| `provider` | `gemini` | `openrouter` |
+| `model` | a Gemini name, `gemini-4-argon` | the slug of the model page, `author/name`; a slug that ends with `:free` is refused (rule 5) |
+| `thinking_level` | `low`, `medium`, `high` (by model) | sent as the reasoning effort; `model_default` sends none, for a model without one |
+| `resolution` | `low` to `ultra_high` | `low` or `high` (the `detail` of an image) |
+| `service_tier` | `standard` or `flex` | `standard` only |
+| `coords` | `yx_1000` only | `yx_1000`, `xy_1000`, `xy_unit` or `xy_pixel`: the convention that the model was trained on |
+
+Rules that the client keeps for every OpenRouter request:
+
+- The inputs stay private: the request is routed only to endpoints with zero data retention
+  (`zdr`), never to a provider that collects data (`data_collection: deny`), only to providers
+  that support every parameter of the request (`require_parameters`), and never falls back to
+  another provider (`allow_fallbacks: false`). When no provider of a model meets these settings,
+  the request fails with the status 503 and its error line says so. Choose another model then;
+  never loosen the settings.
+- No sampling parameter, no limit on the output tokens, `store` does not exist there.
+- The cost of a call is the cost that the answer reports (`usage.cost`), and the ledger takes it
+  as it is. The estimate before a run comes from `configs/openrouter_prices.yaml`: a model that
+  is not in that file has no estimate, and its run does not start. A call served with a provider
+  key of the account (BYOK) is refused as a call whose cost is unknown: keep no provider key in
+  the OpenRouter account.
+- Gemini and OpenRouter share one cache folder, one ledger, the 1.3 times stop and the hard stop
+  at 135 USD. Each provider has its own spend window of `budget.max_usd_per_10_min`.
+
+The key lives in the environment variable `OPENROUTER_API_KEY`, only on this machine. Set it in
+each terminal that runs an OpenRouter step, the same way as the Gemini key:
+
+```bash
+# The key is typed at the prompt. It is not shown and not stored in the shell history.
+printf "OpenRouter API key: " && read -rs OPENROUTER_API_KEY && export OPENROUTER_API_KEY && echo
+```
+
+- The same rules hold as for the Gemini key (section 1). An OpenRouter key starts with
+  `sk-or-v1-` and has 64 hexadecimal digits after it; the guard and the secret scan know this form.
+- A program of another project gets neither key: start the interpreter of a tool environment
+  with `env -u GEMINI_API_KEY -u OPENROUTER_API_KEY` (the scorer gets neither from the package).
+- Before the first paid call, check in the privacy settings of the OpenRouter account that the
+  training of providers on the inputs is not allowed. The request settings deny it too.
+
+First check of one OpenRouter model, gate G0. Ask the owner first: it is paid. The doctor needs
+neither the Gemini key nor the SDK for an OpenRouter model.
+
+```bash
+# The machine and both keys. No model call.
+python -m pitchvlm.cli doctor --no-api
+
+# Contract checks of one OpenRouter model, in the convention that its model card names. Paid:
+# about 0.02 USD at the published prices of the price table (6 calls; an estimate from the Gemini
+# token counts, not measured). The checks stop above the 2 USD of gate G0.
+python -m pitchvlm.cli doctor --models openrouter:qwen/qwen3-vl-235b-a22b-instruct \
+    --coords xy_1000 --thinking-level model_default \
+    --out ../pitchvlm-results/results/metrics/doctor_qwen3_vl_xy_1000.json
+```
+
+- `--coords` holds for every OpenRouter model of the run; a Gemini model of the same run keeps
+  `yx_1000`. Check one OpenRouter model per run.
+- The checks `boxes` and `landmarks` are the proof of the convention. When both fail, read the
+  answers under `contract.<model>.answers` of the report: boxes that are the true boxes with x and
+  y swapped, or with values in pixels or in shares of the side, name the convention of the model.
+  Run the doctor again with that `--coords` and a new `--out` file (it pays again). Only a
+  convention that passed both checks goes into a settings file or an experiment file.
+- The new lines of an OpenRouter model: `data policy` (every request and every sent call carries
+  the private routing settings; a failure is a client fault), `served by` (a fact: the provider
+  that served each call), `reported cost` (fails when an answer reports no cost; its detail
+  compares the reported cost with the price table: above 1 means that the table price is too
+  low). The line `store flag` and `served tier` are for Gemini only.
+- When the status 503 ends the doctor, no provider of the model meets the privacy settings. When
+  the status 400 ends it, a provider refused a part of the request, for example a keyword of the
+  answer schema in its strict mode (`minItems`, `maxItems`). Tell the owner; do not change the
+  routing settings.
+- Write into `docs/DECISIONS.md`: the convention that passed, the two accuracy values, the
+  served providers, the reported cost against the estimate, and the mean tokens of the measured
+  cost lines. Image tokens of other models differ from those of Gemini, so the token estimates
+  of `DEFAULT_TOKEN_ESTIMATES` can be far off for them.
+
+People probe with an OpenRouter model, on the frames of the people probe of Gemini (same group,
+same seed). Run it only after the doctor of the same model and convention passed. Ask the owner
+first: it is paid. The experiment file is `configs/experiments/people_probe_openrouter.yaml`;
+change its `coords` to the convention that passed and commit before the run.
+
+```bash
+# Cost pilot first: 2 clips. The estimate is printed before the first call.
+python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe_openrouter.yaml \
+    --root ~/pitchvlm-data --max-clips 2 --out ../pitchvlm-results/results/metrics/pilot_people_openrouter.json
+# Then the whole probe group. The answers of the pilot are used again.
+python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe_openrouter.yaml \
+    --root ~/pitchvlm-data --out ../pitchvlm-results/results/metrics/people_probe_openrouter.json
+```
+
+- The probe asks the kit legend with the same model. Compare the metrics file with gate G2 and
+  with the people probe of Gemini on the same frames. Which engine a step uses is the owner's
+  decision, written into `docs/DECISIONS.md` with its numbers.
+- Another OpenRouter model: add its price to `configs/openrouter_prices.yaml` from its model page
+  (the highest price of its providers, with the day as `valid_from`), commit, and run its doctor
+  first.
+- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
+
+What was never tested before this machine, for OpenRouter:
+
+| Part | First check | When it fails |
+|---|---|---|
+| OpenRouter client (`OpenRouterBackend`, `UrllibTransport`) | the doctor of one model: the estimate and the budget line before the first check line; `data policy`, `token sum` and `reported cost` pass | A failed `data policy` or `token sum` is a client fault: repair the client. The answers were written by hand from the documentation, so the first real answer can have another shape: an error line that names a missing field (`usage`, `cost`, `choices`) means that the reader of the answer must change. |
+| Cost in credits | `reported cost` of the first doctor: the sum of the reported costs, and the spend of the account page for the same calls | The documentation calls the cost "credits" in one place and USD in another. When the account page shows another amount than the ledger, stop paid OpenRouter runs and tell the owner. |
+| Strict answer schema | the doctor answers parse, `boxes` and `landmarks` pass | A status 400 that names the schema: a provider does not take a keyword. Tell the owner. |
+| Coordinate convention | `boxes` and `landmarks` pass with the `--coords` of the model card | Read the answers and run again with the convention that they show. |
+| Reasoning effort | a doctor with `--thinking-level low` for a model whose page lists `reasoning` | A status 503 or 404: no provider of the model takes the reasoning setting. Use `model_default`. |
+
+## 11 Detector engine (owner decision of 2026-11-22)
 
 The pipeline has a second engine for the people step and for the pitch mapping
-(`docs/DECISIONS.md`, entry of 2026-11-22). The people engine `detector` takes the people and
-the ball of every frame from a detector run, gives each person a team key and a role from the
-kit colours, and follows the ball. The pitch engine `calibration` takes the camera of every frame
+(`docs/DECISIONS.md`, entry "A real-time detector engine" of 2026-11-22). The people engine
+`detector` takes the people and the ball of every frame from a detector run, gives each person
+a team key and a role from the kit colours, and follows the ball. The pitch engine `calibration` takes the camera of every frame
 from a PnLCalib run. With the settings file `configs/engines/detector_calibration.yaml` no step
 calls a model, so the run is free. `configs/engines/detector_calibration_numbers.yaml` adds the
 paid shirt-number step (one kit legend request and one number request per track): it prints its
@@ -1064,7 +1181,7 @@ Measurement, fixed before any run (rule 7):
    (section 5) on the same clips. Compare GS-HOTA, DetA and AssA clip by clip, and the role and
    team-side accuracy of gate G5b. The settings of both runs are fixed before the first clip.
 
-## 11 Plan: a detector trained on soccer (not done; no download, no training yet)
+## 12 Plan: a detector trained on soccer (not done; no download, no training yet)
 
 The weights of the everyday classes (COCO) know `person` and `sports ball`: they do not tell a
 player from a referee, and they miss small and blurred balls. A detector trained on soccer
@@ -1110,5 +1227,6 @@ RFDETRMedium().train(dataset_dir="<home>/pitchvlm-data/finetune/coco", epochs=50
   weights; to confirm), and the class names of the trained weights in `fallbacks/rfdetr.py`
   (`player`, `goalkeeper`, `referee` give a role; `ball` is a ball candidate).
 - Measure the trained detector like the others: gate G2 on the probe frames, then end to end on
-  the dev clips (section 10). Ultralytics weights are not an option for this repository: their
-  code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, 2026-11-22).
+  the dev clips (section 11). Ultralytics weights are not an option for this repository: their
+  code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time
+  detector engine" of 2026-11-22).

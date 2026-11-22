@@ -697,10 +697,157 @@ Items 5 and 6 come from the checks of the change of item 4.
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
 
+## 2026-11-22 — Image models through OpenRouter (owner decision, part of the provider)
+
+1. **The decision** (owner, 2026-11-22). Every image or video model step must work through
+   OpenRouter, not only through Gemini. The same decision takes the ideas of a classic detector
+   stack and adds a real-time detector engine; other entries record those parts. This entry
+   records the provider part. It changes the row "Model: Gemini family only" of the first table
+   of this file, the first paragraph of `CLAUDE.md` and its rules 4 and 5 (item 9 has the
+   proposed text; `CLAUDE.md` is not changed until the owner accepts it).
+2. **What was built** (build machine, offline; nothing called a model or OpenRouter):
+   - A step names `provider` (`gemini` or `openrouter`), `model` and `coords` in
+     `configs/default.yaml` and in the `step` section of each experiment file. The doctor takes
+     `--models openrouter:<slug>`, `--coords` and `--thinking-level`.
+   - `OpenRouterBackend` in `src/pitchvlm/vlm/client.py`: the chat completions API over HTTPS
+     with the standard library (`urllib`), no new dependency. So only `client.py` talks to a model
+     service, and rule 4 keeps its meaning. `ProviderBackend` sends each request to the backend
+     of its provider; `run`, `probe` and `doctor` use it.
+   - Coordinate conventions per step (`src/pitchvlm/vlm/coords.py`): `yx_1000` (Gemini),
+     `xy_1000`, `xy_unit`, `xy_pixel`. The people and landmarks prompts state the convention, the
+     answer schema asks for integers or (for `xy_unit`) numbers, and the parsers read it. The
+     contract checks of `doctor` (gate G0) are the proof per model: with the fake model, an
+     answer in another convention than the one asked fails `boxes` and `landmarks` (tested for
+     three wrong pairs) and the right one passes (tested for all four).
+   - Money: an OpenRouter call costs what its answer reports (`usage.cost`, kept in
+     `VLMResponse.reported_usd`); the ledger takes it, and its lines name the provider and the
+     provider that served the call. The estimate comes from the new price table
+     `configs/openrouter_prices.yaml`; a model without a price there has no estimate and is not
+     sent. One ledger, the 1.3 times stop and the hard stop at 135 USD hold across both providers
+     (tested: a Gemini line and an OpenRouter line together reach the hard stop).
+   - The key comes from `OPENROUTER_API_KEY`. The guard and the secret scan know its form
+     (`sk-or-v1-` and 64 hexadecimal digits), the assignment rule of the secret scan knows its
+     name, and `openrouter.ai` is an allowed host. The scorer gets neither key.
+   - The replay client and the fake client work for the new provider; the cache key holds the
+     provider and the model.
+3. **The Gemini path is unchanged** (measured by a test). `tests/test_vlm_openrouter.py` holds the
+   cache keys, the prompt hashes and the hashes of the Interactions API arguments of five Gemini
+   requests (kit legend, people, people through the flex tier, landmarks, number), computed with
+   the code of commit f7d788e before any change. The new code gives the same 15 values. The
+   provider enters the cache key only when it is not Gemini, and a Gemini cassette is written
+   without the two new answer fields, so its content is the one of before. A Gemini ledger line
+   has two new keys (`provider`, `served_by`).
+4. **Documentation pages read on 2026-11-22** (public pages, no sign-in, no API call). Facts that
+   the code relies on, each with its page:
+   - https://openrouter.ai/docs/api-reference/overview — the endpoint
+     `POST https://openrouter.ai/api/v1/chat/completions`; an image part
+     `{"type": "image_url", "image_url": {"url": <data URL>, "detail": ...}}`; the fields of the
+     answer (`provider`, `choices[].finish_reason`, `native_finish_reason`, `message.content`,
+     `usage` with `prompt_tokens`, `completion_tokens`, `total_tokens`, `cost`, `is_byok`,
+     `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens`).
+   - https://openrouter.ai/docs/api-reference/authentication — `Authorization: Bearer <key>`;
+     a key is `sk-or-v1-` and 64 lowercase hexadecimal characters.
+   - https://openrouter.ai/docs/guides/overview/multimodal/image-understanding — base64 data
+     URLs; `image/png`, `image/jpeg`, `image/webp`, `image/gif`; limits per provider and model.
+   - https://openrouter.ai/docs/features/multimodal/videos — video input (item 7).
+   - https://openrouter.ai/docs/features/structured-outputs — `response_format` of the type
+     `json_schema` with `name`, `strict` and `schema`; support per endpoint; `require_parameters`
+     routes only to endpoints that support it; strict mode can restrict the keywords of a schema,
+     per provider.
+   - https://openrouter.ai/docs/features/provider-routing — the `provider` object:
+     `require_parameters`, `data_collection` (`allow` or `deny`), `zdr`, `allow_fallbacks`;
+     "If you don't want to allow any other public providers, you should disable fallbacks as well."
+   - https://openrouter.ai/docs/features/zdr — "When `zdr` is set to `true`, the request will only
+     be routed to ZDR endpoints"; a request setting is combined with the account settings and
+     cannot switch them off.
+   - https://openrouter.ai/docs/features/privacy-and-logging and
+     https://openrouter.ai/docs/guides/features/input-output-logging — OpenRouter stores the
+     content of a call only after the account switches input and output logging on; the
+     training opt-out is an account setting.
+   - https://openrouter.ai/docs/use-cases/usage-accounting — usage is always in the answer; the
+     old switch `usage: {include: true}` has no effect.
+   - https://openrouter.ai/docs/guides/best-practices/reasoning-tokens — `reasoning: {"effort":
+     ...}` with `minimal` to `xhigh`; reasoning tokens are a part of `completion_tokens`.
+   - https://openrouter.ai/docs/api-reference/parameters — a missing sampling parameter means the
+     default of the provider.
+   - https://openrouter.ai/docs/api-reference/errors — the error body `{"error": {"code",
+     "message", "metadata"}}`; 400, 401, 402, 403, 408, 429, 502, and 503 for "no available model
+     provider that meets your routing requirements"; an error during the generation comes with
+     the status 200, in the body or in the choice; check for `error` in every answer.
+   - https://openrouter.ai/docs/api-reference/limits — `Retry-After` may come with 429 and 503;
+     free models have their own request limits.
+   - https://openrouter.ai/docs/guides/routing/model-variants/free — the `:free` suffix of a slug.
+   - https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation
+     — the generation record, with `total_cost` "in USD".
+5. **Choices made from these pages** (each one tested offline with answers written by hand in
+   the shapes of the pages):
+   - Routing settings of every request: `zdr: true`, `data_collection: deny`,
+     `require_parameters: true`, `allow_fallbacks: false`. No page says how `allow_fallbacks:
+     false` combines with the two filters, and no page says that a filter can be passed over;
+     with fallbacks off, the request fails rather than going to a provider that the filters
+     did not choose. The doctor line `data policy` checks every sent body.
+   - Status codes 408, 409, 429 and 5xx are tried again (at most 4 attempts, the wait of
+     `Retry-After` up to 300 s). The status 503 can mean that no provider meets the routing
+     settings; its error line says so. A timeout is not tried again. Assumed, not documented: a
+     call refused with an error status is not billed (as for Gemini).
+   - A 200 answer without usage, without a cost or with `is_byok: true` raises
+     `UnconfirmedCallError`: the ledger cannot price it. A 200 answer with an error, a finish
+     reason other than `stop` or no text raises `BilledAnswerError` with its reported cost.
+   - The strict schema gets `additionalProperties: false` on every object (the strict mode of
+     several providers needs it). Not known: whether every provider takes `minItems` and
+     `maxItems` in strict mode.
+   - `detail` takes `low` or `high`; an OpenRouter step refuses the resolutions `medium` and
+     `ultra_high`. The pitch diagram goes at the resolution of the step.
+   - The thinking level goes as `reasoning.effort`; the new level `model_default` sends none,
+     for a model without reasoning (allowed for OpenRouter only).
+   - The documentation calls `usage.cost` "credits" in one place and USD in another (the
+     generation record). One credit is taken as one USD; the first doctor compares the ledger
+     with the account page (RUNBOOK, section 10).
+6. **Published prices** (model pages, read on 2026-11-22; not measured). The price table holds
+   the highest price of any provider of a model, because the routing chooses the provider:
+   `qwen/qwen3-vl-235b-a22b-instruct` 0.21 / 1.90 USD per million tokens (input / output; its
+   providers 0.20 / 0.88, 0.21 / 1.90, 0.21 / 1.90), `qwen/qwen2.5-vl-72b-instruct` 0.80 / 1.00
+   (one provider), `google/gemini-2.5-flash` 0.54 / 4.50 (endpoints 0.15 / 1.25, 0.30 / 2.50,
+   0.54 / 4.50). The pages showed no per-image price, no `:free` entry and no mark of zero data
+   retention; so it is not known whether any provider of these models meets the routing settings.
+   Estimated, not measured: the first doctor of `qwen/qwen3-vl-235b-a22b-instruct` costs about
+   0.02 USD (6 calls at the token estimates of Gemini; image tokens of Qwen differ).
+7. **Video input is not built.** The video page shows a `video_url` part with links (YouTube for
+   Gemini on AI Studio; Vertex takes no video links) in its chat examples, and base64 video only in
+   the examples of the Responses API. The footage cannot go to a public link, and no page shows a
+   base64 video in chat completions. So a step that needs video would have to rest on an
+   undocumented request. Build it when a page documents base64 video for chat completions.
+8. **Coordinate conventions of the candidate models** (not verified). The Qwen3-VL repository
+   says that it uses "relative position coordinates" for boxes and points; its scale was not
+   found. The model card of Qwen2.5-VL names no convention and says that the images are resized
+   to multiples of 28 pixels. So the experiment file `people_probe_openrouter.yaml` names
+   `xy_1000` as a first guess, and the doctor decides (RUNBOOK, section 10).
+9. **Proposed text for `CLAUDE.md`** (not applied; the owner decides):
+   - First paragraph: "Soccer broadcast clip in; annotated video, 2D pitch radar and a measured
+     score out. A vision language model does the perception: Gemini, or any image model through
+     OpenRouter, chosen per step in the settings. Plain code does geometry, tracking, export,
+     drawing."
+   - Rule 4: "Only `src/pitchvlm/vlm/client.py` talks to a model service: it imports the model SDK
+     of Gemini and sends the OpenRouter requests with the standard library. Everything else must
+     run without the SDK and without a network. Only `tools/run_tool.py` imports an external tool
+     (RF-DETR, PnLCalib). It runs in the environment of that tool, and the package never imports
+     it."
+   - Rule 5: "Model calls: paid models only (no OpenRouter model with the suffix `:free`), no
+     sampling parameters, and inputs are never stored or used for training: `store=False` for
+     Gemini; for OpenRouter only endpoints with zero data retention and no data collection, with
+     no fallback to another provider. A model whose providers cannot meet this is an error.
+     Players are identified by shirt number plus roster, never by face."
+   - The row "Model: Gemini family only" of the first table of this file: "Gemini, or any image
+     model through OpenRouter (2026-11-22)". Rule 5 of `docs/RUNBOOK.md`, section 7, follows the
+     text of `CLAUDE.md`.
+10. **Measured on the build machine**: the offline suite (counts in the report of this session),
+    the guard of the tracked files and the demo. Not verified: anything against the real
+    OpenRouter API; the answers of the tests were written by hand from the pages of item 4.
+
 ## 2026-11-22 — A real-time detector engine next to the model engine
 
 1. **The decision** (owner, 2026-11-22). (1) Any image or video LLM must work through
-   OpenRouter, not only Gemini (built in its own change). (2) Take the ideas of a classic
+   OpenRouter, not only Gemini (the entry before this one). (2) Take the ideas of a classic
    detector stack that a public repository shows (`Mhmdwael77/ai-football-analytics`): ideas
    only. Its licence file reserves all rights (its README badge says MIT; the file wins), and
    its detector is an Ultralytics model (AGPL-3.0). No code, no config text and no weights of it
@@ -790,21 +937,28 @@ Items 5 and 6 come from the checks of the change of item 4.
      frame, kit colour 3.40 ms, tracks 0.67 ms, all package stages 13.50 ms (74 frames per
      second). This is no claim of real time: it holds no detector, no calibration, no decoding
      of real frames and not the run machine.
-   - The engine table of every result names each step: `model:<id>`, `detector:rfdetr:<class>`,
-     `tool:pnlcalib`, `code`, `code:kit-colour`, `code:ball-tracker` or `none`.
-6. **Measurement, fixed before any run** (RUNBOOK, section 10): gate G2 for the detector on the
+   - The engine table of every result names each step: `model:<model>`, `detector:rfdetr:<class>`,
+     `tool:pnlcalib`, `code`, `code:kit-colour`, `code:ball-tracker` or `none`. A model step is
+     written as the command line reads it: the bare name for Gemini, `openrouter:<slug>` for
+     OpenRouter. The engine and the provider live side by side: the engine of a step says
+     whether a model runs it, and `provider`, `model` and `coords` of the step say which model.
+     A run whose engines call no model needs no key of any provider and builds no model backend
+     (tested).
+6. **Measurement, fixed before any run** (RUNBOOK, section 11): gate G2 for the detector on the
    frames of the people probe (the five RF-DETR files), and end to end on the dev clips with the
    same scorer, each engine with its own tracker name, compared clip by clip together with the
    role and team-side accuracy of G5b. The plan for a detector trained on soccer is RUNBOOK
-   section 11; nothing was downloaded or trained.
-7. **Proposed new text of rule 8 of `CLAUDE.md`** (not applied; the owner decides):
-   "8. Two engines are first-class for the people step and for the pitch mapping: the model
-   (`model`) and a specialist tool (`detector`, `calibration`). The shirt numbers come from the
-   model or from no step (`none`). The settings of a run name the engine of each step, and every
-   result file and report names the engine of every step. A comparison of two engines counts
-   only on the same frames, against the same gate of `configs/gates.yaml`, with the same scorer.
-   A tool runs only through `tools/run_tool.py` in its own environment (rule 4); code under the
-   AGPL or the GPL runs nowhere else."
+   section 12; nothing was downloaded or trained.
+7. **Proposed new text of rule 8 of `CLAUDE.md`** (not applied; the owner decides). It fits the
+   proposed rules 4 and 5 of the entry before this one:
+   "8. Two engines are first-class for the people step and for the pitch mapping: a model
+   (`model`: the provider and the model of the step, under rule 5) and a specialist tool
+   (`detector`, `calibration`). The shirt numbers come from a model or from no step (`none`).
+   The settings of a run name the engine of each step, and every result file and report names
+   the engine of every step, with the provider and the model of each model step. A comparison
+   of two engines, or of two models, counts only on the same frames, against the same gate of
+   `configs/gates.yaml`, with the same scorer. A tool runs only through `tools/run_tool.py` in
+   its own environment (rule 4); code under the AGPL or the GPL runs nowhere else."
    Until the owner applies it, rule 8 stands: the docstring of `fallbacks/__init__.py` and
    section 3 of the RUNBOOK still describe the tools as fallbacks.
 8. **Not verified.** No real detector, no real calibration, no real footage and no timing on
@@ -833,6 +987,12 @@ Items 5 and 6 come from the checks of the change of item 4.
 - How many landmark fits does the share rule refuse on real answers (fact 12)?
 - How often is the flex tier busy, and does a real answer ever reach the token cap of one
   request (facts 7 and 17)?
+- Which coordinate convention does each OpenRouter model answer in, and does any provider of it
+  meet the routing settings (zero data retention, no data collection, all parameters)?
+- Is `usage.cost` of OpenRouter in USD (one credit = one USD), and is a call refused with an
+  error status never billed?
+- Do the providers of the OpenRouter models take the strict answer schema with `minItems` and
+  `maxItems`?
 - Recall, precision and small-box recall of RF-DETR Small and Large with their pretrained
   weights on the frames of the people probe, and their time per frame on the run machine?
 - Position error and share of frames with a camera of PnLCalib on the frames of the pitch
@@ -918,15 +1078,31 @@ Decisions for the owner that are open, each with its recommendation:
   of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
   the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
   of the gate and needs its own entry here (rule 7).
-- **Rule 8 for two first-class engines** (entry of 2026-11-22, item 7). Recommendation: apply
-  the proposed text after the first G2 and dev values of both engines exist, together with the
-  sentence of `CLAUDE.md` about one vision language model.
+- **OpenRouter: rule text** (entry "Image models through OpenRouter", item 9). Accept, change or refuse the proposed
+  text of the first paragraph and of rules 4 and 5 of `CLAUDE.md`. Recommendation: accept; the
+  code already keeps it, and the doctor line `data policy` checks it.
+- **OpenRouter: price table on the estimate side.** The table holds the highest published price
+  of any provider of a model. Recommendation: keep it so until the first doctor names the
+  provider that the routing settings choose, then keep the highest price anyway: a later request
+  can be routed to another provider.
+- **OpenRouter: token estimates per model.** `DEFAULT_TOKEN_ESTIMATES` is one table for all
+  models, measured for none yet. Image tokens of other models differ. Recommendation: after the
+  first doctor of a model, compare its measured tokens with the table; when they differ by more
+  than 1.5 times, add estimates per model (a small change of `vlm/cost.py`) before its first probe.
+- **OpenRouter: which models to try.** Candidates with a published price: Qwen3-VL 235B (first
+  guess `xy_1000`), Qwen2.5-VL 72B and Gemini 2.5 Flash through OpenRouter (`yx_1000`).
+  Recommendation: one doctor of Qwen3-VL first (about 0.02 USD, estimated), then the people
+  probe of the model that passes, on the frames of the Gemini people probe.
+- **Rule 8 for two first-class engines** (entry "A real-time detector engine next to the model
+  engine", item 7). Recommendation: apply the proposed text after the first G2 and dev values of
+  both engines exist. It assumes the proposed rules 4 and 5 of the OpenRouter entry (item
+  "OpenRouter: rule text" above); the first paragraph of `CLAUDE.md` then also names the tools.
 - **Size of the detector.** Recommendation: take the smallest RF-DETR size that passes G2 on
   the probe frames, and RF-DETR Medium until then.
 - **What the AGPL or the GPL means for `tools/run_tool.py`.** Recommendation: decide it with the
   licence of the repository, before an AGPL tool is added; until then add only tools whose code
   and weights are Apache-2.0, MIT or BSD, besides PnLCalib.
-- **Soccer-trained detector** (RUNBOOK, section 11). Recommendation: read the terms of the
+- **Soccer-trained detector** (RUNBOOK, section 12). Recommendation: read the terms of the
   SoccerNet-GSR train data first; build the converter and train only with a budget line for the
   GPU time and a decision that research-only weights may drive the demo.
 - **Video files for the detector engine.** A clip job reads frame images; no command writes the

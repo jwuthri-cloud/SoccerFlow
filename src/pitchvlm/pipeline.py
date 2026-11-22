@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 from pitchvlm.ball import BallCandidate, track_ball
-from pitchvlm.config import PipelineConfig, TrackingConfig
+from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig, model_label
 from pitchvlm.fill import dense_frame_states
 from pitchvlm.frames import FrameSource, keyframe_indices
 from pitchvlm.geometry import (
@@ -485,7 +485,9 @@ def _model_answers(
         if ask_people:
             people_request, people_answer = next(answers)
             with _answer_of(people_request):
-                answered = parse_people(people_answer.text, frame=frame, width=info.width, height=info.height)
+                answered = parse_people(
+                    people_answer.text, frame=frame, width=info.width, height=info.height, coords=config.people.coords
+                )
             kept = _without_repeated_boxes(answered)
             n_repeated += len(answered.people) - len(kept.people)
             people.append(kept)
@@ -493,7 +495,13 @@ def _model_answers(
             landmarks_request, landmarks_answer = next(answers)
             with _answer_of(landmarks_request):
                 landmarks.append(
-                    parse_landmarks(landmarks_answer.text, frame=frame, width=info.width, height=info.height)
+                    parse_landmarks(
+                        landmarks_answer.text,
+                        frame=frame,
+                        width=info.width,
+                        height=info.height,
+                        coords=config.landmarks.coords,
+                    )
                 )
     if n_repeated:
         logger.warning(
@@ -1081,24 +1089,30 @@ def _with_ball(
     return result
 
 
+def _model_engine(settings: StepSettings) -> str:
+    """Name the engine of a model step: its provider and its model (``model_label``)."""
+    return f"model:{model_label(settings.provider, settings.model)}"
+
+
 def _engines(config: PipelineConfig) -> dict[str, str]:
     """Name what does each step.
 
-    ``model:<model id>`` for a model step, ``detector:<tool>:<model class>`` and
-    ``tool:<tool>`` for the answers of an external tool, ``code`` for plain code, and
-    ``none`` for a step that does not run.
+    ``model:<model>`` for a model step, with the model as the command line writes it
+    (``model_label``: the bare name for Gemini, ``openrouter:<slug>`` for OpenRouter),
+    ``detector:<tool>:<model class>`` and ``tool:<tool>`` for the answers of an external
+    tool, ``code`` for plain code, and ``none`` for a step that does not run.
     """
     engines = config.engines
     detector = engines.people == "detector"
     asks_legend = not detector or engines.number == "model"
     landmarks = engines.pitch_mapping == "model"
-    people = f"detector:{config.detector.name}:{config.detector.model}" if detector else f"model:{config.people.model}"
+    people = f"detector:{config.detector.name}:{config.detector.model}" if detector else _model_engine(config.people)
     return {
-        "kit_legend": f"model:{config.kit_legend.model}" if asks_legend else "none",
+        "kit_legend": _model_engine(config.kit_legend) if asks_legend else "none",
         "people": people,
-        "team_role": "code:kit-colour" if detector else f"model:{config.people.model}",
-        "landmarks": f"model:{config.landmarks.model}" if landmarks else "none",
-        "number": f"model:{config.number.model}" if engines.number == "model" else "none",
+        "team_role": "code:kit-colour" if detector else _model_engine(config.people),
+        "landmarks": _model_engine(config.landmarks) if landmarks else "none",
+        "number": _model_engine(config.number) if engines.number == "model" else "none",
         "ball": "code:ball-tracker" if detector else "none",
         "motion": "code",
         "pitch_mapping": "code" if landmarks else f"tool:{config.calibration.name}",
