@@ -1,7 +1,8 @@
 """Tests of the OpenRouter provider: requests, answers, errors, money and the unchanged Gemini path.
 
 No test calls a model service. The OpenRouter answers are written by hand in the shapes of the
-API documentation (docs/DECISIONS.md, entry of 2026-11-22), and a fake HTTP layer returns them.
+API documentation (docs/DECISIONS.md, entry "Image models through OpenRouter" of 2026-11-22,
+item 4), and a fake HTTP layer returns them.
 The tests of ``UrllibTransport`` replace ``urlopen``: no test opens a network connection.
 """
 

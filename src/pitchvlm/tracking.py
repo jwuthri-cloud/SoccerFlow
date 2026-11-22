@@ -10,6 +10,7 @@ by two people.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import math
 from collections import Counter
@@ -891,6 +892,7 @@ def finalize_tracks(
     to_pitch: PitchMap,
     config: TrackingConfig = TrackingConfig(),
     roster: Roster | None = None,
+    cuts: Sequence[int] = (),
 ) -> list[Track]:
     """Fill the attribute fields of every track, and give fragments of one person one id.
 
@@ -933,7 +935,8 @@ def finalize_tracks(
     - With ``config.team_slots`` (an arm of gate G4, off by default), the
       tracks of one team side and role are then linked when the clip holds
       more of them than the side has people (``TEAM_SLOTS``). See
-      ``link_team_slots``.
+      ``link_team_slots``; ``cuts`` are the frames that start a new shot, and
+      no slot link crosses one.
     - ``name`` comes from the roster by team side and displayed number.
 
     The result is ordered like ``tracks``, without the tracks that became part
@@ -949,7 +952,7 @@ def finalize_tracks(
     ]
     linked = _one_person_per_number(decided, fps, to_pitch, config)
     if config.team_slots:
-        linked = link_team_slots(linked, fps=fps, to_pitch=to_pitch, config=config)
+        linked = link_team_slots(linked, fps=fps, to_pitch=to_pitch, config=config, cuts=cuts)
     if roster is None:
         return linked
     return [_named(track, roster) for track in linked]
@@ -1076,7 +1079,12 @@ def _link(chain: Sequence[Track], changed: dict[int, Track], absorbed: set[int])
 
 
 def link_team_slots(
-    tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap, config: TrackingConfig = TrackingConfig()
+    tracks: Sequence[Track],
+    *,
+    fps: float,
+    to_pitch: PitchMap,
+    config: TrackingConfig = TrackingConfig(),
+    cuts: Sequence[int] = (),
 ) -> list[Track]:
     """Link tracks of one team side so that a side has no more tracks than people, where the positions allow it.
 
@@ -1112,10 +1120,21 @@ def link_team_slots(
     view and come back where the other one left are linked the wrong way. A
     clip with a substitution or a red card can hold more people of a side.
 
+    Hard cuts: ``cuts`` holds the frames that start a new shot, in increasing
+    order. A position before a cut says nothing about a position after it, so
+    no link crosses a cut (the earlier track ends in one shot and the later
+    one starts in another). Only a shown shirt number joins tracks across a
+    cut, and that join is made before, by the same number. The count then
+    holds per shot: a group with ``n`` tracks that have an observation in a
+    shot and ``s`` slots gets at most ``n - s`` links inside that shot. A
+    clip without a cut is one shot, so the count is the one of the whole clip.
+
     The result is ordered like ``tracks``, without the tracks that became part
     of an earlier one.
     """
     _check_fps(fps)
+    if any(later <= earlier for earlier, later in zip(cuts, cuts[1:])):
+        raise ValueError("the cuts must be strictly increasing")
     groups: dict[tuple[TeamSide, Role], list[Track]] = {}
     for track in tracks:
         if track.team_side is not None and track.role in TEAM_SLOTS:
@@ -1123,10 +1142,10 @@ def link_team_slots(
     changed: dict[int, Track] = {}
     absorbed: set[int] = set()
     for (_side, role), members in groups.items():
-        excess = len(members) - TEAM_SLOTS[role]
-        if excess <= 0:
+        budgets = _slot_budgets(members, TEAM_SLOTS[role], cuts)
+        if not budgets:
             continue
-        successor = _slot_links(_in_time_order(members), excess, fps, to_pitch, config)
+        successor = _slot_links(_in_time_order(members), budgets, cuts, fps, to_pitch, config)
         heads = [track for track in _in_time_order(members) if track.track_id not in successor.values()]
         by_id = {track.track_id: track for track in members}
         for head in heads:
@@ -1139,13 +1158,33 @@ def link_team_slots(
     return [changed.get(track.track_id, track) for track in tracks if track.track_id not in absorbed]
 
 
-def _slot_links(
-    members: Sequence[Track], wanted: int, fps: float, to_pitch: PitchMap, config: TrackingConfig
-) -> dict[int, int]:
-    """Choose at most ``wanted`` links between the tracks of one group (see ``link_team_slots``).
+def _shot_of(frame: int, cuts: Sequence[int]) -> int:
+    """Return the index of the shot that holds a frame: the number of cuts at or before it."""
+    return bisect.bisect_right(cuts, frame)
 
-    ``members`` are in time order. The result maps the id of a track to the
-    id of the track that follows it.
+
+def _slot_budgets(members: Sequence[Track], slots: int, cuts: Sequence[int]) -> dict[int, int]:
+    """Return the number of slot links that each shot needs: its tracks of the group minus the slots, where above 0."""
+    counts: dict[int, int] = {}
+    for track in members:
+        for shot in {_shot_of(observation.frame, cuts) for observation in track.observations}:
+            counts[shot] = counts.get(shot, 0) + 1
+    return {shot: count - slots for shot, count in counts.items() if count > slots}
+
+
+def _slot_links(
+    members: Sequence[Track],
+    budgets: Mapping[int, int],
+    cuts: Sequence[int],
+    fps: float,
+    to_pitch: PitchMap,
+    config: TrackingConfig,
+) -> dict[int, int]:
+    """Choose the links between the tracks of one group, at most ``budgets[shot]`` in a shot (see ``link_team_slots``).
+
+    ``members`` are in time order. A link lies in the shot where the earlier
+    track ends, and the later track must start in the same shot. The result
+    maps the id of a track to the id of the track that follows it.
     """
     ends = [_foot_on_pitch(to_pitch, track.observations[-1]) for track in members]
     starts = [_foot_on_pitch(to_pitch, track.observations[0]) for track in members]
@@ -1156,6 +1195,9 @@ def _slot_links(
             gap = members[later].first_frame - members[earlier].last_frame
             if gap <= 0 or end is None or start is None:
                 continue
+            shot = _shot_of(members[earlier].last_frame, cuts)
+            if shot != _shot_of(members[later].first_frame, cuts) or shot not in budgets:
+                continue
             displays = (members[earlier].number_display, members[later].number_display)
             if None not in displays and displays[0] != displays[1]:
                 continue
@@ -1163,15 +1205,15 @@ def _slot_links(
                 continue
             distance = _distance(end, start)
             if distance <= _reach_m(gap, fps, config.max_speed_mps, config.reach_margin_m):
-                candidates.append((distance, gap, members[earlier].track_id, members[later].track_id))
+                candidates.append((distance, gap, members[earlier].track_id, members[later].track_id, shot))
     successor: dict[int, int] = {}
     has_earlier: set[int] = set()
-    for _distance_m, _gap, earlier_id, later_id in sorted(candidates):
-        if len(successor) == wanted:
-            break
-        if earlier_id not in successor and later_id not in has_earlier:
+    left = dict(budgets)
+    for _distance_m, _gap, earlier_id, later_id, shot in sorted(candidates):
+        if left[shot] > 0 and earlier_id not in successor and later_id not in has_earlier:
             successor[earlier_id] = later_id
             has_earlier.add(later_id)
+            left[shot] -= 1
     return successor
 
 

@@ -2393,6 +2393,58 @@ def test_finalize_links_team_slots_only_in_the_arm() -> None:
     assert with_slots[0].team_side == "left"
 
 
+def test_team_slots_do_not_link_across_a_cut() -> None:
+    # The same two goalkeeper fragments as above are linked in one shot, and not when a cut
+    # (frame 200) lies between them: a position before a cut says nothing about one after it.
+    keepers = [
+        decided_track(0, [0, 12], 300.0, role="goalkeeper"),
+        decided_track(1, [300, 312], 300.0, role="goalkeeper"),
+    ]
+
+    assert len(link_team_slots(keepers, **ON_THE_FLAT_PITCH)) == 1
+    assert len(link_team_slots(keepers, cuts=(200,), **ON_THE_FLAT_PITCH)) == 2
+
+
+def test_team_slots_count_the_slots_in_each_shot() -> None:
+    # Shot 0 (frames 0 to 96) shows ten players. Shot 1 starts at the cut at frame 200 and shows
+    # ten other tracks of the same side at the same places, and one more fragment: player 19 left
+    # at x = 1000 and comes back there. Over the clip 21 tracks would ask for 11 links, and the
+    # tracks of shot 0 would be linked to those of shot 1. Per shot, shot 1 needs one link.
+    shot_0 = ten_players(range(0, 97, 12))
+    shot_1 = [
+        decided_track(10 + index, range(200, 297, 12), 100.0 * (index + 1)) for index in range(9)
+    ]
+    leaves = decided_track(19, [200, 212, 224], 1000.0)
+    returns = decided_track(20, [272, 284, 296], 1005.0)
+
+    linked = link_team_slots([*shot_0, *shot_1, leaves, returns], cuts=(200,), **ON_THE_FLAT_PITCH)
+
+    assert [track.track_id for track in linked] == list(range(20))
+    assert frames_of(linked[19]) == [200, 212, 224, 272, 284, 296]
+    assert not any(track.first_frame < 200 <= track.last_frame for track in linked)
+
+
+def test_team_slots_refuse_cuts_out_of_order() -> None:
+    with pytest.raises(ValueError, match="cuts"):
+        link_team_slots([], cuts=(200, 100), **ON_THE_FLAT_PITCH)
+
+
+def test_finalize_gives_the_cuts_to_the_team_slots() -> None:
+    keepers = [still_track(0, [0, 12], 100.0, role="goalkeeper"), still_track(1, [300, 312], 105.0, role="goalkeeper")]
+    mean_x = {0: -50.0, 1: -50.0}
+
+    with_cut = finalize_tracks(
+        keepers,
+        readings={},
+        mean_pitch_x=mean_x,
+        config=TrackingConfig(team_slots=True),
+        cuts=(200,),
+        **ON_THE_FLAT_PITCH,
+    )
+
+    assert [frames_of(track) for track in with_cut] == [[0, 12], [300, 312]]
+
+
 def test_team_slots_refuse_a_wrong_frame_rate() -> None:
     with pytest.raises(ValueError, match="fps"):
         link_team_slots([], fps=0.0, to_pitch=flat_pitch)

@@ -57,19 +57,21 @@ def _anchors(track: Track, matrices: Mapping[int, np.ndarray]) -> tuple[list[int
     return frames, np.array(positions, dtype=np.float64).reshape(-1, 2)
 
 
-def _filled_frames(anchor_frames: Sequence[int], max_fill_gap_frames: int) -> np.ndarray:
+def _filled_frames(anchor_frames: Sequence[int], max_fill_gap_frames: int, cuts: Sequence[int]) -> np.ndarray:
     """Return the frames in which a track gets a state, in increasing order.
 
     ``anchor_frames`` are the frames of the observations that have a pitch
     position, in increasing order; there is at least one. The result holds
     every anchor frame. It holds the frames between two anchors that follow
     each other only when the two are at most ``max_fill_gap_frames`` frames
-    apart. Inside a longer gap nobody saw the person for too long, so these
-    frames are left out.
+    apart and no cut lies between them. Inside a longer gap nobody saw the
+    person for too long, and across a cut the next shot shows another camera
+    or another moment, so these frames are left out.
     """
     frames = [anchor_frames[0]]
     for before, after in zip(anchor_frames, anchor_frames[1:]):
-        if after - before <= max_fill_gap_frames:
+        same_shot = bisect.bisect_right(cuts, before) == bisect.bisect_right(cuts, after)
+        if same_shot and after - before <= max_fill_gap_frames:
             frames.extend(range(before + 1, after))
         frames.append(after)
     return np.array(frames, dtype=np.int64)
@@ -157,12 +159,13 @@ def _track_states(
     image_size: tuple[int, int],
     max_fill_gap_frames: int,
     pitch_margin_m: float,
+    cuts: Sequence[int],
 ) -> list[tuple[int, PlayerState]]:
     """Return the states of one track as (frame, state) pairs, in frame order."""
     anchor_frames, anchor_xy = _anchors(track, matrices)
     if not anchor_frames:
         return []
-    frames = _filled_frames(anchor_frames, max_fill_gap_frames)
+    frames = _filled_frames(anchor_frames, max_fill_gap_frames, cuts)
     positions = np.column_stack(
         [np.interp(frames, anchor_frames, anchor_xy[:, 0]), np.interp(frames, anchor_frames, anchor_xy[:, 1])]
     )
@@ -187,6 +190,7 @@ def dense_frame_states(
     image_size: tuple[int, int],
     max_fill_gap_frames: int,
     pitch_margin_m: float = 3.0,
+    cuts: Sequence[int] = (),
 ) -> list[FrameState]:
     """Build the state of every frame from keyframe tracks.
 
@@ -225,6 +229,10 @@ def dense_frame_states(
     so the caller makes it from a time and the frame rate of the clip. It has
     no default for that reason. With 0 no frame is filled: only the
     observations that have a pitch position give a state.
+
+    ``cuts`` holds the frames that start a new shot (``MotionField.cuts``). No
+    frame is filled between two observations that a cut separates: the next
+    shot shows another camera or another moment.
     """
     if n_frames <= 0:
         raise ValueError("n_frames must be positive")
@@ -248,7 +256,9 @@ def dense_frame_states(
             raise ValueError(
                 f"track {track.track_id} has an observation in frame {track.last_frame}, the clip has {n_frames} frames"
             )
-        states = _track_states(track, track.role, matrices, warp, image_size, max_fill_gap_frames, pitch_margin_m)
+        states = _track_states(
+            track, track.role, matrices, warp, image_size, max_fill_gap_frames, pitch_margin_m, cuts
+        )
         for frame, state in states:
             players[frame].append(state)
     return [FrameState(frame=frame, players=tuple(states)) for frame, states in enumerate(players)]

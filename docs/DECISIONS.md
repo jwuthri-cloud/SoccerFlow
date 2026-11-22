@@ -844,6 +844,90 @@ Items 5 and 6 come from the checks of the change of item 4.
     the guard of the tracked files and the demo. Not verified: anything against the real
     OpenRouter API; the answers of the tests were written by hand from the pages of item 4.
 
+## 2026-11-22 — Paint alignment of pitch mappings, and hard cuts
+
+1. **Source of the idea** (owner decision of 2026-11-22, point 2: take the ideas of a classic
+   detector stack). A public repository of such a stack claims that residual checks pass
+   confidently wrong pitch mappings, and checks a mapping against the white lines of the frame
+   instead. Its licence file reserves all rights, so only the idea is taken: no code, no
+   configuration text and no threshold of it. Every value below comes from our own tests.
+2. **Paint alignment, what it is** (`geometry.paint_alignment`, contract in
+   `docs/ARCHITECTURE.md`). The pitch lines of `pitch.py` are projected through the mapping
+   into the frame. A projected pixel hits when white paint (a thin bright ridge of the darkest
+   colour channel, on grass) lies within 0.6% of the image width. The score is the hit share
+   above chance, times a spread factor (the hits must not lie on one line or in one corner), from
+   0 to 1. A frame with less than 0.2% paint, or with 50% or more of the image near paint, cannot
+   judge a mapping: the score is None with a reason, not a low score. The score cannot see a
+   mapping that swaps the halves or the sides of the pitch (the markings are symmetric);
+   `check_homography` finds that. The constants were chosen on the synthetic clip only.
+3. **Where it is reported.** Every landmark fit of `run` and `demo` (`ClipResult.paint`, before
+   the plausibility check), every valid mapping of the pitch probe and every PnLCalib mapping of
+   `tool-score` (`paint_alignment` in the metrics file: counts, score distribution, separation,
+   one number per frame). It is a diagnostic. No rule of the pipeline uses it (rule 7).
+4. **Which result makes it a rule.** The run-machine measurement (`docs/RUNBOOK.md`, section 3,
+   "Paint alignment of the pitch mappings"): the cached answers of the pitch probe, group
+   `probe` (valid clips only, never test clips), replayed for free, and the PnLCalib run file
+   scored again. The score becomes a rule of `geometry.check_homography` for an engine only when
+   all of this holds for that engine, in a new dated entry of this file before G3 is frozen:
+   - at least 20 good mappings (median error at most 2 m) and 20 bad ones (above 3 m);
+   - AUROC at least 0.85, and AUROC minus 1.96 standard errors at least 0.75;
+   - a score limit, chosen on these frames, that refuses at least half of the bad mappings and
+     at most 5% of the good ones, checked once on 3 clips of the group `dev` before it is written;
+   - a frame that cannot judge never refuses a mapping.
+   With fewer than 20 bad mappings the result is inconclusive and the score stays a diagnostic.
+5. **Measured, synthetic** (`PYTHONPATH=src python tools/synthetic_diagnostics.py`, build
+   machine, synthetic clip of 250 frames, seed 0, every 5th frame: 50 frames, noise seed 7).
+   Not broadcast frames: no number here says how the score works on real footage.
+   - Median score of the true mapping shifted on the pitch in 8 directions (n 400 per row, 50
+     for 0 m): 0 m 1.000; 0.5 m 0.920; 1 m 0.650; 2 m 0.508; 3 m 0.436; 5 m 0.238; 10 m 0.055.
+   - Separation of good (at most 2 m) against bad (above 3 m) mappings: shifted mappings AUROC
+     0.948, standard error 0.005 (n good 1,250, n bad 800); landmark fits from the true landmarks
+     with Gaussian noise of 2, 4, 8 and 16 px AUROC 0.987, standard error 0.007 (n good 145, n
+     bad 30). The standard errors count every mapping as independent; the mappings share 50
+     frames, so the real uncertainty is larger. Noise 2, 4, 8, 16 px gave a median error of
+     0.20, 0.60, 1.28, 3.10 m and a median score of 1.000, 0.887, 0.622, 0.323.
+   - Wrong mappings (median over 50 frames): the picture mirrored left to right 0.106 (up to
+     0.994 when the view is symmetric about the halfway line), top to bottom 0.000; the sign of
+     one matrix entry changed: H[1,1] and H[1,2] 0.000, H[2,1] and H[2,2] 0.093, H[1,0] 0.273,
+     H[0,0] 0.402, H[0,2] 0.403, H[0,1] 0.621 (a small entry). The pitch mirrored: 1.000, the
+     same as the right mapping.
+   - Time: about 12 ms per frame of 1280 x 720 on the build machine.
+6. **Hard cuts** (`motion.is_cut`, `MotionField.cuts`). A pair of neighbouring frames is a cut
+   when no camera motion (the identity, the measured motion, the last measured motion of the
+   shot) moves the first frame onto the second with a median block correlation of at least 0.5
+   (4 x 4 blocks of an image 160 px wide). The median of blocks keeps a static score graphic
+   from joining two shots. Measured on synthetic clips (same tool): the lowest value inside a
+   shot 0.881 (n 448 pairs, with a pan of up to 83 px per frame at 1280 px, with and without a
+   score graphic); the highest value across a cut 0.055 (n 8 cuts of 1 to 10 s, with and
+   without the graphic). Known misses: a jump in time that one camera motion explains, for
+   example 0.4 s with a slow camera (0.918), or the same camera pose 6 s later. A pan faster
+   than about 100 px per frame counts as a cut. The clips of SoccerNet GSR have no cut, so no
+   gate measures the cut test; it guards the demo clip and other broadcast footage.
+7. **Nothing crosses a cut.** Before this change, on the synthetic clip with a cut at frame 54
+   (`tests/test_shot_cuts.py`, run on the code of `main` f7d788e): the referee track, which has
+   no shirt number, was linked across the cut by its pitch position (`bridged_warp` and the
+   joins); with a static score graphic the camera motion was measured across the cut and the
+   pitch mapping of frame 54 was carried from the shot before, 47.8 m off at a foot point; and
+   the frames 49 to 53 were filled across the cut. 5 of the 8 tests failed. Now the motion step
+   into a cut is missing, `bridged_warp` gives None across it, `associate` and
+   `stitch_fragments` run per shot (in `pipeline.py`; `tracking.py` is unchanged), and the dense
+   output fills nothing across it. Only `finalize_tracks` may join two tracks across a cut, by
+   one shown shirt number of one team: that is identity, not position. Cost: the frames between
+   the last keyframe before a cut and the first keyframe after it get no state (less than one
+   keyframe interval, 0.48 s, per cut).
+8. **Proposal, not built: a shot type in the landmark answer.** One more field in the landmarks
+   request (main camera, close-up, replay, other) would let the pipeline drop the landmarks of a
+   frame that is not a main-camera view, and would name the shot of a cut. It changes a paid
+   prompt and therefore the cache keys of every stored landmarks answer, and no label of
+   SoccerNet GSR measures it. Recommendation: decide after G3, with the cut counts of the demo
+   clip.
+9. **Open owner decisions of this entry** (also in the last list of this file). (a) The rule of
+   item 4, after the measurement. (b) The proposal of item 8. (c) Whether a shown shirt number may
+   join tracks across a cut (it does now). (d) Whether the frames before a cut stay without a state
+   (they do now) or get the last position. (e) `tools/synthetic_diagnostics.py` is a new file in
+   `tools/`, which holds the scripts of the specialist tools; it is a measurement script of this
+   entry.
+
 ## 2026-11-22 — Track repairs and tracking values without labels (session C)
 
 1. **The owner decision of 2026-11-22, the part of this entry.** Take the ideas of a public
@@ -853,8 +937,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    pitch, and add tracking values that need no labels. All of it works on the records that every
    engine gives (boxes, pitch positions, team keys per keyframe). What that repository claims, not
    measured by us: wide stitching gates weld two players; its swap fix is switched off; its sample
-   output shows top speeds of 35.9 km/h, which points at position noise. The entry "Image models
-   through OpenRouter" of the same day records the provider part of the decision.
+   output shows top speeds of 35.9 km/h, which points at position noise. The entries "Image models
+   through OpenRouter" and "Paint alignment of pitch mappings, and hard cuts" of the same day
+   record the other parts of the decision.
 2. **Split of team swaps** (`tracking.split_team_swaps`, before the joins of `stitch_fragments`).
    Rule: a track of a player or a goalkeeper is cut where its team key changes and the change
    holds, and a person of the other team was in contact at the change. "Holds": runs of one key
@@ -950,7 +1035,31 @@ Items 5 and 6 come from the checks of the change of item 4.
    scene, so the swap of teammates is not in the bench. How often swaps, wrong team keys and
    returns happen in real clips is not known. Nothing ran on real footage or on real model
    answers: G4 on the dev clips decides.
-10. **Open owner decisions** (also in the last list of this file). (a) Is `track_ratio_max` of G4 per clip or over the 6 clips? The
+10. **Hard cuts** (after the merge of the entry "Paint alignment of pitch mappings, and hard
+    cuts"). Only a shown shirt number of one team joins two tracks across a cut, and both repairs
+    keep that rule.
+    - The split of team swaps runs in each shot on its own, between `associate` and
+      `stitch_fragments` of that shot (`pipeline._tracks`). Why per shot: it cuts a track where
+      the key of the track changes, the tracks of `associate` never cross a cut, and the joins of
+      the same shot link the pieces again.
+    - The team slots run over the clip, at the end of `finalize_tracks`, after the joins by shirt
+      number: a track that a shown number joined across a cut is one person in both shots. But no
+      slot link crosses a cut (the earlier track must end in the shot where the later one starts,
+      `finalize_tracks(cuts=...)`), and the slots are counted per shot: a group with `n` tracks
+      seen in a shot and `s` slots gets at most `n - s` links in that shot. Why: the people seen
+      in two shots are two tracks each, so the count of the whole clip would ask for links that
+      join different people inside a shot. A clip without a cut is one shot and keeps the count
+      of the clip, so the code path of the synthetic numbers of item 8 is the same (inferred from
+      the code; the bench was not run again).
+    - The tracking values without labels: the first and the last observation of each shot bound
+      the births and ends inside the image, and no step crosses a cut (a track joined across a
+      cut by its number stands somewhere else after it).
+    - Tests: `tests/test_tracking.py` (a slot link refused across a cut; the slots counted per
+      shot: with the count of the clip 10 tracks of that case would cross the cut, now none
+      does); `tests/test_shot_cuts.py` (the split runs once per shot; with both repairs only a
+      shown shirt number joins tracks across the cut, and no track joins two people);
+      `tests/test_diagnostics.py` (births, ends and steps at a cut).
+11. **Open owner decisions** (also in the last list of this file). (a) Is `track_ratio_max` of G4 per clip or over the 6 clips? The
     RUNBOOK script reads it per clip. (b) Does a repair that passes G4 but lowers AssA of `eval`
     become the default? This entry proposes: no; a repair becomes the default when it passes G4
     and does not lower AssA on the same clips. (c) Should `purity` get a limit in G4 before the
@@ -972,6 +1081,9 @@ Items 5 and 6 come from the checks of the change of item 4.
 - Share of real clips where the team-side rule is right, and the right value for its 3 m limit?
 - Largest output of a real answer, and the limit on output tokens that follows from it?
 - Does a broadcast graphic disturb the measured camera motion on real footage?
+- Does the paint-alignment score separate good from bad pitch mappings on real frames (AUROC,
+  per engine), and how many real frames cannot judge a mapping?
+- How many hard cuts does the cut test find in the demo clip, and how many does it miss?
 - Right value of the two-people margin (6 m) and of the limit for a repeated box (0.6) on real
   answers (RUNBOOK section 8, facts 13 and 15)?
 - Do two crops that are less than one second apart agree on a wrong number, and does the model
@@ -986,8 +1098,8 @@ Items 5 and 6 come from the checks of the change of item 4.
 - Do the providers of the OpenRouter models take the strict answer schema with `minItems` and
   `maxItems`?
 - How often do swaps, wrong team keys for seconds and returns into the image happen in real
-  clips, and how pure are the links of the team slots there (entry "Track repairs" of 2026-11-22,
-  item 9)?
+  clips, and how pure are the links of the team slots there (entry "Track repairs and tracking
+  values without labels" of 2026-11-22, item 9)?
 - Recall, precision and small-box recall of RF-DETR Small and Large with their pretrained
   weights on the frames of the people probe, and their time per frame on the run machine?
 - Position error and share of frames with a camera of PnLCalib on the frames of the pitch
@@ -1066,9 +1178,10 @@ Decisions for the owner that are open, each with its recommendation:
   of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
   the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
   of the gate and needs its own entry here (rule 7).
-- **OpenRouter: rule text** (entry "Image models through OpenRouter" of 2026-11-22, item 9). Accept, change or refuse the proposed
-  text of the first paragraph and of rules 4 and 5 of `CLAUDE.md`. Recommendation: accept; the
-  code already keeps it, and the doctor line `data policy` checks it.
+- **OpenRouter: rule text** (entry "Image models through OpenRouter" of 2026-11-22, item 9).
+  Accept, change or refuse the proposed text of the first paragraph and of rules 4 and 5 of
+  `CLAUDE.md`. Recommendation: accept; the code already keeps it, and the doctor line `data policy`
+  checks it.
 - **OpenRouter: price table on the estimate side.** The table holds the highest published price
   of any provider of a model. Recommendation: keep it so until the first doctor names the
   provider that the routing settings choose, then keep the highest price anyway: a later request
@@ -1081,16 +1194,30 @@ Decisions for the owner that are open, each with its recommendation:
   guess `xy_1000`), Qwen2.5-VL 72B and Gemini 2.5 Flash through OpenRouter (`yx_1000`).
   Recommendation: one doctor of Qwen3-VL first (about 0.02 USD, estimated), then the people
   probe of the model that passes, on the frames of the Gemini people probe.
+- **Paint alignment: the rule** (entry "Paint alignment of pitch mappings, and hard cuts" of
+  2026-11-22, item 4). Recommendation: run the free measurement of the RUNBOOK (section 3) on
+  the cached answers of the pitch probe and on the PnLCalib run file, and make the score a rule
+  of `check_homography` only for an engine that meets every condition of item 4.
+- **Shot type in the landmark answer** (same entry, item 8). Recommendation: decide after G3,
+  with the cut counts of the demo clip; the field changes a paid prompt and every cache key of
+  the landmarks step.
+- **Tracks and states at a cut** (same entry, item 9, points c and d). A shown shirt number of
+  one team joins two tracks across a cut, and the frames between the last keyframe before a cut
+  and the cut get no state. Recommendation: keep both: a number is identity, and a position
+  carried into another shot is a guess.
+- **Measurement script in `tools/`** (same entry, item 9, point e). `tools/synthetic_diagnostics.py`
+  sits beside the scripts of the specialist tools. Recommendation: keep it there; it imports
+  only the package and runs offline.
 - **Track repairs: G4 limit per clip or over the clips** (entry "Track repairs and tracking
-  values without labels" of 2026-11-22, item 10 (a)). Is `track_ratio_max` of G4 read per clip
+  values without labels" of 2026-11-22, item 11 (a)). Is `track_ratio_max` of G4 read per clip
   or over the 6 dev clips? Recommendation: per clip, as the RUNBOOK script reads it; a clip
   with many fragments is the case that the limit is for.
-- **Track repairs: default after G4** (same entry, item 10 (b)). Does a repair that passes G4
+- **Track repairs: default after G4** (same entry, item 11 (b)). Does a repair that passes G4
   but lowers AssA of `eval` become the default? Recommendation: no; a repair becomes the
   default when it passes G4 and does not lower AssA on the same clips.
-- **Track repairs: a limit for `purity`** (same entry, item 10 (c)). Recommendation: decide it
+- **Track repairs: a limit for `purity`** (same entry, item 11 (c)). Recommendation: decide it
   before the dev runs of the arms (rule 7); without a limit a repair can pass G4 and mix people.
-- **Track repairs: cost of the split arm** (same entry, item 10 (d)). It pays new number
+- **Track repairs: cost of the split arm** (same entry, item 11 (d)). It pays new number
   requests for the tracks that it changes (about 0.009 USD each, estimated); the team slots are
   free on stored answers. Recommendation: run the team slots arm first, and the split arm after
   its estimate is printed and accepted.

@@ -14,10 +14,17 @@ and no gate uses them:
   model that names the wrong team for some seconds.
 - The tracks of each team key over time: a team has at most 11 people, so
   many more ids than that are fragments of the same people.
+
+A hard cut (``ClipResult.cuts``) starts a new shot: the camera and the people
+are somewhere else after it. So the first and the last observations of each
+shot count as the start and the end of the clip for births and ends, and the
+step from the last position of a track before a cut to its first one after it
+is not a step (only a shown shirt number joins tracks across a cut).
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -53,11 +60,11 @@ class TrackDiagnostics:
     """Tracking values of one clip that need no labels (see the module text)."""
 
     tracks: int
-    #: Tracks that start after the first observation of the clip with the box away from the image border.
+    #: Tracks that start after the first observation of their shot with the box away from the image border.
     births_inside: int
-    #: Tracks that end before the last observation of the clip with the box away from the image border.
+    #: Tracks that end before the last observation of their shot with the box away from the image border.
     ends_inside: int
-    #: Steps between two observed positions of one track, and those faster than ``max_speed_mps``.
+    #: Steps between two observed positions of one track inside one shot, and those faster than ``max_speed_mps``.
     steps: int
     impossible_steps: int
     max_speed_mps: float
@@ -102,30 +109,36 @@ def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagn
 
     The positions are those of the frame states at the observations of a track
     (``observed``), so a step is the way between two keyframes, not between two
-    filled frames. ``max_speed_mps`` is the fastest plausible speed (the
-    tracking setting of the same name). A team key change is counted with
-    ``tracking.team_key_runs``.
+    filled frames, and no step crosses a cut. ``max_speed_mps`` is the fastest
+    plausible speed (the tracking setting of the same name). A team key change
+    is counted with ``tracking.team_key_runs``.
     """
     if not 0.0 < max_speed_mps < math.inf:
         raise ValueError(f"max_speed_mps must be a finite number above 0, got {max_speed_mps}")
     info = result.info
     tracks = result.tracks
-    first = min((track.first_frame for track in tracks), default=0)
-    last = max((track.last_frame for track in tracks), default=0)
+    cuts = result.cuts
+    frames = sorted({observation.frame for track in tracks for observation in track.observations})
+    first_of_shot: dict[int, int] = {}
+    last_of_shot: dict[int, int] = {}
+    for frame in frames:
+        first_of_shot.setdefault(_shot_of(frame, cuts), frame)
+        last_of_shot[_shot_of(frame, cuts)] = frame
     births = sum(
         1
         for track in tracks
-        if track.first_frame > first and not _at_border(track.observations[0].box, info.width, info.height)
+        if track.first_frame > first_of_shot[_shot_of(track.first_frame, cuts)]
+        and not _at_border(track.observations[0].box, info.width, info.height)
     )
     ends = sum(
         1
         for track in tracks
-        if track.last_frame < last and not _at_border(track.observations[-1].box, info.width, info.height)
+        if track.last_frame < last_of_shot[_shot_of(track.last_frame, cuts)]
+        and not _at_border(track.observations[-1].box, info.width, info.height)
     )
     speeds = _step_speeds(result)
     all_speeds = np.concatenate(list(speeds.values())) if speeds else np.zeros(0)
     changes = [len(team_key_runs(track.observations)) - 1 for track in tracks if track.role in TEAM_ROLES]
-    frames = sorted({observation.frame for track in tracks for observation in track.observations})
     alive = {key: [_alive(tracks, key, frame) for frame in frames] for key in _TEAM_KEYS}
     teams = {key: _team_counts(tracks, key, frames, alive[key]) for key in _TEAM_KEYS}
     return TrackDiagnostics(
@@ -145,6 +158,11 @@ def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagn
     )
 
 
+def _shot_of(frame: int, cuts: Sequence[int]) -> int:
+    """Return the index of the shot that holds a frame: the number of cuts at or before it."""
+    return bisect.bisect_right(cuts, frame)
+
+
 def _at_border(box: Box, width: int, height: int) -> bool:
     """Tell whether an edge of a box is within ``BORDER_BOX_HEIGHTS`` box heights of the image border."""
     margin = BORDER_BOX_HEIGHTS * box.height
@@ -152,7 +170,10 @@ def _at_border(box: Box, width: int, height: int) -> bool:
 
 
 def _step_speeds(result: ClipResult) -> dict[int, np.ndarray]:
-    """Return the speeds in metres per second between the observed positions of each track that has a step."""
+    """Return the speeds in metres per second between the observed positions of each track that has a step.
+
+    Two positions in different shots make no step.
+    """
     positions: dict[int, list[tuple[int, float, float]]] = {}
     for state in result.frames:
         for player in state.players:
@@ -160,11 +181,13 @@ def _step_speeds(result: ClipResult) -> dict[int, np.ndarray]:
                 positions.setdefault(player.track_id, []).append((state.frame, player.pitch_x, player.pitch_y))
     speeds: dict[int, np.ndarray] = {}
     for track_id, points in positions.items():
-        if len(points) < 2:
-            continue
         ordered = np.array(sorted(points), dtype=np.float64)  # (n, 3): frame, x, y
-        seconds = np.diff(ordered[:, 0]) / result.info.fps
-        speeds[track_id] = np.linalg.norm(np.diff(ordered[:, 1:], axis=0), axis=1) / seconds
+        shots = np.array([_shot_of(int(frame), result.cuts) for frame in ordered[:, 0]])
+        same_shot = shots[1:] == shots[:-1]
+        if not same_shot.any():
+            continue
+        seconds = np.diff(ordered[:, 0])[same_shot] / result.info.fps
+        speeds[track_id] = np.linalg.norm(np.diff(ordered[:, 1:], axis=0)[same_shot], axis=1) / seconds
     return speeds
 
 

@@ -557,11 +557,15 @@ class SyntheticScene:
             ],
         }
 
-    def _projection(self, frame: int) -> np.ndarray:
-        """Return the 3x4 camera matrix of one frame. A frame outside the clip raises ``IndexError``."""
+    def _seconds(self, frame: int) -> float:
+        """Return the scene time that one frame shows. A frame outside the clip raises ``IndexError``."""
         if not 0 <= frame < self.info.n_frames:
             raise IndexError(f"frame {frame} is outside the clip (0 to {self.info.n_frames - 1})")
-        pan, focal_px = _camera_pose(frame / self.info.fps, self.info.width)
+        return frame / self.info.fps
+
+    def _projection(self, frame: int) -> np.ndarray:
+        """Return the 3x4 camera matrix of one frame. A frame outside the clip raises ``IndexError``."""
+        pan, focal_px = _camera_pose(self._seconds(frame), self.info.width)
         return _projection_matrix(pan, focal_px, self.info.width, self.info.height)
 
     def _ground_to_image(self, frame: int) -> np.ndarray:
@@ -581,7 +585,7 @@ class SyntheticScene:
     def _sightings(self, frame: int) -> list[_Sighting]:
         """Return every person whose box is visible in one frame, in the fixed order of the people."""
         projection = self._projection(frame)
-        positions = self._paths.at(frame / self.info.fps)
+        positions = self._paths.at(self._seconds(frame))
         on_grass = np.zeros(len(positions))
         feet = _project(projection, np.column_stack([positions, on_grass]))
         heads = _project(projection, np.column_stack([positions, on_grass + PERSON_HEIGHT_M]))
@@ -643,6 +647,41 @@ class SyntheticScene:
             )
 
 
+class RetimedScene(SyntheticScene):
+    """A synthetic clip whose frames show chosen moments of the synthetic match.
+
+    Frame ``k`` of the clip shows the match at frame ``scene_frames[k]`` of a
+    ``SyntheticScene`` with the same frame rate, size and seed. So a jump in
+    ``scene_frames`` is a hard cut: the camera and the people are somewhere
+    else in the next frame. A step larger than 1 makes a faster camera: with
+    a step of 10 the camera pans and zooms 10 times as fast, without a cut.
+    The ground truth of every frame is that of the moment it shows. The
+    people keep their track ids across a cut.
+    """
+
+    def __init__(
+        self,
+        scene_frames: Sequence[int],
+        *,
+        fps: float = 25.0,
+        width: int = 1280,
+        height: int = 720,
+        seed: int = 0,
+    ) -> None:
+        if not scene_frames:
+            raise ValueError("scene_frames must name at least one frame")
+        if min(scene_frames) < 0:
+            raise ValueError("scene_frames must not be negative")
+        super().__init__(n_frames=len(scene_frames), fps=fps, width=width, height=height, seed=seed)
+        self._scene_frames = tuple(int(frame) for frame in scene_frames)
+
+    def _seconds(self, frame: int) -> float:
+        """Return the scene time that one frame of the clip shows."""
+        if not 0 <= frame < self.info.n_frames:
+            raise IndexError(f"frame {frame} is outside the clip (0 to {self.info.n_frames - 1})")
+        return self._scene_frames[frame] / self.info.fps
+
+
 class SyntheticSource:
     """A frame source that draws the frames of a synthetic scene on request."""
 
@@ -655,3 +694,26 @@ class SyntheticSource:
     def read(self, frame: int) -> np.ndarray:
         """Return one frame as a BGR uint8 image of shape (height, width, 3)."""
         return self._scene.image(frame)
+
+
+class ScoreGraphicSource:
+    """The frames of a synthetic scene with a static score graphic in the top left corner, as a broadcast shows.
+
+    The graphic does not move with the camera, and it stays across a cut. Its
+    corners can give a camera motion across a cut, so it tests that the cut
+    test does not trust such a motion.
+    """
+
+    info: ClipInfo
+
+    def __init__(self, scene: SyntheticScene) -> None:
+        self._scene = scene
+        self.info = scene.info
+
+    def read(self, frame: int) -> np.ndarray:
+        """Return one frame with the graphic, as a BGR uint8 image of shape (height, width, 3)."""
+        image = self._scene.image(frame)
+        cv2.rectangle(image, (20, 20), (520, 120), (30, 30, 30), thickness=-1)
+        cv2.putText(image, "HOME 2 - 1 AWAY  67:12", (30, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(image, "LIVE  1ST HALF", (30, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 2)
+        return image

@@ -144,7 +144,7 @@ from pitchvlm.pipeline import run_clip
 from pitchvlm.probes import LabelledClip, write_metrics
 from pitchvlm.render import render_clip
 from pitchvlm.roster import Roster, load_roster
-from pitchvlm.schemas import FrameState, Record
+from pitchvlm.schemas import ClipResult, FrameState, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
@@ -1296,6 +1296,27 @@ def write_json(path: Path, document: Mapping[str, Any]) -> None:
 # --- demo ----------------------------------------------------------------------------
 
 
+def paint_summary(checks: Sequence[PaintCheck]) -> dict[str, Any]:
+    """Summarise the paint-alignment scores of the landmark fits of a clip: counts and score distribution."""
+    scores = np.array([check.score for check in checks if check.score is not None], dtype=np.float64)
+    return {"n_fits": len(checks), "n_cannot_judge": len(checks) - scores.size, "score": summarize(scores)}
+
+
+def print_shots_and_paint(result: ClipResult) -> None:
+    """Print the cuts of a clip and the paint-alignment scores of its landmark fits (diagnostics only)."""
+    cuts = ", ".join(str(frame) for frame in result.cuts) if result.cuts else "none"
+    print(f"hard cuts (frames that start a new shot): {cuts}")
+    summary = paint_summary(result.paint)
+    score = summary["score"]
+    if score["n"]:
+        print(
+            f"paint alignment of {summary['n_fits']} landmark fits (diagnostic): median {score['median']:.2f}, "
+            f"mean {score['mean']:.2f}; {summary['n_cannot_judge']} frames cannot judge"
+        )
+    else:
+        print(f"paint alignment: no score for the {summary['n_fits']} landmark fits (diagnostic)")
+
+
 def _cmd_demo(args: argparse.Namespace) -> int:
     """Run a synthetic clip and the fake model through the whole package. No network and no key are used.
 
@@ -1336,6 +1357,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "checker": {"valid": not problems, "problems": problems},
         "scored_frames": scored_frames,
         "scored_frames_without_prediction": empty_frames,
+        "cuts": list(result.cuts),
+        "paint_alignment": paint_summary(result.paint),
     }
     write_metrics(args.out / SUMMARY_NAME, summary, provenance={"command": "demo", "seed": args.seed})
     print(f"demo clip {info.clip_id}: {info.n_frames} frames, {len(result.tracks)} tracks")
@@ -1345,6 +1368,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         f"identity: {identity.coverage:.0%} of a true track under one id, {identity.switches} id switches, "
         f"{identity.track_ratio:.2f} predicted tracks per true track"
     )
+    print_shots_and_paint(result)
     print_diagnostics(diagnostics.lines())
     print(f"prediction file: {predictions}")
     print_problems(problems)
@@ -1434,6 +1458,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         result = run_clip(source, session.backend, config, roster=roster)
     finally:
         cost = close_session(session)
+    print_shots_and_paint(result)
     clip_dir = args.out / info.clip_id
     provenance = {
         "command": "run",

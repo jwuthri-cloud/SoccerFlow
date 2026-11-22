@@ -31,6 +31,7 @@ from pitchvlm.schemas import (
     KitLegend,
     LandmarkObs,
     NumberReading,
+    PaintCheck,
     PersonDet,
     PlayerState,
     Record,
@@ -664,3 +665,22 @@ def test_clip_result_holds_tuples_and_an_engine_map() -> None:
     assert result.engines == {}
     with_engines = ClipResult(info=info, frames=(), tracks=(), homographies=(), engines={"people": "code"})
     assert with_engines.engines == {"people": "code"}
+
+
+def test_a_paint_check_has_a_score_or_a_reason() -> None:
+    assert PaintCheck(frame=3, score=0.5).score == 0.5
+    assert PaintCheck(frame=3, reason="too little paint").score is None
+    with pytest.raises(ValidationError):
+        PaintCheck(frame=3)
+    with pytest.raises(ValidationError):
+        PaintCheck(frame=3, score=0.5, reason="too little paint")
+    with pytest.raises(ValidationError):
+        PaintCheck(frame=3, score=1.5)
+
+
+def test_a_clip_result_without_cuts_and_paint_checks_is_still_read() -> None:
+    info = ClipInfo(clip_id="c", n_frames=1, fps=25.0, width=10, height=10)
+    result = ClipResult(info=info, frames=(), tracks=(), homographies=())
+    assert (result.cuts, result.paint) == ((), ())
+    again = ClipResult.model_validate_json(result.model_copy(update={"cuts": (5,)}).model_dump_json())
+    assert again.cuts == (5,)

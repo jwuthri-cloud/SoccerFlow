@@ -316,4 +316,4 @@ be tested on the build machine; `doctor` is its first real test.
 - Scorer: https://github.com/SoccerNet/sn-trackeval
 - Gemini docs: https://aistudio.google.com/docs/image-understanding , https://aistudio.google.com/docs/pricing
 - OpenRouter docs: https://openrouter.ai/docs/api-reference/overview , https://openrouter.ai/docs/features/provider-routing
-  (all pages that the client relies on: `docs/DECISIONS.md`, entry of 2026-11-22)
+  (all pages that the client relies on: `docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22, item 4)

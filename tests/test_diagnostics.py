@@ -43,7 +43,9 @@ def track(
 
 
 def result_of(
-    tracks: Sequence[Track], positions: dict[int, dict[int, tuple[float, float]]] | None = None
+    tracks: Sequence[Track],
+    positions: dict[int, dict[int, tuple[float, float]]] | None = None,
+    cuts: tuple[int, ...] = (),
 ) -> ClipResult:
     """Make a clip result. ``positions`` maps a track id to its observed pitch position by frame."""
     positions = positions or {}
@@ -54,7 +56,7 @@ def result_of(
                 PlayerState(track_id=one.track_id, pitch_x=x, pitch_y=y, role=one.role or "player", observed=True)
             )
     frames = tuple(FrameState(frame=frame, players=tuple(by_frame.get(frame, ()))) for frame in range(INFO.n_frames))
-    return ClipResult(info=INFO, frames=frames, tracks=tuple(tracks), homographies=())
+    return ClipResult(info=INFO, frames=frames, tracks=tuple(tracks), homographies=(), cuts=cuts)
 
 
 def test_a_track_that_starts_after_the_clip_start_away_from_the_border_is_a_birth_inside() -> None:
@@ -68,6 +70,35 @@ def test_a_track_that_starts_after_the_clip_start_away_from_the_border_is_a_birt
     values = track_diagnostics(result_of(tracks), max_speed_mps=9.0)
 
     assert (values.tracks, values.births_inside, values.ends_inside) == (4, 1, 1)
+
+
+def test_the_first_and_last_observations_of_each_shot_bound_births_and_ends() -> None:
+    # A cut at frame 50 starts a new shot. The tracks that start with shot 1 (frame 60) and the
+    # tracks that end with shot 0 (frame 36) are no births and no ends inside the image.
+    tracks = [
+        track(0, [0, 12, 24, 36]),  # ends with shot 0
+        track(1, [60, 72, 84]),  # starts with shot 1
+        track(2, [72, 84]),  # starts later in shot 1, in the middle: a birth inside
+    ]
+
+    values = track_diagnostics(result_of(tracks, cuts=(50,)), max_speed_mps=9.0)
+
+    assert (values.births_inside, values.ends_inside) == (1, 0)
+    without_cut = track_diagnostics(result_of(tracks), max_speed_mps=9.0)
+    assert (without_cut.births_inside, without_cut.ends_inside) == (2, 1)
+
+
+def test_no_step_crosses_a_cut() -> None:
+    # A track that a shown shirt number joined across the cut at frame 50 is 40 m away after it.
+    tracks = [track(0, [36, 60, 72])]
+    positions = {0: {36: (0.0, 0.0), 60: (40.0, 0.0), 72: (41.0, 0.0)}}
+
+    values = track_diagnostics(result_of(tracks, positions, cuts=(50,)), max_speed_mps=9.0)
+
+    assert (values.steps, values.impossible_steps) == (1, 0)
+    assert values.top_speed_mps["median"] == pytest.approx(1.0 / 0.48)
+    without_cut = track_diagnostics(result_of(tracks, positions), max_speed_mps=9.0)
+    assert (without_cut.steps, without_cut.impossible_steps) == (2, 1)
 
 
 def test_the_border_is_one_box_height_wide() -> None:

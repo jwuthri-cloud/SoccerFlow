@@ -63,7 +63,7 @@ else.
 
 - `schemas.py` — `Record` (base class), `ShirtNumber`, `Box`, `PersonDet`, `FramePeople`,
   `LandmarkObs`, `FrameLandmarks`, `KitLegend`, `NumberReading`, `HomographyRecord`, `TrackObs`,
-  `Track`, `PlayerState`, `FrameState`, `ClipInfo`, `ClipResult`.
+  `Track`, `PlayerState`, `FrameState`, `ClipInfo`, `ClipResult`, `PaintCheck`.
   - `KitLegend.prompt_text()` leaves the `uncertain` notes out, so that they do not change the
     prompt hash of the later requests.
 - `pitch.py` — `LANDMARKS` (35 real marks, ids 1..35), `landmark_xy`, `landmark_legend_text`,
@@ -203,6 +203,41 @@ def check_homography(H, image_size: tuple[int, int], feet_xy: np.ndarray | None 
   points inside the pitch plus margin. A negative or NaN `pitch_margin_m` and a
   `min_inside_fraction` outside 0 to 1 raise `ValueError`.
 
+Paint alignment (2026-11-22, a diagnostic, not a rule of the pipeline):
+
+```python
+@dataclass(frozen=True)
+class PaintAlignment:
+    score: float | None       # 0..1; None = the frame cannot judge a mapping
+    reason: str | None        # why it cannot judge; None when it can
+    paint_share: float        # share of the image that is paint
+    chance: float             # share of the image within the tolerance of paint
+    n_model_px: int           # image pixels that the projected pitch lines cover
+    precision: float | None   # share of them on paint; None when the lines miss the image
+    spread: float             # 0..1, spread of the hits
+
+def paint_mask(image: np.ndarray) -> np.ndarray                                   # uint8 (H, W), 1 = paint
+def projected_line_pixels(H: np.ndarray, image_size: tuple[int, int]) -> np.ndarray  # int64 (n, 2), unique (x, y)
+def paint_alignment(image: np.ndarray, H: np.ndarray) -> PaintAlignment
+```
+
+- `paint_mask`: white top-hat of the darkest colour channel (square of 1.25% of the width) at
+  least 80 grey levels, on grass or within that square of grass (a grass pixel is greener than
+  it is red and blue). A non-BGR or non-`uint8` frame raises `ValueError`.
+- `projected_line_pixels`: every straight piece of `pitch.pitch_polylines` projected into the
+  image, cut to the side of the horizon that holds the pitch point of the bottom centre of the
+  image, cut to the image, sampled once per pixel. Spots are not used. A mapping without a usable
+  inverse raises `ValueError`.
+- `paint_alignment`: a projected pixel hits when paint lies within 0.6% of the width.
+  `score = max(0, (precision - chance) / (1 - chance)) * spread`; `spread` is the root mean
+  square distance of the hits to their best line over 8% of the height, at most 1. Lines that
+  miss the image score 0 in a frame with paint. `score` is None (cannot judge) when less than
+  0.2% of the frame is paint, or when 50% or more of it lies within the tolerance of paint. The
+  pitch markings are symmetric, so a mapping that swaps the halves or the sides of the pitch gets
+  the same score; `check_homography` finds it. Deterministic, numpy and `cv2` only, about 12 ms
+  for 1280 x 720 on the build machine. The constants (`PAINT_*` in `geometry.py`) were chosen on
+  the synthetic clip only.
+
 ### `motion.py` — camera motion between frames
 
 ```python
@@ -210,8 +245,11 @@ def estimate_motion(prev: np.ndarray, nxt: np.ndarray, *, mask: np.ndarray | Non
                     ransac_px: float = 3.0, min_matches: int = 30) -> np.ndarray | None   # 3x3: prev px -> nxt px
 
 class MotionField:
-    def __init__(self, steps: Sequence[np.ndarray | None])    # steps[i]: frame i px -> frame i+1 px
+    def __init__(self, steps: Sequence[np.ndarray | None], cuts: Sequence[int] = ())  # steps[i]: frame i px -> frame i+1 px
     n_frames: int                                              # len(steps) + 1
+    cuts: tuple[int, ...]                                      # frames that start a new shot
+    def shot_of(self, frame: int) -> int                       # 0 before the first cut, 1 after it, ...
+    def same_shot(self, first: int, second: int) -> bool
     def between(self, src: int, dst: int) -> np.ndarray | None # 3x3 src px -> dst px, both directions
     def warp(self, src: int, dst: int, xy: np.ndarray) -> np.ndarray | None
     @classmethod
@@ -223,6 +261,8 @@ def compute_motion_field(source: FrameSource, *, people: Mapping[int, Sequence[B
                          downscale: float = 0.5) -> MotionField
 def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: MotionField, n_frames: int,
                            *, max_gap_frames: int = 75) -> list[HomographyRecord]
+def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None
+def is_cut(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> bool
 ```
 
 - `estimate_motion` follows corners with sparse optical flow and fits one homography with RANSAC.
@@ -242,6 +282,29 @@ def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: Mot
   `max_gap_frames` whose motion chain exists: `H_t = H_k @ M(t -> k)`, `source="propagated"`.
   Otherwise `source="none"`.
 
+Hard cuts (2026-11-22):
+
+- A cut is a frame that starts a new shot. `MotionField.cuts` holds them in increasing order; the
+  step into a cut must be missing (`ValueError` otherwise), so a cut breaks every chain. A
+  missing step without a cut is a break inside one shot. `to_json` writes `cuts`, and
+  `from_json` needs it.
+- `shot_correlation` shrinks both images to 160 pixels wide (`CUT_TEST_WIDTH`), moves `prev` with
+  the identity and with each given motion (`prev` px -> `nxt` px), and takes the median of the
+  Pearson correlations over a 4 x 4 grid of blocks (`CUT_TEST_GRID`). A block counts when the
+  moved image covers half of it and both images have contrast there; a motion counts with 4
+  blocks or more. The answer is the best median, or None when no motion counts. The median of
+  blocks keeps a static score graphic from making two shots look alike.
+- `is_cut` is True when the correlation is below 0.5 (`MIN_SHOT_CORRELATION`) or None. A pan
+  that is too fast for the optical flow (above about 100 px per frame at 1280 px on the
+  synthetic clip) therefore counts as a cut. A jump in time that one camera motion explains (the
+  same camera, a pose that the optical flow can reach) is not found: the test compares the
+  picture of the camera, not the people.
+- `compute_motion_field` tests every pair of neighbouring frames with the measured motion and
+  the last measured motion of the same shot. A cut gets a missing step, also when a motion was
+  measured, and goes into `MotionField.cuts`.
+- `bridged_warp` returns None across a cut, so no track link and no box warp cross it.
+  `propagate_homographies` carries no mapping across it, because its step is missing.
+
 ### `tracking.py` — tracks, votes, team side, numbers
 
 ```python
@@ -255,7 +318,8 @@ def goal_side(mean_x: float | None) -> TeamSide | None   # the goal zone that a 
 def decide_number(reading: NumberReading | None, frame_numbers: Sequence[int | None]) -> tuple[int | None, int | None]
 def finalize_tracks(tracks: Sequence[Track], *, readings: Mapping[int, NumberReading],
                     mean_pitch_x: Mapping[int, float], fps: float, to_pitch: PitchMap,
-                    config: TrackingConfig = TrackingConfig(), roster: Roster | None = None) -> list[Track]
+                    config: TrackingConfig = TrackingConfig(), roster: Roster | None = None,
+                    cuts: Sequence[int] = ()) -> list[Track]
 ```
 
 - `associate`: Hungarian matching (`scipy.optimize.linear_sum_assignment`) between consecutive
@@ -338,7 +402,7 @@ class TeamRun: team_key: TeamKey; start: int; stop: int    # observations[start:
 def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]
 def split_team_swaps(tracks: Sequence[Track]) -> list[Track]
 def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
-                    config: TrackingConfig = TrackingConfig()) -> list[Track]
+                    config: TrackingConfig = TrackingConfig(), cuts: Sequence[int] = ()) -> list[Track]
 ```
 
 - `team_key_runs`: the observations with the key `A` or `B` vote; votes in a row with one key
@@ -349,7 +413,7 @@ def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
   A run starts at the first vote of its key; the first run starts at observation 0 and the last
   ends at the last observation; `none` belongs to the run it lies in. No vote gives `[]`.
 - `split_team_swaps` (before `stitch_fragments`, in `pipeline._tracks` when
-  `split_team_swaps` is on): a track of a player or a goalkeeper is cut at the first vote of a
+  `split_team_swaps` is on, in each shot on its own like `associate` and `stitch_fragments`): a track of a player or a goalkeeper is cut at the first vote of a
   run when, at that change, a person of the other team was in contact with it. The change spans
   the observations from the last vote of the run before to the first vote of the run after.
   Contact: in the frame of one of them, an observation of another track at most
@@ -376,7 +440,12 @@ def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
   the only evidence, so two players who come back where the other one left are linked the wrong
   way; a substitution or a red card adds people to a side. The slots are not used in
   `stitch_fragments`: the joins run before the shirt numbers are read, and a slot link there
-  could weld two players whose numbers `finalize_tracks` would tell apart.
+  could weld two players whose numbers `finalize_tracks` would tell apart. Hard cuts (`cuts`,
+  the frames that start a new shot; `finalize_tracks` passes them on, `run_clip` gives
+  `MotionField.cuts`): no slot link crosses a cut (the later track must start in the shot where
+  the earlier one ends), and the count holds per shot: `n` is the number of tracks of the group
+  with an observation in that shot, and a shot gets at most `n - s` links. Without a cut the
+  clip is one shot. Cuts out of order raise `ValueError`.
 - `stitch_fragments` was reviewed against the failure "a wide gate welds two players" with two
   cases (`tests/test_tracking.py`, section "Stitching gates"): two teammates who cross while both
   are hidden are not welded (the rival rule refuses both joins, also when one comes back a
@@ -403,7 +472,7 @@ that is not valid YAML or JSON. The same shirt number on both sides is allowed.
 ```python
 def dense_frame_states(tracks: Sequence[Track], homographies: Sequence[HomographyRecord], n_frames: int,
                        *, warp: MotionWarp, image_size: tuple[int, int], max_fill_gap_frames: int,
-                       pitch_margin_m: float = 3.0) -> list[FrameState]
+                       pitch_margin_m: float = 3.0, cuts: Sequence[int] = ()) -> list[FrameState]
 ```
 
 One `FrameState` per frame. For each track: pitch position at every observation whose frame has
@@ -425,6 +494,9 @@ observation without a pitch position. The argument is a number of frames and has
 `pipeline.run_clip` passes `round(config.tracking.max_stitch_gap_s * fps)`, so the dense output
 uses the time limit of `stitch_fragments`. Reason: in GS-HOTA a prediction at a wrong place costs
 more than a missing one.
+
+Cuts: no frame is filled between two observations that a cut separates (`cuts`, the frames that
+start a new shot). `pipeline.run_clip` passes `MotionField.cuts`.
 
 ### `vlm/coords.py`
 
@@ -719,7 +791,7 @@ raises `UnconfirmedCallError`; one with an error, a finish reason other than `st
 raises `BilledAnswerError` with its reported cost. Reasoning tokens are a part of
 `completion_tokens`; `normalize_usage` moves them to `thought_tokens`. The response has
 `service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input is not
-built (`docs/DECISIONS.md`, entry of 2026-11-22).
+built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
 
 ### `synth.py` and `vlm/fake.py` — test world
 
@@ -736,6 +808,11 @@ class SyntheticScene:
     def true_number(self, frame: int, box: Box) -> int | None # by best IoU >= 0.3
     def gsr_labels(self) -> dict                               # content of a Labels-GameState.json
 class SyntheticSource:   # FrameSource over a scene
+    def __init__(self, scene: SyntheticScene)
+class RetimedScene(SyntheticScene):   # frame k shows scene frame scene_frames[k]: a jump is a cut
+    def __init__(self, scene_frames: Sequence[int], *, fps: float = 25.0, width: int = 1280,
+                 height: int = 720, seed: int = 0)
+class ScoreGraphicSource:   # FrameSource with a static score graphic in the top left corner
     def __init__(self, scene: SyntheticScene)
 
 class FakeBackend:       # implements Backend, answers from the scene's ground truth
@@ -934,9 +1011,9 @@ def table_lines(results: Sequence[CaseResult]) -> list[str]
 ```
 
 - `track_diagnostics` reads a `ClipResult` only. A birth (an end) inside is a track that starts
-  after the first (ends before the last) observation of the clip with its box more than one box
+  after the first (ends before the last) observation of its shot (`ClipResult.cuts`) with its box more than one box
   height from every image border. A step is the way between two `observed` states of one track
-  (keyframes, not filled frames), in metres per second; steps above `max_speed_mps` (the
+  (keyframes, not filled frames) inside one shot, in metres per second; steps above `max_speed_mps` (the
   tracking setting) are counted, and `top_speed_mps` summarises the top speed of each track
   (`summarize`). Team-key changes are counted with `tracking.team_key_runs` on the tracks of
   players and goalkeepers. Per team key `A` and `B`: the ids, the most tracks alive (between
@@ -1046,6 +1123,18 @@ sends its requests with `httpx2`.
   logged when no keyframe of a clip has a mapping.
 - The tracking and the dense output get `motion.bridged_warp(field, homographies)`, so people
   are followed across a missing motion step through the pitch mappings of the two frames.
+- Cuts (2026-11-22): nothing is carried across a cut of the motion field. No mapping (the step
+  is missing), no warp (`bridged_warp`), no filled state (`dense_frame_states(cuts=...)`), and
+  `associate` and `stitch_fragments` run on each shot on its own; the track ids are then 0..n-1
+  in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
+  shirt number of one team. `ClipResult.cuts` names the cuts.
+- Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
+  `geometry.paint_alignment` on its keyframe, in `ClipResult.paint` (`schemas.PaintCheck`:
+  frame, score or reason). It decides nothing. `demo` and `run` print the cuts and the median
+  score; the demo summary holds `cuts` and `paint_alignment`. The pitch probe and `tool-score`
+  report `paint_alignment` (`probes.paint_report`): counts, the score distribution, the AUROC of
+  mappings with a median error of at most 2 m against those above 3 m with its standard error
+  (Hanley and McNeil), and one entry per valid mapping (clip, frame, score, median error).
 - `crop_choice` chooses the crops of a number request from the frames and boxes of one person.
   The tallest boxes are taken first, each at least `MIN_CROP_GAP_S` (1 s) away from the others,
   at most `max_crops`. When this leaves one box and the person has more sightings, the sighting
