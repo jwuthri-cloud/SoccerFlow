@@ -543,3 +543,31 @@ def test_motion_field_of_a_scene_follows_the_true_camera() -> None:
     true_points = apply(true_motion, grid)
     assert np.linalg.norm(true_points - grid, axis=1).min() > 3.0
     assert np.median(np.linalg.norm(apply(measured, grid) - true_points, axis=1)) < 1.5
+
+
+def test_a_retimed_scene_shows_the_chosen_moments_of_the_match() -> None:
+    base = SyntheticScene(n_frames=200, width=640, height=360, seed=2)
+    retimed = synth.RetimedScene([3, 4, 150], width=640, height=360, seed=2)
+    assert retimed.info.n_frames == 3
+    assert retimed.info.clip_id == base.info.clip_id
+    np.testing.assert_array_equal(retimed.image(2), base.image(150))
+    np.testing.assert_allclose(retimed.homography(1), base.homography(4))
+    assert retimed.people(2).people == base.people(150).people
+    assert retimed.people(2).frame == 2
+    assert retimed.frame_state(0).players == base.frame_state(3).players
+    with pytest.raises(IndexError):
+        retimed.image(3)
+    with pytest.raises(ValueError):
+        synth.RetimedScene([])
+    with pytest.raises(ValueError):
+        synth.RetimedScene([0, -1])
+
+
+def test_the_score_graphic_is_the_same_in_every_frame() -> None:
+    scene = SyntheticScene(n_frames=200, seed=0)
+    source = synth.ScoreGraphicSource(scene)
+    assert source.info == scene.info
+    first, later = source.read(0), source.read(150)
+    np.testing.assert_array_equal(first[20:120, 20:520], later[20:120, 20:520])
+    assert not np.array_equal(first[20:120, 20:520], scene.image(0)[20:120, 20:520])
+    np.testing.assert_array_equal(first[300:], scene.image(0)[300:])

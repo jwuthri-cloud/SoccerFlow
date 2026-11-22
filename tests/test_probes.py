@@ -29,7 +29,7 @@ import pitchvlm
 from pitchvlm import probes
 from pitchvlm.config import StepSettings
 from pitchvlm.evalx.oracle import LABEL_RANSAC_PX, MIN_ATHLETES_FOR_FIT
-from pitchvlm.geometry import fit_from_landmarks
+from pitchvlm.geometry import PaintAlignment, fit_from_landmarks, matrix_to_rows
 from pitchvlm.labels import GsrAthlete, GsrFrame, GsrLabels, gsr_frame_people, load_gsr_labels
 from pitchvlm.pitch import LANDMARK_BY_ID
 from pitchvlm.probes import (
@@ -1944,3 +1944,79 @@ def test_wrong_box_with_its_foot_on_the_horizon_is_off_the_pitch() -> None:
     task = probes._PeopleTask(clip=people_clip(), frames=(0,), truth=(truth,), mappings={0: mapping})
 
     assert probes._wrong_boxes_off_pitch(task, [FramePeople(frame=0, people=(labelled, on_horizon))]) == 1
+
+
+# --- Paint alignment of the pitch mappings ---------------------------------------------
+
+
+def test_auroc_counts_the_pairs_in_order_and_ties_as_half() -> None:
+    assert probes.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0
+    assert probes.auroc([0.1], [0.9]) == 0.0
+    assert probes.auroc([0.5, 0.9], [0.5, 0.1]) == pytest.approx(0.875)
+    assert math.isnan(probes.auroc([], [0.1]))
+    assert probes.auroc_standard_error(0.875, 2, 2) > 0.0
+    assert math.isnan(probes.auroc_standard_error(0.5, 0, 3))
+
+
+def paint_frame(frame: int, error_m: float, score: float | None) -> probes._MappedFrame:
+    """Return a mapped frame whose people are all ``error_m`` off, with a paint score (None: cannot judge)."""
+    label_xy = np.array([[0.0, 0.0], [10.0, 5.0], [-20.0, -10.0]])
+    paint = PaintAlignment(
+        score=score,
+        reason=None if score is not None else "too little paint: 0.01% of the frame, the minimum is 0.20%",
+        paint_share=0.01,
+        chance=0.1,
+        n_model_px=500,
+        precision=0.5,
+        spread=1.0,
+    )
+    return probes._MappedFrame(
+        frame=frame,
+        view="midfield",
+        valid=True,
+        plausible=True,
+        mapped_xy=label_xy + np.array([error_m, 0.0]),
+        label_xy=label_xy,
+        paint=paint,
+    )
+
+
+def test_the_paint_report_separates_good_from_bad_mappings() -> None:
+    frames = {
+        "A": [paint_frame(0, 0.5, 0.9), paint_frame(1, 2.5, 0.6), paint_frame(2, 6.0, 0.2)],
+        "B": [paint_frame(0, 1.0, 0.7), paint_frame(1, 4.0, 0.75), paint_frame(2, 9.0, None)],
+    }
+    report = probes.paint_report(frames)
+    assert (report["n_mappings"], report["n_scored"], report["n_cannot_judge"]) == (6, 5, 1)
+    assert report["cannot_judge_reasons"] == {"too little paint": 1}
+    separation = report["separation"]
+    # Good: 0.9 and 0.7 (errors 0.5 and 1 m). Bad: 0.2 and 0.75 (6 and 4 m). 2.5 m is in neither group.
+    assert (separation["n_good"], separation["n_bad"]) == (2, 2)
+    assert separation["auroc"] == pytest.approx(0.75)
+    assert separation["score_good"]["median"] == pytest.approx(0.8)
+    assert report["frames"][5] == {"clip_id": "B", "frame": 2, "score": None, "error_median_m": pytest.approx(9.0)}
+    assert_plain(report)
+
+
+def test_the_pitch_probe_scores_every_valid_mapping_with_the_paint(exact_pitch: dict[str, Any]) -> None:
+    paint = exact_pitch["paint_alignment"]
+    assert paint["n_mappings"] == exact_pitch["n_frames_valid"] == 12
+    assert paint["n_cannot_judge"] == 0
+    assert paint["score"]["median"] > 0.9
+    # The exact answers give no mapping above 3 m, so the separation has no bad group.
+    assert paint["separation"]["n_bad"] == 0
+    assert math.isnan(paint["separation"]["auroc"])
+
+
+def test_a_tool_mapping_that_is_10_m_off_scores_low_with_the_paint(
+    synthetic_clip: LabelledClip, scene: SyntheticScene
+) -> None:
+    def mapping_of(clip_id: str, frame: int) -> HomographyRecord:
+        moved = np.array([[1.0, 0.0, 7.07], [0.0, 1.0, 7.07], [0.0, 0.0, 1.0]]) @ scene.homography(frame)
+        return HomographyRecord(frame=frame, matrix=matrix_to_rows(moved), source="landmarks")
+
+    result = score_pitch_mappings([synthetic_clip], mapping_of, CALIBRATION, frames_per_clip=12, seed=1)
+    paint = result["paint_alignment"]
+    assert paint["n_scored"] == 12
+    assert paint["score"]["median"] < 0.3
+    assert paint["separation"]["n_bad"] == 12

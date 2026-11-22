@@ -586,3 +586,20 @@ def test_margin_must_not_be_negative(margin: float) -> None:
 def test_image_size_must_be_positive(image_size: tuple[int, int]) -> None:
     with pytest.raises(ValueError, match="image_size"):
         fill([], [], 3, warp=static_camera, image_size=image_size)
+
+
+def test_no_frame_is_filled_across_a_cut() -> None:
+    track = make_track(0, {0: (500.0, 250.0), 10: (600.0, 250.0), 20: (700.0, 250.0)})
+    states = fill([track], mapping_records(21), 21, warp=static_camera, cuts=(15,))
+    filled = [state.frame for state in states if state.players]
+    # Frames 0 to 10 are filled inside the first shot; frame 20 is the only state of the second.
+    assert filled == [*range(0, 11), 20]
+    assert [state.players[0].observed for state in states if state.frame in (10, 20)] == [True, True]
+    without_cut = fill([track], mapping_records(21), 21, warp=static_camera)
+    assert [state.frame for state in without_cut if state.players] == list(range(21))
+
+
+def test_a_cut_on_an_observation_frame_ends_the_fill_before_it() -> None:
+    track = make_track(0, {0: (500.0, 250.0), 10: (600.0, 250.0), 20: (700.0, 250.0)})
+    states = fill([track], mapping_records(21), 21, warp=static_camera, cuts=(10,))
+    assert [state.frame for state in states if state.players] == [0, *range(10, 21)]

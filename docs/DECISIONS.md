@@ -697,6 +697,89 @@ Items 5 and 6 come from the checks of the change of item 4.
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
 
+## 2026-11-22 — Paint alignment of pitch mappings, and hard cuts
+
+1. **Source of the idea** (owner decision of 2026-11-22, point 2: take the ideas of a classic
+   detector stack). A public repository of such a stack claims that residual checks pass
+   confidently wrong pitch mappings, and checks a mapping against the white lines of the frame
+   instead. Its licence file reserves all rights, so only the idea is taken: no code, no
+   configuration text and no threshold of it. Every value below comes from our own tests.
+2. **Paint alignment, what it is** (`geometry.paint_alignment`, contract in
+   `docs/ARCHITECTURE.md`). The pitch lines of `pitch.py` are projected through the mapping
+   into the frame. A projected pixel hits when white paint (a thin bright ridge of the darkest
+   colour channel, on grass) lies within 0.6% of the image width. The score is the hit share
+   above chance, times a spread factor (the hits must not lie on one line or in one corner), from
+   0 to 1. A frame with less than 0.2% paint, or with 50% or more of the image near paint, cannot
+   judge a mapping: the score is None with a reason, not a low score. The score cannot see a
+   mapping that swaps the halves or the sides of the pitch (the markings are symmetric);
+   `check_homography` finds that. The constants were chosen on the synthetic clip only.
+3. **Where it is reported.** Every landmark fit of `run` and `demo` (`ClipResult.paint`, before
+   the plausibility check), every valid mapping of the pitch probe and every PnLCalib mapping of
+   `tool-score` (`paint_alignment` in the metrics file: counts, score distribution, separation,
+   one number per frame). It is a diagnostic. No rule of the pipeline uses it (rule 7).
+4. **Which result makes it a rule.** The run-machine measurement (`docs/RUNBOOK.md`, section 3,
+   "Paint alignment of the pitch mappings"): the cached answers of the pitch probe, group
+   `probe` (valid clips only, never test clips), replayed for free, and the PnLCalib run file
+   scored again. The score becomes a rule of `geometry.check_homography` for an engine only when
+   all of this holds for that engine, in a new dated entry of this file before G3 is frozen:
+   - at least 20 good mappings (median error at most 2 m) and 20 bad ones (above 3 m);
+   - AUROC at least 0.85, and AUROC minus 1.96 standard errors at least 0.75;
+   - a score limit, chosen on these frames, that refuses at least half of the bad mappings and
+     at most 5% of the good ones, checked once on 3 clips of the group `dev` before it is written;
+   - a frame that cannot judge never refuses a mapping.
+   With fewer than 20 bad mappings the result is inconclusive and the score stays a diagnostic.
+5. **Measured, synthetic** (`PYTHONPATH=src python tools/synthetic_diagnostics.py`, build
+   machine, synthetic clip of 250 frames, seed 0, every 5th frame: 50 frames, noise seed 7).
+   Not broadcast frames: no number here says how the score works on real footage.
+   - Median score of the true mapping shifted on the pitch in 8 directions (n 400 per row, 50
+     for 0 m): 0 m 1.000; 0.5 m 0.920; 1 m 0.650; 2 m 0.508; 3 m 0.436; 5 m 0.238; 10 m 0.055.
+   - Separation of good (at most 2 m) against bad (above 3 m) mappings: shifted mappings AUROC
+     0.948, standard error 0.005 (n good 1,250, n bad 800); landmark fits from the true landmarks
+     with Gaussian noise of 2, 4, 8 and 16 px AUROC 0.987, standard error 0.007 (n good 145, n
+     bad 30). The standard errors count every mapping as independent; the mappings share 50
+     frames, so the real uncertainty is larger. Noise 2, 4, 8, 16 px gave a median error of
+     0.20, 0.60, 1.28, 3.10 m and a median score of 1.000, 0.887, 0.622, 0.323.
+   - Wrong mappings (median over 50 frames): the picture mirrored left to right 0.106 (up to
+     0.994 when the view is symmetric about the halfway line), top to bottom 0.000; the sign of
+     one matrix entry changed: H[1,1] and H[1,2] 0.000, H[2,1] and H[2,2] 0.093, H[1,0] 0.273,
+     H[0,0] 0.402, H[0,2] 0.403, H[0,1] 0.621 (a small entry). The pitch mirrored: 1.000, the
+     same as the right mapping.
+   - Time: about 12 ms per frame of 1280 x 720 on the build machine.
+6. **Hard cuts** (`motion.is_cut`, `MotionField.cuts`). A pair of neighbouring frames is a cut
+   when no camera motion (the identity, the measured motion, the last measured motion of the
+   shot) moves the first frame onto the second with a median block correlation of at least 0.5
+   (4 x 4 blocks of an image 160 px wide). The median of blocks keeps a static score graphic
+   from joining two shots. Measured on synthetic clips (same tool): the lowest value inside a
+   shot 0.881 (n 448 pairs, with a pan of up to 83 px per frame at 1280 px, with and without a
+   score graphic); the highest value across a cut 0.055 (n 8 cuts of 1 to 10 s, with and
+   without the graphic). Known misses: a jump in time that one camera motion explains, for
+   example 0.4 s with a slow camera (0.918), or the same camera pose 6 s later. A pan faster
+   than about 100 px per frame counts as a cut. The clips of SoccerNet GSR have no cut, so no
+   gate measures the cut test; it guards the demo clip and other broadcast footage.
+7. **Nothing crosses a cut.** Before this change, on the synthetic clip with a cut at frame 54
+   (`tests/test_shot_cuts.py`, run on the code of `main` f7d788e): the referee track, which has
+   no shirt number, was linked across the cut by its pitch position (`bridged_warp` and the
+   joins); with a static score graphic the camera motion was measured across the cut and the
+   pitch mapping of frame 54 was carried from the shot before, 47.8 m off at a foot point; and
+   the frames 49 to 53 were filled across the cut. 5 of the 8 tests failed. Now the motion step
+   into a cut is missing, `bridged_warp` gives None across it, `associate` and
+   `stitch_fragments` run per shot (in `pipeline.py`; `tracking.py` is unchanged), and the dense
+   output fills nothing across it. Only `finalize_tracks` may join two tracks across a cut, by
+   one shown shirt number of one team: that is identity, not position. Cost: the frames between
+   the last keyframe before a cut and the first keyframe after it get no state (less than one
+   keyframe interval, 0.48 s, per cut).
+8. **Proposal, not built: a shot type in the landmark answer.** One more field in the landmarks
+   request (main camera, close-up, replay, other) would let the pipeline drop the landmarks of a
+   frame that is not a main-camera view, and would name the shot of a cut. It changes a paid
+   prompt and therefore the cache keys of every stored landmarks answer, and no label of
+   SoccerNet GSR measures it. Recommendation: decide after G3, with the cut counts of the demo
+   clip.
+9. **Open owner decisions of this entry.** (a) The rule of item 4, after the measurement.
+   (b) The proposal of item 8. (c) Whether a shown shirt number may join tracks across a cut
+   (it does now). (d) Whether the frames before a cut stay without a state (they do now) or get
+   the last position. (e) `tools/synthetic_diagnostics.py` is a new file in `tools/`, which
+   holds the scripts of the specialist tools; it is a measurement script of this entry.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

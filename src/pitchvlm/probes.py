@@ -69,7 +69,14 @@ from pitchvlm.evalx.metrics import (
 )
 from pitchvlm.evalx.oracle import LABEL_RANSAC_PX, MIN_ATHLETES_FOR_FIT
 from pitchvlm.frames import FrameSource
-from pitchvlm.geometry import apply_homography, fit_from_landmarks, fit_homography, matrix_from_record
+from pitchvlm.geometry import (
+    PaintAlignment,
+    apply_homography,
+    fit_from_landmarks,
+    fit_homography,
+    matrix_from_record,
+    paint_alignment,
+)
 from pitchvlm.labels import GsrAthlete, GsrLabels, gsr_frame_people
 from pitchvlm.pipeline import MIN_CROP_GAP_S, crop_choice, fit_problems
 from pitchvlm.pitch import inside_pitch
@@ -104,6 +111,11 @@ AXIS_SIGNS = {
     "y_flipped": (1.0, -1.0),
     "both_flipped": (-1.0, -1.0),
 }
+#: The paint-alignment separation compares the mappings whose median position error is at most
+#: this, metres ...
+PAINT_GOOD_MAX_ERROR_M = 2.0
+#: ... with the mappings whose median position error is above this, metres.
+PAINT_BAD_MIN_ERROR_M = 3.0
 #: Keys that ``write_metrics`` adds to the payload.
 PROVENANCE_KEY = "provenance"
 WRITTEN_AT_KEY = "written_at"
@@ -600,6 +612,7 @@ def _counts(scores: DetectionScores) -> dict[str, int]:
 class _MappedFrame:
     """The pitch mapping of one frame, measured at the labelled foot points of that frame."""
 
+    frame: int
     #: ``goal`` or ``midfield``, or None for a frame without labelled people.
     view: str | None
     #: True when the frame has a mapping.
@@ -610,6 +623,8 @@ class _MappedFrame:
     mapped_xy: np.ndarray
     #: The labelled pitch positions of the same people, shape (n, 2). Empty without a mapping.
     label_xy: np.ndarray
+    #: The paint alignment of the mapping in its frame (``geometry.paint_alignment``). None without a mapping.
+    paint: PaintAlignment | None
 
     @property
     def errors_m(self) -> np.ndarray:
@@ -672,7 +687,7 @@ def probe_pitch(
 
     ``landmarks_per_frame`` and ``inliers_per_valid_frame`` describe the
     answers. ``main_metric`` and ``per_clip`` use the median position error
-    per clip.
+    per clip. ``paint_alignment`` scores every valid mapping (``paint_report``).
     """
     _check_clips(clips)
     _check_at_least("frames_per_clip", frames_per_clip, 1)
@@ -740,6 +755,8 @@ def score_pitch_mappings(
     engines that refuse a different number of frames are not counted on the
     same frames; a weak mapping of an engine that never refuses shows in the
     90th percentile and in the mean of ``error_m``, not in its median.
+
+    ``paint_alignment`` scores every valid mapping (``paint_report``).
     """
     _check_clips(clips)
     _check_at_least("frames_per_clip", frames_per_clip, 1)
@@ -766,6 +783,7 @@ def score_pitch_mappings(
         **_mapping_summary(all_frames),
         "by_view": {view: _mapping_summary([frame for frame in all_frames if frame.view == view]) for view in VIEWS},
         "axis_check": _axis_check(all_frames),
+        "paint_alignment": paint_report(frames_of_clip),
         **_error_by_clip({clip_id: _mapping_summary(frames) for clip_id, frames in frames_of_clip.items()}),
     }
 
@@ -787,6 +805,9 @@ def _pitch_report(frames_of_clip: dict[str, list[_PitchFrame]], used_settings: d
             np.array([frame.n_inliers for frame in all_frames if frame.mapped.valid], dtype=np.float64)
         ),
         "n_answers_not_parsed": sum(1 for frame in all_frames if not frame.parsed),
+        "paint_alignment": paint_report(
+            {clip_id: [frame.mapped for frame in frames] for clip_id, frames in frames_of_clip.items()}
+        ),
         **_error_by_clip({clip_id: _pitch_summary(frames) for clip_id, frames in frames_of_clip.items()}),
     }
 
@@ -834,7 +855,8 @@ def _measure_mapping(clip: LabelledClip, frame: int, record: HomographyRecord) -
     """Measure the pitch mapping of one frame at the labelled foot points of that frame.
 
     A mapping is plausible when it passes ``pipeline.fit_problems`` with the
-    foot points of the labelled people who stand on the pitch.
+    foot points of the labelled people who stand on the pitch. A mapping also
+    gets its paint alignment in the frame (``geometry.paint_alignment``).
     """
     info = clip.source.info
     athletes = clip.labels.frames[frame].athletes
@@ -842,16 +864,21 @@ def _measure_mapping(clip: LabelledClip, frame: int, record: HomographyRecord) -
     view = _view(positions)
     if not record.valid:
         nowhere = np.zeros((0, 2), dtype=np.float64)
-        return _MappedFrame(view=view, valid=False, plausible=False, mapped_xy=nowhere, label_xy=nowhere)
+        return _MappedFrame(
+            frame=frame, view=view, valid=False, plausible=False, mapped_xy=nowhere, label_xy=nowhere, paint=None
+        )
     problems = fit_problems(
         record, _feet_on_pitch(athletes), (info.width, info.height), pitch_margin_m=PITCH_MARGIN_M
     )
+    matrix = matrix_from_record(record)
     return _MappedFrame(
+        frame=frame,
         view=view,
         valid=True,
         plausible=not problems,
-        mapped_xy=apply_homography(matrix_from_record(record), feet),
+        mapped_xy=apply_homography(matrix, feet),
         label_xy=positions,
+        paint=paint_alignment(_read_frame(clip, frame), matrix),
     )
 
 
@@ -891,6 +918,102 @@ def _pitch_summary(frames: Sequence[_PitchFrame]) -> dict[str, Any]:
         **_mapping_summary([frame.mapped for frame in frames]),
         "n_frames_valid_without_share_rule": n_without_share_rule,
         "valid_share_without_share_rule": _share(n_without_share_rule, len(frames)),
+    }
+
+
+def auroc(higher: Sequence[float], lower: Sequence[float]) -> float:
+    """Return the share of pairs in which a value of ``higher`` is above a value of ``lower``.
+
+    A tie counts as half a pair. This is the area under the ROC curve of a
+    score that should be higher for the first group (Mann-Whitney U divided
+    by the number of pairs): 1 separates the groups, 0.5 is chance. The value
+    is nan when a group is empty.
+    """
+    first = np.asarray(higher, dtype=np.float64).ravel()
+    second = np.asarray(lower, dtype=np.float64).ravel()
+    if first.size == 0 or second.size == 0:
+        return math.nan
+    above = (first[:, None] > second[None, :]).sum()
+    ties = (first[:, None] == second[None, :]).sum()
+    return float((above + 0.5 * ties) / (first.size * second.size))
+
+
+def auroc_standard_error(area: float, n_higher: int, n_lower: int) -> float:
+    """Return the standard error of an AUROC by Hanley and McNeil (1982). nan when a group is empty."""
+    if n_higher == 0 or n_lower == 0 or not math.isfinite(area):
+        return math.nan
+    q1 = area / (2.0 - area)
+    q2 = 2.0 * area * area / (1.0 + area)
+    variance = (
+        area * (1.0 - area) + (n_higher - 1) * (q1 - area * area) + (n_lower - 1) * (q2 - area * area)
+    ) / (n_higher * n_lower)
+    return math.sqrt(max(variance, 0.0))
+
+
+def _median_error_m(frame: _MappedFrame) -> float:
+    """Return the median finite position error of a mapped frame, or nan when it has none."""
+    errors = frame.errors_m
+    finite = errors[np.isfinite(errors)]
+    return float(np.median(finite)) if finite.size else math.nan
+
+
+def paint_report(frames_of_clip: Mapping[str, Sequence[_MappedFrame]]) -> dict[str, Any]:
+    """Report the paint alignment of the valid mappings of a pitch measurement, and how it separates good from bad.
+
+    The result holds:
+
+    - ``n_mappings``, ``n_scored`` and ``n_cannot_judge``: the valid
+      mappings, those with a score, and those whose frame cannot judge a
+      mapping; ``cannot_judge_reasons`` counts the reasons by their first words.
+    - ``score``: the distribution of the scores (``n``, ``median``, ``p90``, ``mean``).
+    - ``separation``: the scored mappings whose median position error is at
+      most ``PAINT_GOOD_MAX_ERROR_M`` (good) against those above
+      ``PAINT_BAD_MIN_ERROR_M`` (bad): ``n_good``, ``n_bad``, the score
+      distribution of each group, ``auroc`` (``auroc``: the chance that a good
+      mapping scores above a bad one) and its standard error. A mapping
+      between the two limits, or without a finite error, is in neither group.
+    - ``frames``: one entry per valid mapping: clip id, frame, score (None
+      when the frame cannot judge) and the median position error. Text only.
+
+    It is a diagnostic: no rule of the pipeline uses the score (``docs/DECISIONS.md``).
+    """
+    entries: list[dict[str, Any]] = []
+    reasons: dict[str, int] = {}
+    good: list[float] = []
+    bad: list[float] = []
+    for clip_id, frames in frames_of_clip.items():
+        for frame in frames:
+            if frame.paint is None:
+                continue
+            error_m = _median_error_m(frame)
+            score = frame.paint.score
+            entries.append({"clip_id": clip_id, "frame": frame.frame, "score": score, "error_median_m": error_m})
+            if score is None:
+                kind = (frame.paint.reason or "").split(":")[0]
+                reasons[kind] = reasons.get(kind, 0) + 1
+            elif error_m <= PAINT_GOOD_MAX_ERROR_M:
+                good.append(score)
+            elif error_m > PAINT_BAD_MIN_ERROR_M:
+                bad.append(score)
+    scores = [entry["score"] for entry in entries if entry["score"] is not None]
+    area = auroc(good, bad)
+    return {
+        "n_mappings": len(entries),
+        "n_scored": len(scores),
+        "n_cannot_judge": len(entries) - len(scores),
+        "cannot_judge_reasons": reasons,
+        "score": summarize(np.array(scores, dtype=np.float64)),
+        "separation": {
+            "good_max_error_m": PAINT_GOOD_MAX_ERROR_M,
+            "bad_min_error_m": PAINT_BAD_MIN_ERROR_M,
+            "n_good": len(good),
+            "n_bad": len(bad),
+            "score_good": summarize(np.array(good, dtype=np.float64)),
+            "score_bad": summarize(np.array(bad, dtype=np.float64)),
+            "auroc": area,
+            "auroc_standard_error": auroc_standard_error(area, len(good), len(bad)),
+        },
+        "frames": entries,
     }
 
 
