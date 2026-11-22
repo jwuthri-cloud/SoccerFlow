@@ -697,6 +697,119 @@ Items 5 and 6 come from the checks of the change of item 4.
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
 
+## 2026-11-22 — Track repairs and tracking values without labels (session C)
+
+1. **The owner decision of 2026-11-22, the part of this entry.** Take the ideas of a public
+   detector repository (its licence file reserves all rights, so ideas only: no code, no config
+   text, no weights from it; every threshold here comes from our own tests). For the tracks: repair
+   identities after the tracking with plain code, read the 11-plus-11 limit of the people on the
+   pitch, and add tracking values that need no labels. All of it works on the records that every
+   engine gives (boxes, pitch positions, team keys per keyframe). What that repository claims, not
+   measured by us: wide stitching gates weld two players; its swap fix is switched off; its sample
+   output shows top speeds of 35.9 km/h, which points at position noise.
+2. **Split of team swaps** (`tracking.split_team_swaps`, before the joins of `stitch_fragments`).
+   Rule: a track of a player or a goalkeeper is cut where its team key changes and the change
+   holds, and a person of the other team was in contact at the change. "Holds": runs of one key
+   with at least 4 votes for their key on each side (`SWAP_MIN_VOTES`; shorter runs are wrong
+   answers and join their neighbours, `team_key_runs`). "Contact": foot points at most one box
+   height apart in the image at the change (`SWAP_CONTACT_BOX_HEIGHTS`), with the key of the run of
+   the other track. The pieces are joined again by `stitch_fragments`, each with its own team.
+   Both values are estimates. Limits: two teammates who swap show no change and stay swapped; a
+   swap less than 4 votes before the end of a track is not seen; a model that names the wrong
+   team for seconds next to an opponent gives a wrong cut whose pieces are not joined again.
+3. **Team slots** (`tracking.link_team_slots`, at the end of `finalize_tracks`). Rule over time,
+   not per frame (the camera shows a part of the pitch): a team side has at most 10 players and 1
+   goalkeeper in a clip (`TEAM_SLOTS`). A group (side, role) with `n` tracks and `s` slots holds at
+   least `n - s` later parts of its other tracks, so the `n - s` shortest links (pitch distance
+   from the end of one track to the start of a later one) are made, among links that do not
+   overlap in time, show no different numbers, have both positions and lie within the reach of
+   `max_speed_mps`. No more links than the slots need. Not in `stitch_fragments`: the joins run
+   before the numbers are read, and a slot link there could weld two players whose numbers
+   would tell them apart. Limits: the distance is the only evidence (two players who come back
+   where the other one left are linked the wrong way); a substitution or a red card adds people.
+4. **Stitching gates.** `stitch_fragments` was reviewed against "a wide gate welds two players"
+   with two new test cases. Two teammates who cross while both are hidden are not welded: the
+   rival rule refuses both joins. A teammate who enters where a player left is joined when the
+   player does not come back within 3 s (nothing in the tracks tells the two apart: a limit of
+   the data), and not joined when the player comes back while the teammate is in view or when
+   the numbers differ. No test showed a gate to tighten, so none was changed.
+5. **The defaults do not change.** Both repairs are arms of gate G4, off by default
+   (`tracking.split_team_swaps`, `tracking.team_slots`; settings files in `configs/arms`). The
+   current behaviour stays the default until G4 numbers on the 6 dev clips exist for each arm
+   (RUNBOOK, section 4, "The track repairs against gate G4"), with AssA of `eval` next to them.
+6. **A value for wrong joins.** `identity_scores` gives `purity` too: the mean share of a predicted
+   id that one true track covers. Coverage, switches and track ratio (the values of G4) do not
+   fall when one id follows two people one after the other, so a repair that links tracks could
+   pass G4 and still mix people. No gate uses `purity`.
+7. **Tracking values without labels** (`evalx.diagnostics.track_diagnostics`): births and ends of
+   tracks away from the image border, steps faster than `max_speed_mps` between observed
+   positions and the top speed of each track, team-key changes inside tracks, tracks per team
+   key alive and seen per keyframe. `run` and `demo` write them under `diagnostics` and print
+   them. No gate uses them.
+8. **Synthetic numbers, before and after** (measured on the build machine; `python -m
+   pitchvlm.evalx.trackbench --seeds 20`; synthetic, no real footage and no real model answer).
+   100 cases: 5 kinds of fault times 20 seeds, 30 s clips of the synthetic scene, exact answers
+   without per-frame shirt numbers, a confident number reading for a random half of the people
+   (about the share of G5b), true camera motion and pitch mappings. Faults: `none`; `swap` (the
+   tracks of two players of different teams at most one box height apart exchange their later
+   observations, 39 swaps in 20 clips); `team_noise` (10 % of the answers name the other team,
+   10 % no team); `occlusion` (4 players missing for 2.4 to 4.8 s each); `mixed` (all three,
+   39 swaps). Means over the 20 cases of each kind, then the mean change against the current
+   behaviour on the same cases with its 95 % t interval:
+
+   | fault | arm | coverage | switches | track ratio | purity | tracks |
+   |---|---|---|---|---|---|---|
+   | none | current | 0.788 | 13.55 | 1.589 | 1.000 | 36.5 |
+   | none | split of swaps | 0.788 | 13.55 | 1.589 | 1.000 | 36.5 |
+   | none | team slots | 0.922 | 3.90 | 1.085 | 1.000 | 24.9 |
+   | swap | current | 0.762 | 19.35 | 1.589 | 0.975 | 36.5 |
+   | swap | split of swaps | 0.788 | 13.35 | 1.580 | 1.000 | 36.4 |
+   | swap | team slots | 0.895 | 10.35 | 1.089 | 0.969 | 25.1 |
+   | swap | both | 0.926 | 3.50 | 1.076 | 1.000 | 24.8 |
+   | team_noise | current | 0.782 | 13.65 | 1.574 | 0.999 | 36.2 |
+   | team_noise | split of swaps | 0.782 | 13.65 | 1.574 | 0.999 | 36.2 |
+   | team_noise | team slots | 0.928 | 3.55 | 1.070 | 0.996 | 24.6 |
+   | occlusion | current | 0.764 | 14.45 | 1.626 | 1.000 | 37.4 |
+   | occlusion | team slots | 0.896 | 4.95 | 1.104 | 1.000 | 25.4 |
+   | mixed | current | 0.732 | 20.75 | 1.663 | 0.972 | 38.2 |
+   | mixed | split of swaps | 0.744 | 19.30 | 1.685 | 0.989 | 38.8 |
+   | mixed | team slots | 0.857 | 12.15 | 1.135 | 0.966 | 26.1 |
+   | mixed | both | 0.871 | 10.40 | 1.152 | 0.984 | 26.5 |
+
+   | fault | arm | switches vs current | coverage vs current | track ratio vs current |
+   |---|---|---|---|---|
+   | swap | split of swaps | -6.00 [-6.66, -5.34] | +0.026 [+0.019, +0.033] | -0.009 [-0.023, +0.005] |
+   | team_noise | split of swaps | 0.00 [0.00, 0.00] | 0.000 | 0.000 |
+   | mixed | split of swaps | -1.45 [-2.49, -0.42] | +0.012 [+0.005, +0.018] | +0.022 [+0.000, +0.043] |
+   | none | team slots | -9.65 [-10.57, -8.74] | +0.134 [+0.124, +0.144] | -0.504 [-0.536, -0.472] |
+   | mixed | both | -10.35 [-12.35, -8.35] | +0.139 [+0.125, +0.153] | -0.511 [-0.554, -0.468] |
+
+   The split arm changes no value on the clips without swaps, also with 10 % wrong team keys
+   (every one of the 60 cases of `none`, `team_noise` and `occlusion` has the values of the
+   current behaviour). With the swaps alone it takes back
+   all 6 switches that the 39 swaps cost (19.35 -> 13.35, the 13.55 of `none`) and gives purity
+   1.000. With wrong team keys and occlusions together it takes back 1.45 switches, where the
+   swaps alone cost about 6 (inferred from the `swap` rows): the noise hides the contact or
+   shortens the runs, and a cut that is not joined again adds tracks (track ratio +0.022). The team slots link the fragments of people who left the image and came
+   back: with half of the numbers read and no per-frame number, the current behaviour misses three
+   of the four G4 limits on the clean synthetic clips (coverage 0.788, 13.55 switches, track
+   ratio 1.589), the slots meet them (0.922, 3.90, 1.085), and purity stays at 1.000.
+9. **What the bench cannot say.** The players of the synthetic scene drift a few metres around
+   fixed places, so a link by distance is easy there; real players run across the pitch, and the
+   purity of the slots on real clips is not known. The swaps are injected only between people at
+   most one box height apart, the same assumption as the contact rule, so the bench measures the
+   cut and the joins, not the contact rule. Two players of one team never come that close in the
+   scene, so the swap of teammates is not in the bench. How often swaps, wrong team keys and
+   returns happen in real clips is not known. Nothing ran on real footage or on real model
+   answers: G4 on the dev clips decides.
+10. **Open owner decisions.** (a) Is `track_ratio_max` of G4 per clip or over the 6 clips? The
+    RUNBOOK script reads it per clip. (b) Does a repair that passes G4 but lowers AssA of `eval`
+    become the default? This entry proposes: no; a repair becomes the default when it passes G4
+    and does not lower AssA on the same clips. (c) Should `purity` get a limit in G4 before the
+    dev runs (rule 7: gates are fixed before a run)? (d) The split arm pays new number requests
+    for the tracks that it changes (about 0.009 USD each, estimated); the team slots are free on
+    stored answers.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

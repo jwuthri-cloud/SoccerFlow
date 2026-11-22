@@ -113,6 +113,7 @@ from pitchvlm.datasets import (
     make_split_manifest,
     save_manifest,
 )
+from pitchvlm.evalx.diagnostics import track_diagnostics
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.evalx.oracle import (
     TeamSideFacts,
@@ -1267,6 +1268,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     truth = [scene.frame_state(frame) for frame in range(info.n_frames)]
     errors = summarize(position_errors_m(result.frames, truth))
     identity = identity_scores(result.frames, truth)
+    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
     summary = {
         "clip_id": info.clip_id,
         "n_frames": info.n_frames,
@@ -1274,6 +1276,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "median_position_error_m": errors["median"],
         "position_error_m": errors,
         "identity": dataclasses.asdict(identity),
+        "diagnostics": diagnostics.as_dict(),
         "checker": {"valid": not problems, "problems": problems},
         "scored_frames": scored_frames,
         "scored_frames_without_prediction": empty_frames,
@@ -1286,6 +1289,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         f"identity: {identity.coverage:.0%} of a true track under one id, {identity.switches} id switches, "
         f"{identity.track_ratio:.2f} predicted tracks per true track"
     )
+    print_diagnostics(diagnostics.lines())
     print(f"prediction file: {predictions}")
     print_problems(problems)
     print(f"scored frames without a prediction: {empty_frames} of {scored_frames}")
@@ -1298,6 +1302,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
 
 # --- run -----------------------------------------------------------------------------
+
+
+def print_diagnostics(lines: Sequence[str]) -> None:
+    """Print the tracking values that need no labels (``evalx.diagnostics``)."""
+    print("tracking values without labels (no gate uses them):")
+    for line in lines:
+        print(f"  {line}")
 
 
 def require_enough_keyframes(n_keyframes: int, config: PipelineConfig) -> None:
@@ -1406,7 +1417,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     empty = empty_result_reason(result.frames, scored)
     if empty is not None:
         print_empty_result(empty)
-    document = {"provenance": provenance, "prediction_file": prediction_file, "result": result.model_dump(mode="json")}
+    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
+    print_diagnostics(diagnostics.lines())
+    document = {
+        "provenance": provenance,
+        "prediction_file": prediction_file,
+        "diagnostics": diagnostics.as_dict(),
+        "result": result.model_dump(mode="json"),
+    }
     write_json(clip_dir / RESULT_NAME, document)
     print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
     video = render_clip(source, result, clip_dir / f"{info.clip_id}.mp4")

@@ -48,6 +48,7 @@ from pitchvlm.schemas import (
     TrackObs,
 )
 from pitchvlm.synth import SyntheticScene, SyntheticSource
+from pitchvlm.tracking import split_team_swaps
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.coords import box_to_model
 from pitchvlm.vlm.fake import FakeBackend
@@ -863,6 +864,25 @@ def test_dense_output_fills_no_gap_above_the_stitch_gap_setting(
         # Only the keyframes have people. The last two keyframes are 2 frames apart, so frame 73 is filled.
         assert frames_with_people == [*KEYFRAMES[:-1], 73, KEYFRAMES[-1]]
         assert all(player.observed for frame in KEYFRAMES for player in clip_result.frames[frame].players)
+
+
+def test_the_split_of_team_swaps_runs_only_in_its_arm(
+    scene: SyntheticScene, source: SyntheticSource, true_motion: MotionField, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm cuts the tracks of ``associate`` before the joins. On exact answers it cuts nothing."""
+    calls: list[int] = []
+
+    def counted(tracks: Sequence[Track]) -> list[Track]:
+        calls.append(len(tracks))
+        return split_team_swaps(tracks)
+
+    monkeypatch.setattr(pipeline, "split_team_swaps", counted)
+    default = run_clip(source, FakeBackend(scene), motion=true_motion)
+    assert calls == []
+    arm = PipelineConfig(tracking=TrackingConfig(split_team_swaps=True))
+    repaired = run_clip(source, FakeBackend(scene), arm, motion=true_motion)
+    assert len(calls) == 1
+    assert repaired.tracks == default.tracks
 
 
 def test_clip_of_one_frame_runs() -> None:

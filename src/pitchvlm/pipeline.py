@@ -51,7 +51,14 @@ from pitchvlm.schemas import (
     Track,
     TrackObs,
 )
-from pitchvlm.tracking import PitchMap, associate, finalize_tracks, stitch_fragments, vote_role_team
+from pitchvlm.tracking import (
+    PitchMap,
+    associate,
+    finalize_tracks,
+    split_team_swaps,
+    stitch_fragments,
+    vote_role_team,
+)
 from pitchvlm.vlm.steps import (
     ParseError,
     build_kit_legend_request,
@@ -596,8 +603,12 @@ def _tracks(
 
     ``warp`` moves image points from one frame into another. Where it gives no
     answer, the tracks end and the joins of ``stitch_fragments`` connect them again.
+    With ``config.split_team_swaps`` a track is first cut where it took over a person
+    of the other team (``tracking.split_team_swaps``), and the joins link the pieces.
     """
     fragments = associate(people, fps=fps, warp=warp, to_pitch=to_pitch, config=config)
+    if config.split_team_swaps:
+        fragments = split_team_swaps(fragments)
     return stitch_fragments(fragments, fps=fps, to_pitch=to_pitch, config=config)
 
 

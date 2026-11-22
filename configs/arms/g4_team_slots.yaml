@@ -1,0 +1,4 @@
+# Arm of gate G4: the pipeline settings of configs/default.yaml with the team slots
+# (tracking.team_slots). Pass it to "run" with --config. docs/RUNBOOK.md, section 4, says how it is measured.
+tracking:
+  team_slots: true
