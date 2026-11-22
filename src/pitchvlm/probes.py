@@ -513,7 +513,9 @@ def _ask_people(
         request = steps.build_people_request(
             _read_frame(clip, frame), legend, clip_id=info.clip_id, frame=frame, settings=settings, repeat=repeat
         )
-        parse = partial(steps.parse_people, frame=frame, width=info.width, height=info.height)
+        parse = partial(
+            steps.parse_people, frame=frame, width=info.width, height=info.height, coords=settings.coords
+        )
         people = _parsed(request, backend, parse)
         if people is None:
             n_not_parsed += 1
@@ -816,7 +818,9 @@ def _probe_pitch_frame(
     request = steps.build_landmarks_request(
         _read_frame(clip, frame), clip_id=info.clip_id, frame=frame, settings=settings, repeat=repeat
     )
-    parse = partial(steps.parse_landmarks, frame=frame, width=info.width, height=info.height)
+    parse = partial(
+        steps.parse_landmarks, frame=frame, width=info.width, height=info.height, coords=settings.coords
+    )
     answer = _parsed(request, backend, parse)
     landmarks = FrameLandmarks(frame=frame) if answer is None else answer
     record = fit_from_landmarks(landmarks, ransac_px=ransac_px)

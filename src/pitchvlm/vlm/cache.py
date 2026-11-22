@@ -64,8 +64,21 @@ def _cassette(request: VLMRequest, response: VLMResponse) -> dict[str, Any]:
         "prompt_hash": request.prompt_hash,
         "resolutions": list(request.resolutions),
         "image_hashes": list(request.image_hashes),
-        "response": response.model_dump(mode="json"),
+        "response": response.model_dump(mode="json", exclude=_unset_provider_fields(response)),
     }
+
+
+#: Fields of an answer that only an OpenRouter answer fills.
+PROVIDER_FIELDS = ("reported_usd", "served_by")
+
+
+def _unset_provider_fields(response: VLMResponse) -> set[str]:
+    """Return the fields of ``PROVIDER_FIELDS`` that an answer leaves empty.
+
+    A cassette does not write them, so a Gemini cassette has the same content as
+    before OpenRouter was added. Reading such a cassette gives them their default, None.
+    """
+    return {name for name in PROVIDER_FIELDS if getattr(response, name) is None}
 
 
 def _hash_tuple(value: Any) -> tuple[str, ...]:

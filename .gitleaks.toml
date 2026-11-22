@@ -1,6 +1,7 @@
 # Secret scan for every commit and every push.
 # The default rules know a Google API key in the old format (prefix AIza). The rules below add the
-# new format (prefix AQ.), keys with the sk- prefix and a Gemini key written as an assignment.
+# new format (prefix AQ.), keys with the sk- prefix, an OpenRouter key (prefix sk-or-v1-, also a key
+# with the sk- prefix) and a Gemini, Google or OpenRouter key written as an assignment.
 #
 # A key can stand directly after the letter of an escape: in a JSON text a line break is written
 # as a backslash and the letter n. So the rule for the sk- prefix accepts such a letter before the
@@ -16,6 +17,12 @@ regex = '''(?:\b|\\[abfnrtv])(sk-[a-zA-Z0-9_\-]{20,})(?:[\x60'"\s;]|\\[nr]|$)'''
 keywords = ["sk-"]
 
 [[rules]]
+id = "openrouter-key"
+description = "OpenRouter API key: the prefix sk-or-v1- and 64 hex digits"
+regex = '''(?:\b|\\[abfnrtv])(sk-or-v1-[0-9a-f]{64})(?:[^0-9a-f]|$)'''
+keywords = ["sk-or-v1-"]
+
+[[rules]]
 id = "google-auth-key"
 description = "Google API key in the new format (prefix AQ.)"
 regex = '''(?:^|[^A-Z])(AQ\.[A-Za-z0-9_\-]{20,})'''
@@ -23,8 +30,8 @@ keywords = ["aq."]
 
 [[rules]]
 id = "gemini-key-assignment"
-description = "Gemini or Google API key written as an assignment"
-regex = '''(?i)\b(?:GEMINI|GOOGLE)_API_KEY\s*[=:]\s*['"]?((?:AQ\.)?[A-Za-z0-9_\-]{20,})'''
+description = "Gemini, Google or OpenRouter API key written as an assignment"
+regex = '''(?i)\b(?:GEMINI|GOOGLE|OPENROUTER)_API_KEY\s*[=:]\s*['"]?((?:AQ\.)?[A-Za-z0-9_\-]{20,})'''
 keywords = ["api_key", "API_KEY"]
 
 # A stored model answer (a cassette) is the file <clip>/<step>/<cache key>.json, and its first value

@@ -575,8 +575,8 @@ def test_cache_key_follows_the_question_and_not_the_pixels() -> None:
 
 PARSERS: dict[str, Callable[[str], object]] = {
     "kit_legend": parse_kit_legend,
-    "people": lambda text: parse_people(text, frame=0, width=WIDTH, height=HEIGHT),
-    "landmarks": lambda text: parse_landmarks(text, frame=0, width=WIDTH, height=HEIGHT),
+    "people": lambda text: parse_people(text, frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000"),
+    "landmarks": lambda text: parse_landmarks(text, frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000"),
     "number": parse_number,
 }
 
@@ -685,7 +685,7 @@ def test_parse_people_reads_boxes_as_ymin_xmin_ymax_xmax() -> None:
             {"box_2d": [500, 600, 700, 650], "role": "referee", "team": "none", "number": None},
         ]
     }
-    result = parse_people(json.dumps(answer), frame=7, width=WIDTH, height=HEIGHT)
+    result = parse_people(json.dumps(answer), frame=7, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert isinstance(result, FramePeople)
     assert result.frame == 7
@@ -721,7 +721,7 @@ def test_parse_people_drops_bad_people_and_keeps_the_rest() -> None:
         [100, 200, 300, 400],
         last,
     ]
-    result = parse_people(json.dumps({"people": people}), frame=7, width=WIDTH, height=HEIGHT)
+    result = parse_people(json.dumps({"people": people}), frame=7, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert [(person.role, person.team_key, person.number) for person in result.people] == [
         ("player", "A", 10),
@@ -735,7 +735,7 @@ def test_parse_people_drops_bad_people_and_keeps_the_rest() -> None:
 )
 def test_parse_people_keeps_a_number_only_from_0_to_99(raw: object, expected: int | None) -> None:
     answer = {"people": [{**GOOD_PERSON, "number": raw}]}
-    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT).people
+    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000").people
 
     assert person.number == expected
     assert person.number is None or type(person.number) is int
@@ -743,26 +743,26 @@ def test_parse_people_keeps_a_number_only_from_0_to_99(raw: object, expected: in
 
 def test_parse_people_keeps_a_person_without_a_number_key() -> None:
     answer = {"people": [{"box_2d": [100, 200, 300, 400], "role": "other", "team": "none"}]}
-    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT).people
+    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000").people
 
     assert (person.role, person.team_key, person.number) == ("other", "none", None)
 
 
 def test_parse_people_moves_coordinates_into_the_image() -> None:
     answer = {"people": [{**GOOD_PERSON, "box_2d": [-10, -10, 1100, 500]}]}
-    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT).people
+    (person,) = parse_people(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000").people
 
     assert person.box == Box(x1=0.0, y1=0.0, x2=960.0, y2=1080.0)
 
 
 def test_parse_people_takes_an_empty_list() -> None:
-    assert parse_people('{"people": []}', frame=3, width=WIDTH, height=HEIGHT) == FramePeople(frame=3)
+    assert parse_people('{"people": []}', frame=3, width=WIDTH, height=HEIGHT, coords="yx_1000") == FramePeople(frame=3)
 
 
 @pytest.mark.parametrize("answer", ['{"people": null}', '{"people": {"box_2d": [0, 0, 10, 10]}}', '{"persons": []}'])
 def test_parse_people_needs_the_people_list(answer: str) -> None:
     with pytest.raises(ParseError):
-        parse_people(answer, frame=0, width=WIDTH, height=HEIGHT)
+        parse_people(answer, frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
 
 def test_parse_people_reads_back_boxes_of_box_to_model() -> None:
@@ -770,7 +770,7 @@ def test_parse_people_reads_back_boxes_of_box_to_model() -> None:
     people = [
         {"box_2d": box_to_model(box, WIDTH, HEIGHT), "role": "player", "team": "B", "number": None} for box in boxes
     ]
-    result = parse_people(json.dumps({"people": people}), frame=5, width=WIDTH, height=HEIGHT)
+    result = parse_people(json.dumps({"people": people}), frame=5, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert len(result.people) == 2
     for person, box in zip(result.people, boxes, strict=True):
@@ -784,7 +784,7 @@ def test_parse_people_reads_back_boxes_of_box_to_model() -> None:
 
 def test_parse_landmarks_reads_points_as_y_then_x() -> None:
     answer = {"view": "left", "landmarks": [GOOD_LANDMARK, {"id": 18, "point": [500, 500]}]}
-    result = parse_landmarks(json.dumps(answer), frame=3, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks(json.dumps(answer), frame=3, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert isinstance(result, FrameLandmarks)
     assert result.frame == 3
@@ -818,7 +818,7 @@ def test_parse_landmarks_drops_bad_landmarks_and_keeps_the_rest() -> None:
         {"id": 35, "point": [900, 100]},
     ]
     answer = {"view": "right", "landmarks": landmarks}
-    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert [landmark.landmark_id for landmark in result.landmarks] == [1, 35]
     assert all(landmark.landmark_id in pitch.LANDMARK_BY_ID for landmark in result.landmarks)
@@ -826,14 +826,14 @@ def test_parse_landmarks_drops_bad_landmarks_and_keeps_the_rest() -> None:
 
 def test_parse_landmarks_keeps_every_id_of_the_pitch_table() -> None:
     answer = {"view": "centre", "landmarks": [{"id": landmark.id, "point": [500, 500]} for landmark in pitch.LANDMARKS]}
-    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert [landmark.landmark_id for landmark in result.landmarks] == list(range(1, 36))
 
 
 def test_parse_landmarks_moves_coordinates_into_the_image() -> None:
     answer = {"view": "centre", "landmarks": [{"id": 18, "point": [1200, -5]}]}
-    (landmark,) = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT).landmarks
+    (landmark,) = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000").landmarks
 
     assert landmark == LandmarkObs(landmark_id=18, x=0.0, y=float(HEIGHT))
 
@@ -844,14 +844,14 @@ def test_parse_landmarks_moves_coordinates_into_the_image() -> None:
 )
 def test_parse_landmarks_keeps_only_a_known_view(view: object, expected: str | None) -> None:
     answer = {"view": view, "landmarks": [GOOD_LANDMARK]}
-    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert result.view == expected
     assert len(result.landmarks) == 1
 
 
 def test_parse_landmarks_takes_an_answer_without_a_view() -> None:
-    result = parse_landmarks('{"landmarks": []}', frame=4, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks('{"landmarks": []}', frame=4, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert result == FrameLandmarks(frame=4)
 
@@ -859,14 +859,14 @@ def test_parse_landmarks_takes_an_answer_without_a_view() -> None:
 @pytest.mark.parametrize("answer", ['{"view": "left"}', '{"view": "left", "landmarks": null}'])
 def test_parse_landmarks_needs_the_landmarks_list(answer: str) -> None:
     with pytest.raises(ParseError):
-        parse_landmarks(answer, frame=0, width=WIDTH, height=HEIGHT)
+        parse_landmarks(answer, frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
 
 def test_parse_landmarks_reads_back_points_of_point_to_model() -> None:
     points = {1: (123.0, 45.0), 18: (960.0, 540.0), 35: (1900.0, 1070.0)}
     landmarks = [{"id": key, "point": point_to_model(x, y, WIDTH, HEIGHT)} for key, (x, y) in points.items()]
     answer = {"view": "centre", "landmarks": landmarks}
-    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT)
+    result = parse_landmarks(json.dumps(answer), frame=0, width=WIDTH, height=HEIGHT, coords="yx_1000")
 
     assert len(result.landmarks) == 3
     for landmark in result.landmarks:

@@ -6,6 +6,13 @@ and the ``priority`` tier ``PRIORITY_FACTOR`` times. Only the models of
 ``FLEX_TIER_MODELS`` have a flex tier: a flex call of another model has no
 price. A price is valid from its ``valid_from`` day (UTC) until the next entry
 of the same model starts.
+
+Two providers share one ledger and one budget guard. A Gemini call is priced from
+the table ``PRICES`` of this module. An OpenRouter call is priced at the cost that
+its answer reports (``VLMResponse.reported_usd``); the price table of the
+OpenRouter models, ``configs/openrouter_prices.yaml`` (``load_price_table``),
+gives its estimate before a run. A model without a price in its table has no
+estimate, so its run does not start.
 """
 
 from __future__ import annotations
@@ -17,16 +24,17 @@ import math
 import os
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
 
+import yaml
 from pydantic import Field
 
 from pitchvlm.schemas import Record
-from pitchvlm.vlm.types import BilledTier, Usage, VLMRequest, VLMResponse
+from pitchvlm.vlm.types import DEFAULT_PROVIDER, BilledTier, Usage, VLMRequest, VLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +87,19 @@ HIGHEST_PRICE_TIER: BilledTier = max(_TIER_FACTORS, key=lambda tier: _TIER_FACTO
 MAX_LEDGER_FILE_BYTES = 1_000_000
 
 
-def price_for(model: str, on: date) -> Price:
+#: The model slug of OpenRouter ends with this for the free variant of a model. Rule 5 of
+#: ``CLAUDE.md`` allows paid models only, so such a slug is refused everywhere.
+FREE_MODEL_SUFFIX = ":free"
+
+
+def price_for(model: str, on: date, table: Sequence[Price] = PRICES) -> Price:
     """Return the price of a model on a day: the entry with the latest start that is not after the day.
 
-    Raises KeyError for a model that is not in the table, and for a day before
-    the first entry of the model.
+    ``table`` is the price table: the Gemini prices of this module by default, or the
+    table of the OpenRouter models (``load_price_table``). Raises KeyError for a model
+    that is not in the table, and for a day before the first entry of the model.
     """
-    entries = [price for price in PRICES if price.model == model]
+    entries = [price for price in table if price.model == model]
     if not entries:
         raise KeyError(f"no price for the model {model!r}")
     started = [price for price in entries if price.valid_from <= on]
@@ -138,25 +152,97 @@ DEFAULT_TOKEN_ESTIMATES: Mapping[str, TokenEstimate] = MappingProxyType(
 )
 
 
-def _estimated_usd(request: VLMRequest, estimates: Mapping[str, TokenEstimate], on: date) -> float:
+def _estimated_usd(
+    request: VLMRequest, estimates: Mapping[str, TokenEstimate], on: date, openrouter_prices: Sequence[Price]
+) -> float:
     """Return the expected cost of one request from the token estimate of its step."""
     step = request.meta.step
     if step not in estimates:
         raise KeyError(f"no token estimate for the step {step!r}")
     estimate = estimates[step]
     usage = Usage(input_tokens=estimate.input_tokens, output_tokens=estimate.output_tokens)
-    return cost_usd(request.model, usage, request.service_tier, on)
+    if request.provider == DEFAULT_PROVIDER:
+        return cost_usd(request.model, usage, request.service_tier, on)
+    if request.service_tier != "standard":
+        raise ValueError(f"an OpenRouter request has no service tier {request.service_tier!r}: use standard")
+    price = price_for(request.model, on, openrouter_prices)
+    return (
+        usage.input_tokens * price.input_usd_per_million + usage.output_tokens * price.output_usd_per_million
+    ) / 1e6
 
 
-def estimate_usd(requests: Iterable[VLMRequest], estimates: Mapping[str, TokenEstimate], on: date) -> float:
+def estimate_usd(
+    requests: Iterable[VLMRequest],
+    estimates: Mapping[str, TokenEstimate],
+    on: date,
+    *,
+    openrouter_prices: Sequence[Price] = (),
+) -> float:
     """Return the expected cost in USD of the requests, before they are sent.
 
     ``estimates`` maps a step (``meta.step``) to its token estimate. Each request
     is priced with its own model and service tier, at the price of the day ``on``.
-    A step without an estimate raises KeyError. A request that asks for the flex
-    tier of a model without one raises ValueError (``cost_usd``).
+    A Gemini request takes the table ``PRICES``, an OpenRouter request the table
+    ``openrouter_prices`` (``load_price_table``). A step without an estimate and a
+    model without a price raise KeyError. A request that asks for the flex tier of
+    a model without one raises ValueError (``cost_usd``), and so does an OpenRouter
+    request for any tier but the standard one.
     """
-    return math.fsum(_estimated_usd(request, estimates, on) for request in requests)
+    return math.fsum(_estimated_usd(request, estimates, on, openrouter_prices) for request in requests)
+
+
+class _PriceEntry(Record):
+    """One dated price of one model in the price table file."""
+
+    valid_from: date
+    input_usd_per_million: float = Field(gt=0, allow_inf_nan=False)
+    output_usd_per_million: float = Field(gt=0, allow_inf_nan=False)
+
+
+class _PricedModel(Record):
+    """One model of the price table file with its dated prices."""
+
+    model: str = Field(min_length=1)
+    prices: tuple[_PriceEntry, ...] = Field(min_length=1)
+
+
+class _PriceTableFile(Record):
+    """The content of the price table file of the OpenRouter models."""
+
+    models: tuple[_PricedModel, ...] = ()
+
+
+def load_price_table(path: Path) -> tuple[Price, ...]:
+    """Read the price table of the OpenRouter models (YAML) and return its prices.
+
+    The file holds ``models``, a list of models. Each one has its ``model`` slug and
+    ``prices``, a list of entries with ``valid_from`` (a day), ``input_usd_per_million``
+    and ``output_usd_per_million``. Every price must be above 0: a model without a
+    price for its calls is a free model, which rule 5 does not allow. So a slug with
+    the free suffix (``FREE_MODEL_SUFFIX``) is refused too, and so is a model or a start
+    day that the file names two times. Wrong content raises ValueError with the path.
+    """
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    try:
+        table = _PriceTableFile.model_validate({} if data is None else data)
+    except ValueError as error:
+        raise ValueError(f"{path}: the price table is not valid: {error}") from error
+    prices: list[Price] = []
+    seen: set[str] = set()
+    for entry in table.models:
+        if entry.model.endswith(FREE_MODEL_SUFFIX):
+            raise ValueError(f"{path}: {entry.model} is a free model, and only paid models are allowed")
+        if entry.model in seen:
+            raise ValueError(f"{path}: the model {entry.model} is listed two times")
+        seen.add(entry.model)
+        days = [price.valid_from for price in entry.prices]
+        if len(set(days)) != len(days):
+            raise ValueError(f"{path}: the model {entry.model} has two prices with the same start day")
+        prices.extend(
+            Price(entry.model, price.valid_from, price.input_usd_per_million, price.output_usd_per_million)
+            for price in entry.prices
+        )
+    return tuple(prices)
 
 
 def _utc_time(text: str) -> datetime:
@@ -171,11 +257,16 @@ def _utc_time(text: str) -> datetime:
 
 
 def billed_usd(response: VLMResponse) -> float:
-    """Return the cost of an answer in USD: its tokens at the price of its model and of its billed tier.
+    """Return the cost of an answer in USD.
 
-    The price is the one of the UTC day of the answer (``response.created_at``).
-    An answer whose model has no price on that day raises KeyError.
+    An answer that carries the cost that the API reported (``reported_usd``, an
+    OpenRouter answer) costs that amount. Any other answer costs its tokens at the
+    price of its model and of its billed tier, on the UTC day of the answer
+    (``response.created_at``). An answer whose model has no price on that day
+    raises KeyError.
     """
+    if response.reported_usd is not None:
+        return response.reported_usd
     return cost_usd(response.model, response.usage, response.service_tier, _utc_time(response.created_at).date())
 
 
@@ -254,12 +345,20 @@ class Ledger:
 
         The response says what was billed: its model, service tier and tokens,
         at the price of the UTC day of the answer (``response.created_at``),
-        and how many attempts the call needed. An answer whose model has no
-        price on that day raises KeyError, and no line is written.
+        and how many attempts the call needed. An OpenRouter answer costs what
+        its API reported (``billed_usd``). The line names the provider of the
+        request and, for OpenRouter, the provider that served the call. An
+        answer whose model has no price on that day raises KeyError, and an
+        OpenRouter answer without a reported cost raises ValueError: no line is
+        written for either.
 
         A file whose last line has no line end gets one before the new line,
         so that two answers never share a line. A warning is logged then.
         """
+        if request.provider != DEFAULT_PROVIDER and response.reported_usd is None:
+            raise ValueError(
+                f"the {request.provider} answer for {request.model} has no reported cost, so it cannot be priced"
+            )
         usd = billed_usd(response)
         entry = {
             "time": _utc_time(response.created_at).isoformat(),
@@ -270,7 +369,9 @@ class Ledger:
             "item": request.meta.item,
             "repeat": request.meta.repeat,
             "request": request.cache_key(),
+            "provider": request.provider,
             "model": response.model,
+            "served_by": response.served_by,
             "service_tier": response.service_tier,
             "attempts": response.attempts,
             "input_tokens": response.usage.input_tokens,

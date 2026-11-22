@@ -18,8 +18,8 @@ import numpy as np
 
 from pitchvlm.schemas import Box
 from pitchvlm.synth import SyntheticScene
-from pitchvlm.vlm.coords import box_to_model, point_to_model
-from pitchvlm.vlm.types import BackendError, Usage, VLMRequest, VLMResponse
+from pitchvlm.vlm.coords import GEMINI_CONVENTION, CoordConvention, box_to_answer, point_to_answer
+from pitchvlm.vlm.types import DEFAULT_PROVIDER, BackendError, Usage, VLMRequest, VLMResponse
 
 #: Token counts reported for each step. They are fixed, and near the planning estimates.
 STEP_USAGE: dict[str, Usage] = {
@@ -28,6 +28,9 @@ STEP_USAGE: dict[str, Usage] = {
     "landmarks": Usage(input_tokens=2200, output_tokens=400, thought_tokens=400),
     "number": Usage(input_tokens=2500, output_tokens=100, thought_tokens=300),
 }
+#: The price at which the fake backend reports the cost of an OpenRouter request, USD per million
+#: tokens (input, output). A real OpenRouter answer reports its cost; a Gemini answer reports none.
+FAKE_REPORTED_PRICE = (1.0, 4.0)
 
 
 class FakeBackend:
@@ -42,7 +45,12 @@ class FakeBackend:
     The random generator is seeded from ``seed`` and the cache key of the request, so the
     same request always gets the same answer. The backend keeps no state between requests,
     so it can be used from several threads. The response names the model of the request, so
-    that cost code can price it, and reports fixed token counts.
+    that cost code can price it, and reports fixed token counts. An answer to an
+    OpenRouter request also reports a cost, at ``FAKE_REPORTED_PRICE``, as the real
+    API does.
+
+    ``coords`` is the coordinate convention in which boxes and points are answered. It
+    must be the convention of the step settings of the requests (``StepSettings.coords``).
     """
 
     def __init__(
@@ -53,6 +61,7 @@ class FakeBackend:
         box_noise_px: float = 0.0,
         point_noise_px: float = 0.0,
         seed: int = 0,
+        coords: CoordConvention = GEMINI_CONVENTION,
     ) -> None:
         if not 0.0 <= miss_rate <= 1.0:
             raise ValueError("miss_rate must be between 0 and 1")
@@ -65,6 +74,7 @@ class FakeBackend:
         self._box_noise_px = box_noise_px
         self._point_noise_px = point_noise_px
         self._seed = seed
+        self._coords = coords
         self._steps: dict[str, Callable[[VLMRequest], dict[str, Any]]] = {
             "kit_legend": self._kit_legend,
             "people": self._people,
@@ -78,13 +88,20 @@ class FakeBackend:
         build_answer = self._steps.get(step)
         if build_answer is None:
             raise BackendError(f"the fake backend has no answer for step '{step}'")
+        usage = STEP_USAGE[step]
+        reported_usd = None
+        if request.provider != DEFAULT_PROVIDER:
+            input_price, output_price = FAKE_REPORTED_PRICE
+            output_tokens = usage.output_tokens + usage.thought_tokens
+            reported_usd = (usage.input_tokens * input_price + output_tokens * output_price) / 1e6
         return VLMResponse(
             text=json.dumps(build_answer(request)),
-            usage=STEP_USAGE[step],
+            usage=usage,
             model=request.model,
             service_tier=request.service_tier,
             latency_s=0.0,
             created_at=datetime.now(UTC).isoformat(),
+            reported_usd=reported_usd,
         )
 
     def _kit_legend(self, request: VLMRequest) -> dict[str, Any]:
@@ -113,7 +130,7 @@ class FakeBackend:
                 continue
             people.append(
                 {
-                    "box_2d": box_to_model(Box(x1=x1, y1=y1, x2=x2, y2=y2), width, height),
+                    "box_2d": box_to_answer(Box(x1=x1, y1=y1, x2=x2, y2=y2), width, height, self._coords),
                     "role": person.role,
                     "team": person.team_key,
                     "number": person.number,
@@ -127,7 +144,10 @@ class FakeBackend:
         shifts = self._generator(request).normal(0.0, self._point_noise_px, size=(len(truth.landmarks), 2)).tolist()
         width, height = self._scene.info.width, self._scene.info.height
         landmarks = [
-            {"id": seen.landmark_id, "point": point_to_model(seen.x + shift_x, seen.y + shift_y, width, height)}
+            {
+                "id": seen.landmark_id,
+                "point": point_to_answer(seen.x + shift_x, seen.y + shift_y, width, height, self._coords),
+            }
             for seen, (shift_x, shift_y) in zip(truth.landmarks, shifts, strict=True)
         ]
         return {"view": truth.view, "landmarks": landmarks}
