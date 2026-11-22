@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -481,6 +482,7 @@ def test_tool_score_counts_a_frame_without_a_camera_and_sees_a_mirrored_pitch(
     output = capsys.readouterr().out
     assert "axis check, median error in m: as_given " in output
     assert "axis check failed: y_flipped gives a smaller error than as_given." in output
+    assert "plausible_share 0:" in output and "plausible_share above 0:" in output
     assert output.splitlines()[-1] == f"metrics file: {metrics}"
     measured = read_json(metrics)
     assert (measured["n_frames"], measured["n_frames_valid"], measured["valid_share"]) == (5, 4, pytest.approx(0.8))
@@ -791,6 +793,10 @@ def test_tool_job_prints_the_place_of_the_job_file(
         ("[1]", "cannot be used: the top level must be a JSON object"),
         ('{"seed": 7, "valid": {"probe": []}}', "the group 'probe' of the split list holds no clip"),
         ('{"seed": 7, "valid": {"dev": ["SNGS-999"]}}', "the split list has no group 'probe'; its groups are: dev"),
+        (
+            '{"seed": 7, "valid": {"probe": ["SNGS-999", "SNGS-000", "SNGS-999"]}}',
+            "the group 'probe' of the split list names these clips more than once: SNGS-999",
+        ),
     ],
 )
 @pytest.mark.parametrize("command", ["tool-job", "tool-score", "probe"])
@@ -814,11 +820,13 @@ def test_split_list_with_wrong_content_ends_with_one_line(
     arguments = [*command_lines[command], "--root", str(root), "--manifest", str(split), "--out", str(out)]
     if command != "tool-job":
         arguments.append("--allow-dirty")
+    if command == "probe":  # No paid session and no cache folder outside the test folder.
+        arguments += ["--replay", "--cache", str(tmp_path / "cache")]
 
     assert cli.main(arguments) == 2
 
     line = error_line(capsys)
-    assert words in line
+    assert line.endswith(words)
     if "cannot be used" in words:
         assert line.startswith(f"error: the split list {split} cannot be used: ")
     assert not out.exists()
@@ -869,7 +877,7 @@ def broken_clip(root: Path, tmp_path: Path, fault: str) -> Path:
     [
         ("fewer frames", "the frame source and the labels do not belong together: 40 frames against 50 labelled"),
         ("a file that is no frame", "the name of a frame file must be a number, like 000001.jpg"),
-        ("no scored frame", "the frames of the probe cannot be chosen: clip SNGS-999: the labels have no scored frame"),
+        ("no scored frame", "the labels have no scored frame"),
     ],
 )
 @pytest.mark.parametrize("command", ["tool-job", "tool-score"])
@@ -898,27 +906,61 @@ def test_clip_folder_with_a_fault_ends_with_one_line_that_names_it(
 
     line = error_line(capsys)
     assert words in line
-    if fault != "no scored frame":
-        assert line.startswith(f"error: the clip folder {broken / 'SoccerNetGS-valid' / CLIP_ID} cannot be used: ")
+    assert line.startswith(f"error: the clip folder {broken / 'SoccerNetGS-valid' / CLIP_ID} cannot be used: ")
     assert not out.exists()
 
 
-def test_probe_names_a_clip_folder_whose_frames_do_not_fit_its_labels(
-    data_root: tuple[SyntheticScene, Path], split_list: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("kind", "fault", "words"),
+    [
+        ("people", "fewer frames", "the frame source and the labels do not belong together: 40 frames against 50"),
+        ("people", "no scored frame", "the labels have no scored frame"),
+        ("pitch", "no scored frame", "the labels have no scored frame"),
+        ("number", "no scored frame", "the labels have no scored frame"),
+    ],
+)
+def test_probe_names_a_clip_folder_that_cannot_be_measured(
+    data_root: tuple[SyntheticScene, Path],
+    split_list: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+    fault: str,
+    words: str,
 ) -> None:
+    """Each model probe ends with the same line as the two tool commands, before any model call."""
     _, root = data_root
-    broken = broken_clip(root, tmp_path, "fewer frames")
-    arguments = ["probe", "people", "--experiment", str(EXPERIMENTS / "people_probe.yaml"), "--root", str(broken)]
-    arguments += ["--manifest", str(split_list), "--out", str(tmp_path / "out.json"), "--allow-dirty"]
+    broken = broken_clip(root, tmp_path, fault)
+    arguments = ["probe", kind, "--experiment", str(EXPERIMENTS / f"{kind}_probe.yaml"), "--root", str(broken)]
+    arguments += ["--manifest", str(split_list), "--out", str(tmp_path / "out.json"), "--allow-dirty", "--replay"]
     arguments += ["--cache", str(tmp_path / "cache")]
 
     assert cli.main(arguments) == 2
 
-    assert error_line(capsys) == (
-        f"error: the clip folder {broken / 'SoccerNetGS-valid' / CLIP_ID} cannot be used: the frame source and "
-        "the labels do not belong together: 40 frames against 50 labelled images"
-    )
+    line = error_line(capsys)
+    assert line.startswith(f"error: the clip folder {broken / 'SoccerNetGS-valid' / CLIP_ID} cannot be used: {words}")
     assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "out.json").exists()
+
+
+def test_clip_with_some_frames_that_are_not_scored_is_measured(
+    data_root: tuple[SyntheticScene, Path], split_list: Path, tmp_path: Path
+) -> None:
+    """Only a clip without any scored frame is refused. The frames of the job are scored frames."""
+    _, root = data_root
+    partly = tmp_path / "partly"
+    shutil.copytree(root, partly)
+    label_file = partly / "SoccerNetGS-valid" / CLIP_ID / LABEL_NAME
+    labels = read_json(label_file)
+    for image in sorted(labels["images"], key=lambda image: image["file_name"])[:10]:
+        image["has_labeled_camera"] = False
+    label_file.write_text(json.dumps(labels), encoding="utf-8")
+
+    job = write_job(DETECTOR_FILE, partly, split_list, tmp_path)
+
+    frames = [entry["frame"] for entry in job["frames"]]
+    assert len(frames) == 5
+    assert min(frames) >= 10
 
 
 def test_output_file_must_not_be_an_input_file(
@@ -1061,3 +1103,161 @@ def test_format_names_of_the_two_files_are_those_of_their_records() -> None:
     assert ToolJob.model_fields["format"].annotation.__args__ == (JOB_FORMAT,)
     assert ToolRun.model_fields["format"].annotation.__args__ == (RUN_FORMAT,)
     assert JOB_FORMAT != RUN_FORMAT
+
+
+# --- Axis check, main metric line and input files in another spelling ------------------
+
+
+@pytest.mark.parametrize(
+    ("values", "last_line"),
+    [
+        (
+            (math.nan, math.nan, math.nan, math.nan),
+            "axis check: no frame has a mapping with a measured position error, so nothing can be compared",
+        ),
+        ((2.0, 2.0, 2.0, 2.0), "axis check, median error in m: as_given 2.000, x_flipped 2.000"),
+        ((2.0, 2.0, 9.0, 9.0), "axis check, median error in m: as_given 2.000, x_flipped 2.000"),
+    ],
+)
+def test_axis_check_passes_without_a_measured_error_and_with_equal_values(
+    capsys: pytest.CaptureFixture[str], values: tuple[float, ...], last_line: str
+) -> None:
+    """No other value is smaller than the value as given: the check does not fail."""
+    check = dict(zip(probes.AXIS_SIGNS, values, strict=True))
+
+    assert cli.print_axis_check(check) == 0
+
+    assert capsys.readouterr().out.splitlines()[-1].startswith(last_line)
+
+
+def test_tool_score_of_a_calibration_without_any_camera_ends_with_the_code_0(
+    data_root: tuple[SyntheticScene, Path], split_list: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first real run can end like this: the tool finds no camera on any frame."""
+    _, root = data_root
+    job = write_job(CALIBRATION_FILE, root, split_list, tmp_path)
+    no_camera = {"homography_pitch_to_image": None, "fault": "the tool found no camera"}
+    capsys.readouterr()
+
+    code, metrics = score(CALIBRATION_FILE, root, split_list, tmp_path, run_of(job, [dict(no_camera)] * 5))
+
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "main metric error_median_m: mean nan over 0 of 1 clips" in output
+    assert "axis check: no frame has a mapping with a measured position error, so nothing can be compared" in output
+    measured = read_json(metrics)
+    assert (measured["n_frames"], measured["n_frames_valid"], measured["valid_share"]) == (5, 0, 0.0)
+
+
+def test_main_metric_line_names_the_low_end_of_the_interval_first(
+    two_clips: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The detector misses one person of the first clip, so the two clips have different recalls."""
+    root, split = two_clips
+    job = write_job(DETECTOR_FILE, root, split, tmp_path)
+    payloads = []
+    for entry in job["frames"]:
+        labels = cli.read_labels(root / "SoccerNetGS-valid" / entry["clip"] / LABEL_NAME)
+        boxes = [person.box for person in gsr_frame_people(labels, entry["frame"]).people]
+        payloads.append(
+            {"detections": [{"box_xyxy": [b.x1, b.y1, b.x2, b.y2], "score": 0.9, "label": "person"} for b in boxes]}
+        )
+    del payloads[0]["detections"][0]
+    capsys.readouterr()
+
+    code, metrics = score(DETECTOR_FILE, root, split, tmp_path, run_of(job, payloads))
+
+    assert code == 0
+    metric = read_json(metrics)["main_metric"]
+    assert metric["low"] < metric["mean"] < metric["high"]
+    assert f"interval from {metric['low']:.3f} to {metric['high']:.3f})" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "tool: {name: pnlcalib, kp_threshold: yes, line_threshold: 0.7, pnl_refine: true}\n",
+        "tool: {name: pnlcalib, kp_threshold: 0.3, line_threshold: '0.7', pnl_refine: true}\n",
+    ],
+)
+def test_threshold_of_the_calibration_that_is_no_number_is_refused(tmp_path: Path, tool: str) -> None:
+    path = tmp_path / "tool.yaml"
+    path.write_text(TOOL_HEAD + tool, encoding="utf-8")
+
+    with pytest.raises(cli.CliError, match="tool.yaml"):
+        cli.load_tool_experiment(path)
+
+
+def test_output_file_must_not_be_an_input_file_in_another_spelling(
+    data_root: tuple[SyntheticScene, Path], split_list: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hard link to the run file, the split list, and the run file in another letter case."""
+    _, root = data_root
+    job = write_job(DETECTOR_FILE, root, split_list, tmp_path)
+    run_file = tmp_path / "run.json"
+    run_text = json.dumps(run_of(job, detector_payloads(job, root)))
+    run_file.write_text(run_text, encoding="utf-8")
+    shared = ["--experiment", str(DETECTOR_FILE), "--root", str(root), "--manifest", str(split_list)]
+    split_text = split_list.read_text(encoding="utf-8")
+    link = tmp_path / "link.json"
+    os.link(run_file, link)
+
+    # Also behind a folder that is not there yet: the command would make the folder and write through the link.
+    for out in (link, tmp_path / "missing" / ".." / "link.json"):
+        assert cli.main(["tool-score", *shared, "--run", str(run_file), "--out", str(out), "--allow-dirty"]) == 2
+        assert "--out names the same file as --run" in error_line(capsys)
+    assert not (tmp_path / "missing").exists()
+    for command in (["tool-score", *shared, "--run", str(run_file), "--allow-dirty"], ["tool-job", *shared]):
+        assert cli.main([*command, "--out", str(split_list)]) == 2
+        assert "--out names the same file as --manifest" in error_line(capsys)
+    if (tmp_path / "RUN.json").exists():  # A disk that does not tell upper and lower case apart.
+        other_case = ["--run", str(run_file), "--out", str(tmp_path / "RUN.json"), "--allow-dirty"]
+        assert cli.main(["tool-score", *shared, *other_case]) == 2
+        assert "--out names the same file as --run" in error_line(capsys)
+    assert run_file.read_text(encoding="utf-8") == run_text
+    assert split_list.read_text(encoding="utf-8") == split_text
+
+
+@pytest.mark.parametrize("command", ["tool-job", "tool-score"])
+def test_default_split_list_is_used_and_must_not_be_the_output_file(
+    data_root: tuple[SyntheticScene, Path],
+    split_list: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    """The commands of the RUNBOOK give no ``--manifest``: the split list of the repository is the input."""
+    _, root = data_root
+    job = write_job(DETECTOR_FILE, root, split_list, tmp_path)
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps(run_of(job, detector_payloads(job, root))), encoding="utf-8")
+    # An absolute path: joined to the folder of the repository it stays this path.
+    monkeypatch.setattr(cli, "SPLIT_LIST_FILE", split_list)
+    arguments = [command, "--experiment", str(DETECTOR_FILE), "--root", str(root)]
+    if command == "tool-score":
+        arguments += ["--run", str(run_file), "--allow-dirty"]
+    split_text = split_list.read_text(encoding="utf-8")
+
+    assert cli.main([*arguments, "--out", str(tmp_path / "new.json")]) == 0
+    capsys.readouterr()
+    assert cli.main([*arguments, "--out", str(split_list)]) == 2
+
+    assert "--out names the same file as --manifest" in error_line(capsys)
+    assert split_list.read_text(encoding="utf-8") == split_text
+
+
+def test_missing_run_file_with_an_output_file_that_is_there_ends_with_its_own_line(
+    data_root: tuple[SyntheticScene, Path], split_list: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, root = data_root
+    out = tmp_path / "metrics.json"
+    out.write_text("old", encoding="utf-8")
+    missing = tmp_path / "missing.json"
+    arguments = ["tool-score", "--experiment", str(DETECTOR_FILE), "--root", str(root)]
+    arguments += ["--manifest", str(split_list), "--run", str(missing), "--out", str(out), "--allow-dirty"]
+
+    assert cli.main(arguments) == 2
+
+    assert error_line(capsys).startswith(f"error: the tool run file {missing} cannot be read")
+    assert out.read_text(encoding="utf-8") == "old"

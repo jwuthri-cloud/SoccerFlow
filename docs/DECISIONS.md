@@ -550,9 +550,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    - Published values, not measured here: RF-DETR Small needs 20.0 ms per frame on an M4 Max
      with its plain `predict` and 11.1 ms with its compiled predictor; its box accuracy on the
      COCO pictures is 53.0 (Small) and 56.5 (Large). The paper of PnLCalib gives 439 ms per
-     frame on an NVIDIA RTX 2080 Ti for the same voting with line refinement. That time was
-     measured with the reading of the image, at 960 x 540 pixels, with other weights and other
-     thresholds: it is not for the settings above.
+     frame for the same voting with line refinement (the two networks on an NVIDIA RTX 2080 Ti,
+     the calibration on a CPU). That time was measured with the reading of the image, at 960 x
+     540 pixels, with other weights and other thresholds: it is not for the settings above.
 5. **What guards against a wrong script.** The script was written without the tools, and its
    tests use stand-ins. An error of a tool on a frame stops the run and names the frame: no
    frame counts as a frame without an answer because of an error. And: (a) the script refuses
@@ -562,7 +562,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    changed. The pitch convention is right when the matrices as they are give the smallest value
    and that value is small (some metres at most). When another sign gives a smaller value,
    `tool-score` says so, writes the metrics file and ends with the exit code 1: a large value
-   as given next to one small other value means that the script has the wrong pitch convention.
+   as given next to one small other value means that the script has the wrong pitch convention
+   (then no frame is plausible), or that the tool mirrors the pitch on more than half of the
+   frames (then some frames are plausible).
    When all four values are large (about 10 m and more), the check decides nothing: the output
    of the tool is wrong for another reason; (c) a test compares the format names, the settings
    and the model classes of the script with the package; (d) `docs/RUNBOOK.md`, section 8, has
@@ -598,7 +600,7 @@ Items 5 and 6 come from the checks of the change of item 4.
     finding. 50 findings, 48 confirmed: 6 major, 19 minor and 23 small ones. Repaired, each
     code change with a test:
     - The script: a box or a score of the detector that is not a finite number stops the run
-      at its frame; an error inside an installed tool keeps its traceback; a PnLCalib clone
+      at its frame; an import error inside an installed tool keeps its traceback; a PnLCalib clone
       with a changed tracked file is refused; the place of the run file is made before the tool
       is built; the script writes its own SHA-256 into the run file and takes the key variable
       out of its environment.
@@ -610,32 +612,87 @@ Items 5 and 6 come from the checks of the change of item 4.
       a clip folder that does not fit its label file end with one line and no traceback;
       `tool-score` prints the axis check and ends with the exit code 1 when it fails; the line
       of the main metric names how many clips it used; the metrics file names the content of
-      the run file and whether the script is the one of the work tree; an output file that is
-      an input file is refused; `sync` names a run file in every folder below `tools`.
+      the run file and whether the script is the one of the work tree; an `--out` file that
+      is the experiment file or the run file is refused; `sync` names a run file in every
+      folder below `tools`.
     - The documents: what the two commands do not do (item 1), which pitch values of two
       engines are not on the same frames, the size rule of the axis check, the stricter
-      plausibility rule of a tool record, and four new open owner decisions.
+      plausibility rule of a tool record, and two new open owner decisions (the work that
+      lets the pipeline use a tool, the frames of gate G3); the two older ones about the tools
+      were made clearer.
     Kept as it is: one run of the detector serves one score limit. A run file with a lower
     limit could serve a higher one, but then the metrics file would not prove that the tool ran
     with the settings of the experiment file. Named by the review and not built: the share of
     all frames within an error limit, by-view values per clip, and the limit for the
     reprojection error of PnLCalib (item 3).
+11. **Second read of these fixes (2026-11-14).** Three reviews of the fixes of item 10 (the
+    code, the documents against the code, and the documents as the assistant on the run
+    machine reads them), again with a second reading of each finding. 41 findings, all
+    confirmed: 2 major (the same fault, found by two reviews), 10 minor and 29 small ones, and
+    6 more that the second readers added.
+    The major one: after the repository became public, three sentences still told the owner
+    to push the branch `results`. Repaired:
+    - The code: a group of the split list that names a clip twice, and a clip without a scored
+      frame, end the model probe with one line too, as they do for the tool commands (before,
+      the number probe took a clip without a scored frame as a clip with 0 tracks and went
+      on; it stops now, like the two other probes); an
+      `--out` file that is the split list, a hard link to an input file or the same file in
+      another letter case is refused; the script checks the place of the run file before the
+      tool is built (a folder, no write access, the job file); an error of the operating
+      system inside a tool keeps its traceback. 24 test cases were added. The adapter of the
+      calibration no longer repeats the singular test of `geometry.invert_homography`.
+    - The documents: no push of the branch `results` before the owner decision; the identity
+      command of the setup leaves out merge commits; how to tell a wrong pitch convention from
+      a tool that mirrors a part of the frames (`plausible_share`); what to do when the first
+      check ends in a case without a rule; which values to compare between the GPU and the
+      CPU; the group `reserve` for the confirmation of a setting; every command that starts
+      the interpreter of a tool environment begins with `env -u GEMINI_API_KEY`.
+    Kept as it is: a guard of numpy warnings that does nothing in three places with the same
+    comment (it changes no value). Measured for the documents: with matrices in another pitch
+    convention, `plausible_share` is 0 for each of the three sign changes on the synthetic
+    clip of the tests (5 frames); with 3 of 5 frames mirrored it is 0.4.
+12. **Check of the fixes of item 11 (2026-11-15).** Two checks (the code with its tests, and
+    the documents), each with a second reading of its findings. 17 findings, all confirmed:
+    4 minor and 13 small ones. Repaired:
+    - The code: an `--out` path through a folder that is not there yet is judged as the file
+      that the command would write (before, a hard link of an input file behind such a folder
+      was replaced); the line under the git commands of `sync` holds the push of the branch
+      `results` back until the owner decision; three docstrings name what the code does.
+      8 test cases were added, among them a clip with some frames that are not scored, the
+      split list of the repository without `--manifest`, and a second run of the script on
+      the same run file.
+    - The documents: a copy of a tool experiment file goes into a sub-folder, because one
+      offline test names the five tool files of `configs/experiments`; a second remote for
+      the branch `results` needs no change of the guard when it holds the commits of `main`
+      (last list of this file); the size limit of a run file is about 14,000 detections, not
+      16,000; `written_at` always differs between two metrics files; the probe table names
+      the two further lines of gate G2 with their keys; the folder `results/tools` is named
+      at the commit step; item 10 no longer names the refusal of the split list, which is a
+      repair of item 11; the merge commit of the git host is described by what was measured.
+    Measured for the documents: a run file as the script writes it has about 140 bytes per
+    detection. The guard in push mode judges only the commits that the remote of the push
+    does not have: in a scratch repository with a merge commit of another identity, a push to
+    an empty second remote was refused, and a push to a copy of the first remote passed after
+    `git fetch`.
 
 ## 2026-11-14 — The code repository is public
 
 1. **The decision** (owner, 2026-11-14). The owner had the code pushed to a public repository
    and asked for a pull request there. Before, the plan was "private for now" (first table of
-   this file). The branch `main` holds the first build. The fixes of the review of the tool
-   measurement are a pull request from the branch `m1-first-build`.
+   this file). The branch `main` holds the first build and the fixes of the review of the tool
+   measurement: pull request 1 from the branch `m1-first-build` was merged on the page of the
+   git host on 2026-11-14. That merge commit has another author e-mail than the other commits
+   and the git host as its committer.
 2. **What follows for every commit.** A pushed commit is public at once and cannot be taken
    back. So the rules 1 to 3 of `CLAUDE.md` now stand between a mistake and a public leak: the
    guard and the secret scan must pass before every commit and every push, and no way around
    them is allowed (rule 9).
 3. **What is open** (also in the last list of this file):
-   - The branch `results`. The RUNBOOK sends the text results (metrics, stored model answers,
-     the cost ledger) to the remote `origin`, which is public now. These files hold no pixels
-     and no label data. They hold the answers of the model for frames of the dataset, and the
-     dataset is for research use.
+   - The branch `results`. The command `sync` prints a push of the text results (metrics,
+     stored model answers, the cost ledger) to the remote `origin`, which is public now. The
+     line under that command and the RUNBOOK hold the push back until the owner decides.
+     These files hold no pixels and no label data. They hold the answers of the model for
+     frames of the dataset, and the dataset is for research use.
    - The licence. The repository has no licence file. The code of PnLCalib is under
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
@@ -699,16 +756,18 @@ Decisions for the owner that are open, each with its recommendation:
   decision of 13 Nov lets three kinds of text return: metrics, stored model answers and the
   cost ledger. Recommendation: let the run files return too; they are the stored answers of the
   two tools, without pixels and without label data. After a yes, add them to rule 2 of
-  `CLAUDE.md`, to section 6 of the RUNBOOK and to section 9 of the HANDOVER.
+  `CLAUDE.md`, to section 6 of the RUNBOOK, to section 9 of the HANDOVER and to the list of
+  `docs/PLAN.md` (section "Two machines"). Until then the folder `results/tools` is not
+  committed (RUNBOOK, section 3).
 - **A tool that passes its gate cannot be used by the pipeline yet** (item 1 of the same
-  section). Needed before M4: a setting that names the engine of the people step and of the
-  pitch mapping, a path of `run` that reads the answers of a tool, and for RF-DETR one more
-  step that gives each box its role, team key and number (a paid model step on crops, or
-  plain code with the kit legend). None of it is designed, and no budget line holds it.
-  Recommendation: decide on 24 Nov with the measured values; build the switch only for a step
-  whose Gemini gate failed and whose tool passed (rule 8). When G3 fails and PnLCalib passes,
-  the switch is small, because a camera matrix needs no other step. When G2 fails and RF-DETR
-  passes, plan the step for role and team first, with its cost.
+  section). Needed in M4, before the first clip that uses a tool: a setting that names the
+  engine of the people step and of the pitch mapping, a path of `run` that reads the answers of
+  a tool, and for RF-DETR one more step that gives each box its role, team key and number (a
+  paid model step on crops, or plain code with the kit legend). None of it is designed, and no
+  budget line holds it. Recommendation: decide on 24 Nov with the measured values; build the
+  switch only for a step whose Gemini gate failed and whose tool passed (rule 8). When G3 fails
+  and PnLCalib passes, the switch is small, because a camera matrix needs no other step. When G2
+  fails and RF-DETR passes, plan the step for role and team first, with its cost.
 - **Frames of gate G3.** `docs/PLAN.md` and `configs/gates.yaml` name the frames of the people
   probe plus 3 of the dev clips. Both pitch experiment files (the model step and PnLCalib)
   measure the group `probe` only, and the RUNBOOK has no command for the 3 dev clips.
@@ -718,7 +777,22 @@ Decisions for the owner that are open, each with its recommendation:
 - **Branch `results` on a public remote** (section "The code repository is public").
   Recommendation: do not push the branch `results` to the public remote before this is
   decided. Keep it on the run machine, or give it a second remote that is private. The build
-  machine can read the files from either one.
+  machine can read the files only from a remote: with the first way it reads no results until
+  this is decided. For the second way the second remote must hold the commits of `main` before
+  the first push of `results`, for example as a copy of the public repository that the git
+  host makes (not tried), and `git fetch <remote>` must have run: the guard judges only the
+  commits that the remote of the push does not have (measured in a scratch repository). A
+  push to a remote that does not have the merge commit of pull request 1 judges the identity
+  of that commit and is refused, and that commit cannot be changed (RUNBOOK, section 9). The
+  other way is a change of the guard: the identity rule leaves out the commits that a remote
+  of the repository already has.
 - **Licence of this repository.** It has no licence file, and one script imports GPL code of
   another project when it runs. Recommendation: decide both before the two tools are installed
   on the run machine (M2), and add a licence file.
+- **Overlay images of the kill switch of G3.** The gate file wants five overlay images that
+  are checked by eye before the kill switch counts (`overlays_checked_by_eye: 5`), and M3 asks
+  the owner to check 10. No command writes an overlay of a pitch mapping on its frame, for the
+  model step or for PnLCalib. Recommendation: build a small command that draws the pitch lines
+  of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
+  the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
+  of the gate and needs its own entry here (rule 7).

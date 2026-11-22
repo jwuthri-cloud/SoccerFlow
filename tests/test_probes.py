@@ -43,7 +43,7 @@ from pitchvlm.probes import (
     score_pitch_mappings,
     write_metrics,
 )
-from pitchvlm.schemas import Box, ClipInfo, FramePeople, HomographyRecord
+from pitchvlm.schemas import Box, ClipInfo, FramePeople, HomographyRecord, PersonDet
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.vlm import steps
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
@@ -1933,3 +1933,14 @@ def test_a_probe_result_goes_into_a_valid_json_file(tmp_path: Path) -> None:
     assert data["per_clip"]["HAND-1"]["n_frames"] == 3
     assert data["settings"] == result["settings"]
     assert data["provenance"]["seed"] == 0
+
+
+def test_wrong_box_with_its_foot_on_the_horizon_is_off_the_pitch() -> None:
+    """The label mapping has its horizon at the image row 100: a foot point there has no finite pitch position."""
+    mapping = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.01, -1.0]])
+    labelled = PersonDet(box=Box(x1=500.0, y1=500.0, x2=540.0, y2=600.0), role="player", team_key="none")
+    on_horizon = PersonDet(box=Box(x1=40.0, y1=20.0, x2=60.0, y2=100.0), role="player", team_key="none")
+    truth = FramePeople(frame=0, people=(labelled,))
+    task = probes._PeopleTask(clip=people_clip(), frames=(0,), truth=(truth,), mappings={0: mapping})
+
+    assert probes._wrong_boxes_off_pitch(task, [FramePeople(frame=0, people=(labelled, on_horizon))]) == 1

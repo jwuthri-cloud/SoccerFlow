@@ -50,9 +50,6 @@ from pitchvlm.schemas import HomographyRecord
 
 #: The only pitch convention that a payload may state: the origin is the centre mark.
 PITCH_ORIGIN = "centre"
-#: A matrix counts as singular when its smallest singular value is at most this share of its largest one.
-SINGULAR_RATIO = 1e-12
-
 _MATRIX_KEY = "homography_pitch_to_image"
 _ORIGIN_KEY = "pitch_origin"
 _MATRIX_SIDE = 3
@@ -81,7 +78,7 @@ def homography_from_payload(payload: dict[str, Any], *, frame: int) -> Homograph
     largest = float(np.abs(pitch_to_image).max())
     if largest > 0.0:
         pitch_to_image = pitch_to_image / largest  # The scale is free: the inverse then has no huge values.
-    image_to_pitch = None if _is_singular(pitch_to_image) else invert_homography(pitch_to_image)
+    image_to_pitch = invert_homography(pitch_to_image)  # None for a matrix that is singular up to rounding.
     if image_to_pitch is None:
         raise ValueError(f"payload: '{_MATRIX_KEY}' is singular, so it has no inverse")
     scaled = image_to_pitch / np.linalg.norm(image_to_pitch)
@@ -117,14 +114,3 @@ def _matrix(rows: Any) -> np.ndarray:
 def _is_triple(value: Any) -> bool:
     """Tell whether a payload value is a list of 3 items."""
     return isinstance(value, (list, tuple)) and len(value) == _MATRIX_SIDE
-
-
-def _is_singular(matrix: np.ndarray) -> bool:
-    """Tell whether a matrix has no usable inverse.
-
-    The test compares the smallest singular value with the largest one, so it does not depend
-    on the scale of the matrix. It also finds a matrix that is singular only up to rounding
-    errors, which a plain inversion accepts.
-    """
-    singular_values = np.linalg.svd(matrix, compute_uv=False)
-    return bool(singular_values[-1] <= SINGULAR_RATIO * singular_values[0])

@@ -831,8 +831,12 @@ stored and recorded (`cli.finish_in_flight`). A second signal during that call i
 Output and errors: the standard output of every command is line buffered. So the cost estimate
 and the budget line of a paid command can be read in a pipe or a file before the first model
 call, and the line `error:` is the last line also when both streams go to one place. Wrong
-content of a settings file, a roster file, a label file or an experiment file ends with one line
-`error: the <kind> <path> cannot be used: <fault>` and no traceback (`cli.wrong_file`).
+content of a settings file, a roster file, a label file, an experiment file, a split list or a
+run file of a tool ends with one line `error: the <kind> <path> cannot be used: <fault>` and no
+traceback (`cli.wrong_file`). A clip folder that does not fit its label file, or whose labels
+have no scored frame, ends with `error: the clip folder <path> cannot be used: <fault>`
+(`cli.dataset_clip`, `cli.matched_clip`), and a group of the split list that names a clip twice
+with one line too (`cli.group_clips`).
 `cli._configure_logging` sets the loggers `httpx2`, `httpcore2`, `httpx` and `httpcore` to
 WARNING (`cli.HTTP_LOGGERS`), so that no request line goes to the log; from version 3.0 the SDK
 sends its requests with `httpx2`.
@@ -959,19 +963,20 @@ def score_pitch_mappings(clips, mapping_of: Callable[[str, int], HomographyRecor
   puts more than `PITCH_MARGIN_M` outside the pitch: the pipeline drops such people, and a
   detector cannot leave the spectators out as the people prompt tells the model. A frame
   without a label mapping adds nothing to this count.
-- `score_pitch_mappings` returns the keys of `probe_pitch` that do not belong to a landmark
-  fit. A frame is valid when the tool gave a matrix. The plausibility check is
+- `score_pitch_mappings` returns the keys of `probe_pitch` that do not belong to a landmark fit.
+  A frame is valid when the tool gave a matrix. The plausibility check is
   `pipeline.fit_problems`; a tool record has no count of agreeing landmarks, so the check wants
   9 of 10 people on the pitch; a landmark fit with 7 or more agreeing landmarks needs 2 of 3.
-  The error values are counted on the valid frames of that engine, so two engines that refuse
-  a different number of frames are not measured on the same frames there. `axis_check` holds
-  the median position error of the valid frames for the mapped points as they are and with the
-  sign of x, of y or of both changed (`probes.AXIS_SIGNS`). It tests the pitch convention of
-  the tool output. The convention is right when `as_given` is the smallest value and small
-  (some metres at most). A large `as_given` next to one small other value means that the
-  script that ran the tool has a fault. When all four values are large, the check decides
-  nothing. The command `tool-score` prints the check and ends with the exit code 1 when another
-  value is smaller than `as_given` (`cli.print_axis_check`).
+  The error values are counted on the valid frames of that engine, so two engines that refuse a
+  different number of frames are not measured on the same frames there. `axis_check` holds the
+  median position error of the valid frames for the mapped points as they are and with the sign
+  of x, of y or of both changed (`probes.AXIS_SIGNS`). It tests the pitch convention of the tool
+  output. The convention is right when `as_given` is the smallest value and small (some metres
+  at most). A large `as_given` next to one small other value means that the script that ran the
+  tool has a fault (then `plausible_share` is 0), or that the tool mirrors the pitch on more
+  than half of the frames (then it is above 0). When all four values are large, the check
+  decides nothing. The command `tool-score` prints the check and ends with the exit code 1 when
+  another value is smaller than `as_given` (`cli.print_axis_check`).
 - The settings block of a tool result holds the tool section of the experiment file under
   `tool`, and the seed and the measurement values of the probe. It has no `step_settings` and
   no `repeat`.
@@ -1002,8 +1007,9 @@ package:
   the times of the measured frames) and, under `provenance`, the facts of the run (`runner`),
   the SHA-256 of the run file (`run_file_sha256`) and `script_is_current`: whether
   `runner.script_sha256` is the SHA-256 of the `tools/run_tool.py` of the work tree. The
-  command refuses a work tree with changes like `probe`. Both tool commands refuse an output
-  file that is one of their input files (`cli.refuse_input_as_output`).
+  command refuses a work tree with changes like `probe`. Both tool commands refuse an `--out`
+  file that is the experiment file or the split list, and `tool-score` also one that is the run
+  file (`cli.refuse_input_as_output`).
 - `fallbacks.rfdetr.people_from_detections` has no default score limit: the experiment file
   names it, and the script gives the same value to the tool as its threshold.
 
@@ -1012,7 +1018,9 @@ file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`) and the commit of th
 (`PNLCALIB_COMMIT`) and refuses another one, and a clone with a changed tracked file, because it
 was written from the source of these versions and never ran with the tools. It takes the
 variable `GEMINI_API_KEY` out of its environment before it loads a tool, and it writes its own
-SHA-256 into the facts of the run. An error of a tool on a frame is not caught: the script
+SHA-256 into the facts of the run. Before the tool is built it checks the place of the run
+file (`check_out_place`: no folder, write access, not the job file), so that the answers of a
+long run are not lost at its end. An error of a tool on a frame is not caught: the script
 names the frame and stops, so no frame counts as a frame without an answer because of an
 error. For PnLCalib it binds the package names `model` and
 `utils` to the two folders of the clone before it imports from them, loads the weight files as

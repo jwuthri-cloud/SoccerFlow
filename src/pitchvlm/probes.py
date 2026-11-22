@@ -728,11 +728,13 @@ def score_pitch_mappings(
     frames for the mapped points as they are (``as_given``), and with the
     sign of x, of y or of both changed. The convention is right when
     ``as_given`` is the smallest of the four and small (some metres at most).
-    When ``as_given`` is large and another value is small, the matrices are
-    in another pitch convention: the script that ran the tool has a fault,
-    and the other values say nothing about the tool. When all four values
-    are large, the check decides nothing: the output of the tool is wrong
-    for another reason.
+    When ``as_given`` is large and another value is small, either the
+    matrices are in another pitch convention (the script that ran the tool
+    has a fault, and no frame is plausible), or the tool mirrors the pitch on
+    more than half of the frames (some frames are plausible). The other
+    values then say nothing about the tool. When all four values are large,
+    the check decides nothing: the output of the tool is wrong for another
+    reason.
 
     The error values are counted on the valid frames. So the results of two
     engines that refuse a different number of frames are not counted on the

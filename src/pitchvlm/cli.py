@@ -21,8 +21,9 @@ other error). So the exit code 1 never comes from an error. An error ends with a
 ``error: ...`` on the standard error stream. An error that can be a fault of the code also
 shows its traceback before that line. A wrong settings file, roster file, label file or
 experiment file is wrong input: the line names the file and the fault, and no traceback is
-printed. The same holds for a split list, for a run file of an external tool, and for a clip
-folder whose frames do not fit its label file (``probe``, ``tool-job``, ``tool-score``).
+printed. The same holds for a split list (a fault of one of its groups names the group, not
+the file), for a run file of an external tool, and for a clip folder whose frames do not fit
+its label file or whose labels have no scored frame (``probe``, ``tool-job``, ``tool-score``).
 
 The standard output is written line by line, also into a pipe or a file. So the cost
 estimate and the budget line of a paid command can be read before its first model call,
@@ -979,8 +980,9 @@ def clips_of_split(root: Path, split: str, wanted: Sequence[str] | None) -> list
 def dataset_clip(root: Path, split: str, clip: str) -> tuple[ImageFolderSource, GsrLabels]:
     """Open the frames and the labels of one clip of the dataset: ``root/SoccerNetGS-<split>/<clip>``.
 
-    The frame rate comes from the label file. A frame folder with a file that is no frame
-    file raises ``CliError`` with the clip folder.
+    The frame rate comes from the label file. An image file in the frame folder whose name
+    is no number, and two image files with the same number, raise ``CliError`` with the clip
+    folder.
     """
     folder = split_dir(root, split) / clip
     labels = read_labels(folder / LABEL_FILE_NAME)
@@ -996,12 +998,16 @@ def matched_clip(source: FrameSource, labels: GsrLabels, folder: Path) -> Labell
 
     Frames and labels that do not belong together (another clip id, another number of
     frames, another image size) raise ``CliError`` with the clip folder: the cause lies in
-    the data folder, for example a clip that was not extracted to its end.
+    the data folder, for example a clip that was not extracted to its end. So do labels
+    without a scored frame: no probe can measure such a clip.
     """
     try:
-        return LabelledClip(source=source, labels=labels)
+        clip = LabelledClip(source=source, labels=labels)
     except ValueError as error:
         raise CliError(f"the clip folder {folder} cannot be used: {error}") from error
+    if not any(frame.scored for frame in labels.frames):
+        raise CliError(f"the clip folder {folder} cannot be used: the labels have no scored frame")
+    return clip
 
 
 def labelled_clip(root: Path, split: str, clip: str) -> LabelledClip:
@@ -1933,7 +1939,11 @@ def load_tool_experiment(path: Path) -> ToolExperiment:
 
 
 def group_clips(manifest: Mapping[str, Any], group: str) -> tuple[str, list[str]]:
-    """Find a group of the split list. Return its split and its clip names, in the order of the list."""
+    """Find a group of the split list. Return its split and its clip names, in the order of the list.
+
+    ``CliError`` is raised for a split list without the group, for a group that is no list of
+    clip names, and for a group that names a clip more than once.
+    """
     known: list[str] = []
     for split in SPLITS:
         groups = manifest.get(split)
@@ -1945,6 +1955,11 @@ def group_clips(manifest: Mapping[str, Any], group: str) -> tuple[str, list[str]
         clips = groups[group]
         if not isinstance(clips, list) or not all(isinstance(clip, str) for clip in clips):
             raise CliError(f"the group {group!r} of the split list is not a list of clip names")
+        twice = sorted(name for name, count in Counter(clips).items() if count > 1)
+        if twice:
+            raise CliError(
+                f"the group {group!r} of the split list names these clips more than once: {', '.join(twice)}"
+            )
         return split, list(clips)
     raise CliError(f"the split list has no group {group!r}; its groups are: {', '.join(known) or 'none'}")
 
@@ -2114,6 +2129,7 @@ def _cmd_tool_job(args: argparse.Namespace) -> int:
     refuse_input_as_output(args.out, {"--experiment": args.experiment})
     experiment = load_tool_experiment(args.experiment)
     group = clips_of_group(args, experiment.group)
+    refuse_input_as_output(args.out, {"--manifest": group.manifest_path})
     sources: dict[str, ImageFolderSource] = {}
     clips: list[LabelledClip] = []
     for clip in group.clips:
@@ -2140,23 +2156,25 @@ def refuse_input_as_output(out: Path, inputs: Mapping[str, Path]) -> None:
     """Raise ``CliError`` when the output file of a command is one of its input files.
 
     ``inputs`` maps the option of each input file to its path. The command would replace
-    its input: for ``tool-score`` the answers of the tool would be gone.
+    its input: for ``tool-score`` the answers of the tool would be gone. Two paths name the
+    same file when they resolve to the same path, and when both exist as one file (another
+    letter case on a disk that does not tell the cases apart, or a hard link). The output path
+    is resolved first: a path through a folder that is not there yet is judged as the file
+    that the command would write.
     """
+    written = out.resolve()
     for option, path in inputs.items():
-        if out.resolve() == path.resolve():
+        if written == path.resolve() or (written.exists() and path.exists() and written.samefile(path)):
             raise CliError(f"--out names the same file as {option} ({out}): the command would replace its input")
 
 
 def frames_of_probe(clips: Sequence[LabelledClip], experiment: ToolExperiment) -> dict[str, list[int]]:
     """Return the frames of the probe of a tool experiment, by clip id (``probes.probe_frames``).
 
-    ``CliError`` is raised when the frames cannot be chosen: a clip whose labels have no
-    scored frame, or a group of the split list that names a clip two times.
+    The clips come from ``clips_of_group`` and ``matched_clip``: each one has its own name
+    and at least one scored frame, so the frames can be chosen.
     """
-    try:
-        return probes.probe_frames(clips, frames_per_clip=experiment.frames_per_clip, seed=experiment.seed)
-    except ValueError as error:
-        raise CliError(f"the frames of the probe cannot be chosen: {error}") from error
+    return probes.probe_frames(clips, frames_per_clip=experiment.frames_per_clip, seed=experiment.seed)
 
 
 def file_sha256(path: Path) -> str:
@@ -2170,22 +2188,25 @@ def print_axis_check(check: Mapping[str, float]) -> int:
     The check passes when the matrices as they are give the smallest median error of the
     four sign changes (``probes.AXIS_SIGNS``). Then the result is ``EXIT_OK``, and the size
     of the value is for the reader: it must be small, some metres at most. When another
-    sign change gives a smaller error, a line says what that can mean, and the result is
-    ``EXIT_FAILED``. Without any frame with a mapping nothing can be compared: ``EXIT_OK``.
+    sign change gives a smaller error, a line names the three things that this can mean, and
+    the result is ``EXIT_FAILED``. Without any measured position error nothing can be compared: ``EXIT_OK``.
+    That is the case when no frame has a mapping, and when no frame with a mapping has a
+    labelled person with a pitch position.
     """
     print("axis check, median error in m: " + ", ".join(f"{name} {value:.3f}" for name, value in check.items()))
     finite = {name: value for name, value in check.items() if math.isfinite(value)}
     if not finite:
-        print("axis check: no frame has a mapping, so nothing can be compared")
+        print("axis check: no frame has a mapping with a measured position error, so nothing can be compared")
         return EXIT_OK
     smallest = min(finite, key=finite.__getitem__)
     if finite.get("as_given") == finite[smallest]:
         return EXIT_OK
     print(
-        f"axis check failed: {smallest} gives a smaller error than as_given. Either the matrices of the run "
-        "file are in another pitch convention: then that value is small (about 1 m) and tools/run_tool.py has "
-        "a fault. Or the cameras are wrong on most frames: then all four values are large. Read docs/RUNBOOK.md, "
-        "section 3, before any other value of the metrics file"
+        f"axis check failed: {smallest} gives a smaller error than as_given. That value small and "
+        "plausible_share 0: the matrices of the run file are in another pitch convention, and tools/run_tool.py "
+        "has a fault. That value small and plausible_share above 0: the tool mirrors the pitch on a part of the "
+        "frames. All four values large: the cameras are wrong on most frames. Read docs/RUNBOOK.md, section 3, "
+        "before any other value of the metrics file"
     )
     return EXIT_FAILED
 
@@ -2303,6 +2324,7 @@ def _cmd_tool_score(args: argparse.Namespace) -> int:
     experiment = load_tool_experiment(args.experiment)
     state = require_clean_tree(args.allow_dirty)
     group = clips_of_group(args, experiment.group)
+    refuse_input_as_output(args.out, {"--manifest": group.manifest_path})
     clips = [labelled_clip(args.root, group.split, clip) for clip in group.clips]
     run = read_tool_run(args.run)
     frames = frames_of_probe(clips, experiment)
@@ -2536,7 +2558,11 @@ def print_git_commands(work_tree: Path, folder: Path, n_files: int, *, scanned: 
     print(f"  git -C {tree} add -- {shlex.quote(folder.relative_to(work_tree).as_posix())}")
     print(f"  git -C {tree} commit -m {message}")
     print(f"  git -C {tree} push origin {RESULTS_BRANCH}")
-    print("Push only when the owner asks for it. Use the name of the remote when it is not origin.")
+    print(
+        f"Do not run the push before the owner has decided where the branch {RESULTS_BRANCH} goes "
+        "(docs/DECISIONS.md, last list): a push to a public remote cannot be taken back. "
+        "Use the name of the remote when it is not origin."
+    )
     print("This command ran no git command that changes the repository.")
 
 
