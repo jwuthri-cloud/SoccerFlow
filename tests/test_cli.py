@@ -27,10 +27,8 @@ import os
 import queue
 import random
 import re
-import shlex
 import shutil
 import signal
-import string
 import subprocess
 import sys
 import threading
@@ -66,8 +64,7 @@ REPO = Path(__file__).resolve().parents[1]
 EXPERIMENTS = REPO / "configs" / "experiments"
 GATES = REPO / "configs" / "gates.yaml"
 HOOK_FILE = REPO / ".pre-commit-config.yaml"
-SECRET_SCAN_FILE = REPO / ".gitleaks.toml"
-#: The git hooks that the doctor needs: the guard and the secret scan run in both.
+#: The git hooks that the doctor needs: the guard runs in both.
 HOOK_NAMES = ("pre-commit", "pre-push")
 #: The folders and files of the repository that hold its text.
 REPOSITORY_TEXT = (
@@ -80,7 +77,6 @@ REPOSITORY_TEXT = (
     "README.md",
     "pyproject.toml",
     ".gitignore",
-    ".gitleaks.toml",
     ".pre-commit-config.yaml",
 )
 #: Clip id of every synthetic scene.
@@ -747,29 +743,6 @@ def write_run_results(folder: Path, scene: SyntheticScene) -> None:
     )
 
 
-def stand_in_secret_scan(folder: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, report: str = "") -> Path:
-    """Put a small program in the place of the secret scan of the sync command.
-
-    The program writes its arguments and its working folder into the file that is returned, prints
-    ``report`` and ends with ``exit_code``. So a test of the sync command does not need gitleaks.
-    """
-    seen = folder / "secret_scan_call.json"
-    program = folder / "stand_in_secret_scan.py"
-    program.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, sys\n"
-        f"with open({str(seen)!r}, 'w', encoding='utf-8') as handle:\n"
-        "    json.dump({'arguments': sys.argv[1:], 'folder': os.getcwd()}, handle)\n"
-        f"sys.stdout.write({report!r})\n"
-        "print('the stand-in scan is done', file=sys.stderr)\n"
-        f"sys.exit({exit_code})\n",
-        encoding="utf-8",
-    )
-    program.chmod(0o755)
-    monkeypatch.setattr(cli, "SECRET_SCAN_TOOL", str(program))
-    return seen
-
-
 #: Run files of the two external tools, as ``tools/run_tool.py`` writes them: 40 frames each. A box
 #: at the image border has whole numbers, and every third frame of the calibration has no camera.
 TOOL_RUNS: dict[str, dict[str, Any]] = {
@@ -930,12 +903,11 @@ def private_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 @pytest.fixture
 def results_tree(private_git: None, tmp_path: Path) -> Path:
-    """A git work tree on the branch ``results``, without any commit. It holds the rules of the secret scan."""
+    """A git work tree on the branch ``results``, without any commit."""
     tree = tmp_path / "pitchvlm-results"
     tree.mkdir()
     git(tree, "init", "--quiet", "--template=")
     git(tree, "symbolic-ref", "HEAD", "refs/heads/results")
-    shutil.copy(SECRET_SCAN_FILE, tree / ".gitleaks.toml")
     return tree
 
 
@@ -1731,7 +1703,7 @@ def test_environment_checks_fail_without_the_guard_hook(
 def test_environment_checks_need_the_hook_before_a_commit_and_the_hook_before_a_push(
     private_git: None, tmp_path: Path, installed: str, missing: str
 ) -> None:
-    """The guard and the secret scan must run before every commit and before every push."""
+    """The guard must run before every commit and before every push."""
     repo = tmp_path / "repo"
     install_hooks(repo, [installed])
 
@@ -1891,20 +1863,19 @@ def test_sdk_version_of_the_doctor_is_the_version_range_of_the_package() -> None
     assert project["optional-dependencies"]["gemini"] == [f"google-genai>={major}.0,<{major + 1}"]
 
 
-def test_hook_check_needs_a_hook_list_with_the_guard_and_the_secret_scan(private_git: None, tmp_path: Path) -> None:
+def test_hook_check_needs_a_hook_list_with_the_guard(private_git: None, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     install_hooks(repo)
     hook_list = repo / ".pre-commit-config.yaml"
     config = yaml.safe_load(HOOK_FILE.read_text(encoding="utf-8"))
     assert hook_check(repo).status == "ok"
 
-    # Without the guard before a push, and without the secret scan before a commit.
-    kept = [hook for hook in config["repos"][0]["hooks"] if hook["id"] not in ("guard-push", "gitleaks")]
+    # Without the guard before a push.
+    kept = [hook for hook in config["repos"][0]["hooks"] if hook["id"] != "guard-push"]
     hook_list.write_text(yaml.safe_dump({**config, "repos": [{"repo": "local", "hooks": kept}]}), encoding="utf-8")
     check = hook_check(repo)
     assert check.status == "fail"
     assert ".pre-commit-config.yaml names no hook that runs tools/guard.py at the stage pre-push" in check.detail
-    assert "names no hook that runs the secret scan (gitleaks) at the stage pre-commit" in check.detail
     assert "tools/guard.py at the stage pre-commit" not in check.detail
 
     hook_list.write_text("- not\n- a hook list\n", encoding="utf-8")
@@ -1916,7 +1887,7 @@ def test_hook_check_needs_a_hook_list_with_the_guard_and_the_secret_scan(private
     assert "the hook list .pre-commit-config.yaml is missing" in check.detail
 
 
-def test_hook_file_runs_the_guard_and_the_secret_scan_before_a_commit_and_before_a_push() -> None:
+def test_hook_file_runs_the_guard_before_a_commit_and_before_a_push() -> None:
     config = yaml.safe_load(HOOK_FILE.read_text(encoding="utf-8"))
     hooks = hook_entries()
 
@@ -1925,32 +1896,7 @@ def test_hook_file_runs_the_guard_and_the_secret_scan_before_a_commit_and_before
     for stage in HOOK_NAMES:
         entries = [hook["entry"] for hook in hooks.values() if hook["stages"] == [stage]]
         assert sum("tools/guard.py" in entry for entry in entries) == 1, stage
-        assert sum(entry.startswith("gitleaks ") for entry in entries) == 1, stage
-    # Both secret scans use the rules of the repository. Before a commit the staged files are scanned.
-    # Before a push the history is scanned, so the scan must not be limited to staged files.
-    staged, pushed = hooks["gitleaks"]["entry"], hooks["gitleaks-push"]["entry"]
-    assert "--config .gitleaks.toml" in staged and "--staged" in staged
-    assert "--config .gitleaks.toml" in pushed
-    assert "--staged" not in pushed and "--pre-commit" not in pushed
     assert all(hook["pass_filenames"] is False for hook in hooks.values())
-
-
-@pytest.mark.parametrize("target", REPOSITORY_TEXT)
-def test_text_of_the_repository_passes_the_secret_scan(target: str) -> None:
-    """A finding in a file of the repository stops every commit, because the hooks must not be bypassed.
-
-    A value that only looks like a key, for example a pinned cache key next to the name "key", needs
-    the mark ``gitleaks:allow`` on its line.
-    """
-    if shutil.which("gitleaks") is None:
-        pytest.skip("gitleaks is not installed")
-    options = ["--config", str(SECRET_SCAN_FILE), "--redact", "--no-banner", "--no-color", "--verbose"]
-
-    completed = subprocess.run(
-        ["gitleaks", "dir", *options, str(REPO / target)], capture_output=True, text=True, check=False
-    )
-
-    assert completed.returncode == 0, completed.stdout
 
 
 def test_environment_checks_never_show_the_value_of_the_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5448,8 +5394,8 @@ def test_sync_prints_the_git_commands_and_runs_none_of_them(
         "commit -m 'Add text results (6 files)'",
         "push origin results",
     ]
-    # Nothing is staged and nothing is committed: the result folder and the rules file are still untracked.
-    assert git(results_tree, "status", "--porcelain").split() == ["??", ".gitleaks.toml", "??", "results/"]
+    # Nothing is staged and nothing is committed: the result folder is still untracked.
+    assert git(results_tree, "status", "--porcelain").split() == ["??", "results/"]
     assert git(results_tree, "branch", "--list").strip() == ""
 
 
@@ -5483,125 +5429,6 @@ def test_sync_names_a_run_file_of_a_tool_below_and_inside_the_folder_of_the_tool
     assert f"  tool run: cpu/{calibration}" in output
     assert "metrics:" not in output
     assert "add -- results/tools" in output
-
-
-def test_sync_runs_the_secret_scan_of_the_hooks_with_the_rules_of_the_work_tree(
-    results_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The commit hook of the results work tree scans with the rules file of that work tree. So does sync."""
-    write_results(results_tree / "results")
-    seen = stand_in_secret_scan(tmp_path, monkeypatch, exit_code=0)
-
-    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 0
-
-    call = read_json(seen)
-    assert call["arguments"] == [
-        "dir",
-        "--config",
-        ".gitleaks.toml",
-        "--redact",
-        "--verbose",
-        "--no-banner",
-        "--no-color",
-        "--exit-code",
-        "3",
-        "results",
-    ]
-    assert Path(call["folder"]).resolve() == results_tree.resolve()
-    output = capsys.readouterr().out
-    assert "The guard and the secret scan found no problem." in output
-    assert "git -C" in output
-
-
-def test_sync_stops_when_the_secret_scan_finds_something(
-    results_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    write_results(results_tree / "results")
-    report = "RuleID:      generic-api-key\nFile:        results/metrics/notes.json\nLine:        2\n\n"
-    stand_in_secret_scan(tmp_path, monkeypatch, exit_code=cli.SECRET_SCAN_FOUND, report=report)
-
-    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 1
-
-    output = capsys.readouterr().out
-    assert "The secret scan of the git hooks refuses the files. No git command is printed." in output
-    assert "  File:        results/metrics/notes.json" in output
-    assert "  Line:        2" in output
-    assert "git -C" not in output
-
-
-def test_sync_stops_when_the_secret_scan_could_not_check_the_files(
-    results_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The secret scan ends with the exit code 1 when it cannot run. That is not a scan without a finding."""
-    write_results(results_tree / "results")
-    stand_in_secret_scan(tmp_path, monkeypatch, exit_code=1)
-
-    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 2
-
-    captured = capsys.readouterr()
-    assert "error: the secret scan could not check the files: the stand-in scan is done" in captured.err
-    assert "git -C" not in captured.out
-
-
-def test_sync_needs_the_rules_of_the_secret_scan_in_the_results_work_tree(
-    results_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    write_results(results_tree / "results")
-    (results_tree / ".gitleaks.toml").unlink()
-    seen = stand_in_secret_scan(tmp_path, monkeypatch, exit_code=0)
-
-    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 2
-
-    captured = capsys.readouterr()
-    assert "has no file .gitleaks.toml" in captured.err
-    assert "git checkout <code branch> -- .gitleaks.toml" in captured.err
-    assert "git -C" not in captured.out
-    assert not seen.exists()
-
-
-def test_sync_says_when_the_secret_scan_is_not_installed(
-    results_tree: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    write_results(results_tree / "results")
-    monkeypatch.setattr(cli, "SECRET_SCAN_TOOL", "a-secret-scan-that-is-not-installed")
-
-    assert cli.main(["sync", "--results", str(results_tree / "results")]) == 0
-
-    output = capsys.readouterr().out
-    assert "The secret scan of the git hooks did not run here: a-secret-scan-that-is-not-installed is not" in output
-    assert "The guard found no problem. To send the files back, the owner runs:" in output
-    assert "git -C" in output
-
-
-def test_sync_accepts_the_results_of_a_paid_run_and_refuses_a_value_that_only_the_secret_scan_knows(
-    results_tree: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The real secret scan on real result files: cassettes, the ledger and a metrics file.
-
-    The cache key of a cassette looks like a key to the secret scan, and the rules of the repository
-    allow it in a cassette. The same kind of value in a metrics file is refused. The guard has no
-    rule for it, so only the secret scan stops the files before the commit hook does.
-    """
-    if shutil.which("gitleaks") is None:
-        pytest.skip("gitleaks is not installed")
-    results = results_tree / "results"
-    write_run_results(results, SyntheticScene(n_frames=N_FRAMES, seed=2))
-
-    assert cli.main(["sync", "--results", str(results)]) == 0
-    assert "The guard and the secret scan found no problem." in capsys.readouterr().out
-
-    # A made-up value of 32 hex digits next to the name "key". It is built here, so this file does not hold it.
-    made_up = "".join(random.Random(5).choices("0123456789abcdef", k=32))
-    (results / "metrics" / "notes.json").write_text(json.dumps({"key": made_up}, indent=2) + "\n", encoding="utf-8")
-
-    assert cli.main(["sync", "--results", str(results)]) == 1
-
-    output = capsys.readouterr().out
-    assert "The secret scan of the git hooks refuses the files." in output
-    assert "generic-api-key" in output
-    assert "results/metrics/notes.json" in output
-    assert made_up not in output
-    assert "git -C" not in output
 
 
 def test_sync_refuses_a_result_file_that_the_guard_refuses(
@@ -5694,75 +5521,6 @@ def test_sync_refuses_a_linked_folder(tmp_path: Path, capsys: pytest.CaptureFixt
     output = capsys.readouterr().out
     assert "refused: linked is not a text result file" in output
     assert "git -C" not in output
-
-
-def test_secret_scan_allows_only_the_cache_key_line_of_a_cassette() -> None:
-    """The default rules of the secret scan take the cache key of a cassette for a key. One narrow rule allows it."""
-    (allowed,) = tomllib.loads(SECRET_SCAN_FILE.read_text(encoding="utf-8"))["allowlists"]
-    # The line and the path must both fit, and only the rule for generic keys is relaxed.
-    assert (allowed["condition"], allowed["regexTarget"]) == ("AND", "line")
-    assert allowed["targetRules"] == ["generic-api-key"]
-    (line_pattern,), (path_pattern,) = allowed["regexes"], allowed["paths"]
-    line, place = re.compile(line_pattern), re.compile(path_pattern)
-    assert place.search(f"results/cache/{CLIP_ID}/people/{CASSETTE_STEM}.json")
-    assert place.search(f"{CLIP_ID}/people/{CASSETTE_STEM}.json")
-    for other in ("results/metrics/people_probe.json", "results/cache/ledger.jsonl", f"{CASSETTE_STEM}.json"):
-        assert not place.search(other), other
-    assert line.search(f'  "key": "{CASSETTE_STEM}",')
-    for other in (
-        f'  "api_key": "{CASSETTE_STEM}",',
-        f'  "key": "{CASSETTE_STEM}{CASSETTE_STEM}",',
-        f'  "key": "{CASSETTE_STEM.upper()}",',
-        f'  "key": "{CASSETTE_STEM}", "note": "more text"',
-    ):
-        assert not line.search(other), other
-
-
-def test_text_results_pass_the_secret_scan_of_both_hooks_and_a_planted_key_does_not(
-    private_git: None, tmp_path: Path
-) -> None:
-    """The secret scan as the hooks run it, on result files as a paid run writes them.
-
-    Before a commit the staged files are scanned, before a push the history. A made-up value in the
-    shape of a key is found by both. After a later commit removed it, only the history scan finds it.
-    """
-    if shutil.which("gitleaks") is None:
-        pytest.skip("gitleaks is not installed")
-    repo = tmp_path / "pitchvlm-results"
-    repo.mkdir()
-    git(repo, "init", "--quiet", "--template=")
-    shutil.copy(SECRET_SCAN_FILE, repo / ".gitleaks.toml")
-    hooks = hook_entries()
-    author = ["-c", "user.name=Tester", "-c", "user.email=tester" + "@" + "example.org", "-c", "commit.gpgsign=false"]
-
-    def scan(hook_id: str) -> int:
-        """Run the secret scan of one hook in the repository. The exit code is 0 without a finding, else 1."""
-        command = shlex.split(hooks[hook_id]["entry"])
-        return subprocess.run(command, cwd=repo, capture_output=True, check=False).returncode
-
-    def commit(message: str) -> None:
-        git(repo, *author, "commit", "--quiet", "--no-verify", "-m", message)
-
-    write_run_results(repo / "results", SyntheticScene(n_frames=N_FRAMES, seed=2))
-    assert len(list((repo / "results" / "cache").glob(f"{CLIP_ID}/*/*.json"))) == 17
-    git(repo, "add", "--all")
-    assert scan("gitleaks") == 0
-    commit("results")
-    assert scan("gitleaks-push") == 0
-
-    # A made-up value in the shape of a Google API key. It is built here, so this file does not hold it.
-    made_up = "AI" + "za" + "".join(random.Random(7).choices(string.ascii_letters + string.digits, k=35))
-    notes = repo / "results" / "metrics" / "notes.json"
-    notes.write_text(json.dumps({"note": made_up}) + "\n", encoding="utf-8")
-    git(repo, "add", "--all")
-    assert scan("gitleaks") == 1
-    commit("planted")
-    assert scan("gitleaks-push") == 1
-
-    git(repo, "rm", "--quiet", "results/metrics/notes.json")
-    commit("removed")
-    assert scan("gitleaks") == 0
-    assert scan("gitleaks-push") == 1
 
 
 def test_sync_refuses_a_work_tree_that_is_not_on_the_results_branch(

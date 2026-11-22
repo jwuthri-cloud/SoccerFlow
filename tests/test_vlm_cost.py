@@ -50,8 +50,6 @@ LOGGER_NAME = "pitchvlm.vlm.cost"
 REPO = Path(__file__).resolve().parents[1]
 #: The repository guard. Every result file must pass it before it goes to the results branch.
 GUARD = REPO / "tools" / "guard.py"
-#: The rules of the secret scan of the git hooks.
-SECRET_SCAN_FILE = REPO / ".gitleaks.toml"
 #: A day in the first price period of gemini-4-argon (2 / 10 USD per million tokens).
 NOVEMBER = date(2026, 11, 20)
 #: A day in its second price period (4 / 20 USD per million tokens).
@@ -942,22 +940,6 @@ def test_ledger_of_the_whole_budget_needs_several_files_and_its_lines_pass_the_g
         check=False,
     )
     assert (completed.returncode, completed.stdout, completed.stderr) == (0, "", "")
-
-
-def test_ledger_lines_pass_the_secret_scan(tmp_path: Path) -> None:
-    """Every line holds the cache key of its request: 32 hex digits. The secret scan must not take it for a key."""
-    if shutil.which("gitleaks") is None:
-        pytest.skip("gitleaks is not installed")
-    ledger = Ledger(tmp_path / "results" / "cache" / "ledger.jsonl")
-    for request, response in plan_of_one_clip():
-        ledger.record("run-SNGS-021-20261120T100000Z-ab12", request, response)
-    options = ["--config", str(SECRET_SCAN_FILE), "--redact", "--no-banner", "--no-color", "--verbose"]
-
-    completed = subprocess.run(
-        ["gitleaks", "dir", *options, str(tmp_path / "results")], capture_output=True, text=True, check=False
-    )
-
-    assert completed.returncode == 0, completed.stdout
 
 
 # --- Ledger: a file that cannot be written --------------------------------------

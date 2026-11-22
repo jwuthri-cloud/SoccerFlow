@@ -86,8 +86,8 @@ SPEND = "spend"
 
 # --- Environment ---------------------------------------------------------------------
 
-#: The two git hooks that the repository needs. Each one runs the guard and the secret
-#: scan: one before every commit, the other before every push.
+#: The two git hooks that the repository needs. Each one runs the guard: one before
+#: every commit, the other before every push.
 HOOK_NAMES: tuple[str, ...] = ("pre-commit", "pre-push")
 #: The file of the repository that lists the hooks for the pre-commit framework.
 HOOK_CONFIG = Path(".pre-commit-config.yaml")
@@ -97,7 +97,6 @@ HOOK_INSTALL_COMMAND = "pre-commit install --hook-type pre-commit --hook-type pr
 _FRAMEWORK_COMMAND = "hook-impl"
 #: Start of the command line of each kind of hook that the hook list must hold for both hooks.
 _GUARD_ENTRY = "tools/guard.py"
-_SECRET_SCAN_ENTRY = "gitleaks "
 #: Name of the deny-list of the guard. It lies in the git folder of the clone (``tools/guard.py``).
 DENY_LIST_NAME = "guard-deny.txt"
 #: The major version of the model SDK that the client is written for (``pyproject.toml``: from 3.0, below 4).
@@ -179,7 +178,7 @@ def environment_checks(repo: Path, *, key_variable: str, data_dir: Path, api: bo
     ``api`` says whether the caller will call the model. The SDK and the key are needed
     only then: without them, or with an SDK of another major version, the check fails
     when ``api`` is true, and it is a fact without a verdict when ``api`` is false. The
-    guard hooks always fail when git does not run the guard and the secret scan before
+    guard hooks always fail when git does not run the guard before
     every commit and before every push (``_hook_check``). The deny-list always fails
     when the clone has none (``_deny_check``). The value of the key and the entries of
     the deny-list never go into a result.
@@ -243,14 +242,14 @@ def _key_check(key_variable: str, api: bool) -> CheckResult:
 
 
 def _hook_check(repo: Path) -> CheckResult:
-    """Tell whether git runs the guard and the secret scan of the repository before every commit and every push.
+    """Tell whether git runs the guard of the repository before every commit and every push.
 
     A file with the name of a hook is not enough: git must run it, and it must run the
     guard. So the check needs all of this, for the hook before a commit and for the hook
     before a push:
 
     - The hook list ``.pre-commit-config.yaml`` of the repository names a hook that runs
-      the guard script and a hook that runs the secret scan.
+      the guard script.
     - The hook file is at the place where git looks for it. Git names this place, so the
       setting ``core.hooksPath`` and a linked work tree are followed.
     - The hook file is executable. Git ignores a hook file that is not.
@@ -276,7 +275,7 @@ def _hook_check(repo: Path) -> CheckResult:
         return CheckResult(
             HOOK,
             "ok",
-            f"git runs the guard and the secret scan before every commit and every push ({' and '.join(places)})",
+            f"git runs the guard before every commit and every push ({' and '.join(places)})",
         )
     return CheckResult(HOOK, "fail", f"{'; '.join(problems)}. Install both hooks with {HOOK_INSTALL_COMMAND}")
 
@@ -340,7 +339,7 @@ def _hook_file_problem(place: Path, name: str) -> str | None:
 
 
 def _hook_list_problems(repo: Path) -> list[str]:
-    """Say what the hook list of the repository lacks: a guard hook or a secret scan hook for one of the two hooks."""
+    """Say what the hook list of the repository lacks: a guard hook for one of the two hooks."""
     name = HOOK_CONFIG.as_posix()
     try:
         config = yaml.safe_load((repo / HOOK_CONFIG).read_text(encoding="utf-8"))
@@ -355,8 +354,6 @@ def _hook_list_problems(repo: Path) -> list[str]:
     for hook_name in HOOK_NAMES:
         if not any(_GUARD_ENTRY in entry for entry in entries[hook_name]):
             problems.append(f"{name} names no hook that runs {_GUARD_ENTRY} at the stage {hook_name}")
-        if not any(entry.startswith(_SECRET_SCAN_ENTRY) for entry in entries[hook_name]):
-            problems.append(f"{name} names no hook that runs the secret scan (gitleaks) at the stage {hook_name}")
     return problems
 
 

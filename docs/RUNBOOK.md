@@ -32,7 +32,7 @@ traceback.
 
 ```bash
 # Tools.
-brew install uv gitleaks
+brew install uv
 uv tool install pre-commit
 
 # Main environment: Python 3.13. Then run the offline tests.
@@ -45,7 +45,7 @@ python -m pytest
 mkdir -p locks
 uv pip compile pyproject.toml --extra dev --extra gemini -o locks/run-machine.txt
 
-# Hooks: the guard and the secret scan run before a commit and before a push (section 9).
+# Hooks: the guard runs before a commit and before a push (section 9).
 pre-commit install --hook-type pre-commit --hook-type pre-push
 
 # Personal git identity, for this repository only. The guard refuses a commit and a push until
@@ -95,10 +95,10 @@ source .venv/bin/activate
   at this prompt. An assistant gets the key only when the owner starts it from the terminal
   that has the key; it does not run the prompt command and does not print the environment.
 - A key that Google AI Studio makes now starts with `AQ.`; an older key starts with `AIza`. The
-  guard and the secret scan know both forms. The length of the new form is not public: the guard
+  guard knows both forms. The length of the new form is not public: the guard
   expects 20 or more characters after the prefix. On day 1, count the characters of the real key
   without writing it anywhere (`printf %s "$GEMINI_API_KEY" | wc -c`). Tell the owner when the
-  count is below 23: the pattern in `tools/guard.py` and in `.gitleaks.toml` must then change.
+  count is below 23: the pattern in `tools/guard.py` must then change.
   Section 8 (fact 11) has a command that tests the whole pattern and prints no part of the key.
 - The work tree `../pitchvlm-results` also holds a copy of the code. Do not run code from there.
 - The new file `locks/run-machine.txt` belongs to the code branch. Commit it when the owner asks,
@@ -591,16 +591,11 @@ push the branch `results` to that remote before the owner has decided where the 
 python -m pitchvlm.cli sync --results ../pitchvlm-results/results
 ```
 
-The command lists the files, checks them with `tools/guard.py` and with the secret scan of the
-git hooks, and prints three git commands (`add`, `commit`, `push`). It runs none of them. The
+The command lists the files, checks them with `tools/guard.py`, and prints three git commands (`add`, `commit`, `push`). It runs none of them. The
 owner runs them and decides about the push. The command refuses the folder when it holds
-anything but `.json` and `.jsonl` files, and when the guard or the secret scan finds a problem.
+anything but `.json` and `.jsonl` files, and when the guard finds a problem.
 On the build machine, fetch the branch `results` and read the files there.
 
-- The secret scan of `sync` is `gitleaks` with the file `.gitleaks.toml` of the work tree
-  `../pitchvlm-results`, as the commit hook of that work tree runs it. When that file is
-  missing, the command stops and names the git command that brings it. Without `gitleaks` the
-  command says that the scan did not run.
 - The guard refuses a label file and the result file of a clip run by name
   (`Labels-GameState.json`, `result.json`). It also reads every `.json` and `.jsonl` file, also a
   small one: label data, prediction data, the result of a clip run and records of the label
@@ -613,11 +608,9 @@ On the build machine, fetch the branch `results` and read the files there.
   answer and names its repeat index, the cache key of its request (`request`) and the number of
   attempts. Two lines with the same `request` are two payments for the same question.
 - The hooks in `../pitchvlm-results` run the guard and the settings files of the branch `results`,
-  not those of the code branch. After a change of `tools/`, `.gitleaks.toml`, `.gitignore` or
+  not those of the code branch. After a change of `tools/`, `.gitignore` or
   `.pre-commit-config.yaml` on the code branch, merge the code branch into `results` before the
   next commit of results: `git -C ../pitchvlm-results merge <code branch>`.
-- When the secret scan stops a commit, it prints the file and the line of each finding. The
-  secret itself is not printed.
 
 ## 7 Rules
 
@@ -629,7 +622,7 @@ On the build machine, fetch the branch `results` and read the files there.
 6. Money: estimate first, measured cost after; a run stops at 1.3 times its estimate (the contract checks of `doctor`: at the 2 USD of gate G0); hard stop at 135 USD; no paid run without the owner's go-ahead.
 7. Gates are fixed in `configs/gates.yaml` before a run; the 10 test clips are run once, after the freeze tag.
 8. A specialist model replaces a Gemini step only after that step failed its gate and the specialist passed the same gate on the same frames.
-9. The guard and the secret scan run before `git commit` and before a push that sends commits; `--no-verify`, the variable `SKIP` of the hook runner and another hook folder (`core.hooksPath`) are not allowed. Before a push that sends only names (a tag or a new branch), run `python3 tools/guard.py --push` by hand. The deny-list `.git/guard-deny.txt` is never committed (section 9).
+9. The guard runs before `git commit` and before a push that sends commits; `--no-verify`, the variable `SKIP` of the hook runner and another hook folder (`core.hooksPath`) are not allowed. Before a push that sends only names (a tag or a new branch), run `python3 tools/guard.py --push` by hand. The deny-list `.git/guard-deny.txt` is never committed (section 9).
 10. Commit only when the owner asks; never push without being asked; a commit message has no co-author line.
 
 ## 8 What was never tested before the run machine
@@ -639,7 +632,7 @@ Check each one with its first check before you rely on it.
 
 | Part | File | First check | When it fails |
 |---|---|---|---|
-| Offline tests on this machine | `tests/` | `python -m pytest -rs` after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of disk: install the tool. One test of the tool script is skipped without Pillow. Pillow belongs to the environments of the two specialist tools (row "Tool script"): leave this test skipped. A failed test names the code that this machine runs in another way: repair the code, not the test. |
+| Offline tests on this machine | `tests/` | `python -m pytest -rs` after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `pre-commit`) or the kind of disk: install the tool. One test of the tool script is skipped without Pillow. Pillow belongs to the environments of the two specialist tools (row "Tool script"): leave this test skipped. A failed test names the code that this machine runs in another way: repair the code, not the test. |
 | Setup commands | section 1 | Each command of section 1 ends without an error, and `doctor --no-api` shows the SDK as a version 3.x. Most commands of section 1 never ran: the install with the extra `gemini`, the pinned list, the work tree and the scorer | Read the error of the command. Fact 19 below is about the package age limit of `uv pip`. |
 | Gemini client | `src/pitchvlm/vlm/client.py` | `doctor` with one model (step 2 of day 1). The cost estimate and the budget line must be on the screen before the first check line of a model | Read the failed check and the report file. A failed contract check (`boxes`, `landmarks`, `store flag`, `token sum`, `served tier`, `flex tier`) is a client fault: repair the client before any footage is sent. A value of `box accuracy` or `landmark accuracy` that does not reach the value of the gate file is not a client fault. A line `[info] flex tier: not checked` is no client fault either: the flex tier was busy (section 2). When the check `boxes` fails, read the answers under `contract.<model>.answers` in the report file first: a model that names no person for the coloured rectangles of the synthetic frames fails this check without a client fault. |
 | Download | `src/pitchvlm/datasets.py` | `data --split valid`; then `ls ~/pitchvlm-data/SoccerNetGS-valid` shows about 58 clip folders | Run the command again: it continues the download. An archive whose `.part` file in `~/pitchvlm-data/archives` already holds every byte gets its final name at the next start: the server answers the range with the status 416 and the size of the archive, and the command compares that size with the file. When the sizes differ, or the answer names no size, the command stops with an error that names the `.part` file: compare its size with the size on the dataset page, or delete it to start again. When the host refuses the request or its certificate (the download itself was never run), download `valid.zip` by hand into `~/pitchvlm-data/archives` and run the command again: it then only extracts. |
@@ -649,12 +642,12 @@ Check each one with its first check before you rely on it.
 | Video decoding | `src/pitchvlm/frames.py` | The free dry run of the demo clip (section 4) prints the frames, the frame rate and the keyframes: frames divided by the rate must be the length of the clip in seconds, and the clip must have about 2.1 keyframes per second at any frame rate. Only synthetic clips of 25 frames per second ran before | A video with a variable frame rate, rotation data or interlaced frames was never read here. Convert it to a constant frame rate, or extract its frames into a folder and use `--fps`. |
 | Roster file | `src/pitchvlm/roster.py` | The same dry run with `--roster` reads the roster file before any model call. After the paid run, the video shows a name next to every displayed number of the roster | The error names the key and, for YAML, the line (section 4). |
 | Tool script | `tools/run_tool.py`, `src/pitchvlm/fallbacks/` | After the install of the two tools (section 3): the three commands of each tool, with `--max-clips 2` for `tool-job` and `tool-score`. The script was written from the source of the tools (`rfdetr` 1.12.0 and 1.12.1, PnLCalib at one commit) and never ran with them: the tests replace each tool by a stand-in. Its image reader needs Pillow and ran nowhere. RF-DETR: the recall is far above 0, and the largest box values of the run file are near the width and the height of the frames. PnLCalib: `axis_check.as_given` is the smallest of its four values and small (some metres at most), `tool-score` ends with the exit code 0, `valid_share` is above 0, and the payloads of the run file show a camera on the near side above the grass (`camera_position_m`: y above 34, z below 0). Then compare the device `mps` with `cpu` on the same two clips | An `error:` line about a version or a commit: install the version that the line names. A traceback inside a tool: the line before it names the frame on which the tool stopped. When the first frame fails, the tool does not have the interface that the script expects: read the source of the installed version, repair `tools/run_tool.py` with a test, and do not change the tool. When one later frame fails, the tool has an error for that picture: tell the owner; the script counts no frame as a frame without an answer because of an error. An error of `torch.load` about the weights of PnLCalib: the file is not plain weights. Do not switch that check off without the owner: a file that is not plain weights can run code when it is loaded. A recall near 0 with many boxes: the boxes are not in pixels of the frame, or the class names are not those of the tool (read `label` in the run file). `axis check failed` with a large `as_given` and one small other value: the matrix is in another pitch convention; repair `camera_homography` of the script, with a test. All four values of `axis_check` large (about 10 m and more): the check decides nothing, and the output of the tool is wrong for another reason (device, weights, frame size); compare with `--device cpu` first and do not change `camera_homography`. Values that differ between `mps` and `cpu`: tell the owner, and use `cpu` for the measurement. A `ValueError` of an adapter names the key or the value of a payload that does not follow its format. |
-| Git hooks | `.pre-commit-config.yaml` | `doctor --no-api` shows `[ok  ] guard hooks`. The first commit that the owner asks for must list the guard and the secret scan as passed, and the first push the two push hooks. `git -C ../pitchvlm-results rev-parse --git-path hooks` must name the hook folder of this clone: the results work tree then runs the same hooks | `pre-commit install --hook-type pre-commit --hook-type pre-push`. The hooks ran on the build machine in scratch clones only, never in this repository, never against a real remote and never with signed commits. A results work tree that names another hook folder has its own `core.hooksPath`: remove that setting. |
+| Git hooks | `.pre-commit-config.yaml` | `doctor --no-api` shows `[ok  ] guard hooks`. The first commit that the owner asks for must list the guard as passed, and the first push the two push hooks. `git -C ../pitchvlm-results rev-parse --git-path hooks` must name the hook folder of this clone: the results work tree then runs the same hooks | `pre-commit install --hook-type pre-commit --hook-type pre-push`. The hooks ran on the build machine in scratch clones only, never in this repository, never against a real remote and never with signed commits. A results work tree that names another hook folder has its own `core.hooksPath`: remove that setting. |
 
 The cost pilot is also the first use of the stored answers and of the ledger with real probe
 requests. After it, check that the ledger files in `../pitchvlm-results/results/cache` have one
 line for each new answer, and that a second run with `--replay` gives the same metrics for free.
-Then run `sync` (section 6): it is the first time that the guard and the secret scan read real
+Then run `sync` (section 6): it is the first time that the guard reads real
 model answers. A report line names the rule and the file. A false alarm on the text of an
 answer needs a change of the rule with a test, not a change of the answer.
 
@@ -670,10 +663,10 @@ could not run the check. Each row names the command or the observation that sett
 | 5 | Which classes does the SDK raise for a lost connection and for a client timeout? The client knows them by the names `APIConnectionError` and `APITimeoutError` | Free: `grep -rn -e "class APIConnectionError" -e "class APITimeoutError" "$(python -c 'import google.genai, os; print(os.path.dirname(google.genai.__file__))')"` prints one line for each class | No line, or a network failure that ends a call with "status None" and without the words "may still be billed": correct `SDK_CONNECTION_ERROR` and `SDK_TIMEOUT_ERROR` in `src/pitchvlm/vlm/client.py`. |
 | 6 | What does the API answer to a thinking level or a service tier that a model does not have? The tables `THINKING_LEVELS` (`src/pitchvlm/config.py`) and `FLEX_TIER_MODELS` (`src/pitchvlm/vlm/cost.py`) come from the documentation pages, not from a call | Paid, about 0.1 USD for each model: `doctor --models` with every model that a probe or a run will use. The doctor sends the level `low`; another level is checked by the first request of the probe that uses it | A call that the API refuses with an error about the thinking level, the resolution or the service tier costs nothing: correct the table, with a test. |
 | 7 | How many output tokens does a real answer need, and does a limit on them count the thinking tokens? No request limits its output tokens. An answer that reaches 32,768 tokens of thinking and output on `gemini-4-argon` is not continued: it is billed, it cannot be used, and it stops the run | After the cost pilot, free: the script "Largest answers" below prints the largest output plus thinking tokens of one answer for each step. A stop with the words `requires_continuation` in the error line is such an answer | The owner decides the limit. The review proposed a field `max_output_tokens` of a request (not a part of the cache key) at 8 times the output estimate of its step, and a doctor check that sends one request with a small limit and reports the status and the token counts of the cut answer. |
-| 8 | Does the installed `gitleaks` read the rules file? `.gitleaks.toml` uses an allowlist form that was checked with gitleaks 8.30.1 only | Free: `gitleaks version`, then `python -m pytest tests -k "secret_scan" -rs`: every test passes and none is skipped | A skipped or failed test: install a gitleaks version from 8.30.1 on. Without it the commit hook refuses every commit of stored answers. |
+| 8 | Removed on 16 Nov 2026: the secret scan is gone (`docs/DECISIONS.md`, section "The secret scan is removed"). The number stays free so that the numbers of the other facts do not change | - | - |
 | 9 | In which time zone do the prices change on 1 December 2026 and on 1 January 2027? The code prices an answer by its UTC day | Compare the `usd` of the first ledger lines after 00:00 UTC of 1 December with the bill of the provider | Another time zone: the ledger counts a few answers at the wrong price. The plan ends the standard-price runs on 30 November for this reason. |
 | 10 | Does a broadcast graphic (a scoreboard) disturb the measured camera motion? Measured on a synthetic clip of 1920 x 1080 pixels with a static overlay: the 90th percentile of the motion error over 12 frames rises from 0.5 to 1.3 pixels with a rich grass texture and from 3 to 14 pixels with a poor one | After the first dev clip with labels, free: the script "Position error at and between the keyframes" below | A much larger error between the keyframes than at them: the camera motion is off. Mask the graphic in `motion.compute_motion_field` (it masks only the people of the keyframes), with a test on synthetic frames. |
-| 11 | Does the real key have the form that the guard and the secret scan expect: the prefix `AQ.` and then 20 or more letters, digits, `_` or `-`? No public source gives the form | Free: the command "Form of the key" below. It prints no part of the key | "the pattern does not fit": tell the owner. The pattern in `tools/guard.py` (`NEW_GOOGLE_KEY`) and in `.gitleaks.toml` must change before any text result is committed. |
+| 11 | Does the real key have the form that the guard expects: the prefix `AQ.` and then 20 or more letters, digits, `_` or `-`? No public source gives the form | Free: the command "Form of the key" below. It prints no part of the key | "the pattern does not fit": tell the owner. The pattern in `tools/guard.py` (`NEW_GOOGLE_KEY`) must change before any text result is committed. |
 | 12 | How many landmark fits does the share rule refuse on real answers? A fit needs 40% of its landmarks within 3 times the RANSAC threshold. Measured on synthetic cameras only | After the pitch probe, free: compare `valid_share` with `valid_share_without_share_rule` in its metrics file, for all frames and under `by_view` | A difference of some percent of the frames: the rule refuses fits on real answers. Give the two shares to the owner before gate G3 is judged; the rule is `MIN_NEAR_SHARE` and `NEAR_LIMIT_FACTOR` in `src/pitchvlm/geometry.py`. |
 | 13 | Does a real model box one person two times with a small shift? A second box with the same role and team key is dropped above an IoU of 0.6; the 0.6 is an estimate | After the people probe, free: the script "Boxes that nearly repeat each other" below reads the stored people answers and the labels | Pairs on one labelled person below an IoU of 0.6, or pairs on two labelled people above it: the owner changes `REPEATED_BOX_SAME_LABELS_MIN_IOU` in `src/pitchvlm/pipeline.py` before the first dev clip. No pair at all: the limit stays. |
 | 14 | Do two crops of one person that are less than one second apart agree on a wrong number? A track that is seen for a short time gets two such crops, and two crops that agree show the number in the video and link fragments. Does a real model read a number of two digits in parts? The fake model reads every crop on its own and never in parts | After the number probe, free: the script "Short tracks and numbers in parts" below reads the stored number answers and the labels | Many short tracks whose two crops agree on a wrong number: the owner decides whether a short track may display a number (`pipeline.crop_choice`). Readings in parts are counted for the export number (`tracking.decide_number`); no such reading means that this rule is not used. |
@@ -837,10 +830,10 @@ print(f"tracks with two crops less than one second apart: {n_short}; both crops 
 print(f"readings of a number with two digits: {n_two_digits}; with a crop that shows one of its digits alone: {n_in_parts}")
 ```
 
-## 9 The guard, the secret scan and the deny-list
+## 9 The guard and the deny-list
 
-Two checks run before a commit and before a push: the guard (`tools/guard.py`) and the secret
-scan (`gitleaks` with `.gitleaks.toml`). The file `.pre-commit-config.yaml` starts them. The
+The guard (`tools/guard.py`) runs before a commit and before a push. The file
+`.pre-commit-config.yaml` starts it. The
 commit hooks run for `git commit`. A commit that another git command makes, for example the
 merge commit of `git merge`, starts no commit hook: the push hooks check it before it leaves the
 machine. The hook runner skips a hook that the environment variable `SKIP` names. Do not set
@@ -870,8 +863,7 @@ example `[commit 1a2b3c4d5e]`. The rules:
 | `tag` | a tag that does not point at a commit, for example a tag at the content of a file |
 
 The rules `secret`, `host`, `home` and `deny` also read names: the path of every checked file
-and, in the push mode, the names of branches and tags. The secret scan reads the content of
-files only.
+and, in the push mode, the names of branches and tags.
 
 The deny-list:
 
@@ -928,13 +920,12 @@ What the guard does not see:
   values, a list of short text pieces, a byte string in Python code.
 - Label data and prediction data in a file that is not a `.json` or `.jsonl` file, and in a JSON
   file of several lines that is not valid JSON, for example after a comment line.
-- A secret that is cut into pieces or written in another code. The secret scan has the same limit.
+- A secret that is cut into pieces or written in another code.
 - A bare value without a digit after a secret name (`password: <words>`): the guard takes it
   for a name of the code. A value of 20 or more characters in quotes is refused with or without
   a digit.
 - A secret of another service in a commit message, in a tag message or in a name: the guard
-  knows only the key forms of its own list there, and the secret scan reads the content of
-  files only.
+  knows only the key forms of its own list.
 - A name that exists only in the push command (`git push origin <branch>:<other name>`), when
   the push sends no new commit or when it is not the first branch of the push: the hook runner
   gives the guard one such name, for the first branch with new commits.

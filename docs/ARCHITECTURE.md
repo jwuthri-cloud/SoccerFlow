@@ -469,10 +469,7 @@ No lock keeps two commands apart that work on one clip at the same time: both ca
 same request. The second answer then logs a warning, both answers are in the cost ledger (two
 lines with the same `request`), and the newer one stays in the store.
 
-Cassettes go to the `results` branch, so they must pass the guard and the secret scan of the git
-hooks. The default rules of the secret scan take the line `"key": "<32 hex digits>"` for a key.
-`.gitleaks.toml` allows this one line in a file `<clip>/<step>/<32 hex digits>.json`. Keep the
-name and the place of that field, or change the rule with it.
+Cassettes go to the `results` branch, so they must pass the guard of the git hooks.
 
 Rule for an answer that was billed and then rejected (`BilledAnswerError`): its cost reaches the
 cost ledger and the budget guard in exactly one place per call path, the wrapper that reports the
@@ -920,9 +917,7 @@ Output files of the command line:
   rule of the pipeline is right (the value of gate G1), the share where the players alone are
   right, the clips that the goalkeepers decided, and the `TeamSideFacts` of every clip.
 - `sync` lists the text result files (every ledger file is named as a cost ledger), checks them
-  with `tools/guard.py --paths` and then with the secret scan of the git hooks
-  (`gitleaks dir` with the file `.gitleaks.toml` of the results work tree), and prints the git
-  commands. It runs none of them. Without `gitleaks` it says that the secret scan did not run.
+  with `tools/guard.py --paths`, and prints the git commands. It runs none of them.
 
 An experiment file of `probe` (`cli.Experiment`) names the settings of its model step under
 `step`. That section is laid over the defaults of the pipeline step that the probe measures
@@ -1028,8 +1023,8 @@ package.
   `doctor.SDK_MAJOR_VERSION`), the key variable, the guard hooks, the deny-list and the free
   disk space. The check `guard hooks` asks git for the place of the hooks `pre-commit` and
   `pre-push` (`git rev-parse --git-path`). It needs an executable hook file that the pre-commit
-  framework wrote for `.pre-commit-config.yaml`, and a hook list that names `tools/guard.py` and
-  `gitleaks` for both stages. The check `deny-list` fails when the git folder of the clone has
+  framework wrote for `.pre-commit-config.yaml`, and a hook list that names `tools/guard.py` for
+  both stages. The check `deny-list` fails when the git folder of the clone has
   no file `guard-deny.txt`; it counts the entries and never shows one.
 - Contract checks (gate G0), per model, on three synthetic frames of 1920 x 1080 pixels. The
   checks `boxes` and `landmarks` are contract verdicts with limits in `doctor.py`: at least half
@@ -1101,11 +1096,9 @@ python3 tools/guard.py (--staged | --push | --tracked | --paths FILE ...) [--rep
 ## 5. Tests
 
 - `pytest` runs offline and without the model SDK. No test may open a network connection.
-- A test that needs an outside tool (`git`, `gitleaks`, `pre-commit`) is skipped on a machine
+- A test that needs an outside tool (`git`, `pre-commit`) is skipped on a machine
   without that tool. Every test of the guard in `tests/test_guard.py` builds a git repository,
-  so these tests are skipped without `git`. The tests of the secret scan run the hooks of
-  `.pre-commit-config.yaml` on result files, and `gitleaks` on the text of the repository: a
-  value that only looks like a key needs the mark `gitleaks:allow` on its line. The tests of the
+  so these tests are skipped without `git`. The tests of the
   guard run the hooks through the hook runner, as an installed hook does, for a push whose
   files are not in the working tree.
 - Unit tests live in `tests/test_<module>.py`. Use small hand-made fixtures; integration tests use

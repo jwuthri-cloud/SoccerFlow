@@ -640,6 +640,36 @@ Items 5 and 6 come from the checks of the change of item 4.
      GPL-2.0-or-later, and `tools/run_tool.py` imports it when it runs. The check of what that
      means for the script was planned before publishing, and it is not done.
 
+## 2026-11-16 — The secret scan is removed
+
+1. **The decision** (owner, 2026-11-16). The secret scan (`gitleaks` with `.gitleaks.toml`) is
+   removed from the git hooks, from `doctor`, from `sync`, from the tests and from the docs.
+   The guard (`tools/guard.py`) is the one check before every commit and every push. Rule 9
+   of `CLAUDE.md` now names the guard only.
+2. **What the guard still refuses.** Google API keys in both forms (`AIza`, `AQ.`), keys with
+   the `sk-` prefix, GitHub tokens, private key headers, a password in an address, a bearer
+   token and a literal value after a secret name. In the push mode it reads every commit that
+   the remote does not have, so a key that a later commit removed is still found.
+3. **What is lost.** The default rules of `gitleaks` for keys of other services (for example
+   cloud and chat providers) that the guard does not know. The project holds one key only, the
+   Gemini key, and the guard knows both of its forms.
+4. **Tests.** 15 test functions of the secret scan are removed: 9 in `tests/test_cli.py`, 3 in
+   `tests/test_guard.py`, 2 in `tests/test_vlm_cache.py` and 1 in `tests/test_vlm_cost.py`.
+   Most of them were skipped on a machine without `gitleaks`.
+
+## 2026-11-22 — The API key may live in a git-ignored `.env`
+
+1. **The decision** (owner, 2026-11-22). The owner keeps the API keys in a file `.env` in the
+   top folder of the clone, and not only in the environment of a terminal. The desktop app
+   starts its sessions without the environment of a terminal, so a key typed at a prompt does
+   not reach the assistant there.
+2. **Protection.** `.gitignore` names `.env` (it did before this decision), the file has mode
+   600, and it was never in the git history (checked on 2026-11-22). The assistant loads the
+   key into one shell call at a time and never prints the file or the key. Rule 1 of
+   `CLAUDE.md` says this now.
+3. **What is lost.** A key in a file stays on the disk after the session. A backup or a sync
+   of the folder can copy it.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

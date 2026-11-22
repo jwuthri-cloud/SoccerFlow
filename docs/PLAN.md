@@ -159,7 +159,7 @@ pitch-mapping error.
   under `locks/`.
 - Main environment: Python 3.13 on both machines. The Gemini SDK is imported in one module only.
 - Commits on both machines use your personal git name and e-mail, set in the repository only.
-- One guard script (Python standard library only) and a secret scan run before every commit and
+- One guard script (Python standard library only) runs before every commit and
   push on both machines. The guard refuses media, large files, keys, lock files, encoded pixels,
   label and prediction data, non-public host names, home-folder paths, the words of a local
   deny-list and a wrong git identity. `doctor` fails if the hooks are not installed or the

@@ -56,7 +56,7 @@ first build, and the branch `m1-first-build` is a pull request with the fixes of
    ```
 
 2. Make the first commit. A commit message has no co-author line (rule 10). The output of
-   `git commit` must list the guard and the secret scan as passed.
+   `git commit` must list the guard as passed.
 3. Make an empty repository on a git host. Both machines need read and write access to it.
    Put no token into the address of the remote. Add it as the remote and push the branch. The
    two push hooks must pass.
@@ -98,7 +98,7 @@ the work tree and the scorer. So read each error.
 
 | # | Step | Done when |
 |---|---|---|
-| 1 | Install the tools: `git`, `uv`, `gitleaks` (version 8.30.1 or later), `pre-commit`, and the assistant. Keep about 45 GB of disk free | Each tool prints its version |
+| 1 | Install the tools: `git`, `uv`, `pre-commit`, and the assistant. Keep about 45 GB of disk free | Each tool prints its version |
 | 2 | Clone the repository and switch to the branch `m1-first-build` (to `main` after its pull request is merged) | `git status` shows a clean tree on that branch |
 | 3 | Make the data folder: `mkdir -p ~/pitchvlm-data` | The folder exists, outside the repository |
 | 4 | Google AI Studio: a project with billing (paid tier only), a budget alert, an API key | The owner has the key. It is in no file |
@@ -132,7 +132,7 @@ machine.
 | 11 | Make the work tree of the branch `results` next to the repository: `../pitchvlm-results` | `git worktree list` shows it. `git -C ../pitchvlm-results rev-parse --git-path hooks` names the hook folder of this clone |
 | 12 | Make the scorer environment (Python 3.12, numpy 1.26) and clone the repository of the scorer (`sn-trackeval`) at the tag `v0.4.1` | The last command prints the commit. Write it into `docs/DECISIONS.md` |
 | 13 | Run `python -m pitchvlm.cli doctor --no-api`. Then run the command "Form of the key" (RUNBOOK, section 8, fact 11): it prints no part of the key | Exit code 0. The lines `guard hooks`, `deny-list`, `model SDK` and `API key` start with `[ok  ]`, and the SDK is a version 3.x. The key command prints "the pattern fits" |
-| 14 | Commit the setup changes when the owner asks: `locks/run-machine.txt` and the scorer commit in `docs/DECISIONS.md` | `git status --short` prints nothing. The output of `git commit` lists the guard and the secret scan as passed |
+| 14 | Commit the setup changes when the owner asks: `locks/run-machine.txt` and the scorer commit in `docs/DECISIONS.md` | `git status --short` prints nothing. The output of `git commit` lists the guard as passed |
 
 Four things to know in this section:
 
@@ -142,7 +142,7 @@ Four things to know in this section:
   still 0. So read the lines of step 13, not only the exit code.
 - A paid command refuses to start when the git work tree has changes. This is why step 14
   comes before day 1.
-- The hooks call `python3` and `gitleaks` from the path. The work tree `../pitchvlm-results`
+- The hooks call `python3` from the path. The work tree `../pitchvlm-results`
   also holds a copy of the code: do not run code from there.
 
 ## 5 First session of the assistant on the run machine
@@ -167,7 +167,7 @@ Ask the owner before each paid step. Run one paid command at a time.
 | 4 | `oracle` on one clip, then on all clips (gate G1) | Free | Ground truth scores at least 99.5. The other lines of G1 are in `configs/gates.yaml` | The error names the file or shows the last lines of the scorer (RUNBOOK, section 8). A team-side share below 0.97 with a ground truth of at least 99.5 is not a code fault (fact 2): write the shares into `docs/DECISIONS.md`, and the owner decides about the gate |
 | 5 | Cost pilot: the three probes with `--max-clips 2`. Before it, commit the split list and the day-1 notes in `docs/DECISIONS.md` when the owner asks: a probe refuses a work tree with changes | About 0.7 USD | The ledger has one line for each new answer. `--replay` gives the same metrics for free | Compare the measured cost with the estimate. Tell the owner |
 | 6 | Write the mean tokens that the cost pilot measured (the lines after "measured cost" of the three probes, all four model steps) into `DEFAULT_TOKEN_ESTIMATES` (`src/pitchvlm/vlm/cost.py`), into `docs/ARCHITECTURE.md` (section `vlm/cost.py`) and into `docs/DECISIONS.md`, with the owner's go-ahead. The output count is the out tokens plus the thinking tokens. Run the tests. Commit when the owner asks | Free | The tests pass. After the commit, a pilot command with `--replay` prints a cost estimate near the cost that the pilot measured | - |
-| 7 | `sync`. Then the owner commits and pushes the branch `results`, and the code branch too: each metrics file names the commit of the code | Free | The guard and the secret scan pass on real model answers | A report line names the rule and the file. Change the rule with a test, not the answer |
+| 7 | `sync`. Then the owner commits and pushes the branch `results`, and the code branch too: each metrics file names the commit of the code | Free | The guard passes on real model answers | A report line names the rule and the file. Change the rule with a test, not the answer |
 
 G0 and G1 must pass before any footage is sent to the model. The planned budget for the doctor
 and the cost pilot together is 2 USD.
@@ -234,7 +234,7 @@ The guard refuses them. Do not bypass it (rule 9).
 - Small, tested changes on the code branch. `python -m pytest` must pass before a commit.
   Commit when the owner asks.
 - A paid command refuses to start when the git work tree has changes.
-- After a change of `tools/`, `.gitleaks.toml`, `.gitignore` or `.pre-commit-config.yaml`, merge
+- After a change of `tools/`, `.gitignore` or `.pre-commit-config.yaml`, merge
   the code branch into `results` before the next commit of results (RUNBOOK, section 6).
 - Gates are in `configs/gates.yaml`. A change of a gate needs an entry in `docs/DECISIONS.md`.
 

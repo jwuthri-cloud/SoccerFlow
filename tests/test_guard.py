@@ -3,7 +3,7 @@
 Each test builds a throw-away git repository, adds files and runs the guard in a subprocess.
 The strings that the guard refuses are built at run time, so that this file passes the guard.
 Every test needs git and is skipped on a machine without it. A test that needs the hook runner
-or the secret scanner is skipped on a machine without them.
+is skipped on a machine without it.
 Run the tests with `python3 -m unittest tests.test_guard` or with pytest.
 """
 
@@ -28,7 +28,6 @@ REPO = Path(__file__).resolve().parents[1]
 GUARD = REPO / "tools" / "guard.py"
 ALLOW_LIST = GUARD.with_name("allowed_hosts.txt")
 HOOK_FILE = REPO / ".pre-commit-config.yaml"
-SECRET_SCAN_FILE = REPO / ".gitleaks.toml"
 IGNORE_FILE = REPO / ".gitignore"
 
 AUTHOR = "Test Author"
@@ -253,7 +252,7 @@ class CleanRepositoryTest(GuardTestCase):
         self.assert_clean(self.guard("--staged"))
 
     def test_guard_files_pass_the_guard(self) -> None:
-        sources = (GUARD, ALLOW_LIST, Path(__file__).resolve(), HOOK_FILE, SECRET_SCAN_FILE)
+        sources = (GUARD, ALLOW_LIST, Path(__file__).resolve(), HOOK_FILE)
         for source in (*sources, IGNORE_FILE):
             self.stage(source.relative_to(REPO).as_posix(), source.read_bytes())
         self.assert_clean(self.guard("--staged"))
@@ -1898,7 +1897,7 @@ class HookSettingsTest(GuardTestCase):
 
     def copy_guard_files(self) -> None:
         """Commit the guard, the host list and the hook settings into the test repository."""
-        for source in (GUARD, ALLOW_LIST, HOOK_FILE, SECRET_SCAN_FILE):
+        for source in (GUARD, ALLOW_LIST, HOOK_FILE):
             self.stage(source.relative_to(REPO).as_posix(), source.read_bytes())
         self.commit("guard files")
 
@@ -1934,7 +1933,7 @@ class HookSettingsTest(GuardTestCase):
         return f"refs/heads/{branch} {commit} refs/heads/{branch} {remote_commit}\n"
 
     def need_tools(self, *tools: str) -> None:
-        """Skip the test on a machine without the hook runner or the secret scanner."""
+        """Skip the test on a machine without the hook runner."""
         missing = [tool for tool in tools if shutil.which(tool) is None]
         if missing:
             self.skipTest(f"not installed: {', '.join(missing)}")
@@ -1942,7 +1941,7 @@ class HookSettingsTest(GuardTestCase):
     def test_every_hook_always_runs(self) -> None:
         """Without `always_run` the hook runner skips a hook when no changed file is on disk."""
         blocks = re.split(r"(?m)^ +- id: ", HOOK_FILE.read_text(encoding="utf-8"))[1:]
-        self.assertEqual(len(blocks), 4)
+        self.assertEqual(len(blocks), 2)
         for block in blocks:
             self.assertRegex(block, r"(?m)^ +always_run: true$")
             self.assertRegex(block, r"(?m)^ +pass_filenames: false$")
@@ -1952,73 +1951,9 @@ class HookSettingsTest(GuardTestCase):
         self.assertEqual(entries["guard-staged"], "python3 tools/guard.py --staged")
         self.assertEqual(entries["guard-push"], "python3 tools/guard.py --push")
 
-    def test_secret_scan_shows_the_place_and_hides_the_secret(self) -> None:
-        entries = hook_entries()
-        for hook in ("gitleaks", "gitleaks-push"):
-            words = shlex.split(entries[hook])
-            for option in ("--redact", "--verbose", "--no-banner"):
-                self.assertIn(option, words, hook)
-            self.assertEqual(words[words.index("--config") + 1], SECRET_SCAN_FILE.name)
-
-    def test_secret_scan_names_the_file_of_a_key_in_the_new_format(self) -> None:
-        self.need_tools("gitleaks")
-        self.stage(SECRET_SCAN_FILE.name, SECRET_SCAN_FILE.read_bytes())
-        detail = "the request failed: 401 for the key "
-        self.stage("results/metrics/doctor.json", json.dumps({"detail": detail + "<key>"}))
-        command = shlex.split(hook_entries()["gitleaks"])
-
-        def scan() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                command,
-                cwd=self.repo,
-                env=self.env,
-                capture_output=True,
-                encoding="utf-8",
-                check=False,
-            )
-
-        self.assertEqual(scan().returncode, 0)
-        self.stage("results/metrics/doctor.json", json.dumps({"detail": detail + NEW_GOOGLE_KEY}))
-        found = scan()
-        self.assertEqual(found.returncode, 1, found.stdout + found.stderr)
-        self.assertIn("google-auth-key", found.stdout)
-        self.assertIn("results/metrics/doctor.json", found.stdout)
-        self.assert_absent(NEW_GOOGLE_KEY, found)
-
-    def test_secret_scan_finds_a_key_after_an_escape_or_a_word_character(self) -> None:
-        """In a JSON text the letter of an escape stands directly before the key."""
-        self.need_tools("gitleaks")
-        self.stage(SECRET_SCAN_FILE.name, SECRET_SCAN_FILE.read_bytes())
-        command = shlex.split(hook_entries()["gitleaks"])
-        detail = "the call failed with the key:\n"
-        cases = {
-            "escape.json": (json.dumps({"detail": detail + NEW_GOOGLE_KEY}), "google-auth-key"),
-            "word.txt": ("GEMINI_KEY_" + NEW_GOOGLE_KEY + "\n", "google-auth-key"),
-            "sk_escape.json": (json.dumps({"detail": detail + SK_KEY}), "generic-sk-key"),
-        }
-        for name, (content, rule) in cases.items():
-            self.stage(f"results/metrics/{name}", content)
-            found = subprocess.run(
-                command, cwd=self.repo, env=self.env, capture_output=True, encoding="utf-8"
-            )
-            self.assertEqual(found.returncode, 1, name + found.stdout + found.stderr)
-            self.assertIn(rule, found.stdout, name)
-            self.assertIn(f"results/metrics/{name}", found.stdout)
-            self.assert_absent(NEW_GOOGLE_KEY, found)
-            self.assert_absent(SK_KEY, found)
-            self.git("rm", "--quiet", "--cached", f"results/metrics/{name}")
-        # A word in capitals that ends with the letters of the prefix is not a key.
-        self.stage("results/metrics/word.txt", "See F" + NEW_GOOGLE_KEY + " for more.\n")
-        words = "A risk-adjusted-return-on-capital-employed figure.\n"
-        self.stage("results/metrics/risk.txt", words)
-        passed = subprocess.run(
-            command, cwd=self.repo, env=self.env, capture_output=True, encoding="utf-8"
-        )
-        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
-
     def test_push_hook_checks_the_name_of_a_new_branch(self) -> None:
         """A push of a branch whose name holds a private word. Its commit is clean."""
-        self.need_tools("pre-commit", "gitleaks")
+        self.need_tools("pre-commit")
         self.copy_guard_files()
         main = self.branch()
         self.add_remote()
@@ -2042,7 +1977,7 @@ class HookSettingsTest(GuardTestCase):
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
 
     def test_push_hook_reads_the_commits_and_not_the_working_tree(self) -> None:
-        self.need_tools("pre-commit", "gitleaks")
+        self.need_tools("pre-commit")
         self.copy_guard_files()
         main = self.branch()
         self.add_remote()
@@ -2066,7 +2001,7 @@ class HookSettingsTest(GuardTestCase):
         self.assertIn(f"paths.txt:1: {HOME_MESSAGE} [commit {name}]", refused.stdout)
 
     def test_push_hook_checks_another_branch_and_an_empty_commit(self) -> None:
-        self.need_tools("pre-commit", "gitleaks")
+        self.need_tools("pre-commit")
         self.copy_guard_files()
         main = self.branch()
         self.add_remote()
@@ -2080,7 +2015,7 @@ class HookSettingsTest(GuardTestCase):
         self.assertIn(expected, refused.stdout)
 
     def test_commit_hook_checks_the_identity_of_an_empty_commit(self) -> None:
-        self.need_tools("pre-commit", "gitleaks")
+        self.need_tools("pre-commit")
         self.copy_guard_files()
         passed = self.run_hooks("pre-commit")
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)

@@ -57,8 +57,7 @@ Rules that the commands share:
 - The stored answers of a clip belong to its pixels. A stored answer that was recorded with
   other image bytes than the clip shows now stops ``run`` and ``probe`` before any model call,
   unless ``--allow-other-images`` is given.
-- ``sync`` checks the result files with the guard and with the secret scan of the git hooks,
-  so that a commit of the files is not refused later.
+- ``sync`` checks the result files with the guard of the git hooks, so that a commit of the files is not refused later.
 - No output file holds an absolute path, so the text results can go to the results branch.
 
 The package must run from its source checkout: the gate file, the guard script and the git
@@ -79,7 +78,6 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -236,12 +234,6 @@ RESULT_SUFFIXES = (".json", ".jsonl")
 CASSETTE_NAME = re.compile(r"[0-9a-f]{32}\.json")
 #: Number of files that one call of the guard script checks.
 GUARD_BATCH = 200
-#: The secret scan of the git hooks, and the file of its rules in the top folder of a work tree.
-SECRET_SCAN_TOOL = "gitleaks"
-SECRET_SCAN_RULES = Path(".gitleaks.toml")
-#: Exit code that the secret scan is asked to give when it finds something. Its own exit code 1
-#: also means that it could not run, for example because it cannot read its rules.
-SECRET_SCAN_FOUND = 3
 #: Signals that stop a command: Ctrl-C, a plain kill and a closed terminal.
 STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
 #: Loggers of the HTTP libraries below the model SDK. Each one writes a line for every request.
@@ -2457,47 +2449,6 @@ def guard_violations(work_tree: Path, files: Sequence[Path]) -> list[str]:
     return lines
 
 
-def secret_scan_findings(work_tree: Path, folder: Path) -> list[str] | None:
-    """Run the secret scan of the git hooks on a result folder and return the lines of its report.
-
-    An empty list means that nothing was found. None means that the scan did not run,
-    because ``gitleaks`` is not installed. The scan uses the rules file
-    ``.gitleaks.toml`` of the work tree, which is the file that the hooks of that work
-    tree use. So a file that passes here also passes the scan before the commit.
-    ``CliError`` is raised when the rules file is missing, and when the scan could not
-    check the files. The report names the file, the line and the rule of every
-    finding, with paths relative to the work tree. It never shows the secret.
-    """
-    tool = shutil.which(SECRET_SCAN_TOOL)
-    if tool is None:
-        return None
-    if not (work_tree / SECRET_SCAN_RULES).is_file():
-        raise CliError(
-            f"the work tree {work_tree} has no file {SECRET_SCAN_RULES}, so the secret scan of its git hooks "
-            f"cannot run. Take the file from the code branch: 'git checkout <code branch> -- {SECRET_SCAN_RULES}' "
-            "in that work tree."
-        )
-    command = [
-        tool,
-        "dir",
-        "--config",
-        str(SECRET_SCAN_RULES),
-        "--redact",
-        "--verbose",
-        "--no-banner",
-        "--no-color",
-        "--exit-code",
-        str(SECRET_SCAN_FOUND),
-        folder.relative_to(work_tree).as_posix(),
-    ]
-    completed = subprocess.run(command, cwd=work_tree, capture_output=True, text=True, errors="replace", check=False)
-    if completed.returncode == 0:
-        return []
-    if completed.returncode != SECRET_SCAN_FOUND:
-        raise CliError(f"the secret scan could not check the files: {completed.stderr.strip()}")
-    return [line for line in completed.stdout.splitlines() if line.strip()]
-
-
 def print_result_listing(folder: Path, files: Sequence[Path], work_tree: Path) -> None:
     """Print the text result files of a folder: cassettes by folder, every other file by name.
 
@@ -2524,15 +2475,11 @@ def print_result_listing(folder: Path, files: Sequence[Path], work_tree: Path) -
         print(f"  cassettes: {parent} ({count} files)")
 
 
-def print_git_commands(work_tree: Path, folder: Path, n_files: int, *, scanned: bool) -> None:
-    """Print the git commands that put the result files on the results branch. They are not run.
-
-    ``scanned`` says whether the secret scan ran next to the guard.
-    """
+def print_git_commands(work_tree: Path, folder: Path, n_files: int) -> None:
+    """Print the git commands that put the result files on the results branch. They are not run."""
     tree = shlex.quote(str(work_tree))
     message = shlex.quote(f"Add text results ({n_files} files)")
-    checks = "The guard and the secret scan" if scanned else "The guard"
-    print(f"{checks} found no problem. To send the files back, the owner runs:")
+    print(f"The guard found no problem. To send the files back, the owner runs:")
     print(f"  git -C {tree} add -- {shlex.quote(folder.relative_to(work_tree).as_posix())}")
     print(f"  git -C {tree} commit -m {message}")
     print(f"  git -C {tree} push origin {RESULTS_BRANCH}")
@@ -2543,9 +2490,8 @@ def print_git_commands(work_tree: Path, folder: Path, n_files: int, *, scanned: 
 def _cmd_sync(args: argparse.Namespace) -> int:
     """List the text result files below a folder, check them and print the git commands.
 
-    The files are checked with the guard and then with the secret scan of the git hooks
-    (``secret_scan_findings``), so that the commit of the files is not refused later. A
-    printed line says so when the secret scan is not installed. The command refuses the
+    The files are checked with the guard of the git hooks, so that the commit of the files
+    is not refused later. The command refuses the
     folder when it holds anything but text result files. It never runs a git command
     that changes state.
     """
@@ -2573,18 +2519,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         for line in violations:
             print(f"  {line}")
         return EXIT_FAILED
-    findings = secret_scan_findings(work_tree, folder)
-    if findings:
-        print("The secret scan of the git hooks refuses the files. No git command is printed.")
-        for line in findings:
-            print(f"  {line}")
-        return EXIT_FAILED
-    if findings is None:
-        print(
-            f"The secret scan of the git hooks did not run here: {SECRET_SCAN_TOOL} is not installed. "
-            "The hooks need it before the commit."
-        )
-    print_git_commands(work_tree, folder, len(files), scanned=findings is not None)
+    print_git_commands(work_tree, folder, len(files))
     return EXIT_OK
 
 

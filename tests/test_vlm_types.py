@@ -186,9 +186,7 @@ def test_cache_key_is_stable() -> None:
     key = make_request().cache_key()
     assert len(key) == 32
     assert set(key) <= set("0123456789abcdef")
-    # The secret scan of the git hooks takes 32 hex digits next to the name "key" for a secret.
-    # This value is a hash of the request, so the scan is told to pass the line.
-    assert key == "7392b9c8b061888c4efceffcf8b15b4c"  # gitleaks:allow
+    assert key == "7392b9c8b061888c4efceffcf8b15b4c"
     assert make_request().cache_key() == key
 
 

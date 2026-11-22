@@ -13,7 +13,7 @@ For code changes also: `docs/ARCHITECTURE.md` (module contracts), `configs/gates
   label files. It writes code, runs the offline tests and reads returned text results.
 - **Run machine**: has the Gemini key in the environment variable `GEMINI_API_KEY`, and the
   dataset and footage under `~/pitchvlm-data` (outside this repository).
-- How to tell: if `GEMINI_API_KEY` is not set and `~/pitchvlm-data` does not exist, you are on the
+- How to tell: if `GEMINI_API_KEY` is not set (in the environment or in `.env`) and `~/pitchvlm-data` does not exist, you are on the
   build machine. Then never call the API, never download data, and install nothing that is not
   already installed. If a package is missing, stop and say so.
 - A new run machine has neither of the two at first. So the owner makes the folder
@@ -22,7 +22,10 @@ For code changes also: `docs/ARCHITECTURE.md` (module contracts), `configs/gates
 
 ## Hard rules
 
-1. No secret in the repository: no API key, no token, no `.env`. The key lives in the environment.
+1. No secret in a tracked file: no API key, no token. On the run machine the keys may live in a
+   `.env` file in the top folder. It is git-ignored, has mode 600, and is never committed, read
+   out or printed. A command loads it with
+   `set -a; . ./.env; set +a` in the same shell call as the command.
 2. No pixels and no dataset files in the repository: no images, no video, no crops, no label files.
    Result files that go on the `results` branch are text only: metrics, cached model answers, the
    cost ledger. They hold no box, no pitch position and no role, team or shirt number from a
@@ -45,7 +48,7 @@ For code changes also: `docs/ARCHITECTURE.md` (module contracts), `configs/gates
    once, after the freeze tag. Do not tune on them and do not look at their results before.
 8. A specialist model may replace a Gemini step only after that step's gate failed and the
    specialist passed the same gate on the same frames. The report names the engine of every step.
-9. The guard (`tools/guard.py`) and the secret scan are git hooks. They run before `git commit`
+9. The guard (`tools/guard.py`) is a git hook. It runs before `git commit`
    and before a push that sends commits. Do not bypass them: `--no-verify`, the variable `SKIP`
    of the hook runner and another hook folder (`core.hooksPath`) are not allowed. The guard
    knows private words only from the deny-list of the clone, the file `.git/guard-deny.txt`.

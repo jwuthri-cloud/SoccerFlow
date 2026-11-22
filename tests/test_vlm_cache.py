@@ -8,11 +8,6 @@ import json
 import logging
 import os
 import random
-import re
-import shutil
-import string
-import subprocess
-import tomllib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -37,8 +32,6 @@ from pitchvlm.vlm.types import (
 )
 
 LOGGER_NAME = "pitchvlm.vlm.cache"
-#: The rules of the secret scan of the git hooks. Cassettes go to the results branch through these hooks.
-SECRET_SCAN_FILE = Path(__file__).resolve().parents[1] / ".gitleaks.toml"
 #: Stand-in for the encoded bytes of an image. Random bytes cannot be in a text file by accident.
 IMAGE_BYTES = random.Random(0).randbytes(4096)
 #: Other pixels for the same question. The cache key does not see them.
@@ -309,53 +302,6 @@ def test_cassette_has_no_image_bytes(tmp_path: Path) -> None:
     assert IMAGE_BYTES.hex()[:40] not in text
     # The whole cassette is smaller than the image.
     assert path.stat().st_size < len(IMAGE_BYTES)
-
-
-def test_cache_key_line_and_place_of_a_cassette_fit_the_allowed_line_of_the_secret_scan(tmp_path: Path) -> None:
-    """The secret scan of the git hooks takes the line of the cache key for a secret. One rule allows that line.
-
-    The rule names the text of the line and the place of the file. So a change of the field name, of
-    the layout of the JSON text or of the folders needs a change of the rule in ``.gitleaks.toml``.
-    Without it, no cassette can be committed to the results branch.
-    """
-    (allowed,) = tomllib.loads(SECRET_SCAN_FILE.read_text(encoding="utf-8"))["allowlists"]
-    (line_pattern,), (path_pattern,) = allowed["regexes"], allowed["paths"]
-    request = make_request()
-    root = tmp_path / "results" / "cache"
-    path = CassetteStore(root).put(request, make_response())
-    lines = path.read_text(encoding="utf-8").splitlines()
-
-    key_lines = [line for line in lines if request.cache_key() in line]
-    assert key_lines == [f'  "key": "{request.cache_key()}",']
-    assert re.search(line_pattern, key_lines[0])
-    # The rule allows this one line of the cassette and no other line.
-    assert [line for line in lines if re.search(line_pattern, line)] == key_lines
-    # The scan sees the path of the file inside the work tree of the results branch.
-    assert re.search(path_pattern, path.relative_to(tmp_path).as_posix())
-    assert re.search(path_pattern, path.relative_to(root).as_posix())
-
-
-def test_cassettes_pass_the_secret_scan_and_a_planted_key_does_not(tmp_path: Path) -> None:
-    """The scan runs with the rules of the repository on a folder of cassettes, as a paid run writes them."""
-    if shutil.which("gitleaks") is None:
-        pytest.skip("gitleaks is not installed")
-    store = CassetteStore(tmp_path / "results" / "cache")
-    for frame in range(12):
-        store.put(make_request(frame=frame), make_response())
-    store.put(make_landmarks_request(), make_response('{"landmarks": []}'))
-
-    def scan() -> int:
-        """Scan the result folder. The exit code is 0 without a finding, else 1."""
-        options = ["--config", str(SECRET_SCAN_FILE), "--redact", "--no-banner", "--no-color"]
-        command = ["gitleaks", "dir", *options, str(tmp_path / "results")]
-        return subprocess.run(command, capture_output=True, check=False).returncode
-
-    assert scan() == 0
-    # A made-up value in the shape of a Google API key as the answer text of one more cassette is still found.
-    # It is built here, so this file does not hold it.
-    made_up = "AI" + "za" + "".join(random.Random(7).choices(string.ascii_letters + string.digits, k=35))
-    store.put(make_request(frame=99), make_response(made_up))
-    assert scan() == 1
 
 
 def test_put_replaces_an_older_answer_and_leaves_no_other_file(tmp_path: Path) -> None:
