@@ -5448,6 +5448,8 @@ def test_sync_prints_the_git_commands_and_runs_none_of_them(
         "commit -m 'Add text results (6 files)'",
         "push origin results",
     ]
+    # The push is printed and held back: where the branch goes is a decision of the owner.
+    assert "Do not run the push before the owner has decided where the branch results goes" in output
     # Nothing is staged and nothing is committed: the result folder and the rules file are still untracked.
     assert git(results_tree, "status", "--porcelain").split() == ["??", ".gitleaks.toml", "??", "results/"]
     assert git(results_tree, "branch", "--list").strip() == ""

@@ -1416,11 +1416,12 @@ def test_older_python_is_refused_in_one_line(
 
     code, out = run_detector(tmp_path, job)
 
+    made = list(detector.made)  # Read before undo(): undo() puts the list of the class back.
     monkeypatch.undo()
     assert code == 2
     assert error_line(capsys).startswith("error: this script needs Python 3.10 or newer, and this is Python ")
     assert not out.exists()
-    assert detector.made == []
+    assert made == []
 
 
 @pytest.mark.parametrize("value", ["true", 1, None])
@@ -1471,3 +1472,189 @@ def test_interpreter_without_numpy_gets_one_line_and_the_code_2(tmp_path: Path) 
     assert done.stderr.splitlines() == [
         "error: NumPy is not installed here. Run this script with the Python of the environment of the tool"
     ]
+
+
+# --- Order of the checks, and errors that keep their traceback -------------------------
+
+
+def test_run_file_of_another_script_is_not_current(
+    data_root: tuple[SyntheticScene, Path],
+    tmp_path: Path,
+    detector: type[Detector],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A run file from before a repair of the script names another script hash."""
+    _, root = data_root
+    shared, _ = job_of_experiment(EXPERIMENTS / "people_probe_rfdetr_small.yaml", root, tmp_path)
+    run_file, metrics = tmp_path / "run.json", tmp_path / "metrics.json"
+    arguments = ["rfdetr", "--job", str(tmp_path / "job.json"), "--root", str(root), "--out", str(run_file)]
+    assert run_tool.main([*arguments, "--device", "cpu"]) == 0
+    run = read_json(run_file)
+    run["runner"]["script_sha256"] = "0" * 64
+    run_file.write_text(json.dumps(run), encoding="utf-8")
+    capsys.readouterr()
+
+    assert cli.main(["tool-score", *shared, "--run", str(run_file), "--out", str(metrics), "--allow-dirty"]) == 0
+
+    assert read_json(metrics)["provenance"]["script_is_current"] is False
+    assert "the run file was not made by the tools/run_tool.py of this work tree" in capsys.readouterr().out
+
+
+def test_tool_is_built_without_the_key_of_the_model_api(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key is gone when the model class of the tool is called, not only when a frame is answered."""
+    seen: list[str | None] = []
+    build = Detector.__init__
+
+    def init(self: Detector, *, device: str) -> None:
+        seen.append(os.environ.get("GEMINI_API_KEY"))
+        build(self, device=device)
+
+    monkeypatch.setattr(Detector, "__init__", init)
+    monkeypatch.setenv("GEMINI_API_KEY", "a-made-up-value")
+
+    code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 0
+    assert seen == [None]
+
+
+def test_module_of_a_package_that_is_not_installed_gives_one_line() -> None:
+    """The error of Python names the parent package, not the module that was asked for."""
+    with pytest.raises(run_tool.RunnerError, match="the module no_such_package_of_a_tool.transforms cannot be"):
+        run_tool.tool_module("no_such_package_of_a_tool.transforms")
+
+
+def test_import_error_that_names_the_tool_itself_keeps_its_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site = tmp_path / "site" / "rfdetr"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text("from rfdetr import a_name_that_is_not_there\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(site.parent), *sys.path])
+    monkeypatch.delitem(sys.modules, "rfdetr", raising=False)
+
+    code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    lines = capsys.readouterr().err.splitlines()
+    sys.modules.pop("rfdetr", None)
+    assert code == 2
+    assert lines[0].startswith("Traceback")
+    assert lines[-1] == "error: the script stopped with ImportError; the traceback above says where"
+
+
+@pytest.mark.parametrize(
+    ("place", "words"),
+    [
+        ("a folder", "cannot be written: it is a folder, or its place has no write access"),
+        ("a folder without write access", "cannot be written: it is a folder, or its place has no write access"),
+        ("a file without write access", "cannot be written: it is a folder, or its place has no write access"),
+        ("the job file", "--out names the job file"),
+        ("a hard link of the job file", "--out names the job file"),
+    ],
+)
+def test_place_of_the_run_file_that_cannot_be_written_is_refused_before_the_tool_is_built(
+    tmp_path: Path, detector: type[Detector], capsys: pytest.CaptureFixture[str], place: str, words: str
+) -> None:
+    if "without write access" in place and os.geteuid() == 0:
+        pytest.skip("the administrator can write everywhere")
+    job_file = write_json(tmp_path / "job.json", job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+    job_text = job_file.read_text(encoding="utf-8")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    out = {
+        "a folder": locked,
+        "a folder without write access": locked / "run.json",
+        "a file without write access": tmp_path / "old.json",
+        "the job file": job_file,
+        "a hard link of the job file": tmp_path / "link.json",
+    }[place]
+    if place == "a hard link of the job file":
+        os.link(job_file, out)
+    if place == "a folder without write access":
+        locked.chmod(0o555)
+    if place == "a file without write access":
+        out.write_text("old", encoding="utf-8")
+        out.chmod(0o444)
+    arguments = ["rfdetr", "--job", str(job_file), "--root", str(tmp_path / "data"), "--out", str(out)]
+
+    try:
+        code = run_tool.main([*arguments, "--device", "cpu"])
+    finally:
+        locked.chmod(0o755)
+
+    assert code == 2
+    assert words in error_line(capsys)
+    assert detector.made == []
+    assert job_file.read_text(encoding="utf-8") == job_text
+
+
+def test_second_run_replaces_the_run_file(tmp_path: Path, detector: type[Detector]) -> None:
+    """The first run with ``--max-clips 2`` and the full run of the RUNBOOK write the same path."""
+    job = job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data"))
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "run.json").write_text('{"old": true}', encoding="utf-8")
+
+    code, out = run_detector(tmp_path, job)
+
+    assert code == 0
+    assert read_json(out)["format"] == runs.RUN_FORMAT
+
+
+def test_missing_torch_is_found_before_the_tool_is_built(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def version(package: str) -> str:
+        if package == "torch":
+            raise run_tool.RunnerError("the package torch is not installed here")
+        return "1.12.1"
+
+    monkeypatch.setattr(run_tool, "installed_version", version)
+
+    code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    assert error_line(capsys) == "error: the package torch is not installed here"
+    assert detector.made == []
+
+
+def test_first_image_that_cannot_be_read_names_its_frame(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first image is read one more time for the call that is not measured: that read names the frame too."""
+
+    def read(path: Path) -> np.ndarray:
+        if path.name == "000001.png":
+            raise OSError("image file is truncated")
+        return read_rgb_with_opencv(path)
+
+    monkeypatch.setattr(run_tool, "read_rgb", read)
+
+    code, _ = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    assert capsys.readouterr().err.splitlines() == [
+        "the image cannot be read: clip CLIP-A, frame 0 (SoccerNetGS-valid/CLIP-A/img1/000001.png)",
+        "error: image file is truncated",
+    ]
+
+
+def test_error_of_the_operating_system_inside_a_tool_keeps_its_traceback(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken(image: np.ndarray) -> list[Any]:
+        if image[0, 0, 0] == 32:
+            raise OSError(28, "No space left on device")
+        return []
+
+    monkeypatch.setattr(detector, "find", staticmethod(broken))
+
+    code, out = run_detector(tmp_path, job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data")))
+
+    assert code == 2
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == "the tool stopped on clip CLIP-A, frame 2 (SoccerNetGS-valid/CLIP-A/img1/000003.png)"
+    assert lines[1].startswith("Traceback")
+    assert lines[-1] == "error: [Errno 28] No space left on device"
+    assert not out.exists()

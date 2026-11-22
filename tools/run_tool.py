@@ -23,6 +23,8 @@ line also gives the exit code 2, and its last line is the ``error:`` line of the
 
 The script takes the variable ``GEMINI_API_KEY`` out of its environment before it loads a
 tool: the tools are code of other projects, and they must not see the key of the model API.
+Code of the tool environment runs before that line (the start-up code of a package, and
+NumPy), so start the script without the variable: ``env -u GEMINI_API_KEY python ...``.
 
 What each tool gets, and what the script takes from it:
 
@@ -179,15 +181,19 @@ def answer_frames(job: Mapping[str, Any], root: Path, answer: Answer) -> list[di
     answer is thrown away. ``seconds`` of an entry is the time of ``answer`` for the frame.
     An error of the tool on a frame is not caught: a line on the error stream names the
     frame, and the error goes on. So a frame is never counted as a frame without an answer
-    because of an error.
+    because of an error. An error of the operating system inside the tool also shows its
+    traceback here, because ``main`` prints only one line for such an error. An image file
+    that cannot be read stops the run with a line that names the frame.
     """
 
     def ask(entry: Mapping[str, Any], image: np.ndarray) -> dict[str, Any]:
         try:
             return answer(image)
-        except Exception:
+        except Exception as error:
             where = f"clip {entry['clip']}, frame {entry['frame']} ({entry['image']})"
             print(f"the tool stopped on {where}", file=sys.stderr)
+            if isinstance(error, OSError):
+                traceback.print_exc()  # main prints one line for an OSError: the traceback says where in the tool.
             raise
 
     def read(entry: Mapping[str, Any]) -> np.ndarray:
@@ -229,6 +235,20 @@ def write_run(
     path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def check_out_place(out: Path, job: Path) -> None:
+    """Make the folder of the run file and raise ``RunnerError`` when the run file cannot be written there.
+
+    The check runs before the tool is built, so that the answers of a long run are not lost
+    at its end. It refuses a path that is a folder, a place without write access, and the
+    job file, which the script would replace.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.is_dir() or not os.access(out if out.exists() else out.parent, os.W_OK):
+        raise RunnerError(f"the run file {out} cannot be written: it is a folder, or its place has no write access")
+    if out.exists() and out.samefile(job):
+        raise RunnerError(f"--out names the job file ({out}): the script would replace its input")
+
+
 def machine_facts(device: str) -> dict[str, Any]:
     """Return the facts of the run that do not depend on the tool: the device, the machine and the versions.
 
@@ -254,7 +274,11 @@ def installed_version(package: str) -> str:
 
 
 def tool_module(name: str) -> ModuleType:
-    """Import a module of the tool or of its environment. A module that cannot be imported raises ``RunnerError``."""
+    """Import a module of the tool or of its environment.
+
+    A module that is not installed (the module or one of its parent packages) raises
+    ``RunnerError``. Any other import error goes on as it is, with its traceback.
+    """
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as error:
@@ -278,7 +302,8 @@ def rfdetr_engine(settings: Mapping[str, Any], device: str) -> tuple[dict[str, A
     """Build the detector of a job. Return the facts of the tool and the function that answers one frame.
 
     ``RunnerError`` is raised for a version of ``rfdetr`` whose source was not read for this
-    script, and for a model class that is not in ``RFDETR_MODELS``.
+    script, and for a model class that is not in ``RFDETR_MODELS``. The answer function raises
+    ``RunnerError`` for a box or a score that is not a finite number.
     """
     version = installed_version("rfdetr")
     if version not in RFDETR_VERSIONS:
@@ -432,7 +457,8 @@ def pnlcalib_engine(
     """Build the calibration of a job. Return the facts of the tool and the function that answers one frame.
 
     ``repo`` is a clone of the PnLCalib repository. It must have the commit
-    ``PNLCALIB_COMMIT`` checked out, else ``RunnerError`` is raised. The two weight files are
+    ``PNLCALIB_COMMIT`` checked out, and no tracked file may differ from that commit, else
+    ``RunnerError`` is raised. The two weight files are
     loaded as plain weights (``weights_only=True``): a downloaded file must not run code.
 
     The function follows the steps of ``inference.py`` of the clone for one frame: the frame
@@ -563,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if sys.version_info < (3, 10):
             raise RunnerError(f"this script needs Python 3.10 or newer, and this is Python {platform.python_version()}")
         job = read_job(args.job, args.tool)
-        args.out.parent.mkdir(parents=True, exist_ok=True)
+        check_out_place(args.out, args.job)
         machine = machine_facts(args.device)
         if args.tool == "rfdetr":
             facts, answer = rfdetr_engine(job["tool"], args.device)

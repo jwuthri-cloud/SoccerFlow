@@ -79,7 +79,7 @@ cached, replays for free, and can use the half-price tier.
   tiles or crops for small players, several queries averaged, line and circle fit for midfield.
 - Fallbacks: RF-DETR for boxes (Apache-2.0), PnLCalib for pitch mapping (separate tool). Their
   adapters are written in M1 and installed in M2. A fallback replaces a step only after the gate
-  of the step failed and the fallback is scored on the same frames against the same gate.
+  of the step failed and the fallback passed the same gate on the same frames (rule 8).
 - The pipeline has no switch for a fallback yet: `run` takes the people and the pitch mapping
   from the model steps only. A tool that passes its gate needs a pipeline path, and RF-DETR also
   needs a step that gives each box its role and team key. This work is not built and not
@@ -98,7 +98,7 @@ They may change once after the free stage, then they are frozen.
 |---|---|---|---|---|
 | G0 Contract | < 2 USD | Synthetic 1080p frames through the real API, per model | The contract verdict. The answered boxes land on the true boxes (at least half of the possible pairs, median IoU >= 0.3); the median landmark is within 5% of the image side; token sums add up; `store=False` is set; the half-price tier (Flex) answers for a model that has one, or the check reports that the tier had no capacity for 900 seconds (a fact without a verdict: run the doctor again before the first Flex run). The mean IoU (>= 0.6) and the mean point error (<= 1% of the image side) are reported and are no verdict | Fix the client before any footage is sent |
 | G1 Harness | free | Labels only | Ground truth = 100 (>= 99.5); 1 m shift = 89.5 +/- 0.5; keyframes only = about 8.5; 2 fps + interpolation >= 92; team-side rule right on >= 97% of all valid clips | Fix exporter, sampling or the side rule |
-| G2 People | paid | 120 frames from 24 clips | Recall >= 0.85, precision >= 0.85; recall for boxes up to 110 px high >= 0.70 (at least 300 such boxes); foot-point error median <= 0.7 m | Higher resolution, crop, tiles, other Gemini model, then RF-DETR |
+| G2 People | paid | 120 frames from 24 clips | Recall >= 0.85 (lower end of its 95% interval over the clips >= 0.80), precision >= 0.85; recall for boxes up to 110 px high >= 0.70 (at least 300 such boxes); foot-point error median <= 0.7 m and 90th percentile <= 2.0 m | Higher resolution, crop, tiles, other Gemini model, then RF-DETR |
 | G3 Pitch mapping | paid | Same frames + 3 of the dev clips | Position error median <= 1.2 m near goals, <= 2.0 m in midfield; 90th percentile of the position error <= 3.0 m; valid on >= 85% of keyframes. Kill-switch after 20 frames (valid < 50% or median > 3 m), counted only after five overlay images are checked by eye | One more Gemini arm, then PnLCalib. Decision on 24 Nov |
 | G4 Identity | paid | 6 dev clips | >= 80% of each true track under one ID; <= 6 switches per clip | Gemini-carried IDs if better on 5 of 6 clips; else denser keyframes for step 3 only (about +1 USD per clip, test set cut to 6 clips) |
 | G5a Number reading | paid | About 400 tracks cut from ground-truth boxes | Reported as an upper bound (oracle input); no gate | — |
@@ -106,6 +106,9 @@ They may change once after the free stage, then they are frozen.
 | G6 Freeze check | paid | 6 dev clips, then 3 fresh clips once | GS-HOTA >= 22 on dev; fresh >= 0.8 x dev; <= 2.5 USD per clip | One fix round, then freeze and report as measured |
 
 G6 only allows the freeze. The success line is tested once, on the 10 test clips.
+
+The table names the main values of each gate. `configs/gates.yaml` holds all of them, and all
+must hold.
 
 Two gate numbers need care (SN-GSR paper, tables 1 and 2). The published baseline scores 18.05
 on the validation split and 22.26 on the test split, so the 22 of G6 on validation dev clips is
@@ -152,8 +155,9 @@ pitch-mapping error.
 | Does | First build (M1); offline tests; reading returned text results | Gemini calls; dataset; real footage; scoring; replay checks; videos; fixes with an assistant |
 | Never has | API key, API call, footage, dataset, label files | — |
 
-- One code branch, moved with a private git remote. A separate `results` branch brings back text
-  only: metrics, cached Gemini answers, cost ledger.
+- One code branch, moved with a git remote (public since 14 Nov 2026). A separate `results`
+  branch brings back text only: metrics, cached Gemini answers, cost ledger. Where that branch
+  goes now is an open owner decision (`docs/DECISIONS.md`).
 - `pyproject.toml` has version ranges and no index address. No lock file is committed: `uv.lock`
   is git-ignored from the first commit. The pinned list is made on the run machine and committed
   under `locks/`.
@@ -265,7 +269,7 @@ be tested on the build machine; `doctor` is its first real test.
 |---|---|---|
 | 1 | Run machine: install `uv` and an assistant; about 45 GB free disk | 16 Nov |
 | 2 | Google AI Studio: project with billing (paid tier only), a budget alert, an API key. The key stays in an environment variable on the run machine | 16 Nov |
-| 3 | A private git remote that both machines can reach | 16 Nov |
+| 3 | A git remote that both machines can reach (done on 14 Nov: a public repository) | 16 Nov |
 | 4 | Tell me the personal git name and e-mail for the commits of both machines | before the first commit |
 | 5 | Demo clip: one continuous main-camera shot, 1080p, 10-30 s, plus a roster file (team, number, name) | 22 Nov |
 

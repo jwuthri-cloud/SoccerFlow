@@ -21,15 +21,15 @@ Words:
 - **GS-HOTA**: the score of the benchmark, from 0 to 100. **Freeze tag**: the git tag after which
   no setting changes. The test clips run after it.
 
-## 1 State at the handover (14 Nov 2026)
+## 1 State at the handover (15 Nov 2026)
 
 | Topic | State |
 |---|---|
 | Milestone | M1 (first build) is done. M2 starts on the run machine on 17 Nov |
-| Code | Branch `m1-first-build`. Package `pitchvlm` under `src/`, tests under `tests/` |
-| Offline tests | 2698 passed and 1 skipped on the build machine (Python 3.13, no model SDK installed). The skipped test reads an image with Pillow, which the environment of the package does not have |
+| Code | Branch `main` of the remote (public since 14 Nov 2026). Package `pitchvlm` under `src/`, tests under `tests/` |
+| Offline tests | 2730 passed and 1 skipped on the build machine (Python 3.13, no model SDK installed). The skipped test reads an image with Pillow, which the environment of the package does not have |
 | Demo | `demo` gives a video, a radar and a valid prediction file from a synthetic clip and a fake model |
-| Reviews | Two reviews tested the first build, and a third one the measurement of the two specialist tools. Each finding was repaired, or kept with a measured reason (`docs/DECISIONS.md`) |
+| Reviews | Two reviews tested the first build, a third one the measurement of the two specialist tools, a fourth one the fixes of the third, and a fifth one the fixes of the fourth. Each finding was repaired, kept with its reason, or recorded as not built or as an open owner decision (`docs/DECISIONS.md`) |
 | Real API, real scorer, real footage | Never used. Every result so far is synthetic |
 | Money spent | 0 USD of the planned 120 USD |
 
@@ -45,7 +45,8 @@ or pushes without being asked.
 
 State on 14 Nov 2026: steps 1 to 3 are done. The owner chose a public repository
 (`docs/DECISIONS.md`, section "The code repository is public"). Its branch `main` holds the
-first build, and the branch `m1-first-build` is a pull request with the fixes of a review.
+first build and the fixes of a review: the pull request of the branch `m1-first-build` was
+merged on the page of the git host.
 
 1. Set the personal git identity for this repository only. The guard refuses a commit without
    both values.
@@ -99,7 +100,7 @@ the work tree and the scorer. So read each error.
 | # | Step | Done when |
 |---|---|---|
 | 1 | Install the tools: `git`, `uv`, `gitleaks` (version 8.30.1 or later), `pre-commit`, and the assistant. Keep about 45 GB of disk free | Each tool prints its version |
-| 2 | Clone the repository and switch to the branch `m1-first-build` (to `main` after its pull request is merged) | `git status` shows a clean tree on that branch |
+| 2 | Clone the repository. The clone starts on the branch `main` | `git status` shows a clean tree on that branch |
 | 3 | Make the data folder: `mkdir -p ~/pitchvlm-data` | The folder exists, outside the repository |
 | 4 | Google AI Studio: a project with billing (paid tier only), a budget alert, an API key | The owner has the key. It is in no file |
 | 5 | Open a terminal in the top folder of the clone. Type the key with the first line of the prompt block of RUNBOOK section 1. Do not run its second line yet: the environment does not exist before step 6. Start the assistant from this terminal | The assistant runs `test -n "$GEMINI_API_KEY" && echo set`, and it prints `set` |
@@ -127,7 +128,7 @@ machine.
 | 6 | Make the environment with Python 3.13, install the package with the extras `dev` and `gemini`, run `python -m pytest -rs`. In each new terminal: `source .venv/bin/activate` | Every test passes. A skipped test names its reason |
 | 7 | Write the pinned list `locks/run-machine.txt`. Then do the check of fact 19 (RUNBOOK, section 8): it shows whether `uv pip` reads the package age limit of `pyproject.toml`. Write the second list of that check outside the repository, for example into `~/pitchvlm-data` | The file exists. The two lists of the check are equal, or the owner knows that they differ |
 | 8 | Owner: install the hooks: `pre-commit install --hook-type pre-commit --hook-type pre-push` | `doctor --no-api` shows `[ok  ] guard hooks` |
-| 9 | Owner: set the git identity of this clone, with the name and e-mail of the cloned commit (`git log -1 --format='%an <%ae>'` prints them) | `git config --local --get user.name` and `git config --local --get user.email` print the same two values |
+| 9 | Owner: set the git identity of this clone, with the name and e-mail of the commits of the build machine (`git log -1 --no-merges --format='%an <%ae>'` prints them; a merge commit that the git host made has another e-mail, so leave it out) | `git config --local --get user.name` and `git config --local --get user.email` print the same two values |
 | 10 | Owner: write the deny-list `.git/guard-deny.txt`: one name per line that must not leave this machine (RUNBOOK, section 9). Do not list a word that is a part of the git name or e-mail: the guard then refuses every commit | `doctor --no-api` shows `[ok  ] deny-list` |
 | 11 | Make the work tree of the branch `results` next to the repository: `../pitchvlm-results` | `git worktree list` shows it. `git -C ../pitchvlm-results rev-parse --git-path hooks` names the hook folder of this clone |
 | 12 | Make the scorer environment (Python 3.12, numpy 1.26) and clone the repository of the scorer (`sn-trackeval`) at the tag `v0.4.1` | The last command prints the commit. Write it into `docs/DECISIONS.md` |
@@ -167,14 +168,15 @@ Ask the owner before each paid step. Run one paid command at a time.
 | 4 | `oracle` on one clip, then on all clips (gate G1) | Free | Ground truth scores at least 99.5. The other lines of G1 are in `configs/gates.yaml` | The error names the file or shows the last lines of the scorer (RUNBOOK, section 8). A team-side share below 0.97 with a ground truth of at least 99.5 is not a code fault (fact 2): write the shares into `docs/DECISIONS.md`, and the owner decides about the gate |
 | 5 | Cost pilot: the three probes with `--max-clips 2`. Before it, commit the split list and the day-1 notes in `docs/DECISIONS.md` when the owner asks: a probe refuses a work tree with changes | About 0.7 USD | The ledger has one line for each new answer. `--replay` gives the same metrics for free | Compare the measured cost with the estimate. Tell the owner |
 | 6 | Write the mean tokens that the cost pilot measured (the lines after "measured cost" of the three probes, all four model steps) into `DEFAULT_TOKEN_ESTIMATES` (`src/pitchvlm/vlm/cost.py`), into `docs/ARCHITECTURE.md` (section `vlm/cost.py`) and into `docs/DECISIONS.md`, with the owner's go-ahead. The output count is the out tokens plus the thinking tokens. Run the tests. Commit when the owner asks | Free | The tests pass. After the commit, a pilot command with `--replay` prints a cost estimate near the cost that the pilot measured | - |
-| 7 | `sync`. Then the owner commits and pushes the branch `results`, and the code branch too: each metrics file names the commit of the code | Free | The guard and the secret scan pass on real model answers | A report line names the rule and the file. Change the rule with a test, not the answer |
+| 7 | `sync`. Then the owner runs the `add` and the `commit` command of its output, and commits and pushes the code branch: each metrics file names the commit of the code. No push of the branch `results` before the owner has decided where it goes (section 9) | Free | The guard and the secret scan pass on real model answers | A report line names the rule and the file. Change the rule with a test, not the answer |
 
 G0 and G1 must pass before any footage is sent to the model. The planned budget for the doctor
 and the cost pilot together is 2 USD.
 
 M2 also installs the two specialist tools, RF-DETR (boxes) and PnLCalib (pitch mapping).
 RUNBOOK, section 3 has the commands of the install and of the measurement. Ask the owner before
-this install: it downloads packages and about 1 GB of weights. The commands never ran, and the
+this install: it downloads packages and about 1 GB of weights. Ask at the same time for the
+licence decision (`docs/DECISIONS.md`, last list). The commands never ran, and the
 script that runs the tools (`tools/run_tool.py`) was tested with stand-ins only (RUNBOOK,
 section 8, row "Tool script"). In M3 both tools are measured on the frames of the people probe
 and the pitch probe, for free (owner decision of 2026-11-14). The commands measure a tool. The
@@ -221,8 +223,11 @@ the owner has decided where that branch goes (same list).
 
 1. On the run machine: `python -m pitchvlm.cli sync --results ../pitchvlm-results/results`. It
    checks the files and prints three git commands. It runs none of them.
-2. The owner runs the three commands.
-3. On the build machine: `git fetch origin`. The first time, make a work tree for the branch:
+2. The owner runs the `add` and the `commit` command. After a tool run, the folder
+   `results/tools` waits for its own owner decision first (RUNBOOK, section 3). The `push`
+   command waits for the decision above.
+3. After that decision, on the build machine: `git fetch origin`. The first time, make a work
+   tree for the branch:
    `git worktree add ../pitchvlm-results results`. Later: `git -C ../pitchvlm-results pull`.
    Then read the files.
 
@@ -251,15 +256,17 @@ does:
 - A commit message has no co-author line.
 - The two specialist tools, RF-DETR and PnLCalib, are measured in M3 on the frames of the people
   probe and the pitch probe, without training and for free (RUNBOOK, section 3). A tool still
-  replaces a Gemini step only after that step failed its gate.
+  replaces a Gemini step only after that step failed its gate and the tool passed the same gate
+  on the same frames.
 
-Eleven decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
+Twelve decisions of the owner are open (the list is at the end of `docs/DECISIONS.md`). Three
 of them wait for the first real answers: the label penalty of the tracker, the team-side rule
 with goalkeeper evidence, and the requests in flight at a budget stop. Four came with the
 measurement of the two specialist tools: its settings, the place of its run files, the work
 that lets the pipeline use a tool that passed its gate (not built, not budgeted), and the
 frames of gate G3. Two came with the public repository: where the branch `results` goes, and
-the licence of the repository.
+the licence of the repository. One is about the kill switch of gate G3: no command writes the
+overlay images that it names.
 
 ## 12 Schedule after the handover
 
