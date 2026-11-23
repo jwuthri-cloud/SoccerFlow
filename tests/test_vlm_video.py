@@ -273,6 +273,36 @@ def test_inline_data_above_the_limit_is_refused_for_both_providers(tmp_path: Pat
     build_interaction_kwargs(video_request(part, parts=(TextPart(text="x"), ImagePart(data=b"j" * 100))))
 
 
+def test_size_limit_counts_the_whole_request_and_not_only_its_inline_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The video page speaks of the total request size: a long text can push a request over the limit."""
+    part = video_part(tmp_path, fps=None)
+    inline = len(base64.b64encode(part.path.read_bytes()))
+    long_text = TextPart(text="x" * 1000)
+    request = video_request(part, parts=(long_text, part))
+    gemini_size = client.request_size_bytes(build_interaction_kwargs(request))
+    openrouter_request = video_request(part, provider="openrouter", model=OPENROUTER_MODEL, parts=(long_text, part))
+    openrouter_size = client.request_size_bytes(build_openrouter_body(openrouter_request))
+    assert min(gemini_size, openrouter_size) > inline + 1000
+    # The inline data alone is under this limit; the whole request is over it.
+    monkeypatch.setattr(client, "INLINE_REQUEST_MAX_BYTES", inline + 100)
+    with pytest.raises(VideoInputError, match="never uploads"):
+        build_interaction_kwargs(request)
+    with pytest.raises(VideoInputError, match="never uploads"):
+        build_openrouter_body(openrouter_request)
+    # The boundary: a request of exactly the limit is sent, one byte more is refused.
+    for size, build, built in (
+        (gemini_size, build_interaction_kwargs, request),
+        (openrouter_size, build_openrouter_body, openrouter_request),
+    ):
+        monkeypatch.setattr(client, "INLINE_REQUEST_MAX_BYTES", size)
+        build(built)
+        monkeypatch.setattr(client, "INLINE_REQUEST_MAX_BYTES", size - 1)
+        with pytest.raises(VideoInputError, match=f"{size:,} bytes"):
+            build(built)
+
+
 class RecordingInteractions:
     """Stands for ``client.interactions``: it keeps every call and answers with a fixed interaction."""
 

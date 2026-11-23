@@ -269,10 +269,16 @@ class VLMRequest(Record):
 
         A request with video parts has their identities in the key: the hash of
         each file, its range, its sampling rate and its resolution
-        (``VideoPart.identity``). Unlike an image, a video file is sent as it is,
-        so its hash does not change with a library version. A request without
-        video parts has no such entry, so its key is the one of before video
-        parts were added.
+        (``VideoPart.identity``). A video file is sent as it is, so its hash is
+        the hash of the sent bytes. But a file that is written again from the same
+        frames can get other bytes (another OpenCV build or codec: measured with
+        the codecs ``avc1`` and ``mp4v`` on the build machine), and then its request
+        misses its stored answer without an error and is paid again, unlike an
+        image (``OtherImagesError``). So the written videos are kept with the data
+        (``vlm.video``), and a replay of stored answers uses ``--replay``, which
+        refuses a miss (docs/DECISIONS.md, entry "Second read of the video input
+        and the detector families", 2026-11-23). A request without video parts
+        has no such entry, so its key is the one of before video parts were added.
         """
         identity = {
             "clip_id": self.meta.clip_id,
