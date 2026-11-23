@@ -1589,11 +1589,12 @@ class BallCandidate(Record): frame: int; box: Box; score: float          # 0 to 
 @dataclass(frozen=True)
 class BallTrack: boxes: Mapping[int, Box]; observed: frozenset[int]
 def track_ball(candidates: Mapping[int, Sequence[BallCandidate]], n_frames: int, *, fps: float,
-               warp: MotionWarp, max_gap_frames: int, cuts: Sequence[int] = ()) -> BallTrack
+               warp: MotionWarp, max_gap_frames: int, cuts: Sequence[int] = (), first_frame: int = 0) -> BallTrack
 def gate_px(box: Box, frames: int, fps: float) -> float
 
 # timing.py
 class StageClock: def stage(self, name) (context manager); def add(self, name, seconds); def report(self, n_frames)
+    def frame(self) (context manager: one per-frame sample); def frame_report(self)   # the streaming path, below
 
 # schemas.py
 class BallState(Record): box: Box; pitch_x: float | None = None; pitch_y: float | None = None; observed: bool = False
@@ -1762,6 +1763,101 @@ def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_
   compared (`os.path.samefile`) with the top folder of the repository and of every work tree that
   `git worktree list` names (the results work tree is one); a match raises `CliError`. Git that
   cannot list the work trees raises `CliError` too.
+
+### `stream.py` — streaming path of the detector engine (2026-11-23)
+
+The people engine `detector` with the pitch engine `calibration` and the number engine `none`,
+one frame at a time: the state of frame `t` is given once frame `t + L` is in, and is never
+changed later (`docs/DECISIONS.md`, entry "A streaming path for the detector engine" of
+2026-11-23).
+
+```python
+# stream.py
+STREAM_FORMAT = "pitchvlm-stream-1"; KIT_WARMUP_FRAMES = 25
+@dataclass(frozen=True)
+class StreamSettings: delay_frames: int | None = 25; history_frames: int | None = None; kit_warmup_frames: int = 25
+    # None = the whole clip; a delay of the whole clip needs a history of the whole clip
+def default_history_frames(config: PipelineConfig, fps: float) -> int   # max_stitch_gap_s * fps + 4 * keyframe_frames = 123 at 25 fps
+def check_stream_engines(config: PipelineConfig) -> None                 # ValueError for other engines
+@dataclass(frozen=True)
+class StreamInput: frame: int; people: tuple[PersonDet, ...]; balls: tuple[BallCandidate, ...]; camera: HomographyRecord
+    detector_seconds: float | None = None; calibration_seconds: float | None = None
+@dataclass(frozen=True)
+class StreamHeader: clip: str; detector: DetectorSettings; calibration: PnlcalibSettings   # any detector family
+def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]
+def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[StreamInput]]
+def stand_in_inputs(people, balls, cameras) -> Iterator[StreamInput]
+class DetectorStream:
+    def __init__(self, config, settings, *, clip_id: str, fps: float, size: tuple[int, int],
+                 kit_clusters: KitClusters | None = None, clock: StageClock | None = None)
+    def push(self, item: StreamInput, image: np.ndarray | Callable[[], np.ndarray]) -> list[FrameState]  # at most one: frame t - L
+    def finish(self) -> list[FrameState]     # the frames not decided yet, with every frame known
+    def result(self) -> ClipResult           # after finish
+def run_stream(inputs, read_image, config, settings, *, clip_id, fps, size, kit_clusters=None, clock=None) -> ClipResult
+def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
+
+# Shared with the clip path (the clip results stay the same; tests/test_stream.py and the existing tests):
+# tracking.py: class Associator (add(people), tracks(*, since=None), forget_before(frame), last_frame);
+#              associate() runs it
+# motion.py:   class ShotMeter (add(image, boxes), update_transitions(*, final=False), forget_images_before(frame),
+#              keep_images_from(), finish() -> ShotTests); measure_shots() runs it; transition_span(images, steps, first, last)
+# fill.py:     players_in_frame(tracks, homographies, frame, *, n_frames, warp, image_size, max_fill_gap_frames,
+#              pitch_margin_m=3.0, cuts=()) == dense_frame_states(...)[frame].players
+# ball.py:     track_ball(..., first_frame: int = 0)
+# pipeline.py: ball_state(track, frame, to_pitch, margin_m); clip_kit_clusters(source, people)
+# timing.py:   StageClock.frame() (context manager, one sample per block), StageClock.frame_report()
+#              -> {stage: {n, p50_ms, p95_ms, max_ms}} with FRAME_TOTAL = "total" last; percentiles_ms(seconds)
+```
+
+- Arrival of frame `t` (stages `read`, `motion`, `paint`, `camera`, `kit_colour`, `tracks` of the
+  frame sample): `ShotMeter.add` with the boxes of the frame (a hard cut is known now; a dissolve
+  when its window test is over, about `DISSOLVE_WINDOW_FRAMES` after it starts); the paint score
+  of the camera at every keyframe step; the camera checked with `fit_problems` and, without a kept
+  camera, the nearest earlier kept one within `max_gap_frames` moved with the motion; the people
+  on the pitch; the team keys of the kit clusters; `Associator.add` (a new associator at each hard
+  cut). The associator warps through the motion and the cameras known at arrival.
+- Decision of frame `f = t - L` (stage `decide`): the window `[f - H, t]` (`H` = `history_frames`)
+  takes the fragments of the associators, cuts them at the cuts known at `t`, drops their
+  observations on blend frames, and runs per shot `kit_roles`, the split (when set) and
+  `stitch_fragments`, then `finalize_tracks`, `players_in_frame` at `f` and `track_ball` from
+  `f - H`, with the camera of each window frame by the rule of `propagate_homographies` among the
+  cameras up to `t`. The functions are those of the clip path; the pitch positions of single
+  points are kept between decisions while the mapping of their frame is the same object
+  (`_PitchMemo`), and the means of `kit_roles` and of the team sides use `math.fsum`, so they are
+  the same numbers.
+- Ids (`_StreamIds`): a window track takes the id of its newest given observation; tracks that
+  ask for one id get it in the order of how recently they had it; a track without a given
+  observation takes its window id when no state carried it yet, else the lowest free id.
+- Kit clusters: fitted again on every frame of the warm-up on all torso features so far, then
+  fixed; a fit that does not show two kits gives no team key and is tried again on every frame,
+  on the features of the last `kit_warmup_frames` frames. Given clusters are used from the first
+  frame and never fitted.
+- With `delay_frames` and `history_frames` None every frame is decided in `finish` on one window
+  of the whole clip; with the kit clusters of the clip path (`clip_kit_clusters`) the frames, the
+  homographies, the cuts and the paint scores equal those of `run_clip` (tested on a clip without
+  a cut and with a hard cut). `ClipResult.tracks` of a stream are built from the given states
+  (`tracks_of_states`): they are not the tracks of `run_clip`.
+- `result().engines` holds the engines of `_engines(config)` with `tracks` and `fill`
+  `code:stream`, and `delay` and `history` (`"12 frames (0.48 s)"`, `"whole clip"`).
+- Memory: with a finite history the stream forgets what no later window needs (ended tracks,
+  observations of live tracks, cameras, steps, ball candidates, test images, the ids of old
+  observations), so a long stream keeps a bounded state; with `history_frames` None it keeps
+  everything, like the clip path.
+- The line format: a header line `{"format": "pitchvlm-stream-1", "clip": ..., "detector":
+  <DetectorSettings of any family>, "calibration": <PnlcalibSettings>}`, then one line per frame from frame 0,
+  `{"frame": i, "detector": {"seconds": s, "payload": <payload of a clip run frame>},
+  "calibration": {"seconds": s, "payload": <payload of fallbacks.pnlcalib>}}`; JSON objects, one
+  per line, keys sorted. `read_stream_lines` refuses a missing header, another format, a line
+  that is not a JSON object, a frame out of order and a payload that the adapter refuses, with
+  the line number.
+- Command line: `stream --out DIR (--synthetic [--frames N] [--seed S] | --clip PATH (--detections
+  FILE --calibration FILE | --lines FILE|-)) [--config FILE] [--labels FILE] [--fps FPS] [--split]
+  [--tracker] [--delay N|clip] [--history N|clip|default] [--kit-warmup N] [--allow-dirty]`. It
+  writes the files of `run` (`result.json` with `provenance.stream`, `timing`, `frame_timing`,
+  `tool_timing`, `timing_note`, `identity` for the synthetic clip; the prediction file with a
+  label file; the video) and prints the per-frame table with the note that the package times hold
+  no detector and no calibration. The header of the stream must name the clip and the tool
+  settings of the settings file. The exit codes follow `run`.
 
 ## 5. Tests
 

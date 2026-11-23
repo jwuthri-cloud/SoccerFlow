@@ -231,19 +231,67 @@ def associate(
     Track ids are 0, 1, 2, ... in the order in which the tracks start. The
     result is ordered by track id. The attribute fields of the tracks are not
     set here.
+
+    The matching looks at no later keyframe, so ``Associator`` gives the same
+    tracks one keyframe at a time (the streaming path, ``stream``).
     """
-    _check_fps(fps)
-    if keyframe_frames < 1:
-        raise ValueError(f"keyframe_frames must be at least 1, got {keyframe_frames}")
+    associator = Associator(fps=fps, warp=warp, to_pitch=to_pitch, config=config, keyframe_frames=keyframe_frames)
     ordered = sorted(keyframes, key=lambda people: people.frame)
     if len({people.frame for people in ordered}) != len(ordered):
         raise ValueError("two keyframes have the same frame index")
-    ids = itertools.count()
-    live: list[_LiveTrack] = []
-    ended: list[_LiveTrack] = []
     for people in ordered:
-        pitch = _pitch_points(to_pitch, people.frame, _feet(people.people))
-        pairs = _match(live, people, pitch, fps=fps, warp=warp, config=config, keyframe_frames=keyframe_frames)
+        associator.add(people)
+    return associator.tracks()
+
+
+class Associator:
+    """The matching of ``associate``, one keyframe at a time: ``add`` each keyframe in frame order.
+
+    ``tracks`` returns the tracks of the keyframes added so far, the same tracks that
+    ``associate`` gives for these keyframes. ``warp`` and ``to_pitch`` are called with the
+    frames added so far only, so a caller that learns the camera frame by frame (the
+    streaming path) can give functions that answer from what it knows at that time.
+    """
+
+    def __init__(
+        self,
+        *,
+        fps: float,
+        warp: MotionWarp,
+        to_pitch: PitchMap,
+        config: TrackingConfig = TrackingConfig(),
+        keyframe_frames: int = 1,
+    ) -> None:
+        _check_fps(fps)
+        if keyframe_frames < 1:
+            raise ValueError(f"keyframe_frames must be at least 1, got {keyframe_frames}")
+        self._fps = fps
+        self._warp = warp
+        self._to_pitch = to_pitch
+        self._config = config
+        self._keyframe_frames = keyframe_frames
+        self._ids = itertools.count()
+        self._live: list[_LiveTrack] = []
+        self._ended: list[_LiveTrack] = []
+        self._last_frame: int | None = None
+
+    def add(self, people: FramePeople) -> None:
+        """Match the people of the next keyframe. A keyframe that is not later than the last one raises ``ValueError``."""
+        if self._last_frame is not None and people.frame <= self._last_frame:
+            raise ValueError(f"keyframe {people.frame} does not come after keyframe {self._last_frame}")
+        self._last_frame = people.frame
+        config = self._config
+        live = self._live
+        pitch = _pitch_points(self._to_pitch, people.frame, _feet(people.people))
+        pairs = _match(
+            live,
+            people,
+            pitch,
+            fps=self._fps,
+            warp=self._warp,
+            config=config,
+            keyframe_frames=self._keyframe_frames,
+        )
         for track_index, det_index, still_foot in pairs:
             observation = _observation(people.frame, people.people[det_index])
             live[track_index].take(observation, pitch[det_index], still_foot)
@@ -251,15 +299,49 @@ def associate(
         for track_index, track in enumerate(live):
             if track_index not in matched_tracks:
                 track.missed += 1
-        ended.extend(track for track in live if track.missed > config.max_missed_keyframes)
+        self._ended.extend(track for track in live if track.missed > config.max_missed_keyframes)
         live = [track for track in live if track.missed <= config.max_missed_keyframes]
         matched_dets = {det_index for _, det_index, _ in pairs}
         for det_index, person in enumerate(people.people):
             if det_index not in matched_dets:
                 observation = _observation(people.frame, person)
-                live.append(_LiveTrack(next(ids), [observation], pitch[det_index], _Votes.of([observation])))
-    finished = sorted(ended + live, key=lambda track: track.track_id)
-    return [Track(track_id=track.track_id, observations=tuple(track.observations)) for track in finished]
+                live.append(_LiveTrack(next(self._ids), [observation], pitch[det_index], _Votes.of([observation])))
+        self._live = live
+
+    @property
+    def last_frame(self) -> int | None:
+        """The frame of the last keyframe added, or None before the first one."""
+        return self._last_frame
+
+    def tracks(self, *, since: int | None = None) -> list[Track]:
+        """Return the tracks so far, ordered by track id: the ended tracks and the live ones.
+
+        With ``since``, only the tracks with an observation in frame ``since`` or later, and
+        only these observations: the window of the streaming path.
+        """
+        finished = sorted(self._ended + self._live, key=lambda track: track.track_id)
+        if since is None:
+            return [Track(track_id=track.track_id, observations=tuple(track.observations)) for track in finished]
+        result: list[Track] = []
+        for track in finished:
+            if track.observations[-1].frame < since:
+                continue
+            start = bisect.bisect_left(track.observations, since, key=lambda observation: observation.frame)
+            result.append(Track(track_id=track.track_id, observations=tuple(track.observations[start:])))
+        return result
+
+    def forget_before(self, frame: int) -> None:
+        """Forget what a window that starts at ``frame`` no longer needs.
+
+        The ended tracks whose last observation lies before ``frame`` are dropped, and a live
+        track keeps its observations from ``frame`` on, at least its newest one. The matching
+        does not change: it uses the newest observation, the velocity and the votes, and the
+        votes keep every observation.
+        """
+        self._ended = [track for track in self._ended if track.observations[-1].frame >= frame]
+        for track in self._live:
+            start = bisect.bisect_left(track.observations, frame, key=lambda observation: observation.frame)
+            del track.observations[: min(start, len(track.observations) - 1)]
 
 
 def _moved_feet(track: _LiveTrack, frame: int, warp: MotionWarp) -> np.ndarray | None:
