@@ -157,7 +157,9 @@ def run_clip(
        people answer repeats, also with a small shift for the same role and team key, is dropped.
     4. Camera motion between all frames. ``motion`` is used when it is given
        (for example a stored field). Else the motion is measured from the frames.
-       The motion step into a hard cut is missing, and the cuts are in the result.
+       The motion step into a hard cut is missing, and the cuts are in the result. Every
+       frame of a dissolve is a cut, and so is the frame after it (``motion.find_transitions``):
+       a frame of a dissolve forms a shot of one frame (``MotionField.transition_frames``).
     5. Pitch mapping: a landmark fit per keyframe, rejected when it is not
        plausible, then carried to the other frames with the camera motion. Every landmark
        fit gets the paint-alignment score of its keyframe (``geometry.paint_alignment``), a
@@ -179,6 +181,9 @@ def run_clip(
 
     Nothing is carried across a cut: no pitch mapping, no track link by position or image
     motion, no filled state. Only a shown shirt number joins two tracks across a cut (step 9).
+    A shot of one frame, such as a frame of a dissolve, blends two shots: its people, its ball
+    candidates and its pitch mapping are dropped after step 4, so it gets no state, no track
+    and no ball.
 
     The people engine ``detector`` changes steps 2, 3, 7 and 8 and adds a ball:
 
@@ -234,6 +239,16 @@ def run_clip(
     people = list(tools.people or ()) if detector else model_people
     with clock.stage("motion"):
         field = motion if motion is not None else _measured_motion(source, people)
+    blends = field.transition_frames()
+    if blends:
+        logger.info(
+            "clip %s: %d frames form a shot of one frame (a dissolve or a lone frame between cuts) and carry "
+            "nothing: %s",
+            info.clip_id,
+            len(blends),
+            sorted(blends),
+        )
+    people = [FramePeople(frame=item.frame, people=()) if item.frame in blends else item for item in people]
     with clock.stage("pitch_mapping"):
         if engines.pitch_mapping == "model":
             landmark_fits = [
@@ -246,6 +261,7 @@ def run_clip(
             cameras = tools.cameras or ()
             landmark_fits = [cameras[frame] for frame in keyframes]
             homographies = _camera_mapping(cameras, people, field, info, config)
+    homographies = [HomographyRecord(frame=item.frame) if item.frame in blends else item for item in homographies]
     with clock.stage("paint"):
         paint = _paint_checks(source, landmark_fits)
     to_pitch = _pitch_map(homographies)
@@ -296,9 +312,8 @@ def run_clip(
         )
     if detector:
         with clock.stage("ball"):
-            frames = _with_ball(
-                frames, tools.balls or {}, warp, to_pitch, info.fps, config.pitch_margin_m, cuts=field.cuts
-            )
+            balls = {frame: found for frame, found in (tools.balls or {}).items() if frame not in blends}
+            frames = _with_ball(frames, balls, warp, to_pitch, info.fps, config.pitch_margin_m, cuts=field.cuts)
     return ClipResult(
         info=info,
         frames=tuple(frames),

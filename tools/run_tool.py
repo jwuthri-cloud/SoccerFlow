@@ -18,7 +18,10 @@ and it does not import pitchvlm. It needs Python 3.10 or newer.
     python tools/run_tool.py pnlcalib --job JOB --root DATA --out RUN --device cpu \\
         --repo PNLCALIB --weights-kp SV_kp --weights-lines SV_lines
 
-``DATA`` is the data folder: the job names each image by its path below it. ``--device`` is
+``DATA`` is the data folder: the job names each image by its path below it. A clip job of a
+video names the PNG images that ``python -m pitchvlm.cli video-frames`` wrote: PNG keeps every
+pixel, so the tool reads the frames that ``run`` decodes from the video, and the clip run names
+the video by its SHA-256. ``--device`` is
 the device name of PyTorch, for example ``mps`` (Apple Silicon), ``cpu`` or ``cuda:0``.
 
 Exit code 0 means that the run file was written. Exit code 2 means that the script could not
@@ -90,6 +93,8 @@ CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"
 CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"
 #: Largest size of one part of a clip run, bytes: that of ``pitchvlm.fallbacks.runs``.
 CLIP_RUN_PART_MAX_BYTES = 1_000_000
+#: Digits of the SHA-256 of a video in a clip job.
+HEX_DIGITS = "0123456789abcdef"
 #: Rounding of a compact detection row: the box to 0.1 pixel, the score to 0.0001.
 BOX_DECIMALS = 1
 SCORE_DECIMALS = 4
@@ -174,16 +179,20 @@ def read_job(path: Path, tool: str) -> dict[str, Any]:
 def _clip_job_frames(job: dict[str, Any], path: Path) -> dict[str, Any]:
     """Return a clip job with the frames of a job file: frame ``i`` reads ``images[i]``.
 
-    ``RunnerError`` is raised for a clip job without the name of its clip, and for one whose
-    ``images`` is not a list of at least one path.
+    ``RunnerError`` is raised for a clip job without the name of its clip, for one whose
+    ``images`` is not a list of at least one path, and for a ``video_sha256`` that is neither
+    null nor 64 small hexadecimal digits. A job without ``video_sha256`` reads as null.
     """
     clip, images = job.get("clip"), job.get("images")
     if not isinstance(clip, str) or not clip:
         raise RunnerError(f"the clip job {path} has no clip")
     if not isinstance(images, list) or not images:
         raise RunnerError(f"the clip job {path} names no frame")
+    video = job.get("video_sha256")
+    if video is not None and not (isinstance(video, str) and len(video) == 64 and set(video) <= set(HEX_DIGITS)):
+        raise RunnerError(f"the clip job {path}: 'video_sha256' must be null or 64 small hexadecimal digits")
     frames = [{"clip": clip, "frame": index, "image": image} for index, image in enumerate(images)]
-    return {**job, "name": clip, "frames": frames}
+    return {**job, "name": clip, "frames": frames, "video_sha256": video}
 
 
 def _check_job_frame(entry: Any, where: str) -> None:
@@ -341,6 +350,9 @@ def write_clip_run(
 ) -> list[Path]:
     """Write the clip run of a clip job in parts, and return the part files in order.
 
+    The head of each part names the video of the job (``video_sha256``), so that the package
+    reads the run only with the pixels that the tool read.
+
     The answers of the detector are stored as compact rows (``compact_detections``), those of
     the calibration as they are.
     """
@@ -350,6 +362,7 @@ def write_clip_run(
         "tool": job["tool"],
         "n_frames": len(job["frames"]),
         "job_sha256": job_sha256,
+        "video_sha256": job["video_sha256"],
         "runner": dict(runner),
     }
     detector = job["tool"]["name"] == "rfdetr"

@@ -1,10 +1,14 @@
-"""Tests of the pipeline on a synthetic clip with a hard cut.
+"""Tests of the pipeline on a synthetic clip with a hard cut, and on one with a dissolve.
 
 The clip shows the synthetic match from scene frame 0 to 53, then jumps 100 frames (4 seconds)
 ahead: clip frame 54 shows scene frame 154. So the camera and the people are somewhere else after
 the cut. The fake model answers with the exact truth. A second version of the clip carries a
 static score graphic in its top left corner, as a broadcast does. The corners of that graphic do
 not move across the cut, so they can give a camera motion across it.
+
+The dissolve clip blends the same two moments over 10 frames instead (``BlendSource``). The
+answers of the model and of the stand-in tools are those of the hard cut in the middle of the
+dissolve; the pipeline must drop them on the frames of the dissolve.
 """
 
 from __future__ import annotations
@@ -15,10 +19,11 @@ import numpy as np
 import pytest
 
 from pitchvlm import pipeline
-from pitchvlm.config import PipelineConfig, TrackingConfig
+from pitchvlm.config import EngineSettings, PipelineConfig, TrackingConfig
+from pitchvlm.fallbacks.fake import fake_calibration_answers, fake_detector_answers
 from pitchvlm.geometry import apply_homography, matrix_from_record
-from pitchvlm.pipeline import run_clip
-from pitchvlm.schemas import Box, ClipResult, Track
+from pitchvlm.pipeline import ToolAnswers, run_clip
+from pitchvlm.schemas import Box, ClipInfo, ClipResult, Track
 from pitchvlm.synth import RetimedScene, ScoreGraphicSource, SyntheticSource
 from pitchvlm.tracking import split_team_swaps
 from pitchvlm.vlm.fake import FakeBackend
@@ -183,3 +188,105 @@ def test_with_both_repairs_only_a_shown_shirt_number_joins_tracks_across_a_cut(
     # shirt numbers, as without the repairs.
     assert len(crossing) == len(_tracks_across_the_cut(plain))
 
+
+
+# --- A dissolve is a transition: its frames carry nothing --------------------------------------
+
+#: The first frame of the dissolve, and its length in frames.
+DISSOLVE_START = 40
+DISSOLVE_FRAMES = 10
+#: Frames of the dissolve clip: 40 frames of each shot around the dissolve.
+DISSOLVE_CLIP_FRAMES = 2 * DISSOLVE_START + DISSOLVE_FRAMES
+#: The truth of the dissolve clip switches shots in the middle of the dissolve.
+DISSOLVE_MIDDLE = DISSOLVE_START + DISSOLVE_FRAMES // 2
+
+
+class BlendSource:
+    """The first shot (scene frames 0 on) blended into the second (scene frames 100 on) over ``DISSOLVE_FRAMES``."""
+
+    def __init__(self) -> None:
+        frames = range(DISSOLVE_CLIP_FRAMES)
+        self._old = SyntheticSource(RetimedScene(list(frames), seed=0))
+        self._new = SyntheticSource(RetimedScene([frame + 100 for frame in frames], seed=0))
+        self.info = ClipInfo(clip_id="dissolve", n_frames=DISSOLVE_CLIP_FRAMES, fps=25.0, width=1280, height=720)
+
+    def read(self, frame: int) -> np.ndarray:
+        if frame < DISSOLVE_START:
+            return self._old.read(frame)
+        if frame >= DISSOLVE_START + DISSOLVE_FRAMES:
+            return self._new.read(frame)
+        weight = (frame - DISSOLVE_START + 1) / (DISSOLVE_FRAMES + 1)
+        blend = (1.0 - weight) * self._old.read(frame).astype(np.float32) + weight * self._new.read(frame)
+        return np.clip(blend, 0, 255).astype(np.uint8)
+
+
+@pytest.fixture(scope="module")
+def dissolve_truth() -> RetimedScene:
+    frames = range(DISSOLVE_CLIP_FRAMES)
+    return RetimedScene([frame if frame < DISSOLVE_MIDDLE else frame + 100 for frame in frames], seed=0)
+
+
+@pytest.fixture(scope="module")
+def dissolve_results(dissolve_truth: RetimedScene) -> dict[str, ClipResult]:
+    people, balls = fake_detector_answers(dissolve_truth)
+    detector = PipelineConfig(engines=EngineSettings(people="detector", pitch_mapping="calibration", number="none"))
+    tools = ToolAnswers(people=people, balls=balls, cameras=fake_calibration_answers(dissolve_truth))
+    return {
+        "model": run_clip(BlendSource(), FakeBackend(dissolve_truth), PipelineConfig()),
+        "detector": run_clip(BlendSource(), None, detector, tools=tools),
+    }
+
+
+def _blend_frames(result: ClipResult) -> list[int]:
+    """Return the frames of the result that form a shot of one frame."""
+    starts = (0, *result.cuts)
+    ends = (*result.cuts, result.info.n_frames)
+    return [start for start, end in zip(starts, ends, strict=True) if end - start == 1]
+
+
+@pytest.mark.parametrize("engine", ["model", "detector"])
+def test_every_frame_of_a_dissolve_starts_a_shot_of_its_own(
+    dissolve_results: dict[str, ClipResult], engine: str
+) -> None:
+    result = dissolve_results[engine]
+    blends = _blend_frames(result)
+    assert blends == list(range(blends[0], blends[-1] + 1))
+    assert result.cuts == (*blends, blends[-1] + 1)
+    # The window test leaves at most the faint ends of the dissolve in the shots (synthetic seed 0).
+    assert DISSOLVE_START <= blends[0] <= DISSOLVE_START + 2
+    assert DISSOLVE_START + DISSOLVE_FRAMES - 3 <= blends[-1] <= DISSOLVE_START + DISSOLVE_FRAMES - 1
+
+
+@pytest.mark.parametrize("engine", ["model", "detector"])
+def test_the_frames_of_a_dissolve_get_no_state_no_ball_and_no_mapping(
+    dissolve_results: dict[str, ClipResult], engine: str
+) -> None:
+    result = dissolve_results[engine]
+    for frame in _blend_frames(result):
+        assert result.frames[frame].players == ()
+        assert result.frames[frame].ball is None
+        assert not result.homographies[frame].valid
+        assert all(obs.frame != frame for track in result.tracks for obs in track.observations)
+
+
+@pytest.mark.parametrize("engine", ["model", "detector"])
+def test_no_track_crosses_a_dissolve_without_a_shown_number(
+    dissolve_results: dict[str, ClipResult], engine: str
+) -> None:
+    result = dissolve_results[engine]
+    blends = _blend_frames(result)
+    crossing = [track for track in result.tracks if track.first_frame < blends[0] and track.last_frame > blends[-1]]
+    assert [track.track_id for track in crossing if track.number_display is None] == []
+
+
+@pytest.mark.parametrize("engine", ["model", "detector"])
+def test_the_shots_around_a_dissolve_keep_their_own_mappings(
+    dissolve_truth: RetimedScene, dissolve_results: dict[str, ClipResult], engine: str
+) -> None:
+    result = dissolve_results[engine]
+    blends = _blend_frames(result)
+    before = range(blends[0] - 12, DISSOLVE_START)  # frames of the first shot alone
+    after = range(DISSOLVE_START + DISSOLVE_FRAMES, blends[-1] + 13)  # frames of the second shot alone
+    errors = _mapping_errors_m(dissolve_truth, result, [*before, *after])
+    assert len(errors) == len(before) + len(after)
+    assert max(errors) < 1.0

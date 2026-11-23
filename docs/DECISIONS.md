@@ -1389,6 +1389,8 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
    a test over a window of frames needs its own measurement, and a fast pan must not become a
    cut. ARCHITECTURE names the limit. Owner decision: build a window test before the demo
    clip, or accept the limit (the clips of SoccerNet GSR have no cut).
+   Update: a window test was built, see the entry "A dissolve is a transition, not a shot" of
+   2026-11-22.
 6. **Refuted or taken back.** (a) Flat or tiny frames are always a cut: by design and written.
    (b) The change point of `team_key_runs` after merges (for example A10 B3 A3 B10): the contact
    is tested from the last vote of the merged run to the first vote of the next, the right
@@ -1672,11 +1674,228 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
     cached functions, planted again one at a time: the default run catches 7 of 8, as before
     (F01 again caught by no run).
 
+## 2026-11-22 — A dissolve is a transition, not a shot
+
+Closes the open major of the entry "Second read of the tracking, cuts, paint alignment and
+detector engine", item 5. Every number here is synthetic: build machine, synthetic clips of
+`synth.py`, no model, no footage. None is a result on broadcast frames. Base `main` 81bb2d9.
+
+1. **Design.** The pair test of neighbouring frames (`motion.is_cut`) stays as it was; its cuts
+   and motion steps are identical to `main` on 40 synthetic clips (controls, dissolves and hard
+   cuts of seeds 0, 1, 2 and 9, checked against the `motion.py` of 81bb2d9). A second test runs
+   over windows (`motion.window_correlations`): frame `t - 30` is moved onto frame `t` with the
+   chained motion of the 30 steps between them (no identity), and the median block correlation
+   of the 160-pixel test images is taken. A pan that the chain follows explains its window; a
+   dissolve does not, because no frame in it shows the change of view from one shot to the
+   other. The chain takes the measured motion of a pair when it passes the pair test alone,
+   else the motion of the pair test that explains the pair best (identity or last motion): in
+   fast pans the optical flow was wrong by 9 to 250 px on some pairs that the last motion
+   explained. A window with a missing step, a hard cut, or too little cover is not judged.
+2. **Where the transition lies.** Each run of windows below 0.18 holds one transition
+   (`motion.find_transitions`). The first frame of the first window shows the old shot alone,
+   the last frame of the last window the new shot alone, for a dissolve shorter than the
+   window. The motion inside a dissolve follows the shot that dominates the blend: the old one
+   in the first half, the new one in the second. So the transition starts at the first frame
+   that the old anchor, moved with the chain, no longer explains with a regression slope of
+   0.95 (a blend frame with weight `w` has a slope near `1 - w`), and ends after the last frame
+   that the new anchor does not explain. A change without a blend frame gives a cut at one
+   frame.
+3. **Representation: every frame of a transition is a cut, and so is the frame after it.**
+   Each blend frame is then a shot of one frame. This is the smallest form that every consumer
+   of `MotionField.cuts` already handles: `bridged_warp`, `associate`, `stitch_fragments` and
+   `split_team_swaps` (per shot in `pipeline`), `link_team_slots` and `finalize_tracks`, the
+   dense fill, the ball tracker, the propagation of landmark fits and calibration cameras, the
+   tracking values and the radar trails all stop at a cut, so nothing crosses the transition
+   and none of them changed. `MotionField`, its JSON and `ClipResult` keep their form. One
+   change was needed: a blend frame must get no state at all, and a cut alone does not stop a
+   frame's own answers. `MotionField.transition_frames` names the shots of one frame next to a
+   cut, and `pipeline.run_clip` drops the people (before the kit colours and the tracks), the
+   pitch mapping (landmark fit or camera) and the ball candidates of these frames, for both
+   engines. A lone frame between two hard cuts is treated the same way: one frame cannot be
+   tracked. A model keyframe that falls on a blend frame is still paid for (the motion is
+   measured after the people requests), and its answer is dropped. A separate list of spans
+   was the other option: it needed a change in every consumer and in the JSON of the field.
+4. **Measurement.** Hypothesis: the window test finds dissolves of 5 to 25 frames and raises no
+   cut on clips without one. Baseline: the pair test of `main`. Command:
+   `PYTHONPATH=src python tools/synthetic_diagnostics.py dissolve-fit dissolve-held-out`.
+   Clips: two shots of the synthetic match of one seed (shot B 75 to 249 scene frames after
+   shot A, each panning up to 25 px per frame), 40 frames each, blended over the dissolve
+   (frame `40 + i` has the weight `(i + 1) / (length + 1)` of shot B); controls of 60 frames:
+   pans at about 25, 50, 75 and 100 px per frame at 1280 px, a zoom by 1.5 within 8 to 20
+   frames, a shake (sd 0.15 degrees in pan and tilt, 0.1 in roll), a goal kick (fast pan,
+   tilt up 5 degrees and back over 25 frames, zoom out by 12 %), and 100 frames without a cut.
+   The zoom, the shake and the goal kick come from a virtual camera that turns inside a
+   synthetic picture drawn at 2560 x 1440. The thresholds were fixed on seeds 0 to 9; seeds 10
+   to 19 were run once after that, and no threshold changed afterwards.
+5. **Held-out seeds 10 to 19** (one clip per seed and case, n = 10 each). "False cuts" counts
+   blocks of cut frames that do not touch the true change. "Lowest window value" is the lowest
+   judged window of each clip, as a range over the 10 clips; the found transitions need a value
+   below 0.18. Span error: found minus true first and last blend frame, in frames.
+
+   | Case | Fastest motion, px per frame | Hits | Misses | False cuts | Pair test alone: hits, false cuts | Lowest window value | Span error start / end |
+   |---|---|---|---|---|---|---|---|
+   | Dissolve, 5 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.042 to 0.018 | -1 to 0 / 0 to +1 |
+   | Dissolve, 10 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.037 to 0.017 | 0 to +1 / -1 to 0 |
+   | Dissolve, 15 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.037 to 0.012 | 0 to +2 / -2 to -1 |
+   | Dissolve, 20 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.041 to 0.034 | +1 to +2 / -4 to -1 |
+   | Dissolve, 25 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.062 to 0.075 | +2 to +3 / -3 to -2 |
+   | Hard cut | 8 to 25 | 8 | 2 | 0 | 8, 0 | 0.807 to 0.869 | 0 / 0 |
+   | Pan, scene step 3 | 24 to 25 | - | - | 0 | -, 0 | 0.811 to 0.858 | - |
+   | Pan, scene step 6 | 47 to 50 | - | - | 0 | -, 0 | 0.828 to 0.876 | - |
+   | Pan, scene step 9 | 71 to 75 | - | - | 0 | -, 0 | 0.747 to 0.855 | - |
+   | Pan, scene step 12 | 96 to 100 | - | - | 0 | -, 0 | 0.201 to 0.860 | - |
+   | Zoom x1.5 | 9 to 25 | - | - | 0 | -, 0 | 0.750 to 0.889 | - |
+   | Shake | 27 to 49 | - | - | 0 | -, 0 | 0.801 to 0.870 | - |
+   | Goal kick | 31 to 67 | - | - | 0 | -, 0 | 0.776 to 0.828 | - |
+   | No cut, 100 frames | 6 to 8 | - | - | 0 | -, 0 | 0.839 to 0.871 | - |
+
+   Dissolves: 50 of 50 found (the pair test alone: 0 of 50). Controls: 0 false cuts in 80
+   clips, as the pair test alone. The 2 missed hard cuts are missed by the pair test of `main`
+   too (lowest pair value of these clips up to 0.913): shot B is the same synthetic camera some
+   seconds later in a pose the optical flow reaches, the known limit "a jump in time that one
+   camera motion explains". Not one window was judged across a hard cut, so the window test
+   cannot change a hard cut. The span errors leave the faint ends of a dissolve (weight up to
+   about 0.1) in their shots. The closest control is a pan at 100 px per frame with a lowest
+   window value of 0.201, 0.021 above the threshold: the margin at the top of the pan range is
+   thin.
+6. **Fit seeds 0 to 9**, last run with the final code (same layout, n = 10 per case):
+   dissolves 49 of 50 found (5, 10, 15 and 20 frames: 10 of 10; 25 frames: 9 of 10), highest
+   lowest window value of a found dissolve 0.087; the miss (seed 6, 25 frames) has 0.611: its
+   shot B is the same camera in a pose the chain of shot A happens to align. Hard cuts 10 of
+   10. Controls 0 false cuts from the window test; the pans at 96 to 99 px per frame have 3
+   false cuts of the pair test (as `main`, lowest pair value 0.141), and the lowest window value
+   of a control is 0.268 (pan at 99 px per frame). Span error start 0 to +4, end -3 to +4.
+   Shot shares (slopes) between the anchors: frames of the anchor's own shot 1.009 to 1.147
+   (n 1954, 5 not measurable), frames with a blend weight in (0.2, 0.3] 0.747 to 0.898, in
+   (0.1, 0.2] 0.835 to 1.001.
+7. **How the thresholds were fixed (seeds 0 to 9 only).** The window length, 30 frames, is
+   the design: a dissolve of up to 29 frames lies inside one window. 0.18 is halfway between
+   0.087 and 0.268 (item 6); 0.95 is halfway between 0.898 and 1.009. The first design had
+   other values and was changed on the fit seeds, never after the held-out run: (a) with the
+   measured motion as the chain and the pair threshold 0.5 as window threshold, the window
+   test added false cuts in fast pans (1 of 10 at 75 px per frame, 6 of 10 at 100 px against 3
+   of the pair test), from wrong flow steps; (b) a refinement of the chained motion by image
+   alignment (`cv2.findTransformECC`) removed those, but it also aligned shot A with shot B of
+   same-camera dissolves (2 of 50 missed); the corrections it made overlap (2 to 14 test pixels
+   in pans, 3 to 18 in dissolves), so no bound separates them, and it was dropped; (c) the
+   chain rule of item 1 and the threshold 0.18 then separated the fit seeds; (d) 0.9 was the
+   first share threshold, 0.95 the midpoint. The goal-kick control first panned at up to 132 px
+   per frame, beyond the 100 px of the hypothesis (the pair test alone had 8 false cuts in 10);
+   its pan was reduced to the stated range before the held-out run.
+8. **Cost.** Time of the cut test per frame on the build machine (seeds 0 clips, n = 135 frames,
+   `time.perf_counter`): the pair test of `main` median 1.12 ms; the new pair test plus the
+   window test median 1.42 ms, so about 0.3 ms more per frame. The localisation runs only on a
+   window run below 0.18 and was not timed. The motion measurement itself (optical flow) is
+   unchanged. Memory: the 160 x 90 test image of every frame is kept until the field is built
+   (57.6 KB per frame).
+9. **Out of scope, measured once on seeds 10 to 19 (n = 10 each).** A fade through black over
+   10 frames: the darkest frames have too little contrast, so the pair test makes them hard
+   cuts (10 of 10; a block of 1 or 2 cut frames in the middle of the fade, frames 45 to 46 of
+   40 to 49); the dimmed frames stay in their shots. A wipe over 10 frames (shot B covers the picture from left to right): found by the
+   window test as a transition in 10 of 10 (span error start 0 to +4, end -3 to 0), though not
+   designed for it. A picture-in-picture box of shot B (a ninth of the picture) for 25 frames
+   over shot A: the box is not found in 10 of 10 (the clip then cuts to shot B, found in 9 of 10
+   as a hard cut, the miss as in item 5). A dissolve during a pan that the chain cannot follow
+   for a whole window is not judged (the windows of the 50 px pans were judged 171 of 300
+   times), and not measured as a case. A dissolve between two moments of one camera can be
+   explained by the chain (item 6, 1 of 100 dissolves over both seed sets).
+10. **Open.** Nothing ran on broadcast frames: real dissolves (often into and out of a replay,
+    with a logo wipe), real chain drift and real people motion over 1.2 s may move both
+    thresholds; the margin at 100 px per frame (item 5) is thin. The 30-frame window was
+    measured at 25 frames per second only. The faint ends of a dissolve keep their states.
+
+## 2026-11-22 — A video file into the detector engine, and the check images of gate G3
+
+Two tools for the first real clip runs, from the last list below ("Video files for the detector
+engine", "Overlay images of the kill switch of G3"). Everything here was measured on the build
+machine with synthetic clips and stand-ins of the tools (OpenCV 5.0.0, Python 3.13); nothing ran
+on real footage.
+
+1. **Design of the video path: one command writes the frames as images.** `video-frames` writes
+   every frame of a video file as PNG into `~/pitchvlm-data/videos/<clip id>/img1` with the record
+   `video.json` (SHA-256 of the video, frame count, rate, size). `clip-job` reads that folder as it
+   reads a clip of the dataset, and puts the SHA-256 into the job (`video_sha256`); the script
+   copies it into the head of the clip run; `run` reads a clip run only with the video of that
+   check sum (null: only with a folder of images). The other way, a clip job with a video as its
+   source, was not taken: the script would decode the video in each tool environment with the
+   OpenCV and FFmpeg build of that environment, and two builds need not give the same pixels; the
+   script reads images with Pillow, which reads no video; the two tools would decode the video two
+   times. With images the clip job, the script and both tools stay as they were; the cost is disk.
+2. **Same frames, proved on synthetic videos.** A video of 20 random frames (more than the 8
+   frames that the video source keeps) and the synthetic clip of 50 frames (1280 x 720): every
+   image read back by `ImageFolderSource` is equal, pixel for pixel, to the frame that
+   `VideoFileSource` decodes, in the same order and count (`tests/test_frames.py`,
+   `tests/test_video_overlay.py`). The script reads the images with Pillow, which is not installed
+   here: that read of PNG was not compared (open item a).
+3. **A video whose frames are not sure is refused, with one line** (`frames.check_frame_times`,
+   in `VideoFileSource`, so `run` refuses it too). Measured: an mp4 of 10 frames whose second half
+   was given double frame times (variable rate) decodes in OpenCV as 8 frames at 16.7 frames per
+   second, without any error: two frames were dropped in silence. The source now refuses a header
+   without a frame count, a frame more than half a frame away from its time at the constant rate
+   (checked first, so this video gets the line about the rate), and a header count that differs
+   from the decoded frames (a Motion JPEG file cut by 15 % decodes 8 or 9 of its 10 frames).
+   Not found: the same file cut by 400 bytes decodes all 10 frames without an error (FFmpeg
+   prints "overread" on the error stream); the last frame is then damaged (open item b).
+4. **Rule 2.** `video-frames` and `overlay` refuse an image folder inside the repository or any
+   work tree of it (`git worktree list`, so the results work tree too), compared as places on the
+   disk. The defaults are `~/pitchvlm-data/videos` and `~/pitchvlm-data/overlays`. The list file
+   of `overlay` is text: clip ids, frame numbers, the engine, how each mapping was made and its
+   paint score or reason; the guard passes on it (measured with `--paths`).
+5. **Check images: one command, three sources.** `overlay probe` replays the stored landmark
+   answers of the pitch probe (no model call; a missing answer stops it) and fits them as the
+   probe does (`probes.pitch_probe_fits`, the same code path): its count of frames with a mapping
+   equals `n_frames_valid` of the probe (test). `overlay tool` reads the PnLCalib run file of
+   `tool-score` on the frames of its probe. `overlay run` draws the mapping that a run used on
+   each keyframe (`result.json`): the landmark fit or tool camera of that frame, or a mapping
+   carried with the camera motion; the caption says which. The image is the frame under a caption
+   band (clip, frame, engine, mapping, paint score or the reason why the frame cannot judge) with
+   the pixels of `geometry.projected_line_pixels` in 70 % magenta, 1 pixel per 1280 of width, so
+   the white paint stays visible beside a line. A first version with opaque lines of 3 pixels
+   covered the paint of a right mapping completely, and the eye could not judge it.
+6. **The choice cannot be steered.** The frames with a mapping are ordered by paint score
+   (frames that cannot judge first), cut into `count` equal parts, and from each part the frame of
+   the clip with the fewest picks so far is taken; ties by a SHA-256 of the seed, the clip and the
+   frame. The RUNBOOK fixes the seed (20261113, the seed of the probe experiment files) and the
+   counts (5 for the kill switch, 10 for M3). The owner writes `right` or `wrong` into `by_eye` of
+   each entry of the list file and the counts into this file with the decision on G3 (RUNBOOK,
+   section 3, "Check images of the pitch mappings").
+7. **Measured on the synthetic demo clip** (100 frames, 1280 x 720, mp4v): `video-frames` 2.7 s
+   and 63.5 MB (0.64 MB per frame); clip jobs of both tools named the SHA-256; the stand-in clip
+   runs carried it; `run --clip <video>` read them (exit 0). `overlay run` on that result: 10
+   keyframes, all with a mapping, 5 drawn in 1.2 s (3.3 MB of images); the true camera scores
+   1.000 on every keyframe. The size per frame of real 1920 x 1080 footage is not measured
+   (estimate 1 to 2 MB, about 1 GB per clip of 30 s).
+8. **Formats.** `video_sha256` is a new key of the clip job and of the head of a clip run, null for
+   images; a file without the key reads as null, so the format names stay `-1` (no file of the old
+   form exists outside tests). The script refuses a value that is not null or 64 small hexadecimal
+   digits.
+9. **Open.**
+   (a) The script reads the PNG frames with Pillow: compare one image of a real clip read by
+   Pillow (converted to BGR) with `run`'s frame on the run machine before the first tool run.
+   (b) A damaged last frame that still decodes is not found; look at the end of each video.
+   (c) `overlay run` draws used mappings only: a refused landmark fit that no frame uses is not
+   drawn (its score is in `result.json`). For a check of the raw fits of a run, a replay of the
+   landmark answers of the run would be needed; not built.
+   (d) The colour and width of the lines were judged on synthetic frames only.
+   (e) No real video, real tool or real footage ran through any of this.
+10. **After the merge of the dissolve test** (`main` 9b63a02, entry "A dissolve is a
+    transition, not a shot"). A run drops the mapping of every transition frame. `overlay` now
+    lists every frame without a mapping with its reason (printed, and `frames_without_mapping` in
+    the list file) and draws no image of it; a keyframe of a run on a transition frame gets the
+    reason "a frame of a transition", found from the cuts of the result with
+    `MotionField.transition_frames`, the rule of the pipeline. Measured on a synthetic mp4 of 90
+    frames with a dissolve of 10 frames (`tests/test_video_overlay.py`): `video-frames` gives the
+    frames that `run` decodes, pixel for pixel; the run with stand-in clip runs of that video put
+    at least one keyframe on a transition frame (asserted), and the overlay of every keyframe
+    named it and drew it not. The cut test runs on the decoded (lossy) frames, as `run` reads
+    them; the tools never see the cuts.
+
 ## 2026-11-22 — Fewer git processes in the guard, and three test gaps closed
 
 1. **Goal and result.** The guard starts most of the git processes of `tests/test_guard.py`
-   (item 6 of the entry before). Goal: the same behaviour with fewer processes, and tests for
-   the gaps F01, F31 and F33 of that entry. **Result:** the guard starts 16 % fewer git
+   (item 6 of the entry "A faster default run of the offline tests"). Goal: the same
+   behaviour with fewer processes, and tests for the gaps F01, F31 and F33 of that entry.
+   **Result:** the guard starts 16 % fewer git
    processes in that file (1,625 to 1,362), and the file runs 8 % faster with the same tests
    (45.2 s to 41.5 s). The new guard tests cost about 3.6 s, so the whole file is not
    faster (item 5). The default run is about 2 s faster with 17 more tests. No output, message
@@ -1750,7 +1969,7 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
    The new tree of the second and third rows had 5 of the 7 new guard tests; the other two
    (a damaged commit of a detached `HEAD`, a `cat-file` that ends before it answers) came
    after these runs and take less than 1 s together. The
-   machine was faster than in the entry before (70 s for `test_guard.py` then), so the seconds
+   machine was faster than in that entry (70 s for `test_guard.py` then), so the seconds
    of the two entries cannot be compared; only the back-to-back runs here count. The guard runs
    in the test process in most tests, so a test pays for its git processes and not for Python.
 
@@ -1823,8 +2042,9 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
    breaks its own line protocol; `tests/test_guard.py` and the whole default run (run with each
    of the two planted) pass. A control run without a fault passes.
 
-8. **The three gaps of the entry before, closed with tests.** Each new test is in the default
-   run. No gap showed a defect of the code: nothing under `src/` changed.
+8. **The three gaps of the entry "A faster default run of the offline tests", closed with
+   tests.** Each new test is in the default run. No gap showed a defect of the code: nothing
+   under `src/` changed.
    - **F33, rule 4 over the whole package.**
      `tests/test_vlm_client.py::test_only_the_client_imports_the_sdk_and_only_the_tool_runner_imports_a_tool`
      reads the source of every module of `src/pitchvlm/` and of every other script of `tools/`
@@ -1867,7 +2087,8 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
      why they stay); per push `remote`, `for-each-ref`, `rev-list`, `diff-tree` and up to two
      `cat-file --batch`. The tests start the other 700 processes of `test_guard.py`.
    - `test_guard.py` still takes about 41 to 45 s of the default run here. The decision of the
-     entry before (a marker for the process tests, or `pytest-xdist`) stays with the owner.
+     entry "A faster default run of the offline tests" (a marker for the process tests, or
+     `pytest-xdist`) stays with the owner.
    - Faults G07 and G11 (item 7) are found by no test: both need a git that breaks its own
      line protocol.
    - Differences that the generated states cannot show, by reading the code: when two things
@@ -1878,6 +2099,7 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
    - Not verified: any git other than 2.56 on macOS, the run machine, and Linux. The features
      used (`rev-parse` with two options, `cat-file --batch-check` reading one name at a time)
      are old, but the equality of the `HEAD` answers was tried on this git only.
+||||||| 81bb2d9
 
 ## Open questions (to settle with measurements)
 
@@ -1896,6 +2118,8 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
 - Does the paint-alignment score separate good from bad pitch mappings on real frames (AUROC,
   per engine), and how many real frames cannot judge a mapping?
 - How many hard cuts does the cut test find in the demo clip, and how many does it miss?
+- Does the window test find the dissolves of real broadcast clips, and does it raise false
+  transitions in fast real pans (entry "A dissolve is a transition, not a shot")?
 - Right value of the two-people margin (6 m) and of the limit for a repeated box (0.6) on real
   answers (RUNBOOK section 8, facts 13 and 15)?
 - Do two crops that are less than one second apart agree on a wrong number, and does the model
@@ -1995,13 +2219,12 @@ Decisions for the owner that are open, each with its recommendation:
 - **Licence of this repository.** It has no licence file, and one script imports GPL code of
   another project when it runs. Recommendation: decide both before the two tools are installed
   on the run machine (M2), and add a licence file.
-- **Overlay images of the kill switch of G3.** The gate file wants five overlay images that
-  are checked by eye before the kill switch counts (`overlays_checked_by_eye: 5`), and M3 asks
-  the owner to check 10. No command writes an overlay of a pitch mapping on its frame, for the
-  model step or for PnLCalib. Recommendation: build a small command that draws the pitch lines
-  of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
-  the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
-  of the gate and needs its own entry here (rule 7).
+- **Overlay images of the kill switch of G3.** Built on 2026-11-22 (entry "A video file into
+  the detector engine, and the check images of gate G3"): `overlay probe|tool|run` (RUNBOOK,
+  section 3, "Check images of the pitch mappings"). The gate file is unchanged. Owner to do: after
+  the first 4 clips of the pitch probe, run the overlay with `--count 5`, check the images, write
+  `right` or `wrong` into each `by_eye` of the list file and the counts into this file before the
+  kill switch is judged; for M3 the same with `--count 10` for the model step and PnLCalib.
 - **OpenRouter: rule text** (entry "Image models through OpenRouter" of 2026-11-22, item 9).
   Accept, change or refuse the proposed text of the first paragraph and of rules 4 and 5 of
   `CLAUDE.md`. Recommendation: accept; the code already keeps it, and the doctor line `data policy`
@@ -2057,8 +2280,13 @@ Decisions for the owner that are open, each with its recommendation:
 - **Soccer-trained detector** (RUNBOOK, section 12). Recommendation: read the terms of the
   SoccerNet-GSR train data first; build the converter and train only with a budget line for the
   GPU time and a decision that research-only weights may drive the demo.
-- **Video files for the detector engine.** A clip job reads frame images; no command writes the
-  frames of a video file as images. Recommendation: build it before the demo clip (a video) runs
-  through the detector engine.
+- **Video files for the detector engine.** Built on 2026-11-22 (entry "A video file into the
+  detector engine, and the check images of gate G3"): `video-frames`
+  writes the frames of a video as PNG below the data folder, the clip job names the video by
+  its SHA-256, and `run --clip <video>` reads the clip run only with that video (RUNBOOK,
+  section 11, "A video file as the clip"). Owner to do: put the demo clip below
+  `~/pitchvlm-data`, run `video-frames` on it, compare one frame read by Pillow in a tool
+  environment with the frame of `run` (item 9 (a) of that entry), and keep about 1 GB of disk per
+  clip of 30 s (estimated).
 - **Clip runs on the results branch.** They are tool runs (item "Run files of the tools on the
   results branch" above). Recommendation: decide both together; each part passes the guard.

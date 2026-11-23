@@ -142,7 +142,18 @@ a calibration tool on every frame. A tool runs in its own environment through
     `path(frame)` gives the image file of a frame: the job file of an external tool names it.
   - `VideoFileSource` decodes a frame when it is read and keeps only a few frames, so the memory
     use does not grow with the clip. The decoder runs forward: a read of an earlier frame starts
-    it again at the first frame. Read frames in increasing order where you can.
+    it again at the first frame. Read frames in increasing order where you can. The source decodes
+    the whole file once when it is made and refuses (`OSError`, one line) a video whose frames are
+    not sure (`check_frame_times`): a header without a frame count, a frame more than half a frame
+    away from its time at the constant rate (a variable rate, or a frame that the decoder dropped
+    or repeated), and a header count that differs from the decoded frames. `path` is the file.
+  - `write_video_frames(source, video_sha256, clip_folder) -> VideoRecord` writes every frame of a
+    video as PNG (`clip_folder/img1/000001.png` = frame 0) and the record `clip_folder/video.json`
+    (`VideoRecord`: format `pitchvlm-video-frames-1`, the file name of the video, its SHA-256, frame
+    count, frame rate, size; no path). PNG keeps every pixel, so `ImageFolderSource` gives the
+    frames of the video. The folder is written under a hidden name and renamed when complete; a
+    folder that is there raises `FileExistsError`. `read_video_record(clip_folder)` gives the
+    record or None, and `ValueError` for wrong content.
   - `keyframe_indices` raises `ValueError` unless the frame count, the frame rate and the
     interval are above zero.
 
@@ -258,6 +269,7 @@ class MotionField:
     cuts: tuple[int, ...]                                      # frames that start a new shot
     def shot_of(self, frame: int) -> int                       # 0 before the first cut, 1 after it, ...
     def same_shot(self, first: int, second: int) -> bool
+    def transition_frames(self) -> frozenset[int]              # shots of one frame next to a cut: they carry nothing
     def between(self, src: int, dst: int) -> np.ndarray | None # 3x3 src px -> dst px, both directions
     def warp(self, src: int, dst: int, xy: np.ndarray) -> np.ndarray | None
     @classmethod
@@ -267,6 +279,12 @@ class MotionField:
 def bridged_warp(motion: MotionField, homographies: Sequence[HomographyRecord]) -> MotionWarp
 def compute_motion_field(source: FrameSource, *, people: Mapping[int, Sequence[Box]] | None = None,
                          downscale: float = 0.5) -> MotionField
+def measure_shots(source: FrameSource, *, people: Mapping[int, Sequence[Box]] | None = None,
+                  downscale: float = 0.5) -> ShotTests     # steps, pair values, hard cuts, window values, transitions
+class ShotTests:                                           # frozen dataclass; def cuts(self) -> tuple[int, ...]
+def window_correlations(images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None]) -> list[float | None]
+def find_transitions(images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None],
+                     values: Sequence[float | None]) -> list[tuple[int, int]]   # (start, stop): blends start..stop-1
 def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: MotionField, n_frames: int,
                            *, max_gap_frames: int = 75) -> list[HomographyRecord]
 def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None
@@ -309,12 +327,41 @@ Hard cuts (2026-11-22):
   optical flow can reach) is not found: the test compares the picture of the camera, not the
   people. A dissolve is not found either: each frame differs from the next by a small blend step
   (a dissolve of 5 frames keeps every pair at 0.900 or more on the synthetic clip), so the
-  motion chain, the tracks and the fill run through it.
+  motion chain, the tracks and the fill run through it; the window test below finds it.
 - `compute_motion_field` tests every pair of neighbouring frames with the measured motion and
-  the last measured motion of the same shot. A cut gets a missing step, also when a motion was
-  measured, and goes into `MotionField.cuts`.
+  the last measured motion of the same shot (`measure_shots`). A cut gets a missing step, also
+  when a motion was measured, and goes into `MotionField.cuts`.
 - `bridged_warp` returns None across a cut, so no track link and no box warp cross it.
   `propagate_homographies` carries no mapping across it, because its step is missing.
+
+Dissolves (2026-11-22, `docs/DECISIONS.md` entry "A dissolve is a transition, not a shot"):
+
+- A dissolve blends two shots over some frames; each pair of neighbouring frames passes the pair
+  test. `window_correlations` compares frame `t - 30` (`DISSOLVE_WINDOW_FRAMES`) with frame `t`:
+  the first frame is moved with the chained steps of the window (no identity) and the median
+  block correlation is taken, on the 160-pixel test images. The chain takes the measured motion
+  of a pair when it passes the pair test alone, else the motion of the pair test that explains
+  the pair best (`ShotTests.test_steps`). A window is not judged (None) when a step is missing
+  (also a hard cut inside it) or when the moved frame covers too little (a fast pan).
+- `find_transitions`: each run of windows below 0.18 (`MAX_TRANSITION_CORRELATION`) holds one
+  transition. Its first window's first frame shows the old shot alone, its last window's last
+  frame the new shot alone (for a dissolve shorter than the window). The transition starts at
+  the first frame that the old anchor, moved with the chain, no longer explains with a
+  regression slope of 0.95 (`MIN_SHOT_SHARE`), and ends after the last frame that the new anchor
+  does not explain. The answer `(start, stop)`: frames `start` to `stop - 1` blend the shots,
+  frame `stop` starts the new shot; `start == stop` is a cut without a blend frame.
+- `compute_motion_field` makes every frame of a transition a cut, and the frame after it
+  (`ShotTests.cuts`), so each blend frame is a shot of one frame and nothing crosses the
+  transition. This is the only representation: `MotionField`, `to_json` and every consumer of
+  `MotionField.cuts` stay as they were.
+- `MotionField.transition_frames` returns the shots of one frame next to a cut: the frames of a
+  dissolve and a lone frame between two hard cuts (also the first or last frame of a clip cut off
+  by a cut). A clip without a cut has none. `pipeline.run_clip` drops the people, the ball
+  candidates and the pitch mapping of these frames, so they get no state, no track and no ball.
+- Not found: a fade through black is found as hard cuts at the dark frames (no contrast); a
+  wipe, a picture-in-picture replay, a dissolve during a pan the chain cannot follow for a whole
+  window, and a dissolve between two moments of one camera that a chained motion happens to
+  explain. The numbers are in the decision entry.
 
 ### `tracking.py` — tracks, votes, team side, numbers
 
@@ -1052,6 +1099,10 @@ def table_lines(results: Sequence[CaseResult]) -> list[str]
 @dataclass(frozen=True)
 class RenderStyle: ...   # colours per team side / role, trail seconds (4.0), radar scale, font sizes
 def draw_overlay(image: np.ndarray, players: Sequence[PlayerState], style: RenderStyle = RenderStyle()) -> np.ndarray
+def draw_mapping_check(image: np.ndarray, H: np.ndarray, caption: Sequence[str]) -> np.ndarray
+    # caption band (black, ASCII text) above the frame; the pixels of geometry.projected_line_pixels
+    # in 70 % magenta, width/1280 pixels wide (at least 1); ValueError for a wrong image or a mapping without inverse
+def write_png(path: Path, image: np.ndarray) -> None   # OSError when it cannot be written
 class RadarRenderer:
     def __init__(self, fps: float, style: RenderStyle = RenderStyle(), *, cuts: Sequence[int] = ())
     def draw(self, state: FrameState) -> np.ndarray          # keeps trails per track id; a trail ends at a cut
@@ -1082,10 +1133,10 @@ def crop_choice(boxes: Sequence[tuple[int, Box]], fps: float, max_crops: int) ->
 ```
 
 CLI commands: `demo` (synthetic clip, fake backend or stand-ins of the tools, no network), `run`,
-`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`, `clip-job`, `eval`, `sync`. Exit code 0 means done, 1 means
-that a check or a gate failed, 2 means that the command could not run. Fallback adapters convert
-the JSON output of external tools (RF-DETR boxes, PnLCalib mappings) into `FramePeople` and
-`HomographyRecord`.
+`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`, `clip-job`, `video-frames`,
+`overlay`, `eval`, `sync`. Exit code 0 means done, 1 means that a check or a gate failed, 2
+means that the command could not run. Fallback adapters convert the JSON output of external
+tools (RF-DETR boxes, PnLCalib mappings) into `FramePeople` and `HomographyRecord`.
 
 Stop signals: SIGINT (Ctrl-C), SIGTERM and SIGHUP stop a command with exit code 2. The handler
 sets the event `cli.STOP_REQUESTED`, which the real backend gets as its stop event, so no
@@ -1146,6 +1197,13 @@ sends its requests with `httpx2`.
   in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
   shirt number of one team; the positions on the two sides of a cut do not decide whether such
   tracks are two people (the test of the way applies inside a shot only). `ClipResult.cuts` names the cuts.
+- Dissolves (2026-11-22): every frame of a dissolve is a cut, and so is the frame after it. Right
+  after the camera motion, `run_clip` empties the people of every frame of
+  `MotionField.transition_frames` (both engines), and after the pitch mapping it replaces the
+  mapping of these frames with an empty record (landmark fits and calibration cameras alike);
+  the ball candidates of these frames are dropped before the ball tracker. The paint score of a
+  keyframe on such a frame is still computed (a diagnostic). A model keyframe on such a frame is
+  still asked (the motion is measured after the people requests) and its answer is dropped.
 - Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
   `geometry.paint_alignment` on its keyframe (with the pitch engine `calibration`, the camera
   of the tool at each keyframe, also before its check), in `ClipResult.paint` (`schemas.PaintCheck`:
@@ -1445,8 +1503,9 @@ class BallState(Record): box: Box; pitch_x: float | None = None; pitch_y: float 
 
 # fallbacks/runs.py
 CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"; CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"; CLIP_RUN_PART_MAX_BYTES = 1_000_000
-class ClipJob(Record): format; clip: str; tool: ToolSettings; images: tuple[str, ...]
-class ClipRun(Record): clip; tool; n_frames; job_sha256; runner; frames: tuple[ClipRunFrame, ...]   # frames[i].frame == i
+class ClipJob(Record): format; clip: str; tool: ToolSettings; images: tuple[str, ...]; video_sha256: str | None = None
+class ClipRun(Record): clip; tool; n_frames; job_sha256; video_sha256: str | None = None; runner
+    frames: tuple[ClipRunFrame, ...]   # frames[i].frame == i
 def clip_run_part_path(first: Path, part: int) -> Path
 def load_clip_run(first: Path) -> ClipRun
 
@@ -1529,20 +1588,73 @@ Command line:
 
 - `clip-job --tool rfdetr|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]` writes
   the clip job with the tool section of the settings file. A video file is refused, and so is a
-  clip folder that is not below the data folder.
+  clip folder that is not below the data folder. A clip folder of `video-frames` holds the record
+  of its video: the job gets `video_sha256`, and a record that names another frame count or size
+  than the folder holds is refused.
+- `video-frames --video FILE [--out DIR]` (default `~/pitchvlm-data/videos`) writes the clip
+  folder `<out>/<clip id>` of a video (`write_video_frames`); the clip id is the name of the
+  file without its ending, as `run` gives it. A folder inside a work tree of the repository is
+  refused (`refuse_pixels_in_repository`, below).
 - `run --detections FILE --calibration FILE`: each is needed when the settings name its engine,
   and refused otherwise. A clip run with other tool settings than the settings file, or of
-  another clip or frame count, is refused. The plan of model calls (`model_plan`) holds only the
+  another clip or frame count, is refused. So is a clip run on other pixels
+  (`check_clip_run_video`): the clip run must name the SHA-256 of the video file of `--clip`, or
+  null when `--clip` is a folder of images. The plan of model calls (`model_plan`) holds only the
   steps whose engine is `model`, each with its provider. A run without a model step opens no
   model session, builds no model backend, needs no key of any provider and no cache folder, and
   prints that it costs nothing; its cost record is `null`. `result.json` gets
   `timing` (the stages of the package, plus `detector` and `calibration`: the sum of the times
   per frame that the script measured) and `provenance.tool_runs` (file, parts, job SHA-256,
-  `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the
+  video SHA-256, `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the
   engine of every step, a line when no step reads shirt numbers, and the time of each stage.
 - `demo --engine model|detector`: the detector demo runs the people engine `detector` and the
   pitch engine `calibration` with the stand-ins of `fallbacks/fake.py` and no model step. Its
   summary holds the engines, the frames with a ball and the timing.
+
+### Check images of pitch mappings for gate G3 (2026-11-22)
+
+```python
+# overlays.py (no pixel I/O)
+LIST_FORMAT = "pitchvlm-overlay-list-1"; VERDICTS = ("right", "wrong"); CHOICE_RULE: str
+@dataclass(frozen=True, eq=False)
+class MappedFrame: clip: str; frame: int; matrix: np.ndarray; origin: str; score: float | None; reason: str | None
+def choose_frames(frames: Sequence[MappedFrame], *, count: int, seed: int) -> list[MappedFrame]
+def image_name(position: int, item: MappedFrame) -> str          # "01_<clip>_<frame + 1:06d>.png"
+def caption(item, *, engine: str, position: int, count: int) -> list[str]
+def list_document(chosen, *, source, name, engine, seed, count, n_frames, unmapped, provenance) -> dict
+    # unmapped: (clip, frame, reason) of each frame without a mapping -> "frames_without_mapping"
+
+# probes.py
+def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_px, repeat=0)
+    -> dict[str, list[HomographyRecord]]   # the frames, requests and fits of probe_pitch
+```
+
+- `choose_frames`: the frames are ordered by paint score (cannot judge first, then rising; a
+  tie by a SHA-256 of seed, clip and frame), cut into `count` parts of equal size, and from each
+  part the frame of the clip with the fewest picks so far is taken (a tie by a second hash). With
+  at most `count` frames all are taken. A count below 1 and a frame given twice raise `ValueError`.
+- `overlay probe|tool|run ... --seed S --count N --list FILE [--out DIR]` (`cli._cmd_overlay`):
+  - `probe --experiment E --root DATA [--manifest] [--max-clips] [--cache] [--allow-other-images]`:
+    the landmark fits of the pitch probe from the stored answers only (`CachedBackend` without an
+    inner backend: a missing answer stops with one line, no model call).
+  - `tool --experiment E --root DATA --run RUN [--manifest] [--max-clips]`: the cameras of a
+    calibration run file on the frames of its probe, read as `tool-score` reads them.
+  - `run --result result.json --clip PATH`: the mapping that the run used on each keyframe
+    (`ClipResult.homographies`; the keyframes from the settings in its provenance); `--clip` must
+    be the clip of the result (clip id, frame count, size). A keyframe on a transition frame (a
+    shot of one frame between the cuts of the result: `MotionField.transition_frames`, a frame of
+    a dissolve) has no mapping in the run; it gets no image and its own reason.
+  - Every frame without a mapping is printed (grouped by reason) and listed in
+    `frames_without_mapping` of the list file; it gets no image.
+  - Every frame with a mapping gets its paint alignment; `choose_frames` picks; each pick is drawn
+    with `draw_mapping_check` into `<out>/<name>-seed<S>-count<N>/` (written under a hidden name,
+    renamed when complete; a folder that is there is refused) and listed in `--list`
+    (`list_document`: no path, no pixel, no label data; `by_eye` null in each entry). A list file
+    that is there is refused, and so is a source without any mapping.
+- `refuse_pixels_in_repository(path, option)`: the path and each existing folder above it are
+  compared (`os.path.samefile`) with the top folder of the repository and of every work tree that
+  `git worktree list` names (the results work tree is one); a match raises `CliError`. Git that
+  cannot list the work trees raises `CliError` too.
 
 ## 5. Tests
 

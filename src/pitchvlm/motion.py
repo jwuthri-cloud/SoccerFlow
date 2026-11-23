@@ -11,6 +11,13 @@ A hard cut starts a new shot: another camera, a replay or a close-up. No camera
 motion explains the change between the two frames of a cut, so the motion chain
 is broken there, and nothing is carried across it (``MotionField.cuts``).
 
+A dissolve blends two shots over some frames. Each frame differs from the next
+by a small step, so the test of neighbouring frames does not see it. A window
+test does: no camera motion moves the first frame of a window onto its last
+frame (``window_correlations``). Every frame of a dissolve then starts a shot of
+its own, and the frame after it starts the next shot (``find_transitions``). A
+shot of one frame carries nothing (``MotionField.transition_frames``).
+
 All matrices are 3x3 ``float64`` arrays between the pixel grids of two frames.
 """
 
@@ -20,6 +27,7 @@ import bisect
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Self
 
@@ -79,6 +87,25 @@ MIN_CUT_TEST_BLOCK_COVER = 0.5
 MIN_CUT_TEST_STD = 1.0
 #: A motion counts when at least this many blocks count.
 MIN_CUT_TEST_BLOCKS = 4
+#: Length of the window of the dissolve test, in frames: the test compares frame ``t - 30`` with
+#: frame ``t``. A dissolve of up to 29 frames lies between the two ends of some window. Chosen for
+#: the dissolves of 5 to 25 frames of the measurement, at 25 frames per second (``docs/DECISIONS.md``,
+#: entry "A dissolve is a transition, not a shot" of 2026-11-22).
+DISSOLVE_WINDOW_FRAMES = 30
+#: A window holds a transition when the chained camera motion moves its first frame onto its last
+#: with a median block correlation below this. Fixed on the synthetic seeds 0 to 9, halfway between
+#: the highest lowest window value of a found dissolve (0.087) and the lowest one of a control
+#: without a cut (0.268, a pan of 99 px per frame) (``docs/DECISIONS.md``, entry "A dissolve is a
+#: transition, not a shot"). It is lower than ``MIN_SHOT_CORRELATION``: small errors of 30 steps
+#: add up in a fast pan.
+MAX_TRANSITION_CORRELATION = 0.18
+#: A frame of a transition still shows the shot of an anchor frame when the anchor frame, moved
+#: with the camera motion, explains it with a regression slope of at least this. A frame that
+#: blends in another shot with the weight ``w`` has a slope near ``1 - w``. Fixed on the synthetic
+#: seeds 0 to 9, halfway between the highest slope of a frame with a blend weight above 0.2 (0.898)
+#: and the lowest slope of a frame of the anchor's own shot (1.009) (``docs/DECISIONS.md``, entry
+#: "A dissolve is a transition, not a shot").
+MIN_SHOT_SHARE = 0.95
 
 
 def _to_grey(image: np.ndarray) -> np.ndarray:
@@ -197,6 +224,27 @@ def _block_correlation(moved: np.ndarray, target: np.ndarray) -> float | None:
     return float(np.median(values))
 
 
+def _test_size(size: tuple[int, int]) -> tuple[int, int]:
+    """Return the size (width, height) of the image of the cut tests for frames of ``size``."""
+    return CUT_TEST_WIDTH, max(1, round(CUT_TEST_WIDTH * size[1] / size[0]))
+
+
+def _test_image(grey: np.ndarray, test_size: tuple[int, int]) -> np.ndarray:
+    """Return a grey ``uint8`` image shrunk to ``test_size`` (width, height), as ``float32``."""
+    return cv2.resize(grey, test_size, interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def _moved(image: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Move a test image with a 3x3 matrix in test pixels. The answer is NaN where it covers nothing."""
+    size = (image.shape[1], image.shape[0])
+    return cv2.warpPerspective(image, matrix, size, flags=cv2.INTER_LINEAR, borderValue=np.nan)
+
+
+def _correlations(first: np.ndarray, second: np.ndarray, matrices: Sequence[np.ndarray]) -> list[float | None]:
+    """Return the block correlation of ``first`` moved with each matrix onto ``second`` (None where none counts)."""
+    return [_block_correlation(_moved(first, matrix), second) for matrix in matrices]
+
+
 def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None:
     """Return how well a camera motion explains the change from one image to the next.
 
@@ -215,19 +263,12 @@ def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.nda
     if prev_grey.shape != next_grey.shape:
         raise ValueError(f"the two images differ in size: {prev_grey.shape} and {next_grey.shape}")
     full_size = (prev_grey.shape[1], prev_grey.shape[0])
-    test_size = (CUT_TEST_WIDTH, max(1, round(CUT_TEST_WIDTH * full_size[1] / full_size[0])))
+    test_size = _test_size(full_size)
     to_test = _to_small_matrix(full_size, test_size)
     from_test = np.linalg.inv(to_test)
-    first = cv2.resize(prev_grey, test_size, interpolation=cv2.INTER_AREA).astype(np.float32)
-    second = cv2.resize(next_grey, test_size, interpolation=cv2.INTER_AREA).astype(np.float32)
-    best: float | None = None
-    for motion in [np.eye(3), *motions]:
-        matrix = to_test @ np.asarray(motion, dtype=np.float64) @ from_test
-        moved = cv2.warpPerspective(first, matrix, test_size, flags=cv2.INTER_LINEAR, borderValue=np.nan)
-        value = _block_correlation(moved, second)
-        if value is not None and (best is None or value > best):
-            best = value
-    return best
+    matrices = [to_test @ np.asarray(motion, dtype=np.float64) @ from_test for motion in [np.eye(3), *motions]]
+    values = _correlations(_test_image(prev_grey, test_size), _test_image(next_grey, test_size), matrices)
+    return max((value for value in values if value is not None), default=None)
 
 
 def is_cut(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> bool:
@@ -240,6 +281,131 @@ def is_cut(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> 
     """
     correlation = shot_correlation(prev, nxt, motions)
     return correlation is None or correlation < MIN_SHOT_CORRELATION
+
+
+def _chain(steps: Sequence[np.ndarray | None], src: int, dst: int) -> np.ndarray | None:
+    """Return the product of the steps from frame ``src`` to frame ``dst``, inverted when ``dst`` is earlier.
+
+    ``steps[i]`` maps frame ``i`` to frame ``i + 1``. The answer is None when a step between the two frames is missing.
+    """
+    first, last = min(src, dst), max(src, dst)
+    matrix = np.eye(3)
+    for step in steps[first:last]:
+        if step is None:
+            return None
+        matrix = step @ matrix
+    return matrix if src <= dst else np.linalg.inv(matrix)
+
+
+def window_correlations(images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None]) -> list[float | None]:
+    """Return the dissolve-test value of every frame: how well the camera motion explains a whole window.
+
+    ``images`` are the test images of the clip (``CUT_TEST_WIDTH`` pixels wide, ``float32``).
+    ``steps[i]`` maps test pixels of frame ``i`` to frame ``i + 1``; it is None where no
+    motion explains the pair, also into a hard cut. The value of frame ``t`` is the median block
+    correlation (``_block_correlation``) of frame ``t - DISSOLVE_WINDOW_FRAMES``, moved with the
+    chained steps of the window, with frame ``t``. Only the chained motion is tried, not the
+    identity: a pan that the chain follows explains its window, a dissolve does not, whatever
+    the motion. The value is None, so the window is not judged, for the first
+    ``DISSOLVE_WINDOW_FRAMES`` frames, when a step of the window is missing, and when the moved
+    frame covers too little of the last one (a fast pan leaves the picture within the window).
+    """
+    if len(steps) != len(images) - 1:
+        raise ValueError(f"{len(images)} images need {len(images) - 1} steps, got {len(steps)}")
+    values: list[float | None] = [None] * len(images)
+    for frame in range(DISSOLVE_WINDOW_FRAMES, len(images)):
+        matrix = _chain(steps, frame - DISSOLVE_WINDOW_FRAMES, frame)
+        if matrix is not None:
+            values[frame] = _block_correlation(_moved(images[frame - DISSOLVE_WINDOW_FRAMES], matrix), images[frame])
+    return values
+
+
+def _shot_share(anchor: np.ndarray, image: np.ndarray, matrix: np.ndarray | None) -> float | None:
+    """Return how much of the shot of an anchor image an image shows.
+
+    The answer is the regression slope of the image on the moved anchor.
+
+    ``matrix`` maps test pixels of the anchor to test pixels of the image. The slope is taken
+    over the pixels that the moved anchor covers. The answer is None when the chain is broken,
+    when the moved anchor covers less than ``MIN_CUT_TEST_BLOCK_COVER`` of the image, and when
+    the moved anchor has no contrast there.
+    """
+    if matrix is None:
+        return None
+    moved = _moved(anchor, matrix)
+    covered = np.isfinite(moved)
+    if covered.mean() < MIN_CUT_TEST_BLOCK_COVER:
+        return None
+    first = moved[covered] - moved[covered].mean()
+    if first.std() < MIN_CUT_TEST_STD:
+        return None
+    second = image[covered] - image[covered].mean()
+    return float((first * second).sum() / (first * first).sum())
+
+
+def _shows_shot(anchor: np.ndarray, image: np.ndarray, matrix: np.ndarray | None) -> bool:
+    """Tell whether an image still shows the shot of an anchor image: ``_shot_share`` of ``MIN_SHOT_SHARE`` or more."""
+    share = _shot_share(anchor, image, matrix)
+    return share is not None and share >= MIN_SHOT_SHARE
+
+
+def find_transitions(
+    images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None], values: Sequence[float | None]
+) -> list[tuple[int, int]]:
+    """Find the transitions between two shots that the test of neighbouring frames does not see: dissolves.
+
+    ``images`` and ``steps`` are as for ``window_correlations``, and ``values`` is its answer.
+    A transition lies in every run of frames whose window value is below
+    ``MAX_TRANSITION_CORRELATION``: no camera motion moves the first frame of such a window onto
+    its last. For a run from frame ``t1`` to frame ``t2``, frame ``a = t1 - DISSOLVE_WINDOW_FRAMES``
+    shows the old shot alone and frame ``z = t2`` the new shot alone, when the dissolve is
+    shorter than the window. The transition starts at the first frame after ``a`` that ``a``,
+    moved with the camera motion, no longer explains (``_shows_shot``), and ends after the last
+    frame before ``z`` that ``z`` does not explain. The motion inside a dissolve follows the
+    shot that dominates the blend: the old shot in the first half, which ``a`` tests, the new
+    shot in the second half, which ``z`` tests.
+
+    Each answer is ``(start, stop)``: frames ``start`` to ``stop - 1`` are blends of the two
+    shots, and frame ``stop`` starts the new shot. ``start == stop`` is a change without a
+    blend frame: a hard cut at ``start``. When the two tests cross (a frame that both anchors
+    explain), the frames between them are the transition; when an anchor explains every frame
+    up to the other anchor, all frames between the anchors are. Transitions that touch are merged.
+    """
+    if len(values) != len(images):
+        raise ValueError(f"{len(images)} images need {len(images)} window values, got {len(values)}")
+    runs: list[tuple[int, int]] = []
+    for frame, value in enumerate(values):
+        if value is None or value >= MAX_TRANSITION_CORRELATION:
+            continue
+        if runs and runs[-1][1] == frame - 1:
+            runs[-1] = (runs[-1][0], frame)
+        else:
+            runs.append((frame, frame))
+    transitions: list[tuple[int, int]] = []
+    for first, last in runs:
+        old, new = first - DISSOLVE_WINDOW_FRAMES, last
+        start = next(
+            (
+                frame
+                for frame in range(old + 1, new + 1)
+                if not _shows_shot(images[old], images[frame], _chain(steps, old, frame))
+            ),
+            new,
+        )
+        end = next(
+            (
+                frame
+                for frame in range(new - 1, old - 1, -1)
+                if not _shows_shot(images[new], images[frame], _chain(steps, new, frame))
+            ),
+            old,
+        )
+        span = (min(start, end + 1), max(start, end + 1))
+        if transitions and span[0] <= transitions[-1][1]:
+            transitions[-1] = (transitions[-1][0], max(transitions[-1][1], span[1]))
+        else:
+            transitions.append(span)
+    return transitions
 
 
 def _checked_step(index: int, step: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -281,6 +447,9 @@ class MotionField:
     step without a cut is a break inside one shot (the camera was too fast,
     or the frame had too few corners); the camera still stands at the same
     place there.
+
+    Every frame of a dissolve starts a shot of its own (``find_transitions``). So a
+    shot of one frame next to a cut is a transition frame (``transition_frames``).
     """
 
     def __init__(self, steps: Sequence[np.ndarray | None], cuts: Sequence[int] = ()) -> None:
@@ -350,6 +519,19 @@ class MotionField:
     def same_shot(self, first: int, second: int) -> bool:
         """Tell whether no cut lies between two frames."""
         return self.shot_of(first) == self.shot_of(second)
+
+    def transition_frames(self) -> frozenset[int]:
+        """Return the frames that form a shot of one frame: a cut starts them, and a cut or the end of the clip follows.
+
+        These are the frames of a dissolve, each a blend of two shots, and a lone frame
+        between two hard cuts. They carry nothing: no people, no ball and no pitch
+        mapping (``pipeline.run_clip``). A clip without a cut has none, also a clip of one frame.
+        """
+        if not self.cuts:
+            return frozenset()
+        starts = (0, *self.cuts)
+        ends = (*self.cuts, self.n_frames)
+        return frozenset(start for start, end in zip(starts, ends, strict=True) if end - start == 1)
 
     @classmethod
     def identity(cls, n_frames: int) -> Self:
@@ -477,13 +659,47 @@ def _people_mask(small_size: tuple[int, int], boxes: Sequence[Box], to_small: np
     return mask
 
 
-def compute_motion_field(
+@dataclass(frozen=True)
+class ShotTests:
+    """What the cut tests measured on a clip (``measure_shots``).
+
+    ``steps[i]`` is the measured camera motion from frame ``i`` to frame ``i + 1`` in
+    full-size pixels; it is None where it could not be measured and into a hard cut.
+    ``test_images`` are the frames in the pixels of the cut tests (``CUT_TEST_WIDTH`` pixels
+    wide), and ``test_steps[i]`` is the motion from frame ``i`` to frame ``i + 1`` in these
+    pixels: the measured motion when it passes the pair test alone, else the motion of the
+    pair test that explains the pair best (the identity or the last measured motion); None
+    into a hard cut. They are the input of ``window_correlations`` and
+    ``find_transitions``. ``pair_correlations[i]`` is the value of the test of frames ``i``
+    and ``i + 1`` (``shot_correlation``), and ``hard_cuts`` holds the frames where it is below
+    ``MIN_SHOT_CORRELATION`` or None. ``window_correlations[t]`` is the value of the window
+    that ends at frame ``t`` (``window_correlations``), and ``transitions`` are the
+    transitions it finds (``find_transitions``).
+    """
+
+    steps: tuple[np.ndarray | None, ...]
+    test_images: tuple[np.ndarray, ...]
+    test_steps: tuple[np.ndarray | None, ...]
+    pair_correlations: tuple[float | None, ...]
+    hard_cuts: tuple[int, ...]
+    window_correlations: tuple[float | None, ...]
+    transitions: tuple[tuple[int, int], ...]
+
+    def cuts(self) -> tuple[int, ...]:
+        """Return the frames that start a new shot: the hard cuts, every frame of a transition, the frame after it."""
+        frames = set(self.hard_cuts)
+        for start, stop in self.transitions:
+            frames.update(range(start, stop + 1))
+        return tuple(sorted(frames))
+
+
+def measure_shots(
     source: FrameSource,
     *,
     people: Mapping[int, Sequence[Box]] | None = None,
     downscale: float = 0.5,
-) -> MotionField:
-    """Measure the camera motion between all neighbouring frames of a clip.
+) -> ShotTests:
+    """Measure the camera motion between all neighbouring frames of a clip, and test for cuts and dissolves.
 
     The frames are read in order. The work is done on grey images scaled by
     ``downscale`` (for speed), and every matrix is then converted back to
@@ -492,10 +708,13 @@ def compute_motion_field(
     frames are grown by 10% and no corner is taken inside them. A pair whose
     motion cannot be measured gives a missing step.
 
-    Each pair is also tested for a hard cut (``is_cut``) with the measured
-    motion and the last measured motion of the same shot. A cut gives a
-    missing step, also when a motion was measured: static broadcast graphics
-    can give a motion across a cut. The cuts are in ``MotionField.cuts``.
+    Each pair is tested for a hard cut (``is_cut``) with the measured motion
+    and the last measured motion of the same shot. A hard cut gives a missing
+    step, also when a motion was measured: static broadcast graphics can give a
+    motion across a cut. Then the windows of the clip are tested for a
+    dissolve (``window_correlations``, ``find_transitions``). Their motion chain takes the
+    measured motion where it explains its pair alone; in a fast pan the optical flow can be
+    wrong by tens of pixels while the last motion explains the pair, and that motion is taken.
     """
     if not 0.0 < downscale <= 1.0:
         raise ValueError("downscale must be above 0 and at most 1")
@@ -504,26 +723,82 @@ def compute_motion_field(
     small_size = (max(1, round(info.width * downscale)), max(1, round(info.height * downscale)))
     to_small = _to_small_matrix(full_size, small_size)
     to_full = np.linalg.inv(to_small)
+    test_size = _test_size(small_size)
+    to_test = _to_small_matrix(small_size, test_size)
+    from_test = np.linalg.inv(to_test)
     boxes: Mapping[int, Sequence[Box]] = {} if people is None else people
 
     steps: list[np.ndarray | None] = []
-    cuts: list[int] = []
+    test_steps: list[np.ndarray | None] = []
+    pair_values: list[float | None] = []
+    hard_cuts: list[int] = []
     last_step: np.ndarray | None = None
     previous = _small_grey(source.read(0), full_size, small_size)
+    images = [_test_image(previous, test_size)]
     for frame in range(1, info.n_frames):
         current = _small_grey(source.read(frame), full_size, small_size)
+        images.append(_test_image(current, test_size))
         mask = _people_mask(small_size, [*boxes.get(frame - 1, ()), *boxes.get(frame, ())], to_small)
         step = estimate_motion(previous, current, mask=mask)
-        if is_cut(previous, current, [motion for motion in (step, last_step) if motion is not None]):
-            logger.info("clip %s: frame %d starts a new shot", info.clip_id, frame)
-            cuts.append(frame)
+        motions = [motion for motion in (step, last_step) if motion is not None]
+        matrices = [to_test @ motion @ from_test for motion in [np.eye(3), *motions]]
+        values = _correlations(images[-2], images[-1], matrices)
+        known = [(value, matrix) for value, matrix in zip(values, matrices, strict=True) if value is not None]
+        best = max(known, key=lambda pair: pair[0], default=None)  # the first of equal values
+        pair_values.append(None if best is None else best[0])
+        if best is None or best[0] < MIN_SHOT_CORRELATION:
+            hard_cuts.append(frame)
             steps.append(None)
+            test_steps.append(None)
             last_step = None
         else:
             steps.append(None if step is None else to_full @ step @ to_small)
+            # The measured motion, when it explains the pair alone, else the motion that explains it best.
+            measured_explains = step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
+            test_steps.append(matrices[1] if measured_explains else best[1])
             last_step = step if step is not None else last_step
         previous = current
-    return MotionField(steps, cuts)
+    window_values = window_correlations(images, test_steps)
+    transitions = find_transitions(images, test_steps, window_values)
+    for start, stop in transitions:
+        if start == stop:
+            logger.info("clip %s: a window test finds a cut without blend frames at frame %d", info.clip_id, start)
+        else:
+            logger.info(
+                "clip %s: frames %d to %d blend two shots, frame %d starts the next",
+                info.clip_id,
+                start,
+                stop - 1,
+                stop,
+            )
+    return ShotTests(
+        steps=tuple(steps),
+        test_images=tuple(images),
+        test_steps=tuple(test_steps),
+        pair_correlations=tuple(pair_values),
+        hard_cuts=tuple(hard_cuts),
+        window_correlations=tuple(window_values),
+        transitions=tuple(transitions),
+    )
+
+
+def compute_motion_field(
+    source: FrameSource,
+    *,
+    people: Mapping[int, Sequence[Box]] | None = None,
+    downscale: float = 0.5,
+) -> MotionField:
+    """Measure the camera motion of a clip (``measure_shots``) and return it as a motion field.
+
+    Every frame that starts a new shot is a cut of the field (``ShotTests.cuts``): a hard
+    cut, every frame of a dissolve and the frame after it. The step into a cut is missing.
+    """
+    tests = measure_shots(source, people=people, downscale=downscale)
+    cuts = tests.cuts()
+    for frame in cuts:
+        logger.info("clip %s: frame %d starts a new shot", source.info.clip_id, frame)
+    starts = set(cuts)
+    return MotionField([None if index + 1 in starts else step for index, step in enumerate(tests.steps)], cuts)
 
 
 def _propagated_record(

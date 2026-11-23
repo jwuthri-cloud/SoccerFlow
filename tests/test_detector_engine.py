@@ -566,6 +566,7 @@ def test_clip_job_names_every_frame_below_the_data_folder(tmp_path: Path, clip_o
     job = clip_job(tmp_path, clip_on_disk, "rfdetr")
     assert (job["format"], job["clip"], len(job["images"])) == ("pitchvlm-clip-job-1", CLIP_ID, N_FRAMES)
     assert job["images"][0] == f"SoccerNetGS-valid/{CLIP_ID}/img1/000001.png"
+    assert job["video_sha256"] is None
     assert job["tool"] == PipelineConfig().detector.model_dump(mode="json")
     assert clip_job(tmp_path, clip_on_disk, "pnlcalib")["tool"] == PipelineConfig().calibration.model_dump(mode="json")
 

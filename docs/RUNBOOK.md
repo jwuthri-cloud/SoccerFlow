@@ -257,9 +257,9 @@ python -m pitchvlm.cli probe number --experiment configs/experiments/number_prob
 
 - Pitch probe: run the first 4 clips (20 frames) with `--max-clips 4` first. Compare `valid_share`
   and `error_m.median` of the metrics file with the kill switch of gate G3 in `configs/gates.yaml`.
-  The kill switch also names five overlay images that are checked by eye. No command writes
-  such images yet: tell the owner before the kill switch is judged (`docs/DECISIONS.md`, last
-  list).
+  The kill switch counts only after five overlay images are checked by eye: write them with
+  `overlay probe ... --max-clips 4 --count 5` (subsection "Check images of the pitch mappings"
+  below) and let the owner check them before the kill switch is judged.
 - Another setting (another model, another resolution, the flex tier): copy the experiment file,
   change `name` and one value under `step`, commit when the owner asks, and run it with its own
   `--out` file.
@@ -520,6 +520,65 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
   check three things on the first clip: `n_cannot_judge` is small (a large count means that the
   paint mask misses the lines of real frames), the median score of the good mappings is high,
   and the score of a frame does not depend on the run (it is deterministic).
+
+### Check images of the pitch mappings (gate G3, free)
+
+The kill switch of gate G3 counts only after five overlay images are checked by eye
+(`overlays_checked_by_eye: 5`), and milestone M3 asks the owner to check ten. `overlay` draws
+the pitch lines of chosen mappings on their frames (magenta, 70 % opaque, thin, so the white
+paint stays visible beside a line) under a caption with the clip, the frame, the engine, how the
+mapping was made, and the paint alignment score or the reason why the frame cannot judge. It
+calls no model and costs nothing. The images go below `~/pitchvlm-data/overlays` (a folder inside
+a work tree of the repository is refused); the list of the chosen frames goes to `--list`, text
+for the results branch.
+
+The choice of the frames is fixed by a rule and a seed, so it cannot be steered: the frames with
+a mapping are ordered by paint score, cut into `--count` equal parts, and from each part the
+frame of the clip with the fewest picks so far is drawn (ties by a hash of the seed). Always use
+the seed `20261113` (the seed of the probe experiment files), `--count 5` for the kill switch and
+`--count 10` for M3. Do not run another seed to get other frames (rule 7).
+
+```bash
+# Kill switch of G3: the first 4 clips of the model pitch probe, from its stored answers.
+python -m pitchvlm.cli overlay probe --experiment configs/experiments/pitch_probe.yaml --root ~/pitchvlm-data \
+    --max-clips 4 --seed 20261113 --count 5 --list ../pitchvlm-results/results/overlays/pitch_probe_kill_switch.json
+# M3: all clips of the probe, the model step and PnLCalib (the run file of tool-score, section 3).
+python -m pitchvlm.cli overlay probe --experiment configs/experiments/pitch_probe.yaml --root ~/pitchvlm-data \
+    --seed 20261113 --count 10 --list ../pitchvlm-results/results/overlays/pitch_probe_m3.json
+python -m pitchvlm.cli overlay tool --experiment configs/experiments/pitch_probe_pnlcalib.yaml \
+    --root ~/pitchvlm-data --run ../pitchvlm-results/results/tools/pitch_probe_pnlcalib.json \
+    --seed 20261113 --count 10 --list ../pitchvlm-results/results/overlays/pitch_probe_pnlcalib_m3.json
+# The mappings that a run used on its keyframes (landmark fits or calibration cameras, section 11).
+python -m pitchvlm.cli overlay run --result ~/pitchvlm-data/runs/dev-detector/<clip>/result.json \
+    --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> --seed 20261113 --count 5 \
+    --list ../pitchvlm-results/results/overlays/<clip>_dev-detector.json
+```
+
+- `overlay probe` reads the stored answers of the probe only (the cache folder of section 2): a
+  frame without a stored answer stops the command with one line. Give the same `--max-clips` and
+  `--manifest` as the probe. It fits the landmarks as the probe did, so its count of frames with
+  a mapping is `n_frames_valid` of the metrics file.
+- `overlay run` draws the mapping that the run used for each keyframe: the landmark fit or the
+  camera of that frame when the run kept it, else the mapping of another frame carried with the
+  camera motion (the caption says which). A refused fit that no frame uses is not drawn; its paint
+  score is in `paint` of `result.json`. `--clip` is the clip of the run (its video or its folder).
+- A frame without a mapping gets no image. The command prints these frames grouped by the reason,
+  and the list file holds them in `frames_without_mapping`. A keyframe of a run on a frame of a
+  dissolve has the reason "a frame of a transition": the run drops the mapping of every such frame
+  (entry "A dissolve is a transition, not a shot" of `docs/DECISIONS.md`).
+- The command prints each chosen image with its clip, frame and paint score, and writes the images
+  into `~/pitchvlm-data/overlays/<name>-seed<seed>-count<count>/`. It refuses a list file or an
+  image folder that is already there.
+- **The check by eye.** Open each image. A mapping is right when the magenta lines lie on the
+  white paint wherever paint is visible (the far touchline, the halfway line, the penalty box, the
+  centre circle), and wrong when a line lies beside its paint by more than its own width over a
+  long stretch, or the lines show another part of the pitch. The pitch is symmetric: a mirrored
+  mapping looks right here; the axis check of the metrics file finds it. Write the verdict of each
+  image, `right` or `wrong`, into its field `by_eye` of the list file (it is `null` until then).
+  The list file holds clip ids, frame numbers, the engine and the paint scores: no pixel, no path
+  and no label data. Send it back with `sync` (section 6). Write the counts (for example "5 of 5
+  right") with the name of the list file into `docs/DECISIONS.md`, in the entry of the decision
+  on the kill switch or on G3.
 
 `demo` and `run` print the hard cuts of a clip and the median paint score of its keyframe
 mappings (the landmark fits of the pitch engine `model`, or the cameras of the pitch engine
@@ -1275,6 +1334,7 @@ count every observed frame, not keyframes: do not compare them with those of the
 The tools run as in section 3, in their own environments, through `tools/run_tool.py`. The
 package never imports a tool. Three commands per clip: write the clip job, run the tool on every
 frame, run the pipeline. None of them ran before with a real tool, a real clip or real weights.
+A video file (the demo clip) needs one more command first: `video-frames` (below).
 
 ```bash
 CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
@@ -1312,8 +1372,8 @@ python -m pitchvlm.cli run --clip $CLIP --labels $CLIP/Labels-GameState.json --c
   settings do not name the people engine `detector`, and the same for `--calibration`.
 - The script refuses to start when files with the names of later parts lie next to `--out`
   (`detections-0002.json` of an older run): remove them first. It deletes nothing itself.
-- A clip job reads a folder of frame images. A video file is refused: its frames must first be
-  written as numbered images below the data folder (no command does this yet).
+- A clip job reads a folder of frame images. A video file is refused: write its frames first
+  with `video-frames` ("A video file as the clip" below).
 - `result.json` holds `timing`: seconds, milliseconds per frame and frames per second of each
   stage, and `total`. The stages `detector` and `calibration` are the times that the script
   measured per frame on its device (without reading the image file); the other stages are the
@@ -1331,6 +1391,47 @@ python -m pitchvlm.cli run --clip $CLIP --labels $CLIP/Labels-GameState.json --c
   the tool run files (`docs/DECISIONS.md`, last list). Each part passes the size rule of the
   guard (measured: 37.9 bytes per detection; a part of 26 detections on each of 750 frames is
   738,558 bytes, and the guard passed on it).
+
+### A video file as the clip
+
+The tools read image files; `run` reads the video. `video-frames` writes every frame of the video
+as a PNG image (PNG keeps every pixel, so the tools see the frames that `run` decodes: same
+count, same order, same pixels) and the record of the video with its SHA-256. The clip job names
+the video by that check sum, the script copies it into the clip run, and `run` reads the clip run
+only with the video of that check sum: a run of a tool on other pixels is refused.
+
+```bash
+VIDEO=~/pitchvlm-data/footage/<clip>.mp4      # the clip id is the file name without .mp4
+SETTINGS=configs/engines/detector_calibration.yaml
+# 0. The frames of the video, into ~/pitchvlm-data/videos/<clip>/img1 and the record video.json.
+python -m pitchvlm.cli video-frames --video $VIDEO
+# 1. Clip jobs of the clip folder that video-frames wrote.
+python -m pitchvlm.cli clip-job --tool rfdetr --config $SETTINGS --clip ~/pitchvlm-data/videos/<clip> \
+    --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/<clip>/rfdetr.json
+python -m pitchvlm.cli clip-job --tool pnlcalib --config $SETTINGS --clip ~/pitchvlm-data/videos/<clip> \
+    --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/<clip>/pnlcalib.json
+# 2. The tools as above (tools/run_tool.py rfdetr and pnlcalib), with these jobs.
+# 3. The pipeline reads the video itself. A video has its own frame rate: no --fps.
+python -m pitchvlm.cli run --clip $VIDEO --config $SETTINGS \
+    --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+    --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+    --out ~/pitchvlm-data/runs/demo-detector
+```
+
+- `video-frames` and `run` refuse a video whose frames are not sure, with one line: a header
+  without a frame count, a frame count of the header that differs from the decoded frames (a
+  frame that cannot be read), and a variable frame rate (a frame more than half a frame away from
+  its time at the constant rate). OpenCV drops or repeats frames of such a video without an
+  error. Convert it to a constant frame rate first, outside this repository, and run again.
+- A damaged last frame whose bytes are only partly gone can decode without an error (measured on a
+  synthetic Motion JPEG file); the checks do not find it. Look at the last frame of the video.
+- Disk: measured on the synthetic clip of 1280 x 720 pixels, 0.64 MB per frame (100 frames:
+  63.5 MB, 2.7 s). A real clip compresses less well or better; expect about 1 to 2 MB per frame
+  at 1920 x 1080 (estimated), so about 1 GB for a clip of 30 s. The command refuses a clip folder
+  that is already there; remove it to write the frames again.
+- `run` refuses the clip run of a video with the frame folder (`--clip ~/pitchvlm-data/videos/<clip>`),
+  with another video, and the clip run of a dataset folder with a video. The line says which.
+- `--out` of `video-frames` must not lie inside a work tree of the repository (rule 2).
 
 Measurement, fixed before any run (rule 7):
 

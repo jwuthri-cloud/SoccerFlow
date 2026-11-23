@@ -8,7 +8,9 @@ outside the clip is an error, also a negative one. An image has shape
 
 from __future__ import annotations
 
+import json
 import math
+import struct
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -16,7 +18,14 @@ import cv2
 import numpy as np
 import pytest
 
-from pitchvlm.frames import ImageFolderSource, VideoFileSource, keyframe_indices
+from pitchvlm.frames import (
+    ImageFolderSource,
+    VideoFileSource,
+    check_frame_times,
+    keyframe_indices,
+    read_video_record,
+    write_video_frames,
+)
 from pitchvlm.schemas import ClipInfo
 
 #: Size of the test images. Height and width differ so that a swap is found.
@@ -378,3 +387,168 @@ def test_video_read_outside_the_clip_is_an_error(tmp_path: Path) -> None:
         with pytest.raises(IndexError):
             source.read(frame)
     assert level_of(source.read(2), levels) == levels[2]
+
+
+# --- Checks of a video, and its frames written as images ---------------------------------
+
+
+def write_mjpeg_avi(path: Path, frames: Sequence[np.ndarray], fps: float) -> None:
+    """Write a Motion JPEG AVI video. The test is skipped when this OpenCV build cannot write one."""
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+    if not writer.isOpened():
+        pytest.skip("this OpenCV build cannot write a Motion JPEG video")
+    for frame in frames:
+        writer.write(frame)
+    writer.release()
+
+
+def _mp4_box_path(data: bytes, start: int, end: int, wanted: bytes, path: list[int]) -> list[int] | None:
+    """Return the offsets of the boxes from the top down to the first box of type ``wanted``, or None."""
+    containers = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+    offset = start
+    while offset < end:
+        size, kind = struct.unpack(">I4s", data[offset : offset + 8])
+        if kind == wanted:
+            return [*path, offset]
+        if kind in containers:
+            found = _mp4_box_path(data, offset + 8, offset + size, wanted, [*path, offset])
+            if found is not None:
+                return found
+        offset += size
+    return None
+
+
+def make_variable_rate(video: Path, out: Path) -> None:
+    """Copy an mp4v video of OpenCV and give its second half frames that last twice as long.
+
+    The time-to-sample box ``stts`` of the copy has two entries in the place of one, so its
+    frames are not at a constant rate. The boxes that hold it grow by 8 bytes. OpenCV writes
+    the box ``moov`` after the media data, so no offset of a sample moves.
+    """
+    data = bytearray(video.read_bytes())
+    path = _mp4_box_path(bytes(data), 0, len(data), b"stts", [])
+    assert path is not None, "the video has no time-to-sample box"
+    stts = path[-1]
+    size = struct.unpack(">I", data[stts : stts + 4])[0]
+    entries, n_samples, delta = struct.unpack(">III", data[stts + 12 : stts + 24])
+    assert (size, entries) == (24, 1), "the test expects one entry, as OpenCV writes it"
+    half = n_samples // 2
+    data[stts : stts + size] = struct.pack(">I4sIIIIII", 32, b"stts", 0, 2, half, delta, n_samples - half, 2 * delta)
+    for parent in path[:-1]:
+        grown = struct.unpack(">I", data[parent : parent + 4])[0] + 32 - size
+        data[parent : parent + 4] = struct.pack(">I", grown)
+    out.write_bytes(bytes(data))
+
+
+def textured_frames(count: int) -> list[np.ndarray]:
+    """Return frames with random pixels, each one different: a lossy codec keeps them apart."""
+    rng = np.random.default_rng(5)
+    return [rng.integers(0, 256, size=(*VIDEO_SIZE, 3), dtype=np.uint8) for _ in range(count)]
+
+
+def test_frame_times_of_a_constant_rate_pass_also_with_a_late_first_frame() -> None:
+    check_frame_times(Path("v.mp4"), [0.0, 40.0, 80.0, 120.0], fps=25.0, header_frames=4.0)
+    check_frame_times(Path("v.mp4"), [500.0, 540.0, 580.4, 619.7], fps=25.0, header_frames=4.0)
+
+
+@pytest.mark.parametrize(
+    ("times_ms", "header_frames", "words"),
+    [
+        ([0.0, 40.0, 80.0], 0.0, "names no frame count"),
+        ([0.0, 40.0, 80.0], -1.0, "names no frame count"),
+        ([0.0, 40.0, 80.0], 4.0, "its header names 4 frames, but 3 frames can be decoded"),
+        ([0.0, 40.0, 80.0, 120.0], 3.0, "its header names 3 frames, but 4 frames can be decoded"),
+        ([0.0, 40.0, 120.0, 160.0], 4.0, "frame 2 is shown at 120.0 ms"),
+        ([0.0, 40.0, 40.0, 80.0], 4.0, "frame 2 is shown at 40.0 ms"),
+        ([0.0, 40.0, 80.0, 160.0, 240.0], 5.0, "variable frame rate"),
+    ],
+)
+def test_frame_times_that_are_not_sure_are_refused(
+    times_ms: list[float], header_frames: float, words: str
+) -> None:
+    with pytest.raises(OSError, match=words):
+        check_frame_times(Path("v.mp4"), times_ms, fps=25.0, header_frames=header_frames)
+
+
+def test_video_with_a_variable_frame_rate_is_refused(tmp_path: Path) -> None:
+    """OpenCV decodes such a video with frames left out: the source refuses it with the line about the rate."""
+    constant = tmp_path / "constant.mp4"
+    write_video(constant, textured_frames(10), fps=25.0)
+    assert VideoFileSource(constant).info.n_frames == 10
+    variable = tmp_path / "variable.mp4"
+    make_variable_rate(constant, variable)
+    with pytest.raises(OSError, match="variable frame rate"):
+        VideoFileSource(variable)
+
+
+def test_video_with_a_frame_that_cannot_be_read_is_refused(tmp_path: Path) -> None:
+    """The end of the file is cut off: the header names more frames than can be decoded.
+
+    The cut takes about one and a half frames. A cut of a few bytes only is not found: the
+    decoder of OpenCV gives the damaged last frame without an error.
+    """
+    whole = tmp_path / "whole.avi"
+    write_mjpeg_avi(whole, textured_frames(10), fps=25.0)
+    assert VideoFileSource(whole).info.n_frames == 10
+    data = whole.read_bytes()
+    cut = tmp_path / "cut.avi"
+    cut.write_bytes(data[: len(data) - 15 * len(data) // 100])
+    with pytest.raises(OSError, match="its header names 10 frames, but [89] frames can be decoded"):
+        VideoFileSource(cut)
+
+
+def test_written_frames_are_the_frames_of_the_video_source(tmp_path: Path) -> None:
+    """The images that a tool reads are the frames that ``run`` reads: same count, same order, same pixels.
+
+    The video has more frames than the source keeps in memory, so the images come from the
+    decoder that runs forward, and the second read of the video starts it again.
+    """
+    video = tmp_path / "match_07.mp4"
+    write_video(video, textured_frames(20), fps=25.0)
+    source = VideoFileSource(video)
+    record = write_video_frames(source, "a" * 64, tmp_path / "data" / "match_07")
+    clip_folder = tmp_path / "data" / "match_07"
+    assert sorted(path.name for path in clip_folder.iterdir()) == ["img1", "video.json"]
+    assert [path.name for path in sorted((clip_folder / "img1").iterdir())] == [
+        f"{frame + 1:06d}.png" for frame in range(20)
+    ]
+    assert read_video_record(clip_folder) == record
+    assert (record.video, record.video_sha256, record.n_frames) == ("match_07.mp4", "a" * 64, 20)
+    assert (record.width, record.height, record.fps) == (VIDEO_SIZE[1], VIDEO_SIZE[0], source.info.fps)
+    images = ImageFolderSource(clip_folder / "img1", "match_07", fps=source.info.fps)
+    again = VideoFileSource(video)
+    assert images.info == again.info
+    for frame in range(20):
+        assert np.array_equal(images.read(frame), again.read(frame)), f"frame {frame}"
+    # The frames differ from each other, so a shift of the order would fail above.
+    assert not np.array_equal(again.read(0), again.read(1))
+
+
+def test_frames_are_not_written_over_a_folder_and_a_failure_leaves_no_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    write_video(video, textured_frames(4), fps=25.0)
+    source = VideoFileSource(video)
+    taken = tmp_path / "data" / "clip"
+    taken.mkdir(parents=True)
+    with pytest.raises(FileExistsError, match="is already there"):
+        write_video_frames(source, "b" * 64, taken)
+    written: list[str] = []
+
+    def fail_third(path: str, image: np.ndarray, params: Sequence[int]) -> bool:
+        written.append(path)
+        return len(written) < 3
+
+    monkeypatch.setattr(cv2, "imwrite", fail_third)
+    with pytest.raises(OSError, match="cannot write the image"):
+        write_video_frames(source, "b" * 64, tmp_path / "data" / "other")
+    assert sorted(path.name for path in (tmp_path / "data").iterdir()) == ["clip"]
+
+
+def test_video_record_is_none_without_a_file_and_refused_with_wrong_content(tmp_path: Path) -> None:
+    assert read_video_record(tmp_path) is None
+    (tmp_path / "video.json").write_text(json.dumps({"format": "pitchvlm-video-frames-1"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="video.json"):
+        read_video_record(tmp_path)
