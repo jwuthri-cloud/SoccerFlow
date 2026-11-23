@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from pitchvlm.ball import BallCandidate, track_ball
+from pitchvlm.ball import BallCandidate, BallTrack, track_ball
 from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig, model_label
 from pitchvlm.fill import dense_frame_states
 from pitchvlm.frames import FrameSource, keyframe_indices
@@ -43,7 +43,7 @@ from pitchvlm.geometry import (
     matrix_from_record,
     paint_alignment,
 )
-from pitchvlm.kitcolour import fit_kit_clusters, kit_roles, torso_feature
+from pitchvlm.kitcolour import KitClusters, fit_kit_clusters, kit_roles, torso_feature
 from pitchvlm.motion import MotionField, MotionWarp, bridged_warp, compute_motion_field, propagate_homographies
 from pitchvlm.pitch import inside_pitch
 from pitchvlm.roster import Roster
@@ -914,6 +914,30 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
     two different features, or two clusters that are not two kits: ``KitClusters.two_kits``),
     every person keeps the team key ``none`` and a warning says so.
     """
+    clusters, features = clip_kit_clusters(source, people)
+    if clusters is None:
+        return list(people)
+    return [
+        FramePeople(
+            frame=frame_people.frame,
+            people=tuple(
+                person.model_copy(update={"team_key": clusters.team_key(feature)})
+                for person, feature in zip(frame_people.people, frame_features, strict=True)
+            ),
+        )
+        for frame_people, frame_features in zip(people, features, strict=True)
+    ]
+
+
+def clip_kit_clusters(
+    source: FrameSource, people: Sequence[FramePeople]
+) -> tuple[KitClusters | None, list[list[np.ndarray | None]]]:
+    """Fit the two kit clusters of a clip on the torso features of all its people (``_kit_team_keys``).
+
+    The answer is the clusters, or None with a warning when the clip does not have two kit
+    colours, and the torso feature of every person of every frame (None where the torso is
+    too small). The streaming path takes these clusters as its control (``stream``).
+    """
     features: list[list[np.ndarray | None]] = []
     for frame_people in people:
         if not frame_people.people:
@@ -928,7 +952,7 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
             source.info.clip_id,
             len(known),
         )
-        return list(people)
+        return None, features
     clusters = fit_kit_clusters(np.stack(known), seed=KIT_CLUSTER_SEED)
     if not clusters.two_kits():
         logger.warning(
@@ -937,17 +961,8 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
             source.info.clip_id,
             len(known),
         )
-        return list(people)
-    return [
-        FramePeople(
-            frame=frame_people.frame,
-            people=tuple(
-                person.model_copy(update={"team_key": clusters.team_key(feature)})
-                for person, feature in zip(frame_people.people, frame_features, strict=True)
-            ),
-        )
-        for frame_people, frame_features in zip(people, features, strict=True)
-    ]
+        return None, features
+    return clusters, features
 
 
 def _detector_tracks(
@@ -1234,17 +1249,21 @@ def _with_ball(
     )
     result: list[FrameState] = []
     for state in frames:
-        box = track.boxes.get(state.frame)
-        if box is None:
-            result.append(state)
-            continue
-        position = to_pitch(state.frame, np.array([box.foot], dtype=np.float64))
-        pitch: dict[str, float] = {}
-        if position is not None and np.isfinite(position).all() and bool(inside_pitch(position, margin_m)[0]):
-            pitch = {"pitch_x": float(position[0, 0]), "pitch_y": float(position[0, 1])}
-        ball = BallState(box=box, observed=state.frame in track.observed, **pitch)
-        result.append(state.model_copy(update={"ball": ball}))
+        ball = ball_state(track, state.frame, to_pitch, margin_m)
+        result.append(state if ball is None else state.model_copy(update={"ball": ball}))
     return result
+
+
+def ball_state(track: BallTrack, frame: int, to_pitch: PitchMap, margin_m: float) -> BallState | None:
+    """Return the ball of one frame from the ball tracker, or None when the frame has none (see ``_with_ball``)."""
+    box = track.boxes.get(frame)
+    if box is None:
+        return None
+    position = to_pitch(frame, np.array([box.foot], dtype=np.float64))
+    pitch: dict[str, float] = {}
+    if position is not None and np.isfinite(position).all() and bool(inside_pitch(position, margin_m)[0]):
+        pitch = {"pitch_x": float(position[0, 0]), "pitch_y": float(position[0, 1])}
+    return BallState(box=box, observed=frame in track.observed, **pitch)
 
 
 def _model_engine(settings: StepSettings) -> str:

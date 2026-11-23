@@ -10,7 +10,7 @@ which the box of the person lies outside the image is not filled either.
 from __future__ import annotations
 
 import bisect
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -166,6 +166,20 @@ def _track_states(
     if not anchor_frames:
         return []
     frames = _filled_frames(anchor_frames, max_fill_gap_frames, cuts)
+    return _states_at(track, role, frames, anchor_frames, anchor_xy, warp, image_size, pitch_margin_m)
+
+
+def _states_at(
+    track: Track,
+    role: Role,
+    frames: np.ndarray,
+    anchor_frames: Sequence[int],
+    anchor_xy: np.ndarray,
+    warp: MotionWarp,
+    image_size: tuple[int, int],
+    pitch_margin_m: float,
+) -> list[tuple[int, PlayerState]]:
+    """Return the states of a track in some of its filled frames, from its anchors (see ``_track_states``)."""
     positions = np.column_stack(
         [np.interp(frames, anchor_frames, anchor_xy[:, 0]), np.interp(frames, anchor_frames, anchor_xy[:, 1])]
     )
@@ -179,6 +193,53 @@ def _track_states(
             state = PlayerState(**attributes, box=box, pitch_x=pitch_x, pitch_y=pitch_y, observed=observed)
             states.append((frame, state))
     return states
+
+
+def _track_state_at(
+    track: Track,
+    role: Role,
+    matrices: Mapping[int, np.ndarray],
+    warp: MotionWarp,
+    image_size: tuple[int, int],
+    max_fill_gap_frames: int,
+    pitch_margin_m: float,
+    cuts: Sequence[int],
+    frame: int,
+) -> list[tuple[int, PlayerState]]:
+    """Return the state of one track in one frame as at most one (frame, state) pair: ``_track_states`` at that frame.
+
+    Only the anchors next to the frame are mapped: the frame is filled only between the two
+    anchors that follow each other around it, so the other anchors do not change its state.
+    """
+    observations = track.observations
+    index = bisect.bisect_right(observations, frame, key=lambda observation: observation.frame)
+    before = _nearest_anchor(observations, range(index - 1, -1, -1), matrices)
+    after = before if before is not None and before[0] == frame else None
+    if after is None:
+        after = _nearest_anchor(observations, range(index, len(observations)), matrices)
+    near = [anchor for anchor in (before, after) if anchor is not None]
+    if not near:
+        return []
+    anchor_frames = sorted({anchor_frame for anchor_frame, _ in near})
+    anchor_xy = np.array([dict(near)[anchor_frame] for anchor_frame in anchor_frames], dtype=np.float64)
+    frames = _filled_frames(anchor_frames, max_fill_gap_frames, cuts)
+    frames = frames[frames == frame]
+    return _states_at(track, role, frames, anchor_frames, anchor_xy, warp, image_size, pitch_margin_m)
+
+
+def _nearest_anchor(
+    observations: Sequence[TrackObs], order: Iterable[int], matrices: Mapping[int, np.ndarray]
+) -> tuple[int, np.ndarray] | None:
+    """Return the first observation in ``order`` that is an anchor (``_anchors``), as (frame, pitch position)."""
+    for index in order:
+        observation = observations[index]
+        matrix = matrices.get(observation.frame)
+        if matrix is None:
+            continue
+        position = apply_homography(matrix, np.array([observation.box.foot]))[0]
+        if np.isfinite(position).all():
+            return observation.frame, position
+    return None
 
 
 def dense_frame_states(
@@ -234,6 +295,69 @@ def dense_frame_states(
     frame is filled between two observations that a cut separates: the next
     shot shows another camera or another moment.
     """
+    players: list[list[PlayerState]] = [[] for _ in range(n_frames if n_frames > 0 else 0)]
+    for frame, state in _states(
+        tracks,
+        homographies,
+        n_frames,
+        warp=warp,
+        image_size=image_size,
+        max_fill_gap_frames=max_fill_gap_frames,
+        pitch_margin_m=pitch_margin_m,
+        cuts=cuts,
+        only_frame=None,
+    ):
+        players[frame].append(state)
+    return [FrameState(frame=frame, players=tuple(states)) for frame, states in enumerate(players)]
+
+
+def players_in_frame(
+    tracks: Sequence[Track],
+    homographies: Sequence[HomographyRecord],
+    frame: int,
+    *,
+    n_frames: int,
+    warp: MotionWarp,
+    image_size: tuple[int, int],
+    max_fill_gap_frames: int,
+    pitch_margin_m: float = 3.0,
+    cuts: Sequence[int] = (),
+) -> tuple[PlayerState, ...]:
+    """Return the players of one frame: ``dense_frame_states(...)[frame].players``, without the other frames.
+
+    The streaming path (``stream``) asks for one frame at a time; building the states of every
+    frame would cost time that grows with the clip. The arguments and the checks are those
+    of ``dense_frame_states``; ``frame`` must be a frame of the clip.
+    """
+    if not 0 <= frame < n_frames:
+        raise ValueError(f"frame {frame} is outside the clip of {n_frames} frames")
+    states = _states(
+        tracks,
+        homographies,
+        n_frames,
+        warp=warp,
+        image_size=image_size,
+        max_fill_gap_frames=max_fill_gap_frames,
+        pitch_margin_m=pitch_margin_m,
+        cuts=cuts,
+        only_frame=frame,
+    )
+    return tuple(state for _, state in states)
+
+
+def _states(
+    tracks: Sequence[Track],
+    homographies: Sequence[HomographyRecord],
+    n_frames: int,
+    *,
+    warp: MotionWarp,
+    image_size: tuple[int, int],
+    max_fill_gap_frames: int,
+    pitch_margin_m: float,
+    cuts: Sequence[int],
+    only_frame: int | None,
+) -> list[tuple[int, PlayerState]]:
+    """Return the (frame, state) pairs of all tracks, track after track (see ``dense_frame_states``)."""
     if n_frames <= 0:
         raise ValueError("n_frames must be positive")
     if max_fill_gap_frames < 0:
@@ -244,7 +368,7 @@ def dense_frame_states(
     if width <= 0 or height <= 0:
         raise ValueError(f"image_size must be (width, height) with positive values, got {image_size}")
     matrices = _matrices_by_frame(homographies, n_frames)
-    players: list[list[PlayerState]] = [[] for _ in range(n_frames)]
+    pairs: list[tuple[int, PlayerState]] = []
     seen_ids: set[int] = set()
     for track in tracks:
         if track.role is None:
@@ -256,9 +380,22 @@ def dense_frame_states(
             raise ValueError(
                 f"track {track.track_id} has an observation in frame {track.last_frame}, the clip has {n_frames} frames"
             )
-        states = _track_states(
-            track, track.role, matrices, warp, image_size, max_fill_gap_frames, pitch_margin_m, cuts
-        )
-        for frame, state in states:
-            players[frame].append(state)
-    return [FrameState(frame=frame, players=tuple(states)) for frame, states in enumerate(players)]
+        if only_frame is None:
+            pairs.extend(
+                _track_states(track, track.role, matrices, warp, image_size, max_fill_gap_frames, pitch_margin_m, cuts)
+            )
+        elif track.first_frame <= only_frame <= track.last_frame:
+            pairs.extend(
+                _track_state_at(
+                    track,
+                    track.role,
+                    matrices,
+                    warp,
+                    image_size,
+                    max_fill_gap_frames,
+                    pitch_margin_m,
+                    cuts,
+                    only_frame,
+                )
+            )
+    return pairs

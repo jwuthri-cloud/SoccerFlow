@@ -74,8 +74,13 @@ def track_ball(
     warp: MotionWarp,
     max_gap_frames: int,
     cuts: Sequence[int] = (),
+    first_frame: int = 0,
 ) -> BallTrack:
     """Choose at most one ball candidate per frame, and fill the frames between the sightings of a run.
+
+    ``first_frame`` is the first frame that the tracker looks at: the window of the streaming
+    path (``stream``) starts there, so its time does not grow with the clip. A candidate of an
+    earlier frame raises ``ValueError``.
 
     ``candidates`` maps a frame to its candidates; a frame that is not in it has none.
     ``cuts`` holds the frames that start a new shot (``MotionField.cuts``), in increasing
@@ -88,12 +93,14 @@ def track_ball(
         raise ValueError(f"fps must be a finite number above 0, got {fps}")
     if max_gap_frames < 0:
         raise ValueError(f"max_gap_frames must not be negative, got {max_gap_frames}")
+    if first_frame < 0 or (first_frame > 0 and first_frame >= n_frames):
+        raise ValueError(f"first_frame must be a frame of the clip of {n_frames} frames, got {first_frame}")
     for frame, found in candidates.items():
-        if not 0 <= frame < n_frames or any(candidate.frame != frame for candidate in found):
+        if not first_frame <= frame < n_frames or any(candidate.frame != frame for candidate in found):
             raise ValueError(f"the candidates of frame {frame} do not belong to frame {frame} of a clip of {n_frames}")
     if any(not 0 < cut < n_frames for cut in cuts) or any(b <= a for a, b in zip(cuts, cuts[1:], strict=False)):
         raise ValueError(f"cuts must be increasing frames from 1 to {n_frames - 1}, got {list(cuts)}")
-    runs = _runs(candidates, n_frames, fps, warp, max_gap_frames, frozenset(cuts))
+    runs = _runs(candidates, n_frames, fps, warp, max_gap_frames, frozenset(cuts), first_frame)
     kept = [run for run in runs if len(run) >= MIN_RUN_SIGHTINGS]
     boxes: dict[int, Box] = {}
     observed: set[int] = set()
@@ -133,6 +140,7 @@ def _runs(
     warp: MotionWarp,
     max_gap_frames: int,
     cuts: frozenset[int],
+    first_frame: int,
 ) -> list[list[tuple[int, Box]]]:
     """Follow the ball through the clip and return its runs: lists of (frame, box) in frame order.
 
@@ -141,7 +149,7 @@ def _runs(
     runs: list[list[tuple[int, Box]]] = []
     run: list[tuple[int, Box]] = []
     velocity = np.zeros(2)  # pixels per frame, in the image of the last sighting
-    for frame in range(n_frames):
+    for frame in range(first_frame, n_frames):
         found = candidates.get(frame, ())
         if run and frame in cuts:
             runs.append(run)

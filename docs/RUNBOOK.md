@@ -1545,3 +1545,49 @@ and refuses `train`, the converter does not exist, and the training has no job i
   the dev clips (section 11). Ultralytics weights are not an option for this repository: their
   code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time
   detector engine next to the model engine" of 2026-11-22).
+
+## 13 Streaming path of the detector engine (2026-11-23)
+
+The detector engine one frame at a time: the state of frame `t` is decided once frame `t + delay`
+is in, and stays as it was given (`docs/DECISIONS.md`, entry "A streaming path for the detector
+engine" of 2026-11-23). It runs on the same clip runs as `run` (section 11), on the lines of a
+stream (a file, or `-` for a pipe of a tool process), or on the synthetic clip with the
+stand-ins. It makes no model call and costs nothing. Only the settings of
+`configs/engines/detector_calibration.yaml` stream: the number step works on whole tracks.
+
+```bash
+# The synthetic clip with the stand-ins of the tools (build machine too).
+PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --frames 250 --delay 12 --out outputs/stream --allow-dirty
+
+# A clip of the dataset with the clip runs of section 11 (run machine).
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+SETTINGS=configs/engines/detector_calibration.yaml
+python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+    --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+    --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+    --delay 12 --out ~/pitchvlm-data/runs/dev-stream --tracker pitchvlm-stream
+
+# The same from the lines of a stream: a file here, or "--lines -" for a pipe.
+python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+    --lines ~/pitchvlm-data/streams/<clip>.jsonl --delay 12 --out ~/pitchvlm-data/runs/dev-stream-lines
+```
+
+- `--delay N` is the number of frames between a frame and its decision (default 12, 0.48 s at
+  25 fps); `--delay clip` decides every frame at the end, on the whole clip: the control, which
+  must give the result of `run` up to the kit clusters (`docs/DECISIONS.md`, entry of
+  2026-11-23). `--history` is the window before the decided frame (default 123 frames, the
+  longest join plus the votes of a team-key change). `--kit-warmup` is the number of first frames
+  on which the kit clusters are fitted (default 25).
+- The files are those of `run`: `<out>/<clip>/result.json`, the prediction file with a label
+  file, and the video. `result.json` adds `frame_timing` (the median, the 95th percentile and the
+  largest time per frame of each stage and of the whole frame, milliseconds), `tool_timing` (the
+  same for the times per frame that the tools measured) and `provenance.stream` (delay, history,
+  warm-up). The engine table names `tracks code:stream`, the delay and the history.
+- The times of the package hold no detector and no calibration: the tools ran before (a clip run)
+  or run in another process (a pipe). "Real time" needs, on the run machine, the 95th percentile
+  of the total per frame plus that of the slower tool below 40 ms at 25 fps, with the tools and
+  the stream on the same machine at the same time. Write the measured values into
+  `docs/DECISIONS.md` with the device and the load average.
+- A live pipe is not built: `tools/run_tool.py` has no mode that prints the lines of a stream yet
+  (the entry of 2026-11-23 says what it must print), and the package reads the picture of each
+  frame from `--clip`, so the pipe must come from the same frames.
