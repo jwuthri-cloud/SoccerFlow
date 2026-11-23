@@ -1775,7 +1775,7 @@ changed later (`docs/DECISIONS.md`, entry "A streaming path for the detector eng
 # stream.py
 STREAM_FORMAT = "pitchvlm-stream-1"; KIT_WARMUP_FRAMES = 25
 @dataclass(frozen=True)
-class StreamSettings: delay_frames: int | None = 12; history_frames: int | None = None; kit_warmup_frames: int = 25
+class StreamSettings: delay_frames: int | None = 25; history_frames: int | None = None; kit_warmup_frames: int = 25
     # None = the whole clip; a delay of the whole clip needs a history of the whole clip
 def default_history_frames(config: PipelineConfig, fps: float) -> int   # max_stitch_gap_s * fps + 4 * keyframe_frames = 123 at 25 fps
 def check_stream_engines(config: PipelineConfig) -> None                 # ValueError for other engines

@@ -1744,7 +1744,7 @@ stand-ins. It makes no model call and costs nothing. Only the settings of
 
 ```bash
 # The synthetic clip with the stand-ins of the tools (build machine too).
-PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --frames 250 --delay 12 --out outputs/stream --allow-dirty
+PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --frames 250 --delay 25 --out outputs/stream --allow-dirty
 
 # A clip of the dataset with the clip runs of section 11 (run machine).
 CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
@@ -1752,14 +1752,14 @@ SETTINGS=configs/engines/detector_calibration.yaml
 python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
     --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
     --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
-    --delay 12 --out ~/pitchvlm-data/runs/dev-stream --tracker pitchvlm-stream
+    --delay 25 --out ~/pitchvlm-data/runs/dev-stream --tracker pitchvlm-stream
 
 # The same from the lines of a stream: a file here, or "--lines -" for a pipe.
 python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
-    --lines ~/pitchvlm-data/streams/<clip>.jsonl --delay 12 --out ~/pitchvlm-data/runs/dev-stream-lines
+    --lines ~/pitchvlm-data/streams/<clip>.jsonl --delay 25 --out ~/pitchvlm-data/runs/dev-stream-lines
 ```
 
-- `--delay N` is the number of frames between a frame and its decision (default 12, 0.48 s at
+- `--delay N` is the number of frames between a frame and its decision (default 25, 1 s at
   25 fps); `--delay clip` decides every frame at the end, on the whole clip: the control, which
   must give the result of `run` up to the kit clusters (`docs/DECISIONS.md`, entry of
   2026-11-23). `--history` is the window before the decided frame (default 123 frames, the

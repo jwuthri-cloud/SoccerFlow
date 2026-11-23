@@ -144,7 +144,7 @@ class StreamSettings:
     ``kit_warmup_frames`` is the number of first frames on which the kit clusters are fitted.
     """
 
-    delay_frames: int | None = 12
+    delay_frames: int | None = 25
     history_frames: int | None = None
     kit_warmup_frames: int = KIT_WARMUP_FRAMES
 
