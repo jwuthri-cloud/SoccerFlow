@@ -862,8 +862,72 @@ cleaned of the key and cut. A success answer without a usage, without a cost abo
 `is_byok` raises `UnconfirmedCallError`; one with an error, a finish reason other than `stop` or no text
 raises `BilledAnswerError` with its reported cost. Reasoning tokens are a part of
 `completion_tokens`; `normalize_usage` moves them to `thought_tokens`. The response has
-`service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input is not
-built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
+`service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input: see
+the next section.
+
+### Video input (`vlm/types.py`, `vlm/video.py`, `vlm/client.py`, `vlm/cost.py`; 2026-11-23)
+
+```python
+class VideoPart(Record):            # a part of VLMRequest.parts, next to TextPart and ImagePart
+    path: Path                      # the file on the run machine, outside the repository; never stored
+    sha256: str                     # of the file bytes; the backend refuses a file with other bytes
+    mime_type: str = "video/mp4"    # video/mp4, video/mpeg, video/mov, video/webm
+    duration_s: float               # length of the whole file
+    start_s: float | None; end_s: float | None   # a range of the file (Gemini only)
+    fps: float | None               # sampling rate asked from the provider, (0, 24]; Gemini only
+    resolution: Resolution          # low, medium or high (VIDEO_RESOLUTIONS)
+    def identity(self) -> dict      # hash, type, duration, range, rate, resolution: no path, no bytes
+
+# vlm/video.py
+def write_frames_video(source, frames, path, fps) -> None   # MP4 of chosen frames; a file that is there is kept
+def frames_video_part(source, frames, *, folder, step, fps, resolution, send_fps) -> VideoPart
+def context_frames(frame, *, n_frames, clip_fps, video_fps, context) -> list[int]
+
+# vlm/steps.py
+def build_kit_legend_video_request(video, *, clip_id, video_frames, fps, settings, repeat=0) -> VLMRequest
+def build_people_video_request(video, legend, *, clip_id, video_frames, targets, fps, width, height,
+                               settings, repeat=0) -> VLMRequest
+def parse_people_video(text, *, targets, times_s, fps, width, height, coords) -> tuple[list[FramePeople], int]
+
+# vlm/cost.py
+class VideoRate: model, valid_from, tokens_per_frame[resolution], audio_tokens_per_second,
+                 default_fps, takes_clips, video_usd_per_million | None, audio_usd_per_million | None
+GEMINI_VIDEO_RATES: tuple[VideoRate, ...]
+def load_video_rates(path) -> tuple[VideoRate, ...]        # the `video` entries of openrouter_prices.yaml
+def video_input_tokens(part, rate) -> tuple[int, int]      # (frame tokens, sound tokens)
+```
+
+Contracts:
+
+- No bytes and no path of a video reach a result file. The cache key of a request with video parts
+  holds `identity()` of each part; a cassette holds the same identities under `videos`. A request
+  without video parts has neither entry, so its key and its cassette are those of before.
+- A written file is frame `k` at `k / fps` seconds: the frames are written at the sampling rate,
+  so the model sees each written frame. A video request lists its target frames by these times;
+  `parse_people_video` takes entry `k` for target `k` only when its `time_s` is within half a
+  frame interval of that time, and counts the other entries. The context of the request holds
+  `frames` (the targets, kept in a cassette), `video_frames` and `times_s`.
+- A written file is never written again: its hash is in the cache key. Its name holds a hash of
+  the decoded pixels of its frames (`frames_digest`), so new footage under an old clip name gets
+  new files. The files go to a folder of the data folder (`probe --video-dir`, default
+  `~/pitchvlm-data/video-input`), never to the cache.
+- Gemini sends a video inline (`type: video`, base64 `data`, `mime_type`, `resolution`, and
+  `processing: {type: static, start_offset, end_offset, fps}` when the part names one of them).
+  OpenRouter sends a `video_url` part with a data URL and refuses a part with a range or a rate.
+  Both refuse inline data above `client.INLINE_REQUEST_MAX_BYTES` (20,000,000 bytes) and never
+  upload a file. Rule 5 holds: `store=False` or the private routing, no sampling parameter, and
+  the video prompts identify players by shirt number and kit, never by face.
+- A model takes video only with a video rate on the day of the call: `GEMINI_VIDEO_RATES` for
+  Gemini, the `video` entries of `configs/openrouter_prices.yaml` for OpenRouter. Without one, the
+  estimate raises `KeyError` and the backend raises `VideoInputError` before any call. The
+  estimate of a video request is the text estimate of its step (`people_video`: its output once per
+  target frame) plus `video_input_tokens` at the video and sound prices of the rate (the input
+  price when the rate names none). The billed cost comes from the measured usage, as for images.
+- `FakeBackend` answers `kit_legend_video` and `people_video` from the context; it never opens the
+  file, so a test can give it a stand-in file.
+- Only the people probe (`probes.VideoProbe`, section `video` of an experiment file) and the doctor
+  (`--video`, the check `doctor.check_video`) send video. `StepSettings` and the pipeline have no
+  video setting.
 
 ### `synth.py` and `vlm/fake.py` — test world
 

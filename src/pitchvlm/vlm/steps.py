@@ -1,6 +1,10 @@
 """The four model steps: build each request and parse each answer.
 
 A builder returns a stateless request: the prompt text first, then the images.
+Two steps also have a video form, for the probe of video input: ``kit_legend_video``
+and ``people_video``. Their request sends one video part (``vlm.video``) in
+place of the images, and the people answer lists the people of several frames
+of the video, each named by its time.
 A parser turns the JSON answer of the model into a record of ``schemas.py``.
 
 What a parser does with a bad answer:
@@ -55,7 +59,7 @@ from pitchvlm.schemas import (
 )
 from pitchvlm.vlm.coords import CoordConvention, box_from_answer, point_from_answer
 from pitchvlm.vlm.prompts import PROMPT_NAMES, box_format, point_format, render_prompt
-from pitchvlm.vlm.types import ImagePart, RequestMeta, Resolution, TextPart, VLMRequest
+from pitchvlm.vlm.types import ImagePart, RequestMeta, Resolution, TextPart, VideoPart, VLMRequest
 
 _TEAM_KEYS: tuple[str, ...] = get_args(TeamKey)
 _VIEWS: tuple[str, ...] = get_args(PitchView)
@@ -67,6 +71,9 @@ _TEAM_PHRASES: dict[str, str] = {"A": "team A", "B": "team B", "none": "an unkno
 _DIAGRAM_RESOLUTION: Resolution = "medium"
 #: A shirt-number crop is larger than the box of the person by this share of the box size, on every side.
 CROP_PADDING = 0.15
+#: An entry of a video answer belongs to its target frame when its time is at most this share of
+#: the frame interval of the video away from the time of that frame.
+VIDEO_TIME_TOLERANCE = 0.5
 
 
 class ParseError(ValueError):
@@ -160,6 +167,14 @@ def _landmarks_schema(convention: CoordConvention) -> dict[str, Any]:
     return _object_schema({"view": _choice_schema(_VIEWS), "landmarks": _list_schema(landmark)})
 
 
+def _people_video_schema(convention: CoordConvention, n_targets: int) -> dict[str, Any]:
+    """Return the schema of a video people answer: one entry per target frame, with its time and its people."""
+    frame = _object_schema(
+        {"time_s": {"type": "number"}, "people": _people_schema(convention)["properties"]["people"]}
+    )
+    return _object_schema({"frames": _list_schema(frame, length=n_targets)})
+
+
 def _number_schema(n_crops: int) -> dict[str, Any]:
     return _object_schema(
         {
@@ -186,7 +201,7 @@ def _diagram_jpeg() -> bytes:
 def _request(
     *,
     text: str,
-    images: Sequence[ImagePart],
+    images: Sequence[ImagePart | VideoPart],
     schema: dict[str, Any],
     meta: RequestMeta,
     settings: StepSettings,
@@ -271,6 +286,125 @@ def build_landmarks_request(
         meta=RequestMeta(clip_id=clip_id, step="landmarks", frame=frame, repeat=repeat),
         settings=settings,
         context={},
+    )
+
+
+def _video_times(n_video_frames: int, fps: float) -> list[float]:
+    """Return the time of each frame of a written video in seconds: ``k / fps`` for frame ``k``."""
+    return [index / fps for index in range(n_video_frames)]
+
+
+def _time_text(seconds: float) -> str:
+    """Write the time of a frame for a prompt, e.g. ``1.44 s``."""
+    return f"{seconds:.2f} s"
+
+
+def _check_video(video: VideoPart, n_video_frames: int, fps: float) -> None:
+    """Refuse a video part whose file does not hold ``n_video_frames`` frames at ``fps``, or that names a range."""
+    if n_video_frames < 1:
+        raise ValueError("a video request needs at least one video frame")
+    if not 0 < fps < math.inf:
+        raise ValueError(f"the rate of a video must be a number above 0, got {fps!r}")
+    if video.start_s is not None or video.end_s is not None:
+        raise ValueError("the video part of a video step is a whole written file, without start and end")
+    if not math.isclose(video.duration_s, n_video_frames / fps, rel_tol=1e-9):
+        raise ValueError(
+            f"the video part is {video.duration_s:g} s long, but {n_video_frames} frames at {fps:g} frames per "
+            f"second are {n_video_frames / fps:g} s"
+        )
+    if video.fps is not None and not math.isclose(video.fps, fps, rel_tol=1e-9):
+        raise ValueError(f"the video part asks for {video.fps:g} frames per second, but its frames are at {fps:g}")
+
+
+def build_kit_legend_video_request(
+    video: VideoPart,
+    *,
+    clip_id: str,
+    video_frames: Sequence[int],
+    fps: float,
+    settings: StepSettings,
+    repeat: int = 0,
+) -> VLMRequest:
+    """Build the kit legend request of a clip from a video of a few of its frames.
+
+    ``video`` is the file of the frames ``video_frames`` of the clip, written at
+    ``fps`` frames per second (``vlm.video.frames_video_part``). The frames go into
+    the context, so the cache key and a stored answer name them. The answer is
+    read by ``parse_kit_legend``.
+    """
+    _check_video(video, len(video_frames), fps)
+    frames = [operator.index(frame) for frame in video_frames]
+    return _request(
+        text=render_prompt("kit_legend_video", n_video_frames=len(frames)),
+        images=[video],
+        schema=_kit_legend_schema(),
+        meta=RequestMeta(clip_id=clip_id, step="kit_legend_video", repeat=repeat),
+        settings=settings,
+        context={"frames": frames},
+    )
+
+
+def build_people_video_request(
+    video: VideoPart,
+    legend: KitLegend,
+    *,
+    clip_id: str,
+    video_frames: Sequence[int],
+    targets: Sequence[int],
+    fps: float,
+    width: int,
+    height: int,
+    settings: StepSettings,
+    repeat: int = 0,
+) -> VLMRequest:
+    """Build the request for the people of some frames of a clip, from a video of these frames and their neighbours.
+
+    ``video`` is the file of the frames ``video_frames`` of the clip, in this
+    order, written at ``fps`` frames per second: frame ``k`` of the list is at
+    ``k / fps`` seconds of the file. ``targets`` are the frames whose people the
+    answer must list; each one must be in ``video_frames``. The prompt names each
+    target by its time in the file, and the answer gives one entry per target, in
+    the order of ``targets``, with that time (``parse_people_video``). ``width``
+    and ``height`` are the size of the frames.
+
+    The context holds the targets (``frames``, which a stored answer keeps), all
+    written frames (``video_frames``) and the times of the targets (``times_s``).
+    The item names the hash of the file, so another file gives another key.
+    """
+    _check_video(video, len(video_frames), fps)
+    written = [operator.index(frame) for frame in video_frames]
+    wanted = [operator.index(frame) for frame in targets]
+    if not wanted:
+        raise ValueError("a video people request needs at least one target frame")
+    if len(set(wanted)) != len(wanted):
+        raise ValueError("the target frames of a video people request must be different")
+    missing = [frame for frame in wanted if frame not in written]
+    if missing:
+        raise ValueError(f"the target frames {missing} are not frames of the video")
+    times = _video_times(len(written), fps)
+    target_times = [times[written.index(frame)] for frame in wanted]
+    box_text = box_format(settings.coords, image="each frame", width=width, height=height)
+    text = render_prompt(
+        "people_video",
+        n_video_frames=len(written),
+        fps_text=f"{fps:g}",
+        legend=legend.prompt_text(),
+        target_times=", ".join(_time_text(seconds) for seconds in target_times),
+        box_format=box_text,
+    )
+    return _request(
+        text=text,
+        images=[video],
+        schema=_people_video_schema(settings.coords, len(wanted)),
+        meta=RequestMeta(
+            clip_id=clip_id,
+            step="people_video",
+            frame=wanted[0],
+            item=f"video-{video.sha256[:16]}",
+            repeat=repeat,
+        ),
+        settings=settings,
+        context={"frames": wanted, "video_frames": written, "times_s": target_times},
     )
 
 
@@ -515,6 +649,50 @@ def parse_people(text: str, *, frame: int, width: int, height: int, coords: Coor
     data = _load_object(text)
     people = (_person(item, width, height, coords) for item in _list_field(data, "people"))
     return FramePeople(frame=frame, people=tuple(person for person in people if person is not None))
+
+
+def parse_people_video(
+    text: str,
+    *,
+    targets: Sequence[int],
+    times_s: Sequence[float],
+    fps: float,
+    width: int,
+    height: int,
+    coords: CoordConvention,
+) -> tuple[list[FramePeople], int]:
+    """Turn the answer of a video people request into one ``FramePeople`` per target frame.
+
+    ``targets`` and ``times_s`` are the target frames and their times in the video
+    (the context of the request), and ``fps`` is the rate of the video. Entry ``k``
+    of the answer belongs to target ``k``. Its ``time_s`` must be within
+    ``VIDEO_TIME_TOLERANCE`` frame intervals of the time of that target: the model
+    then describes the right frame. An entry with another time, a missing time or
+    a missing entry gives no people for its target, and it is counted. The result
+    is the people of each target and that count. An answer without a ``frames``
+    list raises ``ParseError``. The people of an entry are read as in
+    ``parse_people``.
+    """
+    if len(targets) != len(times_s):
+        raise ValueError("every target frame needs its time")
+    data = _load_object(text)
+    entries = _list_field(data, "frames")
+    tolerance_s = VIDEO_TIME_TOLERANCE / fps
+    answers: list[FramePeople] = []
+    n_wrong_time = 0
+    for index, (frame, time_s) in enumerate(zip(targets, times_s, strict=True)):
+        entry = entries[index] if index < len(entries) else None
+        answered_time = entry.get("time_s") if isinstance(entry, dict) else None
+        people = entry.get("people") if isinstance(entry, dict) else None
+        if not _is_finite_number(answered_time) or abs(answered_time - time_s) > tolerance_s or not isinstance(
+            people, list
+        ):
+            n_wrong_time += 1
+            answers.append(FramePeople(frame=frame))
+            continue
+        found = (_person(item, width, height, coords) for item in people)
+        answers.append(FramePeople(frame=frame, people=tuple(person for person in found if person is not None)))
+    return answers, n_wrong_time
 
 
 def parse_landmarks(text: str, *, frame: int, width: int, height: int, coords: CoordConvention) -> FrameLandmarks:

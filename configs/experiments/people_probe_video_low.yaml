@@ -1,0 +1,19 @@
+# As people_probe_video.yaml, at the low media resolution: 70 instead of 280 tokens per video frame
+# (published, not measured). The same frames as people_probe.yaml (same group, seed and frames per clip).
+name: people_probe_video_low
+probe: people
+group: probe
+frames_per_clip: 5
+seed: 20261113
+repeat: 0
+step:
+  provider: gemini
+  model: gemini-4-argon
+  thinking_level: low
+  resolution: low
+  service_tier: standard
+  coords: yx_1000
+video:
+  fps: 2.0
+  context_frames: 2
+  targets_per_request: 1
