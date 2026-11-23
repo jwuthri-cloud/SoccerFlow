@@ -2980,6 +2980,288 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
       external tool (RF-DETR, Hugging Face transformers for D-FINE and RT-DETRv2, PnLCalib). It
       runs in the environment of that tool, and the package never imports it."
 
+## 2026-11-23 — A streaming path for the detector engine (session B of round 5)
+
+1. **Goal and result.** The detector engine worked on a whole clip: several of its stages look at
+   later frames, and `timing.py` gave a mean per stage only, so nothing could say whether it keeps
+   up with a live feed. Built: `stream.py`, a path that takes one frame at a time (its detections,
+   its camera, its picture) and gives the state of frame `t` once frame `t + L` is in, for a fixed
+   delay `L`; the command `stream`; per-frame times (median, 95th percentile, largest). Everything
+   here is measured on the build machine with synthetic clips and the stand-ins of the tools
+   (`fallbacks.fake`): no real detector, no real calibration, no real footage, no pipe.
+   **Result: the hypothesis holds for clips without a cut and with a hard cut from L = 5 on, and
+   fails for L = 0 and for clips with a dissolve at every L up to 25.** Recommended delay: 25 frames
+   (1 s at 25 fps), the default of `stream` now. The time per frame of the package without the tools, at L = 25: median 22.3 to 23.5 ms, 95th percentile 39.8 to 50.2 ms, largest 90 to 114 ms (3 runs, load average 22.5 to 30.6); the clip path takes a mean of 10.0 to 10.4 ms per frame on the same clip. Whether the stream keeps up with 25 fps on the run machine with the tools is not measured.
+2. **Design** (contract: `docs/ARCHITECTURE.md`, section "`stream.py`").
+   - On arrival of frame `t`, once: the camera motion and the cut tests of the pair `t - 1, t`
+     (`motion.ShotMeter`); the camera of the calibration checked with `pipeline.fit_problems`, and
+     without one the nearest earlier plausible camera moved with the motion; the people off the
+     pitch dropped; the team key of each person from the kit clusters; the matching
+     (`tracking.Associator`; a new one at each hard cut).
+   - Decision of frame `f = t - L`: the steps of the clip path that look at a whole clip run on a
+     window of frames `f - H` to `t`, with the same functions: cuts known at `t`, camera fill (the
+     rule of `propagate_homographies` among the cameras up to `t`), `kit_roles`, the split of team
+     swaps (when set), `stitch_fragments`, `finalize_tracks`, the fill of the people and of the ball.
+     `H` = 123 frames by default: the longest join (3 s) plus the votes of a team-key change on its
+     earlier side (48 frames).
+   - A given state is never changed. A window track keeps the id of its newest given observation;
+     two tracks that ask for one id get it in the order of how recently they had it. So a late
+     join or a late split changes nothing that was given and costs no extra switch.
+   - Kit clusters: fitted again on every frame of a warm-up of 25 frames, on all torso features so
+     far, then fixed; a fit that does not show two kits is tried again on every frame, on the last
+     25 frames, until one does. Fixed and not slowly updated: the kits do not change in a match, a
+     refit can swap the names `A` and `B` of the two clusters, and a slow update drifts towards a
+     mix of the kits when the light changes. The warm-up length was set on the fit seeds 100 to
+     109 (plain clip, 250 frames, n = 10 per cell; team-side accuracy of the matched people, mean
+     and lowest seed):
+
+     | detector | L | warm-up 1 | 5 | 25 | 75 |
+     |---|---|---|---|---|---|
+     | exact | 0 | 0.963 (0.894) | 0.893 (0.358) | 0.973 (0.931) | 0.973 (0.931) |
+     | exact | 12 | 0.982 (0.925) | 0.907 (0.424) | 0.990 (0.959) | 0.990 (0.959) |
+     | noisy | 0 | 0.801 (0.101) | 0.780 (0.113) | 0.984 (0.931) | 0.984 (0.931) |
+     | noisy | 12 | 0.812 (0.114) | 0.793 (0.125) | 0.993 (0.949) | 0.993 (0.950) |
+
+     A fit on 1 to 5 frames of 12 to 14 people can pass the two-kit check with a wrong split and is
+     then fixed for the whole clip (lowest seed 0.10). 25 and 75 frames gave the same numbers; 25
+     is kept (load average 27 to 56 during the run).
+   - Shared code, results of the clip path unchanged: `tracking.associate` runs the new
+     `Associator`, `motion.measure_shots` runs the new `ShotMeter`, `fill.players_in_frame` gives
+     one frame of `dense_frame_states`, `ball.track_ball` takes `first_frame`, `pipeline` has
+     `ball_state` and `clip_kit_clusters` taken out of its functions. Proof: every existing test
+     passes, and `tests/test_stream.py` checks each shared piece against the clip function
+     (the matching with forgetting, the shot tests on a dissolve, every frame of the fill, the
+     ball from a first frame) and the whole-clip control below.
+3. **Input.** Rule 4 forbids importing a tool, so the stream reads lines (`STREAM_FORMAT =
+   "pitchvlm-stream-1"`): a header line `{"format": "pitchvlm-stream-1", "clip": <clip id>,
+   "detector": <detector settings of any family>, "calibration": <PnLCalib settings>}`, then one
+   JSON object per line and per frame from frame 0, `{"frame": i, "detector": {"seconds": s,
+   "payload": <the payload of a clip run frame>}, "calibration": {"seconds": s, "payload": <the
+   payload of fallbacks.pnlcalib>}}`. `clip_run_lines` writes these lines from two clip runs and
+   `read_stream_lines` reads them one at a time (a file, or a pipe with `--lines -`). Not built
+   (session C owns `tools/run_tool.py`): a live mode of the script. Session C names the place: the
+   batch loop of `answer_frames`, where each entry is complete when it is appended. What it must
+   print, to its standard output only (log lines to the error stream), flushed after each line:
+   the header line once, then one line per frame in frame order, with `seconds` as the script
+   measures it now. The two tools run in two environments, so one process cannot fill both parts
+   of a line: either each tool prints its own lines (`{"frame", "seconds", "payload"}` after a
+   header with its settings) and a small merger, to build, zips the two pipes by frame, or the
+   reader takes two pipes. The package reads the picture of each frame from `--clip`, so a live
+   pipe also needs a frame source that gives the same frames as the tool reads (not built).
+4. **Measurement, fixed before the report run.** Hypothesis: with `L` at most 25 frames the stream
+   reaches the offline detector engine on identity switches, coverage, track ratio, role accuracy
+   and team-side accuracy. Baseline: `run_clip` (detector engine, calibration engine, no number)
+   on the same frames, detections and cameras. Controls: `L = 0`, and `L` and `H` of the whole
+   clip (`clip`; and `clip-kits`, the same with the kit clusters of the clip path, which must give
+   the result of the clip path frame for frame). Arms: `L0`, `L5`, `L12`, `L25` (with `H` = 123),
+   `clip`, `clip-kits`. Clips (`evalx/streambench.py`): 250 frames (10 s); `plain` (no cut),
+   `cut` (a hard cut at frame 125 to a moment 250 frames later), `dissolve` (a dissolve of 10
+   frames from frame 120 to the same moment; the stand-ins answer with the truth of a hard cut at
+   frame 125). A jump of 100 frames (4 s), as in the dissolve test of the video path, is not
+   seen by the window test at frame 120 on this scene (lowest window value 0.73), so 250 frames
+   were taken; at 500 frames the camera pan (period 16 s) is back near the same view. Detector:
+   `exact` boxes, and `noisy` (each person missed with a chance of 0.1, box edges with 2 px of
+   noise), fixed before the first run. Report seeds 200 to 209 (seeds 0 to 19 were used by earlier
+   sessions, 100 to 109 for the warm-up above). Values: `evalx.metrics.identity_scores` against
+   the synthetic truth, and the share of matched people (within 5 m, per frame) with the true role
+   and the true team side. Command: `PYTHONPATH=src python -m pitchvlm.evalx.streambench --seeds
+   200-209 --workers 6` on commit `25c09c0` plus the merge of `28f06ad` (load average 21 to 41).
+5. **Measured, per arm: mean (lowest to highest seed), n = 10 seeds each.**
+
+   | kind | detector | arm | cases | coverage | switches | track ratio | purity | role acc. | side acc. | equal to offline |
+   |---|---|---|---|---|---|---|---|---|---|---|
+   | plain | exact | offline | 10 | 0.964 (0.940 to 0.977) | 5.0 (4.0 to 7.0) | 1.213 (1.174 to 1.261) | 0.999 (0.990 to 1.000) | 0.977 (0.936 to 1.000) | 0.974 (0.932 to 1.000) | 10 of 10 |
+   | plain | exact | L0 | 10 | 0.960 (0.948 to 0.970) | 4.7 (4.0 to 6.0) | 1.204 (1.174 to 1.261) | 1.000 (1.000 to 1.000) | 0.974 (0.910 to 0.999) | 0.967 (0.864 to 0.999) | 0 of 10 |
+   | plain | exact | L5 | 10 | 0.968 (0.956 to 0.977) | 4.6 (4.0 to 6.0) | 1.200 (1.174 to 1.261) | 1.000 (1.000 to 1.000) | 0.979 (0.916 to 1.000) | 0.975 (0.884 to 1.000) | 0 of 10 |
+   | plain | exact | L12 | 10 | 0.967 (0.956 to 0.977) | 4.7 (4.0 to 6.0) | 1.204 (1.174 to 1.261) | 1.000 (1.000 to 1.000) | 0.987 (0.923 to 1.000) | 0.986 (0.914 to 1.000) | 0 of 10 |
+   | plain | exact | L25 | 10 | 0.967 (0.956 to 0.977) | 4.7 (4.0 to 6.0) | 1.204 (1.174 to 1.261) | 1.000 (1.000 to 1.000) | 0.996 (0.962 to 1.000) | 0.996 (0.959 to 1.000) | 0 of 10 |
+   | plain | exact | clip | 10 | 0.967 (0.956 to 0.977) | 4.7 (4.0 to 6.0) | 1.204 (1.174 to 1.261) | 1.000 (1.000 to 1.000) | 0.996 (0.963 to 1.000) | 0.996 (0.961 to 1.000) | 5 of 10 |
+   | plain | exact | clip-kits | 10 | 0.964 (0.940 to 0.977) | 5.0 (4.0 to 7.0) | 1.213 (1.174 to 1.261) | 0.999 (0.990 to 1.000) | 0.977 (0.936 to 1.000) | 0.974 (0.932 to 1.000) | 10 of 10 |
+   | plain | noisy | offline | 10 | 0.907 (0.886 to 0.928) | 97.2 (47.0 to 162.0) | 1.457 (1.391 to 1.609) | 0.999 (0.994 to 1.000) | 1.000 (0.998 to 1.000) | 1.000 (0.998 to 1.000) | 10 of 10 |
+   | plain | noisy | L0 | 10 | 0.809 (0.784 to 0.827) | 111.5 (63.0 to 158.0) | 1.461 (1.391 to 1.565) | 0.999 (0.993 to 1.000) | 0.989 (0.953 to 0.999) | 0.986 (0.935 to 0.999) | 0 of 10 |
+   | plain | noisy | L5 | 10 | 0.908 (0.885 to 0.928) | 78.9 (48.0 to 105.0) | 1.543 (1.391 to 1.826) | 0.999 (0.994 to 1.000) | 0.992 (0.953 to 1.000) | 0.991 (0.944 to 1.000) | 0 of 10 |
+   | plain | noisy | L12 | 10 | 0.908 (0.886 to 0.928) | 83.7 (48.0 to 117.0) | 1.561 (1.391 to 2.043) | 0.999 (0.994 to 1.000) | 0.996 (0.969 to 1.000) | 0.995 (0.967 to 1.000) | 0 of 10 |
+   | plain | noisy | L25 | 10 | 0.907 (0.886 to 0.928) | 90.4 (47.0 to 132.0) | 1.457 (1.391 to 1.609) | 0.999 (0.994 to 1.000) | 1.000 (0.997 to 1.000) | 1.000 (0.997 to 1.000) | 0 of 10 |
+   | plain | noisy | clip | 10 | 0.907 (0.886 to 0.928) | 97.2 (47.0 to 162.0) | 1.457 (1.391 to 1.609) | 0.999 (0.994 to 1.000) | 1.000 (0.998 to 1.000) | 1.000 (0.998 to 1.000) | 10 of 10 |
+   | plain | noisy | clip-kits | 10 | 0.907 (0.886 to 0.928) | 97.2 (47.0 to 162.0) | 1.457 (1.391 to 1.609) | 0.999 (0.994 to 1.000) | 1.000 (0.998 to 1.000) | 1.000 (0.998 to 1.000) | 10 of 10 |
+   | cut | exact | offline | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 10 of 10 |
+   | cut | exact | L0 | 10 | 0.569 (0.560 to 0.577) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.973 (0.909 to 0.999) | 0.966 (0.866 to 0.999) | 0 of 10 |
+   | cut | exact | L5 | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.977 (0.916 to 1.000) | 0.974 (0.886 to 1.000) | 0 of 10 |
+   | cut | exact | L12 | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.985 (0.923 to 1.000) | 0.984 (0.914 to 1.000) | 4 of 10 |
+   | cut | exact | L25 | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.994 (0.962 to 1.000) | 0.994 (0.959 to 1.000) | 7 of 10 |
+   | cut | exact | clip | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.997 (0.970 to 1.000) | 0.997 (0.968 to 1.000) | 9 of 10 |
+   | cut | exact | clip-kits | 10 | 0.577 (0.568 to 0.585) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 10 of 10 |
+   | cut | noisy | offline | 10 | 0.557 (0.548 to 0.566) | 102.5 (40.0 to 168.0) | 2.287 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 10 of 10 |
+   | cut | noisy | L0 | 10 | 0.497 (0.488 to 0.507) | 117.1 (48.0 to 167.0) | 2.287 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.986 (0.955 to 0.999) | 0.984 (0.938 to 0.999) | 0 of 10 |
+   | cut | noisy | L5 | 10 | 0.557 (0.548 to 0.566) | 90.4 (40.0 to 125.0) | 2.396 (2.087 to 2.870) | 1.000 (1.000 to 1.000) | 0.989 (0.955 to 1.000) | 0.988 (0.947 to 1.000) | 0 of 10 |
+   | cut | noisy | L12 | 10 | 0.557 (0.548 to 0.566) | 95.3 (40.0 to 135.0) | 2.391 (2.087 to 3.348) | 1.000 (1.000 to 1.000) | 0.993 (0.971 to 1.000) | 0.993 (0.969 to 1.000) | 0 of 10 |
+   | cut | noisy | L25 | 10 | 0.557 (0.548 to 0.566) | 98.9 (40.0 to 148.0) | 2.287 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.997 (0.981 to 1.000) | 0.997 (0.979 to 1.000) | 0 of 10 |
+   | cut | noisy | clip | 10 | 0.557 (0.548 to 0.566) | 102.5 (40.0 to 168.0) | 2.287 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 10 of 10 |
+   | cut | noisy | clip-kits | 10 | 0.557 (0.548 to 0.566) | 102.5 (40.0 to 168.0) | 2.287 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 10 of 10 |
+   | dissolve | exact | offline | 10 | 0.545 (0.535 to 0.552) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 10 of 10 |
+   | dissolve | exact | L0 | 10 | 0.621 (0.591 to 0.650) | 19.5 (18.0 to 21.0) | 1.848 (1.783 to 1.913) | 1.000 (1.000 to 1.000) | 0.962 (0.898 to 0.990) | 0.954 (0.854 to 0.989) | 0 of 10 |
+   | dissolve | exact | L5 | 10 | 0.649 (0.598 to 0.689) | 18.5 (17.0 to 21.0) | 1.804 (1.739 to 1.913) | 1.000 (1.000 to 1.000) | 0.975 (0.913 to 0.999) | 0.971 (0.883 to 0.999) | 0 of 10 |
+   | dissolve | exact | L12 | 10 | 0.736 (0.698 to 0.790) | 14.1 (12.0 to 16.0) | 1.613 (1.522 to 1.696) | 1.000 (1.000 to 1.000) | 0.985 (0.924 to 1.000) | 0.984 (0.915 to 1.000) | 0 of 10 |
+   | dissolve | exact | L25 | 10 | 0.572 (0.562 to 0.583) | 26.7 (24.0 to 28.0) | 2.161 (2.043 to 2.217) | 1.000 (1.000 to 1.000) | 0.994 (0.962 to 1.000) | 0.994 (0.959 to 1.000) | 0 of 10 |
+   | dissolve | exact | clip | 10 | 0.545 (0.535 to 0.552) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 0.997 (0.970 to 1.000) | 0.997 (0.968 to 1.000) | 9 of 10 |
+   | dissolve | exact | clip-kits | 10 | 0.545 (0.535 to 0.552) | 22.0 (22.0 to 22.0) | 1.957 (1.957 to 1.957) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 1.000 (1.000 to 1.000) | 10 of 10 |
+   | dissolve | noisy | offline | 10 | 0.527 (0.519 to 0.540) | 100.0 (39.0 to 164.0) | 2.278 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 10 of 10 |
+   | dissolve | noisy | L0 | 10 | 0.537 (0.502 to 0.564) | 115.1 (45.0 to 165.0) | 2.187 (1.957 to 2.348) | 1.000 (1.000 to 1.000) | 0.977 (0.947 to 0.991) | 0.973 (0.929 to 0.991) | 0 of 10 |
+   | dissolve | noisy | L5 | 10 | 0.650 (0.568 to 0.746) | 86.2 (31.0 to 119.0) | 2.191 (1.739 to 2.652) | 1.000 (1.000 to 1.000) | 0.986 (0.954 to 0.998) | 0.985 (0.946 to 0.998) | 0 of 10 |
+   | dissolve | noisy | L12 | 10 | 0.685 (0.629 to 0.769) | 89.2 (30.0 to 128.0) | 2.104 (1.696 to 3.130) | 1.000 (1.000 to 1.000) | 0.993 (0.971 to 1.000) | 0.992 (0.969 to 1.000) | 0 of 10 |
+   | dissolve | noisy | L25 | 10 | 0.552 (0.544 to 0.563) | 105.0 (44.0 to 155.0) | 2.543 (2.304 to 2.739) | 1.000 (1.000 to 1.000) | 0.997 (0.980 to 1.000) | 0.997 (0.978 to 1.000) | 0 of 10 |
+   | dissolve | noisy | clip | 10 | 0.527 (0.519 to 0.540) | 100.6 (39.0 to 164.0) | 2.283 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 4 of 10 |
+   | dissolve | noisy | clip-kits | 10 | 0.527 (0.519 to 0.540) | 100.6 (39.0 to 164.0) | 2.283 (2.087 to 2.435) | 1.000 (1.000 to 1.000) | 0.999 (0.992 to 1.000) | 0.999 (0.991 to 1.000) | 4 of 10 |
+
+   Paired difference against `offline` on the same seed, mean and 95 % Student t interval
+   ("all cases" when every seed gave the same difference):
+
+   | kind | detector | arm | switches vs offline | coverage vs offline | track ratio vs offline | side acc. vs offline |
+   |---|---|---|---|---|---|---|
+   | plain | exact | L0 | -0.300 [-0.783, +0.183] | -0.004 [-0.010, +0.002] | -0.009 [-0.022, +0.004] | -0.007 [-0.037, +0.022] |
+   | plain | exact | L5 | -0.400 [-0.900, +0.100] | +0.005 [-0.001, +0.011] | -0.013 [-0.028, +0.002] | +0.001 [-0.027, +0.029] |
+   | plain | exact | L12 | -0.300 [-0.783, +0.183] | +0.004 [-0.002, +0.009] | -0.009 [-0.022, +0.004] | +0.012 [-0.013, +0.037] |
+   | plain | exact | L25 | -0.300 [-0.783, +0.183] | +0.004 [-0.002, +0.009] | -0.009 [-0.022, +0.004] | +0.022 [+0.000, +0.043] |
+   | plain | exact | clip | -0.300 [-0.783, +0.183] | +0.004 [-0.002, +0.009] | -0.009 [-0.022, +0.004] | +0.022 [+0.001, +0.043] |
+   | plain | exact | clip-kits | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | plain | noisy | L0 | +14.300 [-0.611, +29.211] | -0.098 [-0.101, -0.094] | +0.004 [-0.013, +0.022] | -0.014 [-0.027, +0.000] |
+   | plain | noisy | L5 | -18.300 [-33.161, -3.439] | +0.001 [-0.001, +0.003] | +0.087 [+0.007, +0.167] | -0.009 [-0.022, +0.003] |
+   | plain | noisy | L12 | -13.500 [-24.106, -2.894] | +0.001 [-0.001, +0.003] | +0.104 [-0.053, +0.262] | -0.005 [-0.012, +0.003] |
+   | plain | noisy | L25 | -6.800 [-13.585, -0.015] | +0.001 [-0.000, +0.001] | +0.000 (all cases) | -0.000 [-0.001, +0.000] |
+   | plain | noisy | clip | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | plain | noisy | clip-kits | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | cut | exact | L0 | +0.000 (all cases) | -0.008 [-0.008, -0.008] | +0.000 (all cases) | -0.034 [-0.063, -0.005] |
+   | cut | exact | L5 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.026 [-0.051, -0.002] |
+   | cut | exact | L12 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.016 [-0.035, +0.003] |
+   | cut | exact | L25 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.006 [-0.016, +0.004] |
+   | cut | exact | clip | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.003 [-0.010, +0.004] |
+   | cut | exact | clip-kits | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | cut | noisy | L0 | +14.600 [+3.808, +25.392] | -0.061 [-0.064, -0.058] | +0.000 (all cases) | -0.016 [-0.029, -0.002] |
+   | cut | noisy | L5 | -12.100 [-24.547, +0.347] | +0.000 [-0.000, +0.000] | +0.109 [-0.023, +0.241] | -0.011 [-0.023, +0.001] |
+   | cut | noisy | L12 | -7.200 [-15.842, +1.442] | +0.000 [-0.000, +0.000] | +0.104 [-0.132, +0.340] | -0.006 [-0.015, +0.002] |
+   | cut | noisy | L25 | -3.600 [-8.501, +1.301] | +0.000 [-0.000, +0.000] | +0.000 (all cases) | -0.002 [-0.007, +0.002] |
+   | cut | noisy | clip | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | cut | noisy | clip-kits | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | dissolve | exact | L0 | -2.500 [-3.108, -1.892] | +0.076 [+0.063, +0.089] | -0.109 [-0.135, -0.082] | -0.046 [-0.075, -0.017] |
+   | dissolve | exact | L5 | -3.500 [-4.408, -2.592] | +0.104 [+0.086, +0.122] | -0.152 [-0.192, -0.113] | -0.029 [-0.054, -0.004] |
+   | dissolve | exact | L12 | -7.900 [-8.937, -6.863] | +0.191 [+0.169, +0.213] | -0.343 [-0.389, -0.298] | -0.016 [-0.035, +0.002] |
+   | dissolve | exact | L25 | +4.700 [+3.805, +5.595] | +0.027 [+0.026, +0.029] | +0.204 [+0.165, +0.243] | -0.006 [-0.016, +0.004] |
+   | dissolve | exact | clip | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.003 [-0.010, +0.004] |
+   | dissolve | exact | clip-kits | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+   | dissolve | noisy | L0 | +15.100 [+4.098, +26.102] | +0.010 [-0.003, +0.023] | -0.091 [-0.119, -0.064] | -0.026 [-0.040, -0.011] |
+   | dissolve | noisy | L5 | -13.800 [-25.309, -2.291] | +0.123 [+0.089, +0.156] | -0.087 [-0.251, +0.077] | -0.014 [-0.026, -0.001] |
+   | dissolve | noisy | L12 | -10.800 [-19.086, -2.514] | +0.158 [+0.131, +0.185] | -0.174 [-0.430, +0.082] | -0.007 [-0.015, +0.001] |
+   | dissolve | noisy | L25 | +5.000 [+0.291, +9.709] | +0.025 [+0.024, +0.027] | +0.265 [+0.234, +0.296] | -0.002 [-0.007, +0.002] |
+   | dissolve | noisy | clip | +0.600 [-0.529, +1.729] | +0.000 (all cases) | +0.004 [-0.005, +0.014] | +0.000 (all cases) |
+   | dissolve | noisy | clip-kits | +0.600 [-0.529, +1.729] | +0.000 (all cases) | +0.004 [-0.005, +0.014] | +0.000 (all cases) |
+
+6. **What the tables say.**
+   - Control `clip-kits`: equal to the clip path frame for frame in all 40 cases without a dissolve
+     and in 14 of 20 with a dissolve (exact 10 of 10, noisy 4 of 10). On the 6 noisy dissolve cases
+     that differ, the switches differ by +0.6 on average (CI -0.5 to +1.7) and the coverage not at
+     all. Inferred, not traced case by case: the matching learns the dissolve about 30 frames after it starts, so it links
+     through the blend frames before the window cuts the fragments at the cut; the new shot then
+     starts from fragments that the clip path never makes (it matches each shot on its own). This
+     is the one difference that remains with the kit clusters given. A second difference was found
+     by the second reader and fixed: a frame without a camera at arrival kept its people off the
+     pitch, where the clip path takes the camera of a later frame and drops them; the window now
+     drops them (test `test_the_control_drops_the_people_off_the_pitch_of_frames_that_had_no_camera_at_arrival`;
+     before the fix 48 of 60 frames differed).
+   - Control `clip` (kit warm-up instead of the clusters of the clip): the same as the clip path on
+     noisy clips, and on exact clips the team side is right more often (plain +0.022, CI +0.001 to
+     +0.043): a fit on the first 25 frames splits the kits better than a fit on all 250 frames in
+     some seeds. Not a claim about real kits.
+   - `L0` fails: noisy coverage -0.098 (plain) and -0.061 (cut), +14.3 and +14.6 switches. A track
+     needs 2 observations (`min_observations`), so the first frame of every track and every frame
+     after a miss, whose gap the fill closes only with a later observation, have no state.
+   - `L5` to `L25` on `plain` and `cut`: coverage within +0.005 of the baseline, team side within
+     0.03 (one interval excludes 0: cut, exact, L5, -0.026, CI -0.051 to -0.002), and fewer
+     switches than the baseline on noisy clips (L5 -18.3, L12 -13.5, L25 -6.8 on plain). Fewer
+     switches come with more ids at L5 and L12 (track ratio +0.087, CI +0.007 to +0.167, at L5 on
+     plain; +0.104, CI -0.053 to +0.262, at L12): a join that the window sees late does not take
+     back an id that was given, so a person keeps two ids where the clip path would join or swap
+     them. At L25 the track ratio is that of the baseline in every case.
+   - `dissolve`: the stream at L <= 25 is not the clip path. At L5 and L12 it carries the ids
+     across the dissolve, which the clip path never does: coverage +0.10 to +0.19 and fewer ids,
+     because the synthetic truth keeps its ids across the shot change and the synthetic people of
+     both moments match by place (purity 1.000). On real footage a dissolve leads mostly to a
+     replay or another camera, where such links are wrong. At L25 the cut is known for part of the
+     frames: +4.7 switches and track ratio +0.20 (exact). The window test knows a dissolve only
+     when its run of low windows has ended (about `DISSOLVE_WINDOW_FRAMES` = 30 frames after it
+     starts; the test bounds it by 42 frames on seed 0). An arm added after the report run, not fixed before it
+     (same seeds 200 to 209, dissolve clips only, a scratch script over `run_case`, load average 26 to
+     34): with L = 50 frames the stream equals the baseline on the dissolve clips: switches +0.000
+     (exact, all cases; noisy CI -1.6 to +1.6), coverage +0.000, track ratio +0.000 (exact) and
+     +0.004 (noisy, CI -0.005 to +0.014), team side -0.005 (CI -0.012 to +0.003) and -0.001. So the
+     gap is the lag of the window test, not the window of the decision.
+   - Hypothesis: holds on `plain` and `cut` from L = 5 (L25 closest to the baseline); fails at
+     L = 0; fails on `dissolve` for every L up to 25.
+7. **Time per frame** (`python -m pitchvlm.evalx.streambench --time --seeds 200`: plain clip, exact
+   boxes, 250 frames, 3 rounds, the order of the arms turned in each round, images drawn before the
+   runs; build machine while other sessions ran, load average given per line). The stream: median
+   / 95th percentile / largest, milliseconds per frame. The clip path has no frame samples: its
+   mean per frame.
+
+   | arm | round (order) | load | total | decide | motion | paint |
+   |---|---|---|---|---|---|---|
+   | offline | 1 | 23.2 | mean 10.35 | - | mean 7.93 | mean 1.10 |
+   | offline | 2 | 23.8 | mean 9.98 | - | mean 7.62 | mean 1.05 |
+   | offline | 3 | 23.8 | mean 10.07 | - | mean 7.49 | mean 1.07 |
+   | L0 | 1 (forward) | 23.2 | 15.82/26.82/32.95 | 7.26/8.63/24.72 | 7.47/8.37/8.78 | 0.00/11.79/13.08 |
+   | L0 | 2 (reverse) | 25.2 | 16.61/27.77/30.69 | 7.80/9.45/11.12 | 7.66/8.65/9.44 | 0.00/12.07/12.58 |
+   | L0 | 3 (forward) | 22.3 | 24.57/73.07/137.12 | 9.04/28.95/108.45 | 11.46/32.46/102.10 | 0.00/14.55/35.58 |
+   | L5 | 1 (forward) | 22.0 | 17.62/29.71/39.62 | 8.35/12.56/25.97 | 7.61/9.80/17.59 | 0.00/12.49/16.71 |
+   | L5 | 2 (reverse) | 26.9 | 18.36/29.85/34.94 | 8.88/11.29/14.38 | 7.74/10.00/12.66 | 0.00/12.58/14.86 |
+   | L5 | 3 (forward) | 24.6 | 25.24/67.87/164.24 | 11.31/28.75/91.63 | 10.24/30.12/141.67 | 0.00/15.68/92.90 |
+   | L12 | 1 (forward) | 21.0 | 20.80/47.92/156.38 | 9.62/20.60/136.17 | 8.99/26.94/55.85 | 0.00/14.05/57.24 |
+   | L12 | 2 (reverse) | 28.0 | 20.56/32.76/40.08 | 10.48/14.74/16.56 | 8.15/11.28/24.79 | 0.00/13.50/20.22 |
+   | L12 | 3 (forward) | 28.9 | 20.55/37.74/63.68 | 9.90/14.59/29.78 | 8.75/18.66/50.33 | 0.00/13.49/35.31 |
+   | L25 | 1 (forward) | 22.5 | 22.26/45.02/90.41 | 10.35/19.01/34.99 | 9.68/23.77/56.06 | 0.00/14.01/35.30 |
+   | L25 | 2 (reverse) | 27.3 | 23.54/50.17/114.43 | 10.47/20.72/103.28 | 10.15/23.46/61.39 | 0.00/14.54/27.99 |
+   | L25 | 3 (forward) | 30.6 | 22.80/39.84/104.03 | 10.30/20.35/93.92 | 9.27/15.78/32.94 | 0.00/13.88/25.73 |
+
+   These times hold no detector and no calibration (the stand-ins take no time), and the load
+   average of the machine was 21.0 to 30.6 (1 minute, 14 cores, other sessions running). Reading, with the times as measured (n = 3 runs per arm, 250 frames each):
+   - The median of the whole frame is 15.8 to 25.2 ms at every delay (40 to 63 frames per second);
+     at L = 25 it is 22.3 to 23.5 ms. The decision costs 7.3 to 11.3 ms at the median: the window
+     of 123 + L frames is run again for each frame. The stream costs about twice the mean of the
+     clip path per frame.
+   - The 95th percentile is above 40 ms in 5 of 12 runs (L0 round 3, L5 round 3, L12 round 1, L25
+     rounds 1 and 2), and the largest frame takes 31 to 164 ms. The rounds of one arm differ by up
+     to a factor of 2.7 at the 95th percentile, so the stalls follow the load of the machine more
+     than the delay. A claim of real time needs the run machine without other load.
+   - The paint score of every 12th frame (a diagnostic) costs 11.8 to 15.7 ms at the 95th
+     percentile: it alone sets most of the 95th percentile of the frame. It could run on another
+     thread or be left out of a live run (owner decision, item 10).
+8. **Not verified.** A real detector, a real calibration, real frames, a live pipe, the run machine;
+   the kit warm-up on real kits (stripes, numbers, shade, a first frame that is a close-up or a
+   replay); the warm-up against a match whose first 25 frames show few people; the time of the
+   tools on the run machine together with the stream; a dissolve on real footage; the number step
+   (it works on whole tracks and does not stream). The second reader read the code (findings in
+   item 9); the tables were read by one session.
+9. **Second read** (one subagent, before the commit): 1 major (item 6, the camera of a frame
+   without one at arrival), 2 minor (the forgetting of a short window dropped what the matching
+   needs when `H + L + max_gap_frames` is below the time a track stays live, fixed: the state of
+   the matching is kept for that time; this entry was missing), 4 small (`--history abc` gave a
+   traceback, fixed to a usage error; line numbers of a stream skipped blank lines, fixed; `track_ball`
+   on 0 frames raised, fixed; a frame `1.0` passed, refused now). Each fix has a test. Refuted by the
+   reader: the matching, the shot tests and the fill equal the old code on its own scripts; no
+   causal leak; ids unique per frame. Open small points: the `--lines` path checks the clip id but
+   not the SHA-256 of the video (a line has none), and `--frames`, `--seed` and `--fps` are ignored
+   where they do not apply.
+10. **Proposed owner decisions.**
+    - The default delay of `stream`: 25 frames (1 s), as recommended above; 5 or 12 frames are
+      closer to live with about one more id per 10 people per 10 s on noisy boxes.
+    - The dissolve: either accept that a dissolve within the delay is linked through (the stream
+      of a live match sees few dissolves outside replays), or a delay of at least the lag of the
+      window test (about 42 frames) for clips with dissolves, or a shorter window of the dissolve
+      test for the stream (a new measurement).
+    - The paint score of the keyframes in a live run: keep it (it sets most of the 95th percentile,
+      item 7), move it to another thread, or leave it out of `stream`.
+    - Whether to build the live mode of `tools/run_tool.py` (item 3) and the merger of the two tool
+      pipes. No text of `CLAUDE.md` is proposed: rule 4 stands as it is (the stream reads lines and
+      imports no tool).
+
 ## 2026-11-23 — A planted-bug check of the money guards, and a second read of the test runner
 
 1. **Question.** Which small bugs in the money code (rule 6 of `CLAUDE.md`: estimate first,
@@ -3172,6 +3454,10 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
 
 ## Open questions (to settle with measurements)
 
+- Does the streaming path keep up with 25 fps on the run machine with the tools on the same
+  machine (the 95th percentile of the package plus that of the slower tool below 40 ms), and how
+  long is the lag of the dissolve test on real dissolves (entry "A streaming path for the detector
+  engine", items 6 and 7)?
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
 - Recall on far-side players about 46 x 99 px (gate G2)?
 - Shirt-number reading at real player size (gates G5a, G5b)?

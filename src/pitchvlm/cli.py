@@ -94,7 +94,7 @@ import tempfile
 import threading
 import traceback
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -180,7 +180,19 @@ from pitchvlm.render import draw_mapping_check, render_clip, write_png
 from pitchvlm.roster import Roster, load_roster
 from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, HomographyRecord, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
-from pitchvlm.timing import StageClock
+from pitchvlm.stream import (
+    KIT_WARMUP_FRAMES,
+    DetectorStream,
+    StreamInput,
+    StreamSettings,
+    frames_text,
+    check_stream_engines,
+    clip_run_lines,
+    default_history_frames,
+    read_stream_lines,
+    stand_in_inputs,
+)
+from pitchvlm.timing import StageClock, percentiles_ms
 from pitchvlm.tracking import SWAP_MIN_VOTES
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
@@ -1822,6 +1834,251 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "provenance": provenance,
         "prediction_file": prediction_file,
         "timing": timing,
+        "diagnostics": diagnostics.as_dict(),
+        "result": result.model_dump(mode="json"),
+    }
+    write_json(clip_dir / RESULT_NAME, document)
+    print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
+    video = render_clip(source, result, clip_dir / f"{info.clip_id}.mp4")
+    print(f"video: {video}")
+    return EXIT_FAILED if problems or empty is not None else EXIT_OK
+
+
+# --- stream --------------------------------------------------------------------------
+
+
+#: What the time tables of the streaming path hold, printed with them and written into the result file.
+STREAM_TIME_NOTE = (
+    "the package times hold no detector and no calibration: the tools ran before (a clip run) or in "
+    "another process (a pipe), and the stand-ins of the synthetic clip take no time"
+)
+
+
+def _frames_or_clip(text: str) -> int | None:
+    """Read a number of frames (0 or more), or ``clip`` for the whole clip (None)."""
+    if text == "clip":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of frames or 'clip', got {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"expected 0 frames or more, got {value}")
+    return value
+
+
+def _history(text: str) -> int | None | Literal["default"]:
+    """Read ``--history``: a number of frames, ``clip``, or ``default``."""
+    return "default" if text == "default" else _frames_or_clip(text)
+
+
+def stream_settings(args: argparse.Namespace, config: PipelineConfig, fps: float) -> StreamSettings:
+    """Return the delay, the window and the kit warm-up of a ``stream`` command.
+
+    ``--history default`` (the default) is ``stream.default_history_frames``; a delay of the
+    whole clip takes a window of the whole clip.
+    """
+    delay = args.delay
+    history = args.history
+    if history == "default":
+        history = None if delay is None else default_history_frames(config, fps)
+    try:
+        return StreamSettings(delay_frames=delay, history_frames=history, kit_warmup_frames=args.kit_warmup)
+    except ValueError as error:
+        raise CliError(str(error)) from error
+
+
+def stream_inputs(
+    args: argparse.Namespace, config: PipelineConfig, info: ClipInfo, video_sha256: str | None
+) -> tuple[Iterator[StreamInput], dict[str, Any]]:
+    """Return the inputs of a ``stream`` command and the facts of where they come from.
+
+    From two clip runs (``--detections``, ``--calibration``) the lines of the stream are
+    written in memory (``stream.clip_run_lines``) and read back, the path that a pipe takes.
+    From ``--lines`` (a file, or ``-`` for the standard input) the lines are read one by one.
+    The header must name the clip and the tool settings of the settings file.
+    """
+    facts: dict[str, Any] = {}
+    if args.lines is not None:
+        if str(args.lines) == "-":
+            lines: Iterable[str] = sys.stdin
+            facts["lines"] = "standard input"
+        else:
+            lines = _lines_of(args.lines)
+            facts["lines"] = args.lines.name
+    else:
+        if args.detections is None or args.calibration is None:
+            raise CliError("stream --clip needs --detections and --calibration, or --lines")
+        detections = read_clip_run(args.detections, config.detector, info, video_sha256)
+        calibration = read_clip_run(args.calibration, config.calibration, info, video_sha256)
+        facts["detections"] = clip_run_facts(detections, args.detections)
+        facts["calibration"] = clip_run_facts(calibration, args.calibration)
+        lines = clip_run_lines(detections, calibration)
+    try:
+        header, inputs = read_stream_lines(lines)
+    except ValueError as error:
+        raise CliError(f"the stream cannot be read: {error}") from error
+    if header.clip != info.clip_id:
+        raise CliError(f"the stream is a stream of the clip {header.clip}, not of the clip {info.clip_id}")
+    if (header.detector, header.calibration) != (config.detector, config.calibration):
+        raise CliError("the stream was made with other tool settings than the settings file")
+    return _checked_inputs(inputs), facts
+
+
+def _lines_of(path: Path) -> Iterator[str]:
+    """Yield the lines of a file one by one, and close it at the end (or when the reader stops)."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            yield from handle
+    except OSError as error:
+        raise CliError(f"the lines of the stream cannot be read from {path}: {error}") from error
+
+
+def _checked_inputs(inputs: Iterator[StreamInput]) -> Iterator[StreamInput]:
+    """Pass the inputs on, and turn an error of a line into ``CliError``."""
+    try:
+        yield from inputs
+    except ValueError as error:
+        raise CliError(f"the stream cannot be read: {error}") from error
+
+
+def print_frame_timing(report: Mapping[str, Mapping[str, float]], tools: Mapping[str, Sequence[float]]) -> None:
+    """Print the per-frame time of each stage: median, 95th percentile and largest, milliseconds."""
+    print("measured time per frame (median / 95th percentile / largest, milliseconds):")
+    for stage, values in report.items():
+        print(f"  {stage}: {values['p50_ms']:.2f} / {values['p95_ms']:.2f} / {values['max_ms']:.2f}")
+    for tool, seconds in tools.items():
+        if seconds:
+            values = percentiles_ms(seconds)
+            print(
+                f"  {tool} (as the tool measured it, not in the total): {values['p50_ms']:.2f} / "
+                f"{values['p95_ms']:.2f} / {values['max_ms']:.2f}"
+            )
+    print(f"  note: {STREAM_TIME_NOTE}")
+
+
+def _cmd_stream(args: argparse.Namespace) -> int:
+    """Run the streaming path of the detector engine on a clip run, a stream of lines or the synthetic clip.
+
+    The state of frame ``t`` is decided once frame ``t + delay`` is in (``stream``). The files
+    are those of ``run``: ``<out>/<clip id>/result.json``, the prediction file with a label
+    file (the synthetic clip has its own labels), and the video. The result file also holds
+    the per-frame times (``frame_timing``). The exit code follows ``run``.
+    """
+    config = PipelineConfig(engines=DEMO_ENGINES["detector"]) if args.config is None else read_settings(args.config)
+    try:
+        check_stream_engines(config)
+    except ValueError as error:
+        raise CliError(str(error)) from error
+    state = require_clean_tree(args.allow_dirty)
+    scene: SyntheticScene | None = None
+    labels: GsrLabels | None
+    if args.synthetic:
+        if args.clip is not None or args.lines is not None or args.detections is not None or args.calibration:
+            raise CliError("stream --synthetic takes no --clip, --lines, --detections or --calibration")
+        scene = SyntheticScene(n_frames=args.frames, seed=args.seed)
+        source: FrameSource = SyntheticSource(scene)
+        labels = scene_labels(scene)
+        people, balls = fake_detector_answers(scene, seed=args.seed)
+        inputs: Iterator[StreamInput] = stand_in_inputs(people, balls, fake_calibration_answers(scene))
+        facts: dict[str, Any] = {"synthetic": {"seed": args.seed, "frames": args.frames}}
+    else:
+        if args.clip is None:
+            raise CliError("stream needs --clip (with --detections and --calibration, or --lines), or --synthetic")
+        labels = None if args.labels is None else read_labels(args.labels)
+        source = open_clip(args.clip, fps=args.fps, labels=labels)
+        if labels is not None:
+            check_labels_match(source, labels)
+        video_sha256 = file_sha256(args.clip) if args.clip.is_file() else None
+        inputs, facts = stream_inputs(args, config, source.info, video_sha256)
+    info = source.info
+    settings = stream_settings(args, config, info.fps)
+    print(
+        f"clip {info.clip_id}: {info.n_frames} frames, {info.fps:g} frames per second; streaming path with a "
+        f"delay of {frames_text(settings.delay_frames, info.fps)} and a window of "
+        f"{frames_text(settings.history_frames, info.fps)} before the decided frame"
+    )
+    print("no step of the settings asks a model: this run makes no model call and costs nothing")
+    clock = StageClock()
+    stream = DetectorStream(
+        config, settings, clip_id=info.clip_id, fps=info.fps, size=(info.width, info.height), clock=clock
+    )
+    for item in inputs:
+        if item.frame >= info.n_frames:
+            raise CliError(f"the stream holds frame {item.frame}, the clip has {info.n_frames} frames")
+        stream.push(item, partial(source.read, item.frame))
+    if stream.n_frames != info.n_frames:
+        raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
+    stream.finish()
+    result = stream.result()
+    print_shots_and_paint(result, config)
+    clip_dir = args.out / info.clip_id
+    provenance = {
+        "command": "stream",
+        "commit": state.commit,
+        "dirty": state.dirty,
+        "package_version": __version__,
+        "written_at": utc_now_text(),
+        "config": config.model_dump(mode="json"),
+        "stream": dataclasses.asdict(settings),
+        "inputs": facts,
+    }
+    problems: list[str] = []
+    prediction_file: dict[str, Any] | None = None
+    scored: tuple[int, int] | None = None
+    if labels is not None:
+        predictions = write_clip_predictions(
+            result.frames,
+            labels,
+            args.out / PREDICTIONS_FOLDER,
+            split=DEMO_SPLIT if scene is not None else args.split,
+            tracker=args.tracker,
+            clip_id=info.clip_id,
+        )
+        problems = prediction_problems(predictions, labels)
+        scored = frames_without_prediction(predictions, labels)
+        empty_frames, scored_frames = scored
+        print(f"prediction file: {predictions}")
+        print_problems(problems)
+        print(f"scored frames without a prediction: {empty_frames} of {scored_frames}")
+        prediction_file = {
+            "problems": problems,
+            "scored_frames": scored_frames,
+            "scored_frames_without_prediction": empty_frames,
+        }
+    empty = empty_result_reason(result.frames, scored)
+    if empty is not None:
+        print_empty_result(empty)
+    print_engines(result.engines)
+    print(f"ball: {sum(frame.ball is not None for frame in result.frames)} of {info.n_frames} frames")
+    identity: dict[str, Any] | None = None
+    if scene is not None:
+        truth = [scene.frame_state(frame) for frame in range(info.n_frames)]
+        scores = identity_scores(result.frames, truth)
+        identity = dataclasses.asdict(scores)
+        print(
+            f"identity against the synthetic truth: {scores.coverage:.0%} of a true track under one id, "
+            f"{scores.switches} id switches, {scores.track_ratio:.2f} predicted tracks per true track"
+        )
+    diagnostics = track_diagnostics(
+        result,
+        max_speed_mps=config.tracking.max_speed_mps,
+        team_min_votes=SWAP_MIN_VOTES * keyframe_frames(config, info.fps),
+    )
+    print_diagnostics(diagnostics.lines())
+    timing = clock.report(info.n_frames)
+    frame_timing = clock.frame_report()
+    print_timing(timing)
+    print_frame_timing(frame_timing, stream.tool_seconds)
+    tool_timing = {name: percentiles_ms(seconds) for name, seconds in stream.tool_seconds.items() if seconds}
+    document = {
+        "provenance": provenance,
+        "prediction_file": prediction_file,
+        "timing": timing,
+        "frame_timing": frame_timing,
+        "tool_timing": tool_timing,
+        "timing_note": STREAM_TIME_NOTE,
+        "identity": identity,
         "diagnostics": diagnostics.as_dict(),
         "result": result.model_dump(mode="json"),
     }
@@ -3886,6 +4143,59 @@ def _add_run(commands: Any) -> None:
     parser.set_defaults(handler=_cmd_run)
 
 
+def _add_stream(commands: Any) -> None:
+    """Add the command ``stream`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "stream", help="detector engine frame by frame with a fixed delay: the files of run, and per-frame times"
+    )
+    parser.add_argument("--out", type=_path, required=True, metavar="DIR", help="output folder, as for run")
+    parser.add_argument("--clip", type=_path, metavar="PATH", help="a folder of frame images, or a video file")
+    parser.add_argument(
+        "--synthetic", action="store_true", help="the synthetic clip with the stand-ins of the tools (no --clip)"
+    )
+    parser.add_argument(
+        "--frames", type=_positive_int, default=DEMO_FRAMES, metavar="N", help="frames of the synthetic clip"
+    )
+    parser.add_argument("--seed", type=_seed, default=0, metavar="S", help="seed of the synthetic clip (default: 0)")
+    parser.add_argument(
+        "--config", type=_path, metavar="FILE", help="settings file (YAML); default: the detector engine settings"
+    )
+    parser.add_argument("--labels", type=_path, metavar="FILE", help="label file of the clip, as for run")
+    parser.add_argument("--fps", type=_frame_rate, metavar="FPS", help="frame rate of a folder of frame images")
+    parser.add_argument("--split", default=DEFAULT_SPLIT, metavar="NAME", help="split name in the prediction path")
+    parser.add_argument("--tracker", default=DEFAULT_TRACKER, metavar="NAME", help="tracker name in the prediction path")
+    parser.add_argument("--detections", type=_path, metavar="FILE", help="first part of the clip run of the detector")
+    parser.add_argument("--calibration", type=_path, metavar="FILE", help="first part of the clip run of the calibration")
+    parser.add_argument(
+        "--lines", type=_path, metavar="FILE", help="the lines of a stream (format pitchvlm-stream-1); - for a pipe"
+    )
+    parser.add_argument(
+        "--delay",
+        type=_frames_or_clip,
+        default=StreamSettings().delay_frames,
+        metavar="N",
+        help=f"frames between a frame and its decision, or clip (default: {StreamSettings().delay_frames})",
+    )
+    parser.add_argument(
+        "--history",
+        type=_history,
+        default="default",
+        metavar="N",
+        help="frames of the window before the decided frame, clip, or default (stream.default_history_frames)",
+    )
+    parser.add_argument(
+        "--kit-warmup",
+        type=_positive_int,
+        default=KIT_WARMUP_FRAMES,
+        metavar="N",
+        help=f"first frames on which the kit clusters are fitted (default: {KIT_WARMUP_FRAMES})",
+    )
+    parser.add_argument(
+        "--allow-dirty", action="store_true", help="run on a work tree with changes; the result file says so"
+    )
+    parser.set_defaults(handler=_cmd_stream)
+
+
 def _add_doctor(commands: Any) -> None:
     """Add the command ``doctor`` to the sub-parsers object of argparse."""
     parser = commands.add_parser("doctor", help="checks of the machine, and of the model API (gate G0)")
@@ -4155,6 +4465,7 @@ def build_parser() -> argparse.ArgumentParser:
     for add_command in (
         _add_demo,
         _add_run,
+        _add_stream,
         _add_doctor,
         _add_data,
         _add_oracle,

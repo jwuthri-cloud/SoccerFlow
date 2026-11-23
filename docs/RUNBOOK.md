@@ -1732,3 +1732,49 @@ What was never tested before this machine, for video input:
 | Codec of the written files | the first doctor: the video call answers | OpenCV of this machine may not write H.264 (`avc1`) and fall back to MPEG-4 Part 2 (`mp4v`); a provider may refuse that. Tell the owner. |
 | Time of the sampled frames | `video boxes` passes on the moving camera of the synthetic scene (`video times` only shows that the model copies the listed times) | The provider samples at other times than `k / fps`: the boxes land on other frames and `video boxes` fails although `video times` passes. Stop the video probes and tell the owner. |
 | The same bytes for the same frames | a second probe run of the pilot pays nothing | The cache misses although the files were kept: something rewrote them. |
+
+## 14 Streaming path of the detector engine (2026-11-23)
+
+The detector engine one frame at a time: the state of frame `t` is decided once frame `t + delay`
+is in, and stays as it was given (`docs/DECISIONS.md`, entry "A streaming path for the detector
+engine" of 2026-11-23). It runs on the same clip runs as `run` (section 11), on the lines of a
+stream (a file, or `-` for a pipe of a tool process), or on the synthetic clip with the
+stand-ins. It makes no model call and costs nothing. Only the settings of
+`configs/engines/detector_calibration.yaml` stream: the number step works on whole tracks.
+
+```bash
+# The synthetic clip with the stand-ins of the tools (build machine too).
+PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --frames 250 --delay 25 --out outputs/stream --allow-dirty
+
+# A clip of the dataset with the clip runs of section 11 (run machine).
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+SETTINGS=configs/engines/detector_calibration.yaml
+python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+    --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+    --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+    --delay 25 --out ~/pitchvlm-data/runs/dev-stream --tracker pitchvlm-stream
+
+# The same from the lines of a stream: a file here, or "--lines -" for a pipe.
+python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+    --lines ~/pitchvlm-data/streams/<clip>.jsonl --delay 25 --out ~/pitchvlm-data/runs/dev-stream-lines
+```
+
+- `--delay N` is the number of frames between a frame and its decision (default 25, 1 s at
+  25 fps); `--delay clip` decides every frame at the end, on the whole clip: the control, which
+  must give the result of `run` up to the kit clusters (`docs/DECISIONS.md`, entry of
+  2026-11-23). `--history` is the window before the decided frame (default 123 frames, the
+  longest join plus the votes of a team-key change). `--kit-warmup` is the number of first frames
+  on which the kit clusters are fitted (default 25).
+- The files are those of `run`: `<out>/<clip>/result.json`, the prediction file with a label
+  file, and the video. `result.json` adds `frame_timing` (the median, the 95th percentile and the
+  largest time per frame of each stage and of the whole frame, milliseconds), `tool_timing` (the
+  same for the times per frame that the tools measured) and `provenance.stream` (delay, history,
+  warm-up). The engine table names `tracks code:stream`, the delay and the history.
+- The times of the package hold no detector and no calibration: the tools ran before (a clip run)
+  or run in another process (a pipe). "Real time" needs, on the run machine, the 95th percentile
+  of the total per frame plus that of the slower tool below 40 ms at 25 fps, with the tools and
+  the stream on the same machine at the same time. Write the measured values into
+  `docs/DECISIONS.md` with the device and the load average.
+- A live pipe is not built: `tools/run_tool.py` has no mode that prints the lines of a stream yet
+  (the entry of 2026-11-23 says what it must print), and the package reads the picture of each
+  frame from `--clip`, so the pipe must come from the same frames.

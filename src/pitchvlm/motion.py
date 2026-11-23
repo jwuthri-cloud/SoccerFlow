@@ -383,29 +383,53 @@ def find_transitions(
             runs.append((frame, frame))
     transitions: list[tuple[int, int]] = []
     for first, last in runs:
-        old, new = first - DISSOLVE_WINDOW_FRAMES, last
-        start = next(
-            (
-                frame
-                for frame in range(old + 1, new + 1)
-                if not _shows_shot(images[old], images[frame], _chain(steps, old, frame))
-            ),
-            new,
-        )
-        end = next(
-            (
-                frame
-                for frame in range(new - 1, old - 1, -1)
-                if not _shows_shot(images[new], images[frame], _chain(steps, new, frame))
-            ),
-            old,
-        )
-        span = (min(start, end + 1), max(start, end + 1))
-        if transitions and span[0] <= transitions[-1][1]:
-            transitions[-1] = (transitions[-1][0], max(transitions[-1][1], span[1]))
-        else:
-            transitions.append(span)
+        _add_transition(transitions, transition_span(images, steps, first, last))
     return transitions
+
+
+def transition_span(
+    images: Sequence[np.ndarray | None], steps: Sequence[np.ndarray | None], first: int, last: int
+) -> tuple[int, int]:
+    """Return the transition ``(start, stop)`` of one run of low window values, frames ``first`` to ``last``.
+
+    See ``find_transitions``, which calls this for each run. The images of the frames from
+    ``first - DISSOLVE_WINDOW_FRAMES`` to ``last`` are used, no other image: the streaming path
+    keeps only these (``ShotMeter``).
+    """
+    old, new = first - DISSOLVE_WINDOW_FRAMES, last
+    start = next(
+        (
+            frame
+            for frame in range(old + 1, new + 1)
+            if not _shows_shot(_image(images, old), _image(images, frame), _chain(steps, old, frame))
+        ),
+        new,
+    )
+    end = next(
+        (
+            frame
+            for frame in range(new - 1, old - 1, -1)
+            if not _shows_shot(_image(images, new), _image(images, frame), _chain(steps, new, frame))
+        ),
+        old,
+    )
+    return min(start, end + 1), max(start, end + 1)
+
+
+def _image(images: Sequence[np.ndarray | None], frame: int) -> np.ndarray:
+    """Return a test image that must still be kept. A forgotten image raises ``ValueError``."""
+    image = images[frame]
+    if image is None:
+        raise ValueError(f"the test image of frame {frame} was forgotten, but a transition test needs it")
+    return image
+
+
+def _add_transition(transitions: list[tuple[int, int]], span: tuple[int, int]) -> None:
+    """Append a transition, or merge it into the last one when the two touch."""
+    if transitions and span[0] <= transitions[-1][1]:
+        transitions[-1] = (transitions[-1][0], max(transitions[-1][1], span[1]))
+    else:
+        transitions.append(span)
 
 
 def _checked_step(index: int, step: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -721,65 +745,11 @@ def measure_shots(
     between two pairs with a step and the last measured motion explains it alone. A clip of
     ``DISSOLVE_WINDOW_FRAMES`` frames or fewer has no window, and an info line says so.
     """
-    if not 0.0 < downscale <= 1.0:
-        raise ValueError("downscale must be above 0 and at most 1")
     info = source.info
-    full_size = (info.width, info.height)
-    small_size = (max(1, round(info.width * downscale)), max(1, round(info.height * downscale)))
-    to_small = _to_small_matrix(full_size, small_size)
-    to_full = np.linalg.inv(to_small)
-    test_size = _test_size(small_size)
-    to_test = _to_small_matrix(small_size, test_size)
-    from_test = np.linalg.inv(to_test)
+    meter = ShotMeter((info.width, info.height), downscale=downscale)
     boxes: Mapping[int, Sequence[Box]] = {} if people is None else people
-
-    steps: list[np.ndarray | None] = []
-    test_steps: list[np.ndarray | None] = []
-    pair_values: list[float | None] = []
-    hard_cuts: list[int] = []
-    last_step: np.ndarray | None = None
-    #: The last motion of each pair without a measured motion that the last motion explains alone.
-    bridges: dict[int, np.ndarray] = {}
-    previous = _small_grey(source.read(0), full_size, small_size)
-    images = [_test_image(previous, test_size)]
-    for frame in range(1, info.n_frames):
-        current = _small_grey(source.read(frame), full_size, small_size)
-        images.append(_test_image(current, test_size))
-        mask = _people_mask(small_size, [*boxes.get(frame - 1, ()), *boxes.get(frame, ())], to_small)
-        step = estimate_motion(previous, current, mask=mask)
-        motions = [motion for motion in (step, last_step) if motion is not None]
-        matrices = [to_test @ motion @ from_test for motion in [np.eye(3), *motions]]
-        values = _correlations(images[-2], images[-1], matrices)
-        known = [(value, matrix) for value, matrix in zip(values, matrices, strict=True) if value is not None]
-        best = max(known, key=lambda pair: pair[0], default=None)  # the first of equal values
-        pair_values.append(None if best is None else best[0])
-        if best is None or best[0] < MIN_SHOT_CORRELATION:
-            hard_cuts.append(frame)
-            steps.append(None)
-            test_steps.append(None)
-            last_step = None
-        elif step is None:
-            # No motion was measured: the windows over this pair are not judged. The identity or the
-            # last motion explains the pair well enough for the pair test, but chained over a window
-            # in a pan it would make up a dissolve. A lone such pair may be bridged below.
-            steps.append(None)
-            test_steps.append(None)
-            if last_step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION:
-                bridges[len(test_steps) - 1] = matrices[1]
-        else:
-            steps.append(to_full @ step @ to_small)
-            # The measured motion, when it explains the pair alone, else the motion that explains it best.
-            measured_explains = values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
-            test_steps.append(matrices[1] if measured_explains else best[1])
-            last_step = step
-        previous = current
-    # A lone pair without a measured motion between two pairs with a step takes the last motion:
-    # one step that is a little wrong does not make up a dissolve, and one failed pair inside a
-    # dissolve does not hide it (second read of 2026-11-22). Two or more in a row stay missing.
-    missing = [test_step is None for test_step in test_steps]
-    for index, matrix in bridges.items():
-        if 0 < index < len(test_steps) - 1 and not missing[index - 1] and not missing[index + 1]:
-            test_steps[index] = matrix
+    for frame in range(info.n_frames):
+        meter.add(source.read(frame), boxes.get(frame, ()))
     if info.n_frames <= DISSOLVE_WINDOW_FRAMES:
         logger.info(
             "clip %s: %d frames, not more than the window of %d frames: no dissolve test",
@@ -787,9 +757,8 @@ def measure_shots(
             info.n_frames,
             DISSOLVE_WINDOW_FRAMES,
         )
-    window_values = window_correlations(images, test_steps)
-    transitions = find_transitions(images, test_steps, window_values)
-    for start, stop in transitions:
+    tests = meter.finish()
+    for start, stop in tests.transitions:
         if start == stop:
             logger.info("clip %s: a window test finds a cut without blend frames at frame %d", info.clip_id, start)
         else:
@@ -800,15 +769,184 @@ def measure_shots(
                 stop - 1,
                 stop,
             )
-    return ShotTests(
-        steps=tuple(steps),
-        test_images=tuple(images),
-        test_steps=tuple(test_steps),
-        pair_correlations=tuple(pair_values),
-        hard_cuts=tuple(hard_cuts),
-        window_correlations=tuple(window_values),
-        transitions=tuple(transitions),
-    )
+    return tests
+
+
+class ShotMeter:
+    """The tests of ``measure_shots``, one frame at a time: ``add`` each frame in order, then ``finish``.
+
+    ``finish`` returns the ``ShotTests`` that ``measure_shots`` gives for the same frames and
+    boxes. The streaming path reads what is known before the end:
+
+    - after ``add`` of frame ``t``: ``steps[t - 1]`` (None into a hard cut) and ``hard_cuts``;
+    - ``update_transitions`` judges every window whose value can no longer change and returns
+      the transitions that are known now. A window that ends at frame ``t`` is judged once
+      frame ``t + 1`` is in (a lone pair without a measured motion takes the last motion only
+      when the next pair has a step), and a transition once its run of low windows has ended.
+      So a dissolve that starts at frame ``s`` is known at about frame ``s + DISSOLVE_WINDOW_FRAMES``.
+
+    ``forget_images_before`` drops the test images that no later test can need, so a long
+    stream keeps a bounded number of images.
+    """
+
+    def __init__(self, size: tuple[int, int], *, downscale: float = 0.5) -> None:
+        if not 0.0 < downscale <= 1.0:
+            raise ValueError("downscale must be above 0 and at most 1")
+        width, height = size
+        self._full_size = (width, height)
+        self._small_size = (max(1, round(width * downscale)), max(1, round(height * downscale)))
+        self._to_small = _to_small_matrix(self._full_size, self._small_size)
+        self._to_full = np.linalg.inv(self._to_small)
+        test_size = _test_size(self._small_size)
+        self._test_size = test_size
+        self._to_test = _to_small_matrix(self._small_size, test_size)
+        self._from_test = np.linalg.inv(self._to_test)
+        #: Measured motion of each pair in full-size pixels, None where missing and into a hard cut.
+        self.steps: list[np.ndarray | None] = []
+        #: The steps of the window test (see ``ShotTests``); a bridge is put in by ``_bridge``.
+        self.test_steps: list[np.ndarray | None] = []
+        self.pair_values: list[float | None] = []
+        self.hard_cuts: list[int] = []
+        #: Test image of every frame; a forgotten image is None.
+        self.images: list[np.ndarray | None] = []
+        self._last_step: np.ndarray | None = None
+        #: The last motion of each pair without a measured motion that the last motion explains alone.
+        self._bridges: dict[int, np.ndarray] = {}
+        self._bridged: set[int] = set()
+        self._previous: np.ndarray | None = None
+        self._previous_boxes: Sequence[Box] = ()
+        #: Window value of every judged frame (``window_correlations``), in frame order.
+        self.window_values: list[float | None] = []
+        #: The open run of low window values, (first, last), or None.
+        self._run: tuple[int, int] | None = None
+        self.transitions: list[tuple[int, int]] = []
+        self._finished = False
+
+    @property
+    def n_frames(self) -> int:
+        """Number of frames added so far."""
+        return len(self.images)
+
+    def add(self, image: np.ndarray, boxes: Sequence[Box] = ()) -> None:
+        """Add the next frame and the people boxes of that frame (full-size pixels), and test the pair it ends."""
+        if self._finished:
+            raise ValueError("the meter is finished: no frame can be added")
+        current = _small_grey(image, self._full_size, self._small_size)
+        self.images.append(_test_image(current, self._test_size))
+        if self._previous is None:
+            self._previous, self._previous_boxes = current, boxes
+            return
+        frame = len(self.images) - 1
+        previous, to_small, to_test, from_test = self._previous, self._to_small, self._to_test, self._from_test
+        mask = _people_mask(self._small_size, [*self._previous_boxes, *boxes], to_small)
+        step = estimate_motion(previous, current, mask=mask)
+        motions = [motion for motion in (step, self._last_step) if motion is not None]
+        matrices = [to_test @ motion @ from_test for motion in [np.eye(3), *motions]]
+        values = _correlations(_image(self.images, frame - 1), self.images[-1], matrices)
+        known = [(value, matrix) for value, matrix in zip(values, matrices, strict=True) if value is not None]
+        best = max(known, key=lambda pair: pair[0], default=None)  # the first of equal values
+        self.pair_values.append(None if best is None else best[0])
+        if best is None or best[0] < MIN_SHOT_CORRELATION:
+            self.hard_cuts.append(frame)
+            self.steps.append(None)
+            self.test_steps.append(None)
+            self._last_step = None
+        elif step is None:
+            # No motion was measured: the windows over this pair are not judged. The identity or the
+            # last motion explains the pair well enough for the pair test, but chained over a window
+            # in a pan it would make up a dissolve. A lone such pair may be bridged (``_bridge``).
+            self.steps.append(None)
+            self.test_steps.append(None)
+            if self._last_step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION:
+                self._bridges[len(self.test_steps) - 1] = matrices[1]
+        else:
+            self.steps.append(self._to_full @ step @ to_small)
+            # The measured motion, when it explains the pair alone, else the motion that explains it best.
+            measured_explains = values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
+            self.test_steps.append(matrices[1] if measured_explains else best[1])
+            self._last_step = step
+        self._previous, self._previous_boxes = current, boxes
+        # The pair before this one is final now: its bridge needs to know whether this pair has a step.
+        self._bridge(len(self.test_steps) - 2)
+
+    def _bridge(self, index: int) -> None:
+        """Give a lone pair without a measured motion between two pairs with a step the last motion.
+
+        One step that is a little wrong does not make up a dissolve, and one failed pair inside a
+        dissolve does not hide it (second read of 2026-11-22). Two or more in a row stay missing.
+        The answer of the test of a pair is taken before any bridge, as in ``measure_shots``.
+        """
+        matrix = self._bridges.pop(index, None)
+        if matrix is None or not 0 < index < len(self.test_steps) - 1:
+            return
+        if self._missing(index - 1) or self._missing(index + 1):
+            return
+        self.test_steps[index] = matrix
+        self._bridged.add(index)
+
+    def _missing(self, index: int) -> bool:
+        """Tell whether a pair had no test step before any bridge: a bridged pair counts as missing."""
+        return self.test_steps[index] is None or index in self._bridged
+
+    def update_transitions(self, *, final: bool = False) -> list[tuple[int, int]]:
+        """Judge the windows whose value is final now, and return every transition known so far.
+
+        With ``final`` (the end of the clip) the last window and the open run are judged too.
+        """
+        n_frames = len(self.images)
+        last_final = n_frames - 1 if final else n_frames - 2
+        for frame in range(len(self.window_values), last_final + 1):
+            value: float | None = None
+            if frame >= DISSOLVE_WINDOW_FRAMES:
+                matrix = _chain(self.test_steps, frame - DISSOLVE_WINDOW_FRAMES, frame)
+                if matrix is not None:
+                    moved = _moved(_image(self.images, frame - DISSOLVE_WINDOW_FRAMES), matrix)
+                    value = _block_correlation(moved, _image(self.images, frame))
+            self.window_values.append(value)
+            low = value is not None and value < MAX_TRANSITION_CORRELATION
+            if low:
+                self._run = (frame, frame) if self._run is None else (self._run[0], frame)
+            elif self._run is not None:
+                self._close_run()
+        if final and self._run is not None:
+            self._close_run()
+        return list(self.transitions)
+
+    def _close_run(self) -> None:
+        assert self._run is not None
+        first, last = self._run
+        self._run = None
+        _add_transition(self.transitions, transition_span(self.images, self.test_steps, first, last))
+
+    def keep_images_from(self) -> int:
+        """Return the first frame whose test image a later test can still need."""
+        newest = len(self.images) - 1
+        first = min(newest - 1, len(self.window_values)) - DISSOLVE_WINDOW_FRAMES
+        if self._run is not None:
+            first = min(first, self._run[0] - DISSOLVE_WINDOW_FRAMES)
+        return max(0, first)
+
+    def forget_images_before(self, frame: int) -> None:
+        """Drop the test images of the frames before ``frame`` (at most up to ``keep_images_from``)."""
+        for index in range(min(frame, self.keep_images_from())):
+            self.images[index] = None
+
+    def finish(self) -> ShotTests:
+        """Judge the last windows and return the tests of the whole clip. No frame can be added afterwards."""
+        if not self.images:
+            raise ValueError("the meter has no frame")
+        self._bridge(len(self.test_steps) - 1)
+        transitions = self.update_transitions(final=True)
+        self._finished = True
+        return ShotTests(
+            steps=tuple(self.steps),
+            test_images=tuple(self.images),
+            test_steps=tuple(self.test_steps),
+            pair_correlations=tuple(self.pair_values),
+            hard_cuts=tuple(self.hard_cuts),
+            window_correlations=tuple(self.window_values),
+            transitions=tuple(transitions),
+        )
 
 
 def compute_motion_field(
