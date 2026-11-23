@@ -24,6 +24,7 @@ import sys
 import tempfile
 import textwrap
 import traceback
+import zlib
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -1957,6 +1958,125 @@ class ModeTest(GuardTestCase):
             self.git("branch", f"topic-{number}")
             self.git("tag", "-a", f"mark-{number}", "-m", "A clean message")
         self.assertEqual(self.count_git_processes("--push"), pushed)
+
+    def test_each_mode_starts_a_known_number_of_git_processes(self) -> None:
+        """Each question of a run goes to git once: the folders, the sizes of objects, HEAD.
+
+        The counts: `--paths` 2 (folders, ignore rules); `--tracked` 3 (and the file list);
+        `--staged` 8 (folders, index, ignore rules, sizes, contents, local identity, author,
+        committer); `--push` 10 (folders, remotes, names, sizes and HEAD, commits, files,
+        contents of commits and tags, ignore rules, contents of files, local identity), and
+        one more for the commit that the hook runner names.
+        """
+        self.stage("notes.md", "text\n")
+        self.assertEqual(self.count_git_processes("--paths", str(self.repo / "notes.md")), 2)
+        self.assertEqual(self.count_git_processes("--staged"), 8)
+        self.commit("add notes")
+        self.assertEqual(self.count_git_processes("--tracked"), 3)
+        self.git("tag", "-a", "mark", "-m", "A clean message")
+        self.assertEqual(self.count_git_processes("--push"), 10)
+        self.env[PUSHED_COMMIT_VARIABLE] = self.git("rev-parse", "HEAD").strip()
+        self.assertEqual(self.count_git_processes("--push"), 11)
+
+    def test_damaged_object_is_a_git_error_in_every_mode_that_reads_objects(self) -> None:
+        """A damaged object stops the guard with exit code 2; it never makes the guard wait."""
+        self.stage("notes.md", "text\n")
+        self.commit("add notes")
+        self.stage("more.md", "more text\n")
+        blobs = {mode: self.git("rev-parse", name).strip() for mode, name in (("--push", "HEAD:notes.md"), ("--staged", ":more.md"))}
+        for mode, blob in blobs.items():
+            stored = self.repo / ".git" / "objects" / blob[:2] / blob[2:]
+            stored.chmod(0o644)
+            damages = {
+                # The header gives 5 bytes and the content has 3: git prints a short object.
+                zlib.compress(b"blob 5\0tex"): "git cat-file --batch did not print the object " + blob,
+                zlib.compress(b"blob 99999999999999999999\0text\n"): "git cat-file --batch-check failed with exit code 128",
+            }
+            for data, message in damages.items():
+                stored.write_bytes(data)
+                result = self.guard(mode)
+                self.assertEqual((result.returncode, result.stdout), (2, ""), mode)
+                self.assertIn("guard: error: " + message, result.stderr, mode)
+
+    def test_damaged_commit_of_a_detached_head_is_named_by_the_git_command_that_fails(self) -> None:
+        """Git dies when it reads the commit of HEAD; the error names `git rev-parse --verify`, as it always did."""
+        self.stage("notes.md", "text\n")
+        self.commit("add notes")
+        branch = self.branch()
+        self.stage("notes.md", "more text\n")
+        self.commit("change notes")
+        commit = self.git("rev-parse", "HEAD").strip()
+        # Only the detached HEAD names the second commit; the branch keeps the first one.
+        self.git("checkout", "--quiet", "--detach")
+        self.git("branch", "--force", branch, "HEAD~1")
+        stored = self.repo / ".git" / "objects" / commit[:2] / commit[2:]
+        stored.chmod(0o644)
+        stored.write_bytes(zlib.compress(b"commit 99999999999999999999\0x"))
+        result = self.guard("--push")
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertIn("guard: error: git rev-parse --verify --quiet HEAD^{commit} failed with exit code 128", result.stderr)
+
+    def test_object_that_git_cannot_find_is_a_git_error(self) -> None:
+        self.stage("notes.md", "text\n")
+        blob = self.git("rev-parse", ":notes.md").strip()
+        (self.repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        result = self.guard("--staged")
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertIn(f"guard: error: git cannot find the object {blob}", result.stderr)
+
+    def test_deny_list_is_found_from_a_subfolder_a_work_tree_and_a_folder_with_a_line_break(self) -> None:
+        """Git prints the top level and the git folder on two lines; a line break in a path needs two processes."""
+        self.set_deny_list()
+        self.stage("sub/notes.md", f"made by {DENIED}\n")
+        self.commit("add notes")
+        expected = ["sub/notes.md:1: deny: content matches the entry on line 3 of the local deny-list"]
+        self.assertEqual(self.assert_refused(self.guard("--tracked", repo=self.repo / "sub"), "deny"), expected)
+        work_tree = self.base / "second"
+        self.git("worktree", "add", "--quiet", "--detach", str(work_tree))
+        self.assertEqual(self.assert_refused(self.guard("--tracked", repo=work_tree / "sub"), "deny"), expected)
+        odd = self.base / "line\nbreak"
+        shutil.copytree(self.repo, odd, symlinks=True)
+        # A work tree in a folder with a line break: its git folder is that of the repository.
+        odd_work_tree = self.base / "second\nwork tree"
+        self.git("worktree", "add", "--quiet", "--detach", str(odd_work_tree))
+        for repo in (odd, odd / "sub", odd_work_tree, odd_work_tree / "sub"):
+            result = self.guard("--tracked", repo=repo)
+            self.assertEqual(self.assert_refused(result, "deny"), expected)
+            self.assertNotIn(NO_DENY_LIST, result.stderr)
+
+    def failing_cat_file(self, before: bool) -> dict[str, str]:
+        """Return an environment whose `git cat-file --batch-check` ends with exit code 3.
+
+        `before`: it ends at once, without an answer; else it ends after its answers.
+        """
+        tools = self.base / ("failing-at-once" if before else "failing-at-the-end")
+        tools.mkdir()
+        real_git = shutil.which("git", path=self.env["PATH"])
+        self.assertIsNotNone(real_git)
+        check = '[ "$1 $2" = "cat-file --batch-check" ] && exit 3\n'
+        run = f'{shlex.quote(str(real_git))} "$@"\nstatus=$?\n'
+        script = "#!/bin/sh\n" + (check + run if before else run + check) + "exit $status\n"
+        (tools / "git").write_text(script, encoding="utf-8")
+        (tools / "git").chmod(0o755)
+        return dict(self.env, PATH=str(tools) + os.pathsep + self.env["PATH"])
+
+    def test_git_that_ends_with_an_error_after_its_answers_is_a_git_error(self) -> None:
+        """The process that tells the sizes of objects stays open for the run; its exit code is still checked."""
+        self.stage("notes.md", "text\n")
+        result = self.guard("--staged", env=self.failing_cat_file(before=False))
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertIn("guard: error: git cat-file --batch-check failed with exit code 3", result.stderr)
+
+    def test_git_that_ends_with_an_error_before_it_answers_is_a_git_error_in_every_mode(self) -> None:
+        """In the push mode `git rev-parse` then tells whether HEAD names a commit, and the sizes are asked again."""
+        self.stage("notes.md", "text\n")
+        self.commit("add notes")
+        self.stage("more.md", "more text\n")
+        env = self.failing_cat_file(before=True)
+        for mode in ("--staged", "--push"):
+            result = self.guard(mode, env=env)
+            self.assertEqual((result.returncode, result.stdout), (2, ""), mode)
+            self.assertIn("guard: error: git cat-file --batch-check failed with exit code 3", result.stderr, mode)
 
     def test_tracked_mode_reads_the_working_tree(self) -> None:
         self.stage("leak.txt", "clean\n")

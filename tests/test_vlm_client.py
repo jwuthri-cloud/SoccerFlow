@@ -518,6 +518,109 @@ def test_sdk_is_imported_only_inside_a_function() -> None:
     assert any(_imports_sdk(node) for node in lazy)
 
 
+# --- Hard rule 4 over the whole package -------------------------------------------
+
+PACKAGE_DIR = Path(client_module.__file__).resolve().parents[1]
+TOOLS_DIR = PACKAGE_DIR.parents[1] / "tools"
+#: The one module that may import the model SDK, and the one script that may import a tool.
+SDK_MODULE = Path(client_module.__file__).resolve()
+TOOL_RUNNER = TOOLS_DIR / "run_tool.py"
+#: Top-level name of the model SDK (``google-genai``).
+SDK_NAMES = frozenset({"google"})
+COMPUTED_NAME = "<a name computed at run time>"
+
+
+def _tool_names() -> frozenset[str]:
+    """Return the top-level module names of the external tools: RF-DETR and the packages of PnLCalib.
+
+    The packages of PnLCalib are read from the source of ``tools/run_tool.py``, which is not imported.
+    """
+    tree = ast.parse(TOOL_RUNNER.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "PNLCALIB_PACKAGES" for target in node.targets
+        ):
+            return frozenset({"rfdetr", *ast.literal_eval(node.value)})
+    raise AssertionError("tools/run_tool.py has no PNLCALIB_PACKAGES")
+
+
+def _is_import_call(function: ast.expr) -> bool:
+    name = function.attr if isinstance(function, ast.Attribute) else getattr(function, "id", "")
+    return name in ("import_module", "__import__")
+
+
+def imported_modules(source: str) -> list[tuple[int, str]]:
+    """Return the line and the module name of every import of a source, at any depth.
+
+    A call of ``importlib.import_module`` or ``__import__`` counts as an import; its name is
+    ``COMPUTED_NAME`` when it is not a text in the source. A relative import names a module
+    of the same package and is left out.
+    """
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found += [(node.lineno, alias.name) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            found.append((node.lineno, node.module or ""))
+        elif isinstance(node, ast.Call) and _is_import_call(node.func):
+            first = node.args[0] if node.args else None
+            text = isinstance(first, ast.Constant) and isinstance(first.value, str)
+            found.append((node.lineno, first.value if text else COMPUTED_NAME))  # type: ignore[union-attr]
+    return found
+
+
+def rule_4_breaks(label: str, source: str, *, may_import_sdk: bool) -> list[str]:
+    """Return one line for each import of the source that hard rule 4 forbids."""
+    tools = _tool_names()
+    breaks = []
+    for line, name in imported_modules(source):
+        top = name.split(".")[0]
+        if name == COMPUTED_NAME:
+            breaks.append(f"{label}:{line}: imports a module whose name is computed, so no check can read it")
+        elif top in SDK_NAMES and not may_import_sdk:
+            breaks.append(f"{label}:{line}: imports the model SDK ({name})")
+        elif top in tools:
+            breaks.append(f"{label}:{line}: imports an external tool ({name})")
+    return breaks
+
+
+def test_only_the_client_imports_the_sdk_and_only_the_tool_runner_imports_a_tool() -> None:
+    """Hard rule 4, read from the source of every module of the package and of every other script of tools/."""
+    sources = sorted(PACKAGE_DIR.rglob("*.py")) + sorted(set(TOOLS_DIR.glob("*.py")) - {TOOL_RUNNER})
+    assert len(sources) > 20 and SDK_MODULE in sources
+    breaks = []
+    for path in sources:
+        source = path.read_text(encoding="utf-8")
+        breaks += rule_4_breaks(path.name, source, may_import_sdk=path == SDK_MODULE)
+    assert breaks == []
+    assert any(name.split(".")[0] in SDK_NAMES for _, name in imported_modules(SDK_MODULE.read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # At the top of a module, guarded, as the fault F33 of the fault check of 2026-11-22 put it into pipeline.py.
+        ("try:\n    import google.genai\nexcept ImportError:\n    pass\n", "imports the model SDK (google.genai)"),
+        ("from google import genai\n", "imports the model SDK (google)"),
+        ("import google.genai as sdk\n", "imports the model SDK (google.genai)"),
+        ("def ask():\n    from google.genai import types\n    return types\n", "imports the model SDK (google.genai)"),
+        ("import importlib\n\ndef load():\n    return importlib.import_module('google.genai')\n", "imports the model SDK (google.genai)"),
+        ("class Detector:\n    def run(self):\n        import rfdetr\n", "imports an external tool (rfdetr)"),
+        ("from model.cls_hrnet import get_cls_net\n", "imports an external tool (model.cls_hrnet)"),
+        ("def load(name):\n    return __import__(name)\n", "imports a module whose name is computed"),
+    ],
+)
+def test_rule_4_check_finds_an_import_at_the_top_and_inside_a_function(source: str, expected: str) -> None:
+    breaks = rule_4_breaks("pipeline.py", source, may_import_sdk=False)
+    assert len(breaks) == 1 and expected in breaks[0], breaks
+
+
+def test_rule_4_check_lets_the_client_import_the_sdk_but_no_tool() -> None:
+    assert rule_4_breaks("client.py", "def connect():\n    from google import genai\n", may_import_sdk=True) == []
+    assert rule_4_breaks("client.py", "import rfdetr\n", may_import_sdk=True) == ["client.py:1: imports an external tool (rfdetr)"]
+    assert rule_4_breaks("pipeline.py", "from . import synth\nimport numpy as np\nfrom pitchvlm.vlm import client\n", may_import_sdk=False) == []
+
+
 # --- Request to keyword arguments ------------------------------------------------
 
 

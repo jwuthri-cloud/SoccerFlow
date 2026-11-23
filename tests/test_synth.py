@@ -495,6 +495,55 @@ def test_image_shows_grass_marks_lines_and_kits(scene: SyntheticScene) -> None:
     assert tuple(int(value) for value in image[row, column]) == synth.KEEPER_A_KIT.fill_bgr
 
 
+#: The fill colour of each kind of person: role and team key (``synth._build_people``).
+KIT_FILLS = {
+    ("player", "A"): synth.TEAM_A_KIT.fill_bgr,
+    ("player", "B"): synth.TEAM_B_KIT.fill_bgr,
+    ("goalkeeper", "A"): synth.KEEPER_A_KIT.fill_bgr,
+    ("goalkeeper", "B"): synth.KEEPER_B_KIT.fill_bgr,
+    ("referee", "none"): synth.REFEREE_KIT.fill_bgr,
+}
+
+
+def test_near_person_covers_a_far_person_where_their_boxes_overlap() -> None:
+    """The person whose feet are lower in the image stands nearer to the camera and is drawn on top.
+
+    The check takes two whole boxes of different kit colours that overlap, and no third box
+    that reaches into the overlap. Inside the overlap, one pixel in from its edges (the boxes
+    are drawn at whole pixels), every pixel belongs to the near person: their kit colour or
+    their shirt number, never the kit colour of the far person. People overlap in the clips
+    of seeds 1 and 14 (in the clip of seed 7 they do not). In seed 1 the near person always
+    comes later in the fixed order of the people; seed 14 has pairs where it comes first, so
+    a drawing in the fixed order fails too.
+    """
+    checked = {"near person listed first": 0, "near person listed later": 0}
+    for seed in (1, 14):
+        scene = SyntheticScene(seed=seed)
+        for frame in range(scene.info.n_frames):
+            people = scene.people(frame).people  # in the fixed order of the people
+            image = None
+            for near_place, near in enumerate(people):
+                for far_place, far in enumerate(people):
+                    if not (is_whole(near.box, scene.info) and is_whole(far.box, scene.info)):
+                        continue
+                    near_fill, far_fill = KIT_FILLS[(near.role, near.team_key)], KIT_FILLS[(far.role, far.team_key)]
+                    if near.box.y2 < far.box.y2 + 1.0 or near_fill == far_fill:
+                        continue
+                    x1, y1 = math.ceil(max(near.box.x1, far.box.x1)) + 1, math.ceil(max(near.box.y1, far.box.y1)) + 1
+                    x2, y2 = math.floor(min(near.box.x2, far.box.x2)) - 1, math.floor(min(near.box.y2, far.box.y2)) - 1
+                    if x2 - x1 < 2 or y2 - y1 < 2:
+                        continue
+                    others = [person for person in people if person is not near and person is not far]
+                    if any(o.box.x1 < x2 + 1 and x1 - 1 < o.box.x2 and o.box.y1 < y2 + 1 and y1 - 1 < o.box.y2 for o in others):
+                        continue
+                    image = scene.image(frame) if image is None else image
+                    overlap = image[y1:y2, x1:x2]
+                    assert count_colour(overlap, far_fill) == 0, (seed, frame, near, far)
+                    assert count_colour(overlap, near_fill) > 0, (seed, frame, near, far)
+                    checked["near person listed first" if near_place < far_place else "near person listed later"] += 1
+    assert min(checked.values()) >= 3, checked
+
+
 def test_image_follows_the_frame_the_seed_and_the_size(scene: SyntheticScene) -> None:
     assert np.array_equal(scene.image(3), SyntheticScene(seed=7).image(3))
     assert not np.array_equal(scene.image(3), scene.image(4))

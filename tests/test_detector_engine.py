@@ -27,7 +27,7 @@ from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.export_gsr import check_predictions, prediction_items
 from pitchvlm.fallbacks.fake import fake_ball_position, fake_calibration_answers, fake_detector_answers
 from pitchvlm.frames import keyframe_indices
-from pitchvlm.geometry import matrix_to_rows
+from pitchvlm.geometry import apply_homography, matrix_to_rows
 from pitchvlm.pipeline import ToolAnswers, every_frame_tracking, run_clip
 from pitchvlm.render import RadarRenderer, draw_ball
 from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, HomographyRecord, Track
@@ -156,6 +156,24 @@ def test_ball_follows_the_stand_in_ball(scene: SyntheticScene, detector_result: 
         assert state.ball.pitch_x is not None and state.ball.pitch_y is not None
         true_x, true_y = fake_ball_position(scene, state.frame)
         assert abs(state.ball.pitch_x - true_x) < 0.5 and abs(state.ball.pitch_y - true_y) < 0.5
+
+
+def test_stand_in_ball_rolls_from_its_start_at_its_speed(scene: SyntheticScene) -> None:
+    """The stand-in ball starts at (-10, 5) m and rolls at (6, -2) m/s: the numbers of its design.
+
+    The expectation does not come from ``fake_ball_position``: the check reads each ball box
+    that the detector answers give, maps the bottom centre of the box (the point under the
+    ball) to the pitch with the true mapping of the scene, and compares that point with the
+    numbers written here. The ball is left out in frames 0 to 5 and 40 to 45 of every 40.
+    """
+    _, balls = fake_detector_answers(scene)
+    assert sorted(balls) == [frame for frame in range(N_FRAMES) if frame % 40 >= 6]
+    for frame, (candidate,) in balls.items():
+        seconds = frame / 25.0
+        box = candidate.box
+        under = np.array([[(box.x1 + box.x2) / 2.0, box.y2]])
+        (pitch_x, pitch_y), = apply_homography(scene.homography(frame), under)
+        assert (pitch_x, pitch_y) == pytest.approx((-10.0 + 6.0 * seconds, 5.0 - 2.0 * seconds), abs=1e-6), frame
 
 
 def test_prediction_file_of_the_detector_engine_is_valid_and_has_no_ball(
