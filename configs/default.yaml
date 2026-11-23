@@ -119,9 +119,9 @@ engines:
   # Shirt numbers: model (one paid number request per track) or none (no player has a number).
   number: model
 
-# The detector of the people engine "detector"; its clip run file must have exactly these settings.
+# The detector of the people engine "detector" (family rfdetr, dfine or rtdetrv2: docs/RUNBOOK.md, section 11); its clip run file must have exactly these settings.
 detector:
-  # The tool: rfdetr.
+  # The family: rfdetr (the keys below); or dfine or rtdetrv2 with model, min_score, input_size, batch, half (defaults: DEFAULT_DETECTORS in config.py).
   name: rfdetr
   # Model class with weights under Apache-2.0: RFDETRNano, RFDETRSmall, RFDETRMedium or RFDETRLarge.
   model: RFDETRMedium

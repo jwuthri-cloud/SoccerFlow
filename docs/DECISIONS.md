@@ -2612,6 +2612,198 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
       (25.1) s. The machine was slower for both. Process starts were not the cause: 450 starts of
       `/usr/bin/true` per second in this window, against 180 in the first.
 
+## 2026-11-23 — A second detector family: D-FINE and RT-DETRv2 through transformers
+
+1. **Goal.** The owner can run the same gate (G2 on the frames of the people probe, then the dev
+   clips) with a second detector family and choose by measurement (rule 8: same frames, same
+   gate, same scorer). Point 3 of the entry "A real-time detector engine next to the model
+   engine" named D-FINE with its COCO-only weights through the Apache-2.0 code of Hugging Face
+   transformers, "added only after the licence of each weight file is read". Ultralytics YOLO is
+   not added (AGPL-3.0; open owner decision). No code, config text or weights of any project
+   were copied. Hypothesis for the run machine: a family of the same published latency as an
+   RF-DETR size has a G2 recall within the noise of the 5-frame probe; baseline: the five
+   RF-DETR files; nothing was measured here.
+2. **Licences, read on 2026-11-23** (one reader, this session; pages read as text with `curl`,
+   not checked by a second reader):
+
+   | What | Page | What it says |
+   |---|---|---|
+   | Code path: transformers 5.23.0 | `LICENSE` and `src/transformers/models/rt_detr/image_processing_rt_detr.py` of https://github.com/huggingface/transformers at tag v5.23.0; PyPI page of `transformers` | Apache License 2.0; the file headers say Apache-2.0; PyPI: "Apache 2.0 License" |
+   | D-FINE upstream code and weights | `LICENSE` and `README.md` of https://github.com/Peterande/D-FINE (master, commit `956d1709`) | Apache-2.0. The README: checkpoints trained or pretrained on Objects365 (`*_obj365`, `*_obj2coco`) "may be subject to the Objects365 dataset terms" and are not to be assumed commercially cleared |
+   | RT-DETRv2 upstream code and weights | `LICENSE` and `rtdetrv2_pytorch/README.md` of https://github.com/lyuwenyu/RT-DETR (main, commit `df2a96c8`) | Apache-2.0; the COCO+Objects365 weights are a separate table |
+   | 5 D-FINE checkpoints `ustc-community/dfine-{nano,small,medium,large,xlarge}-coco` | model card (README.md) and API page of each on huggingface.co, at the commits of `TRANSFORMERS_CHECKPOINTS` in `tools/run_tool.py` | licence `apache-2.0`, dataset `coco`; the card: "_coco -> model trained on COCO", "trained on COCO (Lin et al. [2014]) train2017"; weights as `model.safetensors` |
+   | 4 RT-DETRv2 checkpoints `PekingU/rtdetr_v2_{r18vd,r34vd,r50vd,r101vd}` | same, at the commits of the script | licence `apache-2.0`, dataset `coco`; the card: "trained on COCO (Lin et al. [2014]) train2017"; no mention of Objects365; `model.safetensors` |
+   | COCO, the training data of the 9 checkpoints | https://cocodataset.org/#termsofuse (text of `dataset/termsofuse.htm`) | annotations CC BY 4.0; the consortium does not own the images, "Use of the images must abide by the Flickr Terms of Use", and users "accept full responsibility" |
+
+   Not usable until read: the 8 D-FINE checkpoints `*-obj365` and `*-obj2coco` of
+   `ustc-community` (Objects365 terms not read; the hub tags `dataset: coco` on the `obj2coco`
+   cards, but their README says Objects365 then COCO: the tag is not enough), the RT-DETRv2
+   COCO+Objects365 weights of the upstream README, and the RT-DETR (v1) checkpoints
+   `PekingU/rtdetr_*_coco_o365`. Not read at all: the data on which the backbones were
+   pretrained before COCO (HGNetv2 for D-FINE, ResNet-vd for RT-DETRv2); the cards do not name
+   it. The same question holds for the backbone of RF-DETR, which the entry of 2026-11-22 did not
+   ask.
+3. **Published values, not measured here** (COCO val2017 AP50:95; latency on one NVIDIA T4,
+   batch 1, FP16; D-FINE with TensorRT 10.4.0, RT-DETRv2 with TensorRT 8.5.1 or newer, given as
+   frames per second and converted here as 1000 / fps):
+
+   | Checkpoint (size key) | Upstream model | AP | Latency, ms | Parameters (hub page) |
+   |---|---|---|---|---|
+   | dfine nano | D-FINE-N | 42.8 | 2.12 | 3.80 M |
+   | dfine small | D-FINE-S | 48.5 | 3.49 | 10.35 M |
+   | dfine medium | D-FINE-M | 52.3 | 5.62 | 19.64 M |
+   | dfine large | D-FINE-L | 54.0 | 8.07 | 31.36 M |
+   | dfine xlarge | D-FINE-X | 55.8 | 12.89 | 62.85 M |
+   | rtdetrv2 r18vd | RT-DETRv2-S | 48.1 | 4.61 (217 fps) | 20.21 M |
+   | rtdetrv2 r34vd | RT-DETRv2-M* | 49.9 | 6.21 (161 fps) | 31.47 M |
+   | rtdetrv2 r50vd | RT-DETRv2-L (inferred) | 53.4 | 9.26 (108 fps) | 43.02 M |
+   | rtdetrv2 r101vd | RT-DETRv2-X | 54.3 | 13.51 (74 fps) | 76.80 M |
+
+   The card of `rtdetr_v2_r50vd` does not say which of the two upstream r50vd models it is
+   (M 51.9 AP, 36 M parameters; L 53.4 AP, 42 M). Its configuration (encoder expansion 1.0, 6
+   decoder layers) and its 43.0 M parameters fit L: inferred, not stated. The entry of
+   2026-11-22 gave RT-DETRv2 M as 6.9 ms: that is the upstream r50vd-M, which has no checkpoint
+   in transformers.
+4. **The interface, read from the source of transformers 5.23.0** (tag v5.23.0, read on
+   2026-11-23) and from the `config.json` and `preprocessor_config.json` of each of the 9
+   checkpoints at its commit:
+   - All 9 use `RTDetrImageProcessor`: resize to 640 x 640 pixels without keeping the aspect
+     ratio (`size: {height, width}`), no padding, values times 1/255, no normalisation. In 5.23.0
+     the processor runs on torchvision (`TorchvisionBackend`).
+   - `post_process_object_detection(outputs, threshold, target_sizes, use_focal_loss=True)`:
+     the corners from the centre format, times (width, height, width, height) of each target
+     size given as (height, width); the logistic function of the logits, the best `queries`
+     values over all pairs of query and class (`topk` on the flattened scores), class = index
+     modulo the classes, and the scores above the threshold (strictly).
+   - The output classes `DFineObjectDetectionOutput` and `RTDetrV2ObjectDetectionOutput` hold
+     `logits` and `pred_boxes` (normalised centre x, centre y, width, height). Their docstring
+     says `num_classes + 1` for the logits; every configuration has 80 labels and the focal
+     loss, and the post-processing takes the last dimension as the classes: the script reads the
+     shape and refuses one that does not fit `id2label`.
+   - All 9 configurations: `num_queries` 300, `use_focal_loss` true, `id2label` 0 `person`,
+     32 `sports ball`, `eval_size` and `anchor_image_size` null. With both null the models build
+     their position embeddings and anchors for the size of the input (`modeling_d_fine.py`,
+     `modeling_rt_detr_v2.py`), so another `input_size` runs; how well the weights do at
+     another size is not known.
+   - `from_pretrained(..., dtype=...)`: `torch_dtype` is deprecated in 5.23.0.
+5. **What was built** (build machine, offline, stand-ins only):
+   - Settings: the `name` of the section `detector` is the family: `rfdetr` (default, unchanged),
+     `dfine` or `rtdetrv2` (`fallbacks.runs.DETECTOR_FAMILIES`). The two new families share
+     `TransformersDetectorSettings`: `model` (a size of `TRANSFORMERS_MODELS`), `min_score`,
+     `input_size` (320 to 1280, a multiple of 32), `batch` (1 to 64), `half`. One class serves
+     RT-DETRv2 without an extra code path: the same processor, the same output, the same
+     post-processing; only the checkpoint table and the model type differ. A settings file that
+     names a family is laid over the defaults of that family (`config.DEFAULT_DETECTORS`: D-FINE
+     Medium and RT-DETRv2 r18vd, 0.5, 640, batch 1, float32), because the families have other
+     keys. The device stays an option of the script (`--device`), as for RF-DETR: in the
+     settings it would tie the clip run to one machine, and the run facts name it.
+   - Script (`tools/run_tool.py`, sub-commands `dfine` and `rtdetrv2`): lazy import of `torch` and
+     `transformers`, the version check (`TRANSFORMERS_VERSIONS`), the checkpoint and its commit
+     by size (`TRANSFORMERS_CHECKPOINTS`), safetensors only, float16 when `half` (refused on the
+     device `cpu`), the checks of the configuration (model type of the family, focal loss, the
+     classes `person` and `sports ball`). `detections_of_queries` converts the output in NumPy
+     like the post-processing of the tool, from `min_score` on (the tool: above it), and keeps
+     only `person` and `sports ball` (RF-DETR keeps every class; the package reads only these
+     two). On the warm-up call the script compares its boxes with the post-processing of the
+     installed tool and stops when they differ by more than 0.01 pixel or 1e-5 in score. The
+     detections are matched by these tolerances, not by their order (item 9).
+   - Time per frame: frames go to a tool in batches (`answer_frames(job, root, answer, batch)`;
+     RF-DETR and PnLCalib through `one_at_a_time`, batch 1, as before). `seconds` of a frame is
+     the whole call (image processor, model, conversion) divided by the frames of the batch:
+     the same meaning as the `predict` time of RF-DETR. A transformers run adds
+     `runner.stage_ms_per_frame` (median per frame of `preprocess`, `model` after a device
+     synchronisation, `postprocess`) and prints it. The per-frame loop of `answer_frames` is the
+     place for a line per frame of a live feed (session B): each entry is complete when it is
+     appended.
+   - Package: the clip run format does not change; `answers.detector_answers`, `tool-score` and
+     `clip-job` take every family (`runs.is_detector`); `clip-job --tool <family>` refuses a family
+     other than that of the settings file. The engine name is `detector:<family>:<size>`
+     (`detector:rfdetr:RFDETRMedium` as before, `detector:dfine:medium`); `pipeline._engines` is
+     the only place that writes it, and nothing parses it.
+   - Experiment files of G2 with the frames of the five RF-DETR files (group `probe`, 5 frames
+     per clip, seed 20261113), `min_score` 0.5, 640 pixels, batch 1, float32: D-FINE Small,
+     Medium, Large and RT-DETRv2 r18vd, r50vd. They bracket RF-DETR Small to Large by published
+     latency (3.5 to 6.8 ms): D-FINE 3.49, 5.62, 8.07 ms; RT-DETRv2 4.61, 9.26 ms (RT-DETRv2 has
+     no size below 4.61 ms).
+   - RUNBOOK section 11 (subsection "A second detector family"), the install proposal with
+     pinned versions, all at least 7 days old on 2026-11-23: transformers 5.23.0 (2026-11-13),
+     torch 2.15.0 (2026-10-28), torchvision 0.29.2 (2026-10-28, needs torch 2.14.0 or newer),
+     huggingface-hub 2.4.0 (2026-10-29), safetensors 0.8.0 (2026-06-09), numpy 2.5.4
+     (2026-10-10), pillow 13.0.0 (2026-10-16); dates of the PyPI pages. The requirement file of
+     `locks/` is written on the run machine. Section 12 says how the plan applies to a fine-tune
+     of these families.
+6. **Measured on the build machine** (offline, stand-ins of `torch` and `transformers`):
+   - `tests/test_detector_families.py`: 51 tests (the conversion by hand: centre format against
+     corners, parts of the input against pixels on a frame of 200 x 100 pixels; the class filter
+     and the limit; the best pairs; values that are not finite; the script with the stand-ins:
+     checkpoint, commit, dtype, safetensors, input size, synchronisation, batches, the self-check,
+     the refusals; the clip run read by the package; `tool-score` of a D-FINE run on the 5 probe
+     frames of one synthetic clip: recall 1.0, precision 1.0; the settings, the defaults, the engine
+     name, the experiment files, `clip-job`).
+   - Each fix has a test that fails without it: 15 changes of the code were made one at a time
+     and each made a test fail (width and height swapped in the scale; no limit on the pairs;
+     strict limit; boxes read as corners; no class filter; the target size as (width, height);
+     no compact rows for the new families; batch time not divided; no synchronisation; no
+     family defaults in `load_config`; no family check in `clip-job`; `tool-score` only for
+     RF-DETR; and the three fixes of the second read in item 9).
+   - Test runs: see item 9.
+7. **Assumptions that only the run machine can check** (each one is a line of RUNBOOK section 8
+   to add after the first run):
+   (a) `AutoImageProcessor.from_pretrained` and `AutoModelForObjectDetection.from_pretrained`
+   take `revision=`, and the model takes `dtype=` and `use_safetensors=True` as in the source
+   read; (b) the processor takes a list of NumPy arrays of shape (height, width, 3) in RGB and
+   the keyword `size={"height": s, "width": s}` in its call, and gives `pixel_values` of shape
+   (batch, 3, s, s); (c) the model takes `pixel_values` alone (no `pixel_mask` without padding)
+   and gives `logits` of shape (batch, 300, 80) and `pred_boxes` (batch, 300, 4); (d)
+   `post_process_object_detection` takes `target_sizes` as a list of (height, width) and a plain
+   object with `logits` and `pred_boxes`; (e) the self-check passes on the first frame; (f)
+   `torch.cuda.synchronize(device)` and `torch.mps.synchronize()` exist in torch 2.15.0; (g)
+   half precision runs on the device of the run machine (`mps` or `cuda`); (h) the pinned
+   versions install together for the Python and the platform of the run machine; (i) the hub
+   still serves the 9 commits; (j) the time per frame: nothing here says how fast either family
+   is on the run machine, and the published values are TensorRT, which the script does not use.
+8. **Not verified.** No real model, no weights, no footage, no timing. The licence pages were
+   read by one reader. The terms of Objects365, of the Flickr images of COCO and of the backbone
+   pretraining data were not read.
+9. **Second read** (a subagent of this session that was given the code, not these conclusions).
+   It confirmed the conversion against the source of `post_process_object_detection` of
+   5.23.0 (box format, the order (height, width), the best pairs, the threshold) and the batch
+   loop (RF-DETR and PnLCalib unchanged at batch 1), and read the configuration of
+   `dfine-medium-coco` and two of the 9 commits on the hub again. Its findings, each fixed with a
+   test that fails without the fix:
+   - Medium, confirmed: the self-check paired the detections by sorted order. Two scores that
+     are equal in float32 (the tool) and differ in float64 (the script) sort differently, so a
+     correct run could stop (reproduced with two logits one float32 step apart near 4.0). Fix:
+     each detection of the tool is matched to its own detection of the script by the
+     tolerances.
+   - Low, confirmed: `detector: {name: [dfine]}` raised `TypeError` in `load_config` instead of a
+     settings error. Fix: the family must be text before it names defaults.
+   - Low, confirmed: the batch test could not see a warm-up call counted in the stage times (the
+     median hid it). Fix: a test of one frame whose warm-up call is 100 times slower.
+   - Low: one assertion compared a value with itself; a branch for an empty list of times could
+     not run; an import out of order. Fixed.
+   - Not changed: the script does not check the types of `batch` and `input_size` again (the
+     package validates both, as for `min_score` of RF-DETR); a float32 score that rounds onto
+     the threshold could change the count of the self-check (chance estimated at about 1e-5 per
+     detection, not measured).
+10. **Test runs** (build machine, `tools/run_tests.py`, 14 workers, after the fixes of item 9):
+    default run 3,310 passed, 1 skipped, 9 deselected, exit 0, 111.5 s (load 28.8 at the start);
+    full run (`-m "slow or not slow"`) 3,319 passed, 1 skipped, exit 0, 102.2 s (load 61.8). An
+    earlier full run at load 50 had one failure in `tests/test_run_tests.py` (a worker
+    watchdog of 1 s killed a second, passing worker as well); that test passed alone, and the
+    file is not part of this change.
+11. **Owner decisions, proposed.**
+    - Install the transformers environment (RUNBOOK section 11) and run the five new files with
+      the five RF-DETR files, `--max-clips 2` first. Recommendation: keep RF-DETR Medium as the
+      default until G2 has numbers of both families on the same frames.
+    - Licence of the training data: the COCO images carry the Flickr Terms of Use for every
+      detector here, RF-DETR too; the backbone pretraining data is not named on any card.
+      Recommendation: decide both with the licence of the repository (last list), before a
+      demo is shown outside research.
+    - Proposed text for rule 4 of `CLAUDE.md` (not applied): "Only `tools/run_tool.py` imports an
+      external tool (RF-DETR, Hugging Face transformers for D-FINE and RT-DETRv2, PnLCalib). It
+      runs in the environment of that tool, and the package never imports it."
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
