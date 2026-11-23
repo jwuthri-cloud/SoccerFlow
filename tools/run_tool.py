@@ -81,6 +81,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import statistics
@@ -88,7 +89,7 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -108,6 +109,8 @@ RUN_FORMAT = "pitchvlm-tool-run-1"
 #: Format names of the clip job and the clip run: those of ``pitchvlm.fallbacks.runs``.
 CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"
 CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"
+#: Format name of the feed of a live run (``--feed``): that of ``pitchvlm.feed``.
+TOOL_FEED_FORMAT = "pitchvlm-tool-feed-1"
 #: Largest size of one part of a clip run, bytes: that of ``pitchvlm.fallbacks.runs``.
 CLIP_RUN_PART_MAX_BYTES = 1_000_000
 #: Digits of the SHA-256 of a video in a clip job.
@@ -278,7 +281,7 @@ def read_rgb(path: Path) -> np.ndarray:
 
 
 def answer_frames(
-    job: Mapping[str, Any], root: Path, answer: BatchAnswer, batch: int = 1
+    job: Mapping[str, Any], root: Path, answer: BatchAnswer, batch: int = 1, live: LiveFeed | None = None
 ) -> list[dict[str, Any]]:
     """Give every frame of a job to the tool and return the frame entries of the run file.
 
@@ -296,8 +299,10 @@ def answer_frames(
     such an error. An image file that cannot be read stops the run with a line that names the
     frame.
 
-    The loop below is the place where a line per frame (for a live feed) would be written: each
-    entry is complete when it is appended.
+    With ``live`` (a live run, ``--feed``) the frames come in the groups of ``LiveFeed.groups``,
+    which may wait for a frame to come (``--pace``) or skip frames (``--skip-behind``), and each
+    entry is written to the feed as soon as its batch is answered. An entry then also holds
+    ``arrived_at``, the time at which its frame came to the tool.
     """
 
     def where(entries: Sequence[Mapping[str, Any]]) -> str:
@@ -328,16 +333,21 @@ def answer_frames(
     frames = job["frames"]
     batches = [frames[start : start + batch] for start in range(0, len(frames), batch)]
     ask(batches[0], [read(entry) for entry in batches[0]])
+    if live is not None:
+        live.start()
     entries = []
-    for group in batches:
+    for group in batches if live is None else live.groups(frames, batch):
+        arrived = [live.arrived_at(entry["frame"]) for entry in group] if live is not None else []
         images = [read(entry) for entry in group]
         start = time.perf_counter()
         payloads = ask(group, images)
         seconds = (time.perf_counter() - start) / len(group)
-        for entry, payload in zip(group, payloads, strict=True):
-            entries.append(
-                {"clip": entry["clip"], "frame": entry["frame"], "seconds": round(seconds, 6), "payload": payload}
-            )
+        for position, (entry, payload) in enumerate(zip(group, payloads, strict=True)):
+            done = {"clip": entry["clip"], "frame": entry["frame"], "seconds": round(seconds, 6), "payload": payload}
+            if live is not None:
+                done["arrived_at"] = arrived[position]
+                live.write(done)
+            entries.append(done)
     return entries
 
 
@@ -460,6 +470,105 @@ def write_clip_run(
         part.write_text(text, encoding="utf-8")
         paths.append(part)
     return paths
+
+
+class LiveFeed:
+    """The feed of a live run (``--feed``): a header line, then one line per frame as soon as it is answered.
+
+    The lines go to every stream of ``outputs`` in their order (the copy at ``--out`` first, so
+    that it holds every line that the feed got, then the feed), each one flushed at once. The header is that of ``pitchvlm.feed``: ``{"format": TOOL_FEED_FORMAT,
+    "clip", "n_frames", "video_sha256", "job_sha256", "tool"}``; a frame line is ``{"frame",
+    "seconds", "arrived_at", "payload"}`` (the compact payload for a detector, as in a clip run),
+    or ``{"frame", "arrived_at", "skipped": true}``.
+
+    ``pace`` (frames per second) plays the clip as a camera would send it: frame ``i`` comes at
+    ``start + i / pace`` and is not read before. ``start`` is ``start_at`` (seconds since the
+    epoch, so that two tools share one clock) or the time of ``start``. ``skip_behind`` (with a
+    pace and batches of one frame) takes the newest frame that has come and skips the frames
+    before it that the tool did not reach. Without a pace, a frame comes when the tool reads it.
+    """
+
+    def __init__(
+        self,
+        outputs: Sequence[Any],
+        head: Mapping[str, Any],
+        *,
+        pace: float | None = None,
+        start_at: float | None = None,
+        skip_behind: bool = False,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if pace is not None and not 0.0 < pace < float("inf"):
+            raise RunnerError(f"--pace must be a number of frames per second above 0, got {pace}")
+        if (start_at is not None or skip_behind) and pace is None:
+            raise RunnerError("--start-at and --skip-behind need --pace")
+        self._outputs = list(outputs)
+        self._head = dict(head)
+        self._detector = head["tool"]["name"] in DETECTOR_TOOLS
+        self._pace = pace
+        self._start: float | None = start_at
+        self._skip_behind = skip_behind
+        self._clock = clock
+        self._sleep = sleep
+        self.skipped = 0
+
+    def start(self) -> None:
+        """Fix the start of the pace (when ``start_at`` was not given) and write the header line."""
+        if self._start is None:
+            self._start = self._clock()
+        self._line({"format": TOOL_FEED_FORMAT, **self._head})
+
+    def due(self, frame: int) -> float | None:
+        """Return the time at which a frame comes, with a pace; else None."""
+        if self._pace is None:
+            return None
+        assert self._start is not None
+        return self._start + frame / self._pace
+
+    def arrived_at(self, frame: int) -> float:
+        """Return the time at which a frame came: its due time with a pace, else now (it comes when it is read)."""
+        due = self.due(frame)
+        return self._clock() if due is None else due
+
+    def groups(self, frames: Sequence[Mapping[str, Any]], batch: int) -> Iterator[list[Mapping[str, Any]]]:
+        """Yield the groups of frames to answer, in order, waiting for the last frame of each group to come."""
+        if self._skip_behind and batch != 1:
+            raise RunnerError(f"--skip-behind needs batches of one frame, and the job has batches of {batch}")
+        index = 0
+        while index < len(frames):
+            if self._skip_behind:
+                newest = self._newest_come(len(frames))
+                for skipped in range(index, max(index, newest)):
+                    self._line({"frame": frames[skipped]["frame"], "arrived_at": self.arrived_at(skipped), "skipped": True})
+                    self.skipped += 1
+                index = max(index, newest)
+            group = list(frames[index : index + batch])
+            due = self.due(index + len(group) - 1)
+            if due is not None:
+                wait = due - self._clock()
+                if wait > 0:
+                    self._sleep(wait)
+            yield group
+            index += len(group)
+
+    def _newest_come(self, n_frames: int) -> int:
+        """Return the newest frame that has come by now (with a pace), at most the last frame."""
+        assert self._start is not None and self._pace is not None
+        return min(n_frames - 1, int(math.floor((self._clock() - self._start) * self._pace)))
+
+    def write(self, entry: Mapping[str, Any]) -> None:
+        """Write the line of an answered frame."""
+        payload = compact_detections(entry["payload"]) if self._detector else entry["payload"]
+        self._line(
+            {"frame": entry["frame"], "seconds": entry["seconds"], "arrived_at": entry["arrived_at"], "payload": payload}
+        )
+
+    def _line(self, data: Mapping[str, Any]) -> None:
+        text = json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n"
+        for output in self._outputs:
+            output.write(text)
+            output.flush()
 
 
 def check_out_place(out: Path, job: Path) -> None:
@@ -1108,6 +1217,23 @@ def build_parser() -> argparse.ArgumentParser:
         tool.add_argument(
             "--device", required=True, metavar="NAME", help="device name of PyTorch, for example mps, cpu or cuda:0"
         )
+        tool.add_argument(
+            "--feed",
+            metavar="FILE",
+            help="live run of a clip job: write the tool feed to this file or named pipe (- for the standard output), "
+            "one line per frame as it is answered; --out then gets a copy of the feed instead of a clip run",
+        )
+        tool.add_argument(
+            "--pace", type=float, metavar="FPS", help="with --feed: frame i comes at the start plus i / FPS seconds"
+        )
+        tool.add_argument(
+            "--start-at", type=float, metavar="SECONDS", help="with --pace: the start, in seconds since the epoch"
+        )
+        tool.add_argument(
+            "--skip-behind",
+            action="store_true",
+            help="with --pace: take the newest frame that has come, and skip the frames that the tool did not reach",
+        )
         if name == "pnlcalib":
             tool.add_argument(
                 "--repo", type=_path, required=True, metavar="DIR", help="clone of the PnLCalib repository"
@@ -1132,8 +1258,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RunnerError(f"this script needs Python 3.10 or newer, and this is Python {platform.python_version()}")
         job = read_job(args.job, args.tool)
         clip_job = job["format"] == CLIP_JOB_FORMAT
+        live = args.feed is not None
+        if live and not clip_job:
+            raise RunnerError("--feed needs a clip job: a live run is a run of one clip")
+        if not live and (args.pace is not None or args.start_at is not None or args.skip_behind):
+            raise RunnerError("--pace, --start-at and --skip-behind need --feed")
+        if args.skip_behind and int(job["tool"].get("batch", 1)) != 1:
+            raise RunnerError(
+                f"--skip-behind needs batches of one frame, and the job has batches of {job['tool']['batch']}"
+            )
         check_out_place(args.out, args.job)
-        if clip_job:
+        if clip_job and not live:
             check_no_later_parts(args.out)
         job_sha256 = file_sha256(args.job)
         machine = machine_facts(args.device)
@@ -1147,13 +1282,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             facts, single = pnlcalib_engine(job["tool"], args.device, args.repo, args.weights_kp, args.weights_lines)
             answer = one_at_a_time(single)
-        frames = answer_frames(job, args.root, answer, batch)
-        runner = {**machine, **facts, **run_facts()}
-        if clip_job:
-            written = write_clip_run(args.out, job, job_sha256, runner, frames)
+        skipped = 0
+        if live:
+            frames, skipped = run_live(args, job, job_sha256, answer, batch)
         else:
+            frames = answer_frames(job, args.root, answer, batch)
+        runner = {**machine, **facts, **run_facts()}
+        written = [args.out]
+        if live:
+            written.append(write_live_facts(args.out, job, job_sha256, runner, len(frames), skipped))
+        if clip_job and not live:
+            written = write_clip_run(args.out, job, job_sha256, runner, frames)
+        elif not live:
             write_run(args.out, job, runner, frames)
-            written = [args.out]
     except (RunnerError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_ERROR
@@ -1161,16 +1302,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         traceback.print_exc()
         print(f"error: the script stopped with {type(error).__name__}; the traceback above says where", file=sys.stderr)
         return EXIT_ERROR
-    median = statistics.median(entry["seconds"] for entry in frames)
+    # The standard output of a live run to "-" is the feed: the report goes to the error stream then.
+    report = sys.stderr if args.feed == "-" else sys.stdout
+    median = statistics.median(entry["seconds"] for entry in frames) if frames else float("nan")
     print(
         f"{args.tool}: {len(frames)} frames of the job {job['name']}, "
-        f"median time per frame {median:.3f} s on {args.device}"
+        f"median time per frame {median:.3f} s on {args.device}",
+        file=report,
     )
     if "stage_ms_per_frame" in runner:
         stages = ", ".join(f"{name} {value} ms" for name, value in runner["stage_ms_per_frame"].items())
-        print(f"median time per frame of each part: {stages}")
-    print(f"run file: {args.out}" + (f" and {len(written) - 1} more parts" if len(written) > 1 else ""))
+        print(f"median time per frame of each part: {stages}", file=report)
+    if live:
+        print(f"live run: {skipped} frames skipped; copy of the feed: {args.out}; facts of the run: {written[1]}", file=report)
+    else:
+        print(f"run file: {args.out}" + (f" and {len(written) - 1} more parts" if len(written) > 1 else ""))
     return EXIT_OK
+
+
+def live_facts_path(out: Path) -> Path:
+    """Return the file of the facts of a live run: ``<stem>-runner.json`` next to the copy of the feed."""
+    return out.with_name(f"{out.stem}-runner.json")
+
+
+def write_live_facts(
+    out: Path, job: Mapping[str, Any], job_sha256: str, runner: Mapping[str, Any], answered: int, skipped: int
+) -> Path:
+    """Write the facts of a live run, which its feed has no place for, and return the file.
+
+    They are those of a clip run (the device, the versions, the script, the self-check of a
+    detector of transformers, ...), with the numbers of answered and skipped frames.
+    """
+    path = live_facts_path(out)
+    document = {
+        "format": TOOL_FEED_FORMAT,
+        "clip": job["clip"],
+        "job_sha256": job_sha256,
+        "tool": job["tool"],
+        "runner": dict(runner),
+        "answered_frames": answered,
+        "skipped_frames": skipped,
+    }
+    path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
+    return path
+
+
+def run_live(
+    args: argparse.Namespace, job: Mapping[str, Any], job_sha256: str, answer: BatchAnswer, batch: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Answer the frames of a clip job as a live run: write the feed and its copy at ``--out`` as frames are answered.
+
+    Returns the answered entries and the number of skipped frames. The feed is opened after the
+    tool is built, so a named pipe waits for its reader only then.
+    """
+    head = {
+        "clip": job["clip"],
+        "n_frames": len(job["frames"]),
+        "video_sha256": job["video_sha256"],
+        "job_sha256": job_sha256,
+        "tool": job["tool"],
+    }
+    with args.out.open("w", encoding="utf-8") as copy:
+        if args.feed == "-":
+            feed = LiveFeed(
+                [copy, sys.stdout], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind
+            )
+            frames = answer_frames(job, args.root, answer, batch, live=feed)
+        else:
+            with open(args.feed, "w", encoding="utf-8") as target:
+                feed = LiveFeed([copy, target], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
+                frames = answer_frames(job, args.root, answer, batch, live=feed)
+    return frames, feed.skipped
 
 
 if __name__ == "__main__":

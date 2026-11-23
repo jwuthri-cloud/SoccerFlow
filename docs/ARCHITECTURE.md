@@ -1777,19 +1777,30 @@ changed later (`docs/DECISIONS.md`, entry "A streaming path for the detector eng
 
 ```python
 # stream.py
-STREAM_FORMAT = "pitchvlm-stream-1"; KIT_WARMUP_FRAMES = 25
+STREAM_FORMAT = "pitchvlm-stream-2"; KIT_WARMUP_FRAMES = 25; EARLY_DISSOLVE_WINDOWS = 4; PAINT_MAX_PENDING = 4
+MISSING_REASONS = ("late", "skipped", "ended"); STREAM_TOOLS = ("detector", "calibration")
 @dataclass(frozen=True)
 class StreamSettings: delay_frames: int | None = 25; history_frames: int | None = None; kit_warmup_frames: int = 25
-    # None = the whole clip; a delay of the whole clip needs a history of the whole clip
+    early_dissolve_windows: int | None = 4
+    # None = the whole clip; a delay of the whole clip needs a history of the whole clip;
+    # early_dissolve_windows None waits for the end of the window test of a dissolve
 def default_history_frames(config: PipelineConfig, fps: float) -> int   # max_stitch_gap_s * fps + 4 * keyframe_frames = 123 at 25 fps
 def check_stream_engines(config: PipelineConfig) -> None                 # ValueError for other engines
 @dataclass(frozen=True)
 class StreamInput: frame: int; people: tuple[PersonDet, ...]; balls: tuple[BallCandidate, ...]; camera: HomographyRecord
     detector_seconds: float | None = None; calibration_seconds: float | None = None
+    arrived_at: float | None = None                      # earliest time a tool had the frame, seconds since the epoch
+    missing: tuple[tuple[str, str], ...] = ()            # (tool, reason) of each part without an answer
 @dataclass(frozen=True)
-class StreamHeader: clip: str; detector: DetectorSettings; calibration: PnlcalibSettings   # any detector family
+class StreamHeader: clip: str; n_frames: int; video_sha256: str | None; detector: DetectorSettings
+    calibration: PnlcalibSettings                         # any detector family
+def stream_header_line(clip, n_frames, video_sha256, detector, calibration) -> str
+def stream_frame_line(frame, detector: Mapping, calibration: Mapping) -> str   # a part: {seconds, payload[, arrived_at]} | {missing}
 def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]
 def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[StreamInput]]
+class QueuedLines:                                        # the lines of a pipe, read on a thread into a bounded queue
+    def __init__(self, lines: Iterable[str], max_lines: int, clock=time.monotonic)
+    last_read_at: float | None; last_backlog: int; largest_backlog: int   # iterate once
 def stand_in_inputs(people, balls, cameras) -> Iterator[StreamInput]
 class DetectorStream:
     def __init__(self, config, settings, *, clip_id: str, fps: float, size: tuple[int, int],
@@ -1797,6 +1808,8 @@ class DetectorStream:
     def push(self, item: StreamInput, image: np.ndarray | Callable[[], np.ndarray]) -> list[FrameState]  # at most one: frame t - L
     def finish(self) -> list[FrameState]     # the frames not decided yet, with every frame known
     def result(self) -> ClipResult           # after finish
+    paint_seconds: list[float]               # time of each paint score on its thread
+    transition_log: list[tuple[str, tuple[int, int], int]]   # ("early" | "final", (start, stop), newest frame then)
 def run_stream(inputs, read_image, config, settings, *, clip_id, fps, size, kit_clusters=None, clock=None) -> ClipResult
 def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
 
@@ -1804,19 +1817,26 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
 # tracking.py: class Associator (add(people), tracks(*, since=None), forget_before(frame), last_frame);
 #              associate() runs it
 # motion.py:   class ShotMeter (add(image, boxes), update_transitions(*, final=False), forget_images_before(frame),
-#              keep_images_from(), finish() -> ShotTests); measure_shots() runs it; transition_span(images, steps, first, last)
+#              keep_images_from(), finish() -> ShotTests, open_run, open_transition(stable_windows) -> (start, stop) | None);
+#              measure_shots() runs it (and never open_transition); transition_span(images, steps, first, last)
 # fill.py:     players_in_frame(tracks, homographies, frame, *, n_frames, warp, image_size, max_fill_gap_frames,
 #              pitch_margin_m=3.0, cuts=()) == dense_frame_states(...)[frame].players
 # ball.py:     track_ball(..., first_frame: int = 0)
 # pipeline.py: ball_state(track, frame, to_pitch, margin_m); clip_kit_clusters(source, people)
 # timing.py:   StageClock.frame() (context manager, one sample per block), StageClock.frame_report()
-#              -> {stage: {n, p50_ms, p95_ms, max_ms}} with FRAME_TOTAL = "total" last; percentiles_ms(seconds)
+#              -> {stage: {n, p50_ms, p95_ms, max_ms}} with FRAME_TOTAL = "total" last; percentiles_ms(seconds);
+#              class LatencyLog(delay_frames) (arrived(frame, *, source_at, line_at, backlog), given(frame, *, wall, mono),
+#              report() -> {decided_live, source_to_decision, after_last_needed_frame, line_to_decision, backlog_lines})
 ```
 
 - Arrival of frame `t` (stages `read`, `motion`, `paint`, `camera`, `kit_colour`, `tracks` of the
   frame sample): `ShotMeter.add` with the boxes of the frame (a hard cut is known now; a dissolve
-  when its window test is over, about `DISSOLVE_WINDOW_FRAMES` after it starts); the paint score
-  of the camera at every keyframe step; the camera checked with `fit_problems` and, without a kept
+  when its window test is over, about `DISSOLVE_WINDOW_FRAMES` after it starts, or earlier with
+  `early_dissolve_windows`: the span of the open run of low windows, taken once it came out the
+  same for that many judged windows in a row and its new shot starts at or before the newest
+  judged frame, and kept until the run ends; then the final span replaces it); the paint score
+  of the camera at every keyframe step, on one thread beside the frame path (`_PaintWorker`: the
+  stage `paint` is the hand-over; a frame waits only when `PAINT_MAX_PENDING` scores are open); the camera checked with `fit_problems` and, without a kept
   camera, the nearest earlier kept one within `max_gap_frames` moved with the motion; the people
   on the pitch; the team keys of the kit clusters; `Associator.add` (a new associator at each hard
   cut). The associator warps through the motion and the cameras known at arrival.
@@ -1837,9 +1857,12 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
   on the features of the last `kit_warmup_frames` frames. Given clusters are used from the first
   frame and never fitted.
 - With `delay_frames` and `history_frames` None every frame is decided in `finish` on one window
-  of the whole clip; with the kit clusters of the clip path (`clip_kit_clusters`) the frames, the
+  of the whole clip; `finish` then matches the whole clip again with the cameras of the whole
+  clip, the people of the blend frames dropped and the people off the pitch dropped with those
+  cameras (as `run_clip` does: a frame without a camera of its own takes the nearest camera,
+  also a later one); with the kit clusters of the clip path (`clip_kit_clusters`) the frames, the
   homographies, the cuts and the paint scores equal those of `run_clip` (tested on a clip without
-  a cut and with a hard cut). `ClipResult.tracks` of a stream are built from the given states
+  a cut, with a hard cut, and with a hard cut whose first frame has no camera). `ClipResult.tracks` of a stream are built from the given states
   (`tracks_of_states`): they are not the tracks of `run_clip`.
 - `result().engines` holds the engines of `_engines(config)` with `tracks` and `fill`
   `code:stream`, and `delay` and `history` (`"12 frames (0.48 s)"`, `"whole clip"`).
@@ -1847,21 +1870,77 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
   observations of live tracks, cameras, steps, ball candidates, test images, the ids of old
   observations), so a long stream keeps a bounded state; with `history_frames` None it keeps
   everything, like the clip path.
-- The line format: a header line `{"format": "pitchvlm-stream-1", "clip": ..., "detector":
-  <DetectorSettings of any family>, "calibration": <PnlcalibSettings>}`, then one line per frame from frame 0,
-  `{"frame": i, "detector": {"seconds": s, "payload": <payload of a clip run frame>},
-  "calibration": {"seconds": s, "payload": <payload of fallbacks.pnlcalib>}}`; JSON objects, one
-  per line, keys sorted. `read_stream_lines` refuses a missing header, another format, a line
-  that is not a JSON object, a frame out of order and a payload that the adapter refuses, with
-  the line number.
+- `push` refuses, before it changes anything, a frame out of order, a camera or a ball candidate
+  of another frame.
+- The line format (`pitchvlm-stream-2`): a header line `{"format", "clip", "n_frames",
+  "video_sha256" (null for images), "detector": <DetectorSettings of any family>, "calibration":
+  <PnlcalibSettings>}`, then one line per frame from frame 0, `{"frame": i, "detector": part,
+  "calibration": part}`, where a part is `{"seconds": s, "payload": <payload of a clip run frame
+  or of fallbacks.pnlcalib>, "arrived_at": t (optional)}` or `{"missing": "late" | "skipped" |
+  "ended"}` (no people, or no camera, for that frame); JSON objects, one per line, keys sorted.
+  `read_stream_lines` refuses a missing header, another format, a line that is not a JSON object
+  (also NaN, infinity and a nesting too deep for the parser), a frame out of order or past
+  `n_frames`, a part of another form and a payload that the adapter refuses, with the line number.
 - Command line: `stream --out DIR (--synthetic [--frames N] [--seed S] | --clip PATH (--detections
-  FILE --calibration FILE | --lines FILE|-)) [--config FILE] [--labels FILE] [--fps FPS] [--split]
-  [--tracker] [--delay N|clip] [--history N|clip|default] [--kit-warmup N] [--allow-dirty]`. It
-  writes the files of `run` (`result.json` with `provenance.stream`, `timing`, `frame_timing`,
-  `tool_timing`, `timing_note`, `identity` for the synthetic clip; the prediction file with a
-  label file; the video) and prints the per-frame table with the note that the package times hold
-  no detector and no calibration. The header of the stream must name the clip and the tool
-  settings of the settings file. The exit codes follow `run`.
+  FILE --calibration FILE | --lines FILE|- [--queue N])) [--config FILE] [--labels FILE [--split]
+  [--tracker]] [--fps FPS] [--delay N|clip] [--history N|clip|default] [--kit-warmup N]
+  [--allow-dirty]`; an option that does not apply to the input is refused (`check_stream_options`).
+  It writes the files of `run` (`result.json` with `provenance.stream`, `timing`, `frame_timing`,
+  `tool_timing`, `paint_timing`, `latency` (with `--lines`, `timing.LatencyLog`), `missing_parts`,
+  `transitions_known_at`, `timing_note`, `identity` for the synthetic clip; the prediction file
+  with a label file; the video) and prints the per-frame table with the note that the package
+  times hold no detector and no calibration. The header of the stream must name the clip, its
+  number of frames, the video of `--clip` (its SHA-256, or none for a folder of images) and the
+  tool settings of the settings file. `--lines` reads through `QueuedLines` (default 50 lines,
+  `cli.STREAM_QUEUE_LINES`). The exit codes follow `run`.
+
+### `feed.py` — the live feeds of the two tools, merged by frame (2026-11-23)
+
+```python
+# feed.py
+TOOL_FEED_FORMAT = "pitchvlm-tool-feed-1"; DEFAULT_WAIT_S = 1.0; DEFAULT_QUEUE_LINES = 250
+class FeedError(ValueError)                              # headers that are wrong or do not fit together
+class FeedMerger:                                        # the policy, one event at a time; the caller gives the time
+    def __init__(self, wait_s: float = 1.0)
+    def header(self, tool: str, text: str, now: float) -> None
+    def line(self, tool: str, text: str, now: float) -> None
+    def cut_off(self, tool: str) -> None
+    def end(self, tool: str) -> None
+    def take(self, now: float, limit: int | None = None) -> list[str]   # the stream header first, then frames
+    def deadline(self) -> float | None
+    finished: bool; ended: frozenset[str]; n_frames: int | None; next_frame: int; counts: MergeCounts
+def merge_feeds(feeds: Mapping[str, Iterable[str]], write: Callable[[str], None], *, wait_s=1.0,
+                queue_lines=250, clock=time.monotonic) -> FeedMerger   # one reading thread per feed
+def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a last line without its end as it is
+```
+
+- A tool feed (`tools/run_tool.py --feed`): `{"format": TOOL_FEED_FORMAT, "clip", "n_frames",
+  "video_sha256", "job_sha256", "tool"}`, then `{"frame", "seconds", "arrived_at", "payload"}` (the
+  compact payload for a detector) or `{"frame", "arrived_at", "skipped": true}` per frame.
+- The policy (module docstring of `feed.py`; `docs/DECISIONS.md`, entry "The live feed of the
+  detector engine"): frames go out in order, each once, as soon as both parts are in; the clock
+  of frame `n` starts at the first line of frame `n` or later from either tool (not before both
+  headers), and after `wait_s` the parts that are not in go out as `late`; skipped parts and the
+  parts of an ended feed do not wait; lines out of order wait for their frame; late, repeated,
+  broken and cut-off lines are dropped and counted; each feed has a queue of `queue_lines` lines,
+  and a full queue stops the reading of its pipe (back-pressure); frames are decided one at a
+  time (`take(now, limit=1)`), with the lines that came during a write applied first; after the
+  last frame a feed that is still open is read to its end.
+- Command line: `merge-feeds --detector FILE --calibration FILE [--wait SECONDS] [--queue N]`:
+  the merged lines to the standard output, flushed one at a time, a report to the error stream;
+  exit code 0 when every frame went out whole, 1 when a part was missing, a line was dropped or
+  the stream ended early, 2 when the feeds cannot be merged or the reader stopped. Named pipes
+  are opened with `os.open` and read with `fd_lines`, so a reader that stops early ends the chain.
+- `tools/run_tool.py` (live mode): `--feed FILE|-` (a clip job only) writes the feed as the
+  frames are answered and a copy at `--out` (no clip run), and at the end the facts of the run
+  (those of a clip run, with the self-check of a transformers detector) at `<stem>-runner.json`; `--pace FPS` reads frame `i` not before
+  the start plus `i / FPS` (`--start-at` seconds since the epoch, else when the tool is ready);
+  `--skip-behind` (with a pace and batches of one frame, checked before the tool is built) takes
+  the newest frame that has come and writes a skipped line for each frame it leaves out
+  (`LiveFeed`, called from `answer_frames`); each line goes to the copy first, then to the feed.
+- `tools/stand_in_tool.py`: runs `tools/run_tool.py` with the tool replaced by the answers of an
+  answers file (by the SHA-256 of the pixels) after a simulated time per frame; for
+  `tests/test_live_feed.py` and `evalx/livebench.py` (four processes, two named pipes, a pipe).
 
 ## 5. Tests
 
