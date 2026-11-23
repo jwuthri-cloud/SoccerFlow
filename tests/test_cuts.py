@@ -7,6 +7,7 @@ a step of 10 scene frames per clip frame is a fast pan (83 pixels per frame at 1
 from __future__ import annotations
 
 import json
+import warnings
 
 import numpy as np
 import pytest
@@ -76,6 +77,15 @@ def test_frames_without_contrast_are_a_cut() -> None:
     assert shot_correlation(flat, picture, []) is None
     assert is_cut(flat, picture, [])
     assert is_cut(flat, flat, [])
+
+
+@pytest.mark.parametrize("shape", [(2, 640), (10, 1920)])
+def test_an_image_too_flat_for_the_test_grid_gives_no_correlation(shape: tuple[int, int]) -> None:
+    # Shrunk to 160 px wide, the image has fewer rows than the grid: some blocks are empty.
+    image = np.random.default_rng(0).integers(0, 256, shape, dtype=np.uint8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert shot_correlation(image, image, []) is None
 
 
 def test_a_motion_that_moves_the_frame_out_of_the_picture_does_not_count() -> None:

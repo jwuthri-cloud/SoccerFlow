@@ -155,13 +155,14 @@ from pitchvlm.fallbacks.runs import (
 )
 from pitchvlm.frames import FrameSource, ImageFolderSource, VideoFileSource, keyframe_indices
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
-from pitchvlm.pipeline import ToolAnswers, run_clip
+from pitchvlm.pipeline import ToolAnswers, keyframe_frames, run_clip
 from pitchvlm.probes import LabelledClip, write_metrics
 from pitchvlm.render import render_clip
 from pitchvlm.roster import Roster, load_roster
 from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.timing import StageClock
+from pitchvlm.tracking import SWAP_MIN_VOTES
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
     FLEX_TIMEOUT_S,
@@ -1390,7 +1391,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     errors = summarize(position_errors_m(result.frames, truth))
     identity = identity_scores(result.frames, truth)
     timing = clock.report(info.n_frames)
-    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
+    diagnostics = track_diagnostics(
+        result,
+        max_speed_mps=config.tracking.max_speed_mps,
+        team_min_votes=SWAP_MIN_VOTES * keyframe_frames(config, info.fps),
+    )
     summary = {
         "clip_id": info.clip_id,
         "engine": args.engine,
@@ -1685,7 +1690,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print_empty_result(empty)
     timing = clock.report(info.n_frames)
     print_engines(result.engines)
-    diagnostics = track_diagnostics(result, max_speed_mps=config.tracking.max_speed_mps)
+    if config.engines.people == "detector":
+        print(f"ball: {sum(frame.ball is not None for frame in result.frames)} of {info.n_frames} frames")
+    diagnostics = track_diagnostics(
+        result,
+        max_speed_mps=config.tracking.max_speed_mps,
+        team_min_votes=SWAP_MIN_VOTES * keyframe_frames(config, info.fps),
+    )
     print_diagnostics(diagnostics.lines())
     print_timing(timing)
     document = {

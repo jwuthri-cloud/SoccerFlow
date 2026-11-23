@@ -29,8 +29,8 @@ Where the caches are not used:
 
 - In the modules that test these functions themselves (``NO_CACHE_MODULES``): there a second
   call computes again, so a test that compares two calls compares two computations.
-- While a test has replaced a function of ``motion``, ``geometry`` or ``cv2`` (a monkeypatch):
-  then results 3, 4 and 5 are computed, not read.
+- While a test has replaced a function or a setting of ``motion``, ``geometry`` or ``cv2`` (a
+  monkeypatch): then results 3, 4 and 5 are computed, not read.
 - For any other class of scene or frame source.
 
 No result changes: a cached value is what the code under test computed for the same input in
@@ -78,18 +78,20 @@ def _digest(data: Any) -> bytes:
     return hashlib.sha256(data).digest()
 
 
-def _functions(module: types.ModuleType) -> dict[str, object]:
-    return {name: value for name, value in vars(module).items() if callable(value)}
+def _values(module: types.ModuleType) -> dict[str, object]:
+    return {name: value for name, value in vars(module).items() if not name.startswith("__")}
 
 
-#: The functions of the modules that results 3, 4 and 5 use, as the test process started with them.
-_ORIGINAL_FUNCTIONS = {module: _functions(module) for module in (motion, geometry, cv2)}
+#: The functions and settings of the modules that results 3, 4 and 5 use, as the test process
+#: started with them. A test that replaces one of them (a function or a threshold) gets a real
+#: computation.
+_ORIGINAL_VALUES = {module: _values(module) for module in (motion, geometry, cv2)}
 
 
 def _functions_unchanged() -> bool:
-    for module, functions in _ORIGINAL_FUNCTIONS.items():
+    for module, values in _ORIGINAL_VALUES.items():
         current = vars(module)
-        if any(current.get(name) is not value for name, value in functions.items()):
+        if any(current.get(name) is not value for name, value in values.items()):
             return False
     return True
 

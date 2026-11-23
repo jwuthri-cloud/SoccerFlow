@@ -5,7 +5,8 @@ each person of the detector engine a team key and a role with plain code:
 
 1. ``torso_feature``: a colour histogram of the torso part of the box (the middle half of
    its width, from 15% to 45% of its height from the top). Saturated pixels count in one of
-   12 hue bins; the others in one of 3 brightness bins (dark, grey, light), so black, white
+   12 hue bins (shifted by half a bin, so that the reds on both sides of the hue wrap share a
+   bin); the others in one of 3 brightness bins (dark, grey, light), so black, white
    and grey kits have their own bins. The feature is the square root of the shares, so that
    the distance of two features is the Hellinger distance of the histograms times sqrt(2).
 2. ``fit_kit_clusters``: a 2-cluster k-means of the features of the clip, in numpy. The two
@@ -47,6 +48,9 @@ TORSO_Y = (0.15, 0.45)
 #: A torso window with fewer pixels gives no feature.
 MIN_TORSO_PIXELS = 12
 HUE_BINS = 12
+#: The hue bins start half a bin before hue 0 (OpenCV hue runs from 0 to 179), so that the reds on both
+#: sides of the wrap (hue 178 and hue 2) fall in one bin and not in the two bins furthest apart.
+_HUE_SHIFT = 180 // (2 * HUE_BINS)
 #: A pixel counts in a hue bin when its saturation and its brightness (0-255) are at least these values.
 MIN_SATURATION = 64
 MIN_BRIGHTNESS = 48
@@ -60,6 +64,10 @@ _MAD_SCALE = 1.4826
 #: Smallest outlier margin, so that a cluster of equal features does not make every other feature an outlier.
 _MIN_MARGIN = 0.05
 _MAX_ITERATIONS = 100
+#: Number of k-means++ starts; the fit with the smallest sum of squared distances is kept. One start
+#: can end in a split of the referee against both teams when the three kits are about equally far
+#: apart (seen in 4 of 10 seeds of the synthetic scene).
+KMEANS_STARTS = 10
 TEAM_KEYS: tuple[TeamKey, TeamKey] = ("A", "B")
 
 
@@ -79,7 +87,7 @@ def torso_feature(image: np.ndarray, box: Box) -> np.ndarray | None:
     hsv = cv2.cvtColor(np.ascontiguousarray(image[top:bottom, left:right]), cv2.COLOR_BGR2HSV).reshape(-1, 3)
     hue, saturation, value = (hsv[:, channel].astype(np.int64) for channel in range(3))
     coloured = (saturation >= MIN_SATURATION) & (value >= MIN_BRIGHTNESS)
-    hue_bin = np.minimum(hue * HUE_BINS // 180, HUE_BINS - 1)  # OpenCV hue runs from 0 to 179.
+    hue_bin = (hue + _HUE_SHIFT) % 180 * HUE_BINS // 180
     brightness_bin = HUE_BINS + np.searchsorted(np.array(BRIGHTNESS_LIMITS), value, side="right")
     bins = np.where(coloured, hue_bin, brightness_bin)
     counts = np.bincount(bins, minlength=FEATURE_SIZE).astype(np.float64)
@@ -95,6 +103,15 @@ class KitClusters:
     #: Outlier limit of each cluster, the same order.
     limits: tuple[float, float]
 
+    def two_kits(self) -> bool:
+        """Tell whether the clusters are two kits: each centre lies beyond the outlier limit of the other.
+
+        Noisy crops of one kit are never equal, so k-means splits them into two clusters
+        whose centres lie inside each other's limits. Such clusters name no teams.
+        """
+        distance = float(np.linalg.norm(self.centres[0] - self.centres[1]))
+        return distance > max(self.limits)
+
     def team_key(self, feature: np.ndarray | None) -> TeamKey:
         """Return the team key of a feature: its cluster, or ``none`` for an outlier and for no feature."""
         if feature is None:
@@ -108,16 +125,19 @@ def fit_kit_clusters(features: np.ndarray, *, seed: int = 0) -> KitClusters:
     """Split the features of a clip into two kit clusters with k-means, and set the outlier limits.
 
     ``features`` has shape ``(n, FEATURE_SIZE)``. The start centres come from k-means++ with
-    ``seed``, so a run gives the same clusters again. Cluster 0 is the one whose centre comes
-    first in the order of the feature values, so the names do not depend on the order of the
-    rows. ``ValueError`` is raised for a wrong shape, and when the features do not hold two
+    ``seed``, so a run gives the same clusters again. ``KMEANS_STARTS`` starts are run, and the
+    fit with the smallest sum of squared distances is kept (the first one in a tie). Cluster 0
+    is the one whose centre comes first in the order of the feature values, so the names do not
+    depend on the order of the rows. ``ValueError`` is raised for a wrong shape, and when the features do not hold two
     different values.
     """
     if features.ndim != 2 or features.shape[1] != FEATURE_SIZE:
         raise ValueError(f"features must have the shape (n, {FEATURE_SIZE}), got {features.shape}")
     if len(np.unique(features, axis=0)) < 2:
         raise ValueError("the kit colours of the clip need at least two different features")
-    centres, labels = _kmeans2(features, np.random.default_rng(seed))
+    rng = np.random.default_rng(seed)
+    fits = [_kmeans2(features, rng) for _ in range(KMEANS_STARTS)]
+    centres, labels = min(fits, key=lambda fit: _cost(features, *fit))
     order = sorted(range(2), key=lambda index: tuple(centres[index]))
     centres, labels = centres[order], np.array([order.index(label) for label in labels])
     first, second = (
@@ -143,6 +163,11 @@ def _kmeans2(features: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray
             break
         labels = new_labels
     return centres, labels
+
+
+def _cost(features: np.ndarray, centres: np.ndarray, labels: np.ndarray) -> float:
+    """Return the sum of squared distances of the features to the centres of their clusters."""
+    return float(np.sum((features - centres[labels]) ** 2))
 
 
 def _nearest(features: np.ndarray, centres: np.ndarray) -> np.ndarray:

@@ -790,8 +790,9 @@ Items 5 and 6 come from the checks of the change of item 4.
      `Retry-After` up to 300 s). The status 503 can mean that no provider meets the routing
      settings; its error line says so. A timeout is not tried again. Assumed, not documented: a
      call refused with an error status is not billed (as for Gemini).
-   - A 200 answer without usage, without a cost or with `is_byok: true` raises
-     `UnconfirmedCallError`: the ledger cannot price it. A 200 answer with an error, a finish
+   - A 200 answer without usage, without a cost above 0 or with `is_byok: true` raises
+     `UnconfirmedCallError`: the ledger cannot price it. So does a 200 answer whose body cannot
+     be read; it is not sent again. A redirect is not followed. A 200 answer with an error, a finish
      reason other than `stop` or no text raises `BilledAnswerError` with its reported cost.
    - The strict schema gets `additionalProperties: false` on every object (the strict mode of
      several providers needs it). Not known: whether every provider takes `minItems` and
@@ -810,8 +811,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    (one provider), `google/gemini-2.5-flash` 0.54 / 4.50 (endpoints 0.15 / 1.25, 0.30 / 2.50,
    0.54 / 4.50). The pages showed no per-image price, no `:free` entry and no mark of zero data
    retention; so it is not known whether any provider of these models meets the routing settings.
-   Estimated, not measured: the first doctor of `qwen/qwen3-vl-235b-a22b-instruct` costs about
-   0.02 USD (6 calls at the token estimates of Gemini; image tokens of Qwen differ).
+   Estimated, not measured: the first doctor of `qwen/qwen3-vl-235b-a22b-instruct` costs
+   0.015 USD, the estimate that the doctor prints (6 calls at the token estimates of Gemini;
+   image tokens of Qwen differ).
 7. **Video input is not built.** The video page shows a `video_url` part with links (YouTube for
    Gemini on AI Studio; Vertex takes no video links) in its chat examples, and base64 video only in
    the examples of the Responses API. The footage cannot go to a public link, and no page shows a
@@ -829,7 +831,7 @@ Items 5 and 6 come from the checks of the change of item 4.
      drawing."
    - Rule 4: "Only `src/pitchvlm/vlm/client.py` talks to a model service: it imports the model SDK
      of Gemini and sends the OpenRouter requests with the standard library. Everything else must
-     run without the SDK and without a network. Only `tools/run_tool.py` imports an external tool
+     run without the SDK and must not call a model service. Only `tools/run_tool.py` imports an external tool
      (RF-DETR, PnLCalib). It runs in the environment of that tool, and the package never imports
      it."
    - Rule 5: "Model calls: paid models only (no OpenRouter model with the suffix `:free`), no
@@ -1226,6 +1228,234 @@ Items 5 and 6 come from the checks of the change of item 4.
    synthetic kits; the ball with a stand-in ball that the synthetic picture does not show. The
    values of the table above were read by one agent and not checked by a second reader.
 
+## 2026-11-22 — Second read of the model provider and money code
+
+The second read of the code that the OpenRouter entry above brought in (`vlm/client.py`,
+`vlm/cost.py`, `vlm/types.py`, `vlm/coords.py`, `vlm/steps.py`, the prompts, the doctor and its
+command line, the price table, the guard and the secret scan, and the OpenRouter parts of the
+docs). Four readers read separate parts (rules 4 and 5 with the secrets; the money; errors,
+coordinates and cache keys; the docs). Each claim then went to a second reader whose job was to
+refute it with a test or an exact trace. Every test ran offline, with fake HTTP layers.
+
+Counts: 24 distinct claims. 12 confirmed and fixed: 1 major, 5 minor, 6 small. 11 refuted. 1
+not sent to a second reader, because the docs already describe it (a `Retry-After` header with a
+date is ignored, and the normal wait is used). Each code fix has one test that fails on the code
+before the fix (run on a copy of the old code with the new tests: 9 of 9 fail for the reason
+that the fix removes).
+
+1. **Major. A success answer whose body breaks off was sent again.** `UrllibTransport` turned a
+   failed read after the status 200 into a lost connection, which is tried again: up to 4
+   billed calls for one request, none of them in the ledger. Now it raises
+   `HttpUnreadAnswerError`, and the backend ends the request with `UnconfirmedCallError` at
+   once, as for a timeout.
+2. **Minor. A redirect carried the key to another host.** `urlopen` follows 301, 302 and 303 on
+   a POST as a GET with every header, also `Authorization`. The transport now follows no
+   redirect: a 3xx answer is an error status that is not tried again.
+3. **Minor. A reported cost of 0 counted as a paid answer.** The ledger, the spend window and the
+   stops then counted 0 USD for the call. A cost of 0 now raises `UnconfirmedCallError` (after
+   the BYOK case, which keeps its own message), and the doctor line `reported cost` fails for it.
+4. **Minor. The guard and the secret scan missed an OpenRouter key after a letter, a digit or an
+   underscore** (`MY_KEY_sk-or-v1-...`), where they find a Google key. The `sk-or-v1-` prefix is
+   long enough to need no word start: both rules dropped it.
+5. **Minor. Doc: proposed rule 4** said that everything else runs "without a network", but
+   `datasets.py` downloads the dataset. It now says "must not call a model service".
+6. **Minor. Doc: RUNBOOK section 10** said that a 503 that ends the doctor means that no provider
+   meets the privacy settings. A 503 is retried like every 5xx, can be a busy service, and a
+   failed request fails one check while the doctor goes on. The text now says so.
+7. **Small. An error status whose body read failed** escaped as a raw `IncompleteRead`, not
+   retried and not logged. The body is now left out with a warning, and the status decides.
+8. **Small. Error text from a 200 body** went into the error unchanged: no key removal, no cut
+   to 500 characters. `_error_message` now cleans every body text.
+9. **Small. `"error": null`** in a 200 body rejected a usable, billed answer. Only an error that
+   is not null counts now.
+10. **Small. Docs:** the first Qwen3-VL doctor costs 0.015 USD as estimated by the code (6
+    calls, `DEFAULT_TOKEN_ESTIMATES` at 0.21 / 1.90 USD per million), not "about 0.02";
+    `--thinking-level` applies to every model of a doctor run, not only to the OpenRouter
+    models; the Gemini thinking levels are `minimal` to `xhigh`, by model.
+
+Refuted (behaviour reproduced, but not a defect of this change):
+- An answer with readable tokens but no usable cost gets no ledger line: the documented policy
+  for a call whose cost is unknown, as for Gemini; the run stops at the first one.
+- One spend window per provider: documented; the window protects the limit of each account,
+  and the ledger stops count both providers together.
+- The doctor goes on after a call whose cost is unknown: unchanged since f7d788e, and the line
+  `reported cost` fails.
+- `:FREE`, a trailing space or `:free:beta` pass the free-model check: a request is sent only
+  for a slug with an exact entry in the tracked price table, which is paid only.
+- An upper-case key followed by `,` or `)` escapes gitleaks: real keys are lower-case (auth
+  page), and the guard's general `sk-` rule finds them.
+- A model that answers in another coordinate convention is not detected in a run: by design,
+  gate G0 proves the convention before a settings file names it.
+- The routing settings and the image type are not in the cache key; the prompt names stay `v1`;
+  "data policy checks every sent body"; "the doctor compares the ledger with the account page";
+  reasoning tokens counted twice without `total_tokens` (logged, and the money uses the
+  reported cost): intended, harmless, or only loose wording.
+
+Open, not fixed (inferred, not measured):
+- Unknown-cost answers with readable tokens could be priced at the table price as an upper
+  bound, instead of having no ledger line. That needs a ledger field that says the cost is
+  not reported; owner decision.
+- `run` and `probe` do not check that a G0 pass exists for the model and the convention of a
+  step, and nothing counts coordinates outside the bounds of the convention.
+- Not checkable offline: whether OpenRouter ever redirects, reports a cost of 0, treats slugs
+  case-insensitively, or bills a 524; `urllib` applies the timeout to each read, so a server
+  that sends bytes slowly can hold a call longer than 300 s.
+
+## 2026-11-22 — Second read of the tracking, cuts, paint alignment and detector engine
+
+A second read of the code that pull requests 5, 6 and 7 brought into `main` (`652c82b`; base
+`f7d788e`), with the hand-resolved merges. Five readers read separate parts (merge seams, the cut
+rule, the two track repairs, kit colours and numbers, texts and rules). Each finding was checked
+by a second reader with a test that fails on the old code or with an exact trace; one more
+reader then tried to refute the fixes. Every number below is synthetic: build machine, synthetic
+clips, stand-ins of the model, the detector and the calibration. None is a result on real
+footage. "Before" is `652c82b`; "after" is the commit of this entry.
+
+1. **Counts.** Major: 4 found, 4 confirmed, 3 fixed, 1 open (item 5). Minor: 8 found, 8
+   confirmed, 7 fixed, 1 kept as a written limit (item 3, last point). Small: 13 found, 9
+   confirmed and fixed, 4 refuted or taken back (item 6). The read of the fixes found 1 small
+   regression of this review (fixed, item 4) and 1 change of this review that it argued
+   against (taken back, item 6).
+2. **Major, fixed.**
+   - `tracking.link_team_slots` checked the numbers of each link alone, so a chain 1, (no
+     number), 13 of one goalkeeper slot became one track and number 13 was lost. A link is now
+     refused when the chain it makes shows two displayed numbers or two most frequent per-frame
+     numbers. Test: `test_team_slots_do_not_chain_two_numbers_through_a_track_without_one`.
+   - The detector engine counted two keyframe limits in frames: a team-key change of
+     `split_team_swaps` needed 4 votes = 4 frames (0.16 s at 25 fps) instead of 1.9 s, and the
+     label penalty of `associate` grew per missed frame instead of per missed keyframe (a
+     detection with another kit key could not match after 4 missed frames). Found by three
+     readers. `pipeline.keyframe_frames` (12 frames at 25 fps; 1 for the model engine) now
+     scales both: `associate(keyframe_frames=)`, `split_team_swaps(min_votes=4 * 12)`, and the
+     team-key changes of the tracking values (`track_diagnostics(team_min_votes=)`). The model
+     engine is unchanged (1 and 4). Tests in `tests/test_tracking.py` (penalty per interval,
+     a 4-frame flip next to an opponent is no change, a 120-frame swap is cut) and
+     `tests/test_detector_engine.py` (the split gets 48 votes). Measured: see item 7.
+   - `kitcolour.fit_kit_clusters` ran one k-means++ start. On the synthetic scene (250 frames,
+     seeds 0 to 9) it split the referee against both teams in 4 of 10 seeds (1, 5, 6, 8): the
+     referee got the key `A` and 41 % to 42 % of the player boxes got `none`. Now 10 starts
+     (`KMEANS_STARTS`), the fit with the smallest sum of squared distances is kept: 0 of 10
+     seeds, players in their own cluster 0.933 to 0.998 (before, in the 6 good seeds, 0.960 to
+     0.994). Test: `test_the_kit_clusters_are_the_two_teams_and_the_referee_is_an_outlier`
+     (50 frames, seed 0, fails before). The test of two kits with 40 noisy copies each was
+     changed: with the new fit one blue copy of 40 lies beyond the outlier limit (0.119 against
+     0.114), which the rule (median plus 3 scaled deviations of a skewed distance) allows; the
+     old fit passed because an outlier inside the cluster widened the limit. The test now
+     asks for distinct team keys, no copy with the key of the other team, and at most one
+     outlier per team.
+3. **Minor, fixed.**
+   - A shown number joined two tracks across a cut only when their positions on the two sides
+     were within the reach of a runner (`_one_person_per_number` compared positions across the
+     cut), so after a replay or another camera the number was taken from all but the longest
+     track. Across a cut the number alone decides now; inside a shot the test of the way stays.
+   - Without kit clusters (one torso feature, or none) every track of the detector engine
+     became a referee or a goalkeeper (`kit_roles` read every `none` as an outlier kit). Now
+     `kit_roles` runs only when a person of the clip has the key `A` or `B`.
+   - Noisy crops of one kit were split into two "teams" (the check asked only for two
+     different features). `KitClusters.two_kits` (each centre beyond the outlier limit of the
+     other) now refuses such clusters with a warning.
+   - The comment of `SWAP_MIN_VOTES` said a false change has a chance of 0.6 % per track of 60
+     observations. The weak runs join their neighbours, so 4 votes need not come in a row.
+     Monte Carlo (10 % wrong keys, 10 % no key, one by one; 2,000 tracks per length, seed 0):
+     2.15 % at 60 observations, 9.30 % at 250, 26.6 % at 750; with 48 votes 0 of 2,000 at 250
+     and at 750. The comment now says so.
+   - RUNBOOK section 12: step 1 ran `data --split train`, which the command refuses; step 3
+     imported `rfdetr` in a `python -c` line, against rule 4. Both are now written as "to
+     build", the training as a job of `tools/run_tool.py`.
+   - "A pan above about 100 px per frame counts as a cut" (ARCHITECTURE; the paint-and-cuts
+     entry, item 6) was not measured. Measured now: at 100 px per frame no pair is below 0.5
+     (lowest 0.873), at 125 px 7 of 39 pairs are, at 150 px 15 of 39. ARCHITECTURE says so.
+   - Kept as a written limit, not fixed: `link_team_slots` counts every track of a group as a
+     person, so a second box of one person, a wrong-team piece or a referee with a team key
+     can force one link between two people. Two of these causes are fixed above; the limit is
+     in the docstring.
+4. **Small, fixed.** `run` printed no ball count (`demo` did). The radar drew trails across a
+   cut (`RadarRenderer(cuts=)`, `render_clip` passes `result.cuts`). OpenCV hue 2 and hue 178
+   (one red) fell in the first and the last hue bin, distance sqrt(2); the bins now start half
+   a bin before hue 0. `shot_correlation` raised `ZeroDivisionError` on an image whose 160 px
+   copy has fewer rows than the grid (empty blocks). `load_clip_run` looked for an older part
+   only at `parts + 1`; it now looks at every 4-digit part above the run, with the name escaped
+   for `glob` (the escape also in `tools/run_tool.later_parts`; a stem with `[` was the
+   regression that the read of the fixes found). `track_diagnostics` gave an infinite speed for
+   two positions of one track in one frame; it raises `ValueError` now. Texts: ARCHITECTURE
+   on the keyframe check of `run` and `demo` (model engine only), on `BallState` defaults, on
+   the chain rule of the slots, and the contracts of every changed function.
+5. **Major, open: a dissolve is not a cut.** `is_cut` compares neighbouring frames; in a
+   dissolve each frame differs from the next by a small blend step. Measured
+   (`tools/synthetic_diagnostics.py`, seed 0, two shots of the synthetic match 100 frames apart):
+   a hard cut 0.033, a dissolve of 5 frames lowest pair 0.900, of 10 frames 0.929; so the motion
+   chain, the tracks and the fill run through it, and a mapping carried across a 10-frame
+   dissolve was 39 m off at the frames after it (one reader, scratch script). No fix is small:
+   a test over a window of frames needs its own measurement, and a fast pan must not become a
+   cut. ARCHITECTURE names the limit. Owner decision: build a window test before the demo
+   clip, or accept the limit (the clips of SoccerNet GSR have no cut).
+6. **Refuted or taken back.** (a) Flat or tiny frames are always a cut: by design and written.
+   (b) The change point of `team_key_runs` after merges (for example A10 B3 A3 B10): the contact
+   is tested from the last vote of the merged run to the first vote of the next, the right
+   window. (c) The engine table names `model` for the number step when no number request is
+   sent (no mapping): older than these pull requests, and `run` prints that no player has a
+   number; the ball step names the tracker, and the detector of its candidates is named in
+   `people`. (d) Taken back: this review first refused slot links between different export
+   numbers; an export number can come from one low-confidence crop, so one misread crop would
+   block a link. The display number stays the evidence. (e) `min_observations` of the detector
+   engine stays 2, of frames (0.08 s): a noise filter whose value G2 and G4 decide; written in
+   `every_frame_tracking`.
+7. **Measured, before and after** (build machine; commands from the top folder with
+   `PYTHONPATH=src`):
+   - `python -m pitchvlm.evalx.trackbench --seeds 20` (seeds 0 to 19): before, every number of
+     the table of the track-repairs entry, item 8, again to the last digit. This also checks the
+     claim of that entry, item 10, that the cut changes leave the clips without a cut alone.
+     After: the same table to the last digit (the chain rule of the slots changes no case of the
+     bench). A first run with the export-number check of item 6 (d) changed one row (mixed,
+     both: track ratio 1.154, purity 0.985, 26.6 tracks).
+   - `python tools/synthetic_diagnostics.py`: before, every number of the paint-and-cuts entry,
+     items 5 and 6, again (median scores per shift, AUROC 0.948 and 0.987, the mirrored
+     mappings, 448 pairs lowest 0.881, 8 cuts highest 0.055, the jump 0.918). The script now
+     also prints the time of one score (17.5 ms median, n 2,450, on the build machine while
+     other sessions ran; the earlier "about 12 ms" was not measured by a script), the limits of
+     items 3 and 5, and the detector-engine numbers of the detector entry, item 5: 250 frames,
+     seed 3, without slots 27 tracks, 4 switches, coverage 0.972, track ratio 1.174; with slots
+     23, 0, 1.000, 1.000; a cut at frame 54: 33 tracks, 0 across the cut, paint of 10 keyframe
+     cameras 0.996 to 1.000. The same numbers before and after.
+   - Detector engine, split of team swaps (scratch scripts of the review, kept in the notes of
+     the session, not in the repository; stand-in detector, true camera, 10 s clips, seeds 0 to
+     9, a team-A player passes in front of a team-B player, depth gap 0.5 m):
+
+     | case | far player wrongly cut, before | after | switches without split; with split, before; after |
+     |---|---|---|---|
+     | pass 0.5 m/s | 10 of 10 | 0 of 10 | 38; 184; 38 |
+     | pass 1 m/s | 10 of 10 | 0 of 10 | 38; 80; 38 |
+     | pass 2 m/s | 10 of 10 | 0 of 10 | 38; 76; 38 |
+     | pass 4 m/s | 0 of 10 | 0 of 10 | 38; 38; 38 |
+     | mark 1 s | 10 of 10 | 0 of 10 | 38; 156; 38 |
+     | mark 2 s | 10 of 10 | 10 of 10 | 38; 260; 260 |
+     | depth gap 1 m: pass 0.5, 1 m/s; mark 1 s | 2, 1, 4 of 10 | 0, 0, 0 of 10 | 38; 62, 44, 72; 38 |
+
+     The before column was measured with a best-of-20 k-means fit in the script, so that the
+     cluster failure of item 2 did not hide the split; the after column with the code of this
+     entry. A mark of 2 s shows the shirt of the other kit for longer than the 1.9 s of the
+     keyframe design, so it is still cut: the limit that the track-repairs entry, item 2, names
+     for the model engine.
+   - Detector engine, injected swaps (the swap of `trackbench` applied to the output of
+     `associate`, 15 s clips, seeds 0 to 9): switches over 10 clips (19 swaps
+     after, 18 before), before then after: clean without repair 90 and 90, clean with the split
+     92 and 90; with the swaps, no repair 126 and 128, split 106 and 118, slots 41 and 46, both
+     18 and 36. The split now takes back 10 of the 38 switches that the swaps cost (20 of 36
+     before): a swap must hold for 48 frames on each side, and on these clips the tracks of the
+     detector engine are often shorter after a swap. This is the cost of the fix. Whether the
+     detector engine should use a shorter time than the keyframe design is for G4 on the dev
+     clips.
+   - Natural scene (30 s, seeds 0 to 9): tracks of a team with a run of 4 or more wrong kit
+     votes: 1 of 532 (5 frames, seed 4); wrong cuts of the split 2 before and 0 after; switches
+     263 without the split, with it 265 before and 263 after.
+8. **Not verified.** Nothing ran on real footage, a real detector or a real model. The new
+   `two_kits` check has no measurement on real crops: on simulated two-kit features its margin
+   was 0.79 to 0.99 against limits of 0.53 to 0.66 (4 cases, one reader); similar real kits
+   could fail it, and the clip then has no team keys. The 10 k-means starts were measured on
+   flat synthetic kits only. The `keyframe_frames` scaling keeps the time of the keyframe
+   design; whether 1.9 s is the right time for a kit-colour swap is for G4. The swap of two
+   teammates and the dissolve stay unseen.
+
 ## 2026-11-22 — A faster default run of the offline tests
 
 1. **Goal and result.** The owner called the wait for the offline tests unusable (3,090 tests,
@@ -1419,6 +1649,29 @@ Items 5 and 6 come from the checks of the change of item 4.
     sessions (base 256 to 306 s against 181 s on the orchestrator's earlier run). The caches
     were tested on this machine and Python 3.13 only; a run with `pytest-xdist` was never tried.
 
+11. **Measured again after the merge of `main` c1ae26a** (the reviews of the provider and of the
+    tracking, merged into 344a851; 3,117 tests, the same ids as `main`; the 27 new tests are in
+    the default run). Items 2 to 10 above are the runs on 344a851. New runs, one after the other,
+    load average 2.5 to 4.3:
+
+    | Run | Tests | Wall, s |
+    |---|---|---|
+    | Default run, two times | 3,108 (1 skipped) | 155.9, 160.1 |
+    | Full run with the caches | 3,117 (1 skipped) | 171.1 |
+    | Full run without the caches (`PITCHVLM_TEST_CACHE=0`) | 3,117 (1 skipped) | 243.1 |
+    | Slow tier | 9 | 18.3 |
+
+    `test_guard.py` took 69.8 and 71.8 s, `test_cli.py` 36.2 and 36.5 s of these default runs.
+    The merge changed no cached function and no call of one (`compute_motion_field`,
+    `paint_alignment`, `encode_jpeg`, `code_state`, the scene frames and the image reads); the
+    change in `motion.py` is inside the cut test and changes no input of the cache key. The
+    change in `tools/guard.py` is one pattern; the guard inside the test process runs its `main`
+    as before. One change of `tests/conftest.py`: the caches of the motion, the paint alignment
+    and the JPEG bytes now also stop while a test has replaced a setting (not only a function)
+    of `motion`, `geometry` or `cv2`; no test does that today. The faults F01 to F08 of the
+    cached functions, planted again one at a time: the default run catches 7 of 8, as before
+    (F01 again caught by no run).
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
@@ -1556,7 +1809,7 @@ Decisions for the owner that are open, each with its recommendation:
   than 1.5 times, add estimates per model (a small change of `vlm/cost.py`) before its first probe.
 - **OpenRouter: which models to try.** Candidates with a published price: Qwen3-VL 235B (first
   guess `xy_1000`), Qwen2.5-VL 72B and Gemini 2.5 Flash through OpenRouter (`yx_1000`).
-  Recommendation: one doctor of Qwen3-VL first (about 0.02 USD, estimated), then the people
+  Recommendation: one doctor of Qwen3-VL first (0.015 USD, estimated), then the people
   probe of the model that passes, on the frames of the Gemini people probe.
 - **Paint alignment: the rule** (entry "Paint alignment of pitch mappings, and hard cuts" of
   2026-11-22, item 4). Recommendation: run the free measurement of the RUNBOOK (section 3) on

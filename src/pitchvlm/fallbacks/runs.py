@@ -98,6 +98,7 @@ part passes the guard like a ledger file. A part::
 
 from __future__ import annotations
 
+import glob
 import json
 from collections import Counter
 from pathlib import Path
@@ -330,10 +331,11 @@ def load_clip_run(first: Path) -> ClipRun:
                 "differs)"
             )
         frames.extend(part.frames)
-    stray = clip_run_part_path(first, first_part.parts + 1)
-    if stray.exists():
+    pattern = f"{glob.escape(first.stem)}-[0-9][0-9][0-9][0-9]{glob.escape(first.suffix)}"
+    strays = sorted(path for path in first.parent.glob(pattern) if int(path.stem[-4:]) > first_part.parts)
+    if strays:
         raise ValueError(
-            f"{stray.name} lies next to a run of {first_part.parts} parts: it is a part of another run. Remove it"
+            f"{strays[0].name} lies next to a run of {first_part.parts} parts: it is a part of another run. Remove it"
         )
     return ClipRun.model_validate(
         {

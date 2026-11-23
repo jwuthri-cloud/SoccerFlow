@@ -923,12 +923,13 @@ class SecretRuleTest(GuardTestCase):
             "OPENROUTER_API_KEY=" + OPENROUTER_KEY,
             'curl -H "Authorization: Bearer ' + OPENROUTER_KEY + '"',
             json.dumps({"detail": "the call failed with the key:\n" + OPENROUTER_KEY}),
+            "MY_KEY_" + OPENROUTER_KEY,
         ]
         self.stage("notes.txt", "\n".join(content) + "\n")
         result = self.guard("--staged")
         lines = self.assert_refused(result, "secret")
         message = "secret: OpenRouter API key (starts with sk-o...)"
-        self.assertEqual(lines, [f"notes.txt:{number}: {message}" for number in range(1, 4)])
+        self.assertEqual(lines, [f"notes.txt:{number}: {message}" for number in range(1, 5)])
         self.assert_absent(OPENROUTER_KEY, result)
 
     def test_sk_inside_a_word_passes(self) -> None:
@@ -2133,6 +2134,7 @@ class HookSettingsTest(GuardTestCase):
             "sk_escape.json": (json.dumps({"detail": detail + SK_KEY}), "generic-sk-key"),
             "openrouter.json": (json.dumps({"detail": detail + OPENROUTER_KEY}), "openrouter-key"),
             "openrouter.env": ("OPENROUTER_API_KEY=" + OPENROUTER_KEY + "\n", "openrouter-key"),
+            "openrouter_word.txt": ("MY_KEY_" + OPENROUTER_KEY + "\n", "openrouter-key"),
         }
         for name, (content, rule) in cases.items():
             self.stage(f"results/metrics/{name}", content)

@@ -56,6 +56,7 @@ tests replace each tool by a stand-in with the same interface.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import importlib
 import importlib.metadata
@@ -299,7 +300,7 @@ def clip_run_part_path(first: Path, part: int) -> Path:
 
 def later_parts(first: Path) -> list[Path]:
     """Return the files next to ``first`` that have the name of a later part of a clip run, sorted."""
-    pattern = f"{first.stem}-[0-9][0-9][0-9][0-9]{first.suffix}"
+    pattern = f"{glob.escape(first.stem)}-[0-9][0-9][0-9][0-9]{glob.escape(first.suffix)}"
     return sorted(path for path in first.parent.glob(pattern) if int(path.stem[-4:]) >= 2)
 
 

@@ -151,9 +151,10 @@ NEW_GOOGLE_KEY = re.compile(r"AQ\.(?<![A-Z]AQ\.)[0-9A-Za-z_\-]{20,}")
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("Google API key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
     ("Google API key in the new format", NEW_GOOGLE_KEY),
-    # An OpenRouter key is the prefix sk-or-v1- and 64 hex digits. The general sk- rule below finds
-    # it too; this rule comes first, so that the message names the service.
-    ("OpenRouter API key", whole_word("sk-or-v1-", r"[0-9a-f]{64}")),
+    # An OpenRouter key is the prefix sk-or-v1- and 64 hex digits. The prefix is long enough to need
+    # no word start, so the key is also found after a letter, a digit or an underscore, as the
+    # Google key is. This rule comes before the general sk- rule, so that the message names the service.
+    ("OpenRouter API key", re.compile(r"sk-or-v1-[0-9a-f]{64}")),
     ("key with the sk- prefix", whole_word("sk-", r"[0-9A-Za-z_\-]{20,}")),
     ("Google OAuth token", whole_word("ya29.", r"[0-9A-Za-z_\-]+")),
     ("GitHub token", re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}|github_pat_[0-9A-Za-z_]{22,}")),

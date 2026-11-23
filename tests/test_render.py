@@ -475,6 +475,25 @@ def test_trail_has_a_gap_where_the_track_has_no_state() -> None:
     assert len(renderer.trail(5)) == 12
 
 
+def test_trail_ends_at_a_cut() -> None:
+    fps = 10.0
+    style = RenderStyle(trail_seconds=4.0)
+    empty = _empty_radar(fps, style)
+    renderer = RadarRenderer(fps, style, cuts=(6,))
+    image = empty
+    # A track joined across the cut by its shirt number has a state in every frame: x = -30 to -25 m
+    # before the cut at frame 6, then x = 0 to 5 m in the next shot.
+    for frame in range(12):
+        x = -30.0 + frame if frame < 6 else -6.0 + frame
+        image = renderer.draw(FrameState(frame=frame, players=(_player(track_id=5, pitch_x=x, pitch_y=15.0),)))
+
+    # The trail of the new shot is drawn; nothing of the shot before, and no line across the cut.
+    assert _difference(image, empty, *_radar_pixel(style, 2.5, 15.0)) > 0
+    for x in (-27.5, -20.0, -12.5, -5.0):
+        assert _difference(image, empty, *_radar_pixel(style, x, 15.0)) == 0
+    assert len(renderer.trail(5)) == 6
+
+
 def test_trail_joins_the_frames_that_were_drawn_one_after_the_other() -> None:
     fps = 10.0
     style = RenderStyle(trail_seconds=4.0)

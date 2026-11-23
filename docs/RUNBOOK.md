@@ -1138,7 +1138,7 @@ ran against the real API before this machine: the first check of each model is i
 |---|---|---|
 | `provider` | `gemini` | `openrouter` |
 | `model` | a Gemini name, `gemini-4-argon` | the slug of the model page, `author/name`; a slug that ends with `:free` is refused (rule 5) |
-| `thinking_level` | `low`, `medium`, `high` (by model) | sent as the reasoning effort; `model_default` sends none, for a model without one |
+| `thinking_level` | `minimal` to `xhigh`, the levels of the model (`config.THINKING_LEVELS`) | sent as the reasoning effort; `model_default` sends none, for a model without one |
 | `resolution` | `low` to `ultra_high` | `low` or `high` (the `detail` of an image) |
 | `service_tier` | `standard` or `flex` | `standard` only |
 | `coords` | `yx_1000` only | `yx_1000`, `xy_1000`, `xy_unit` or `xy_pixel`: the convention that the model was trained on |
@@ -1183,7 +1183,7 @@ neither the Gemini key nor the SDK for an OpenRouter model.
 python -m pitchvlm.cli doctor --no-api
 
 # Contract checks of one OpenRouter model, in the convention that its model card names. Paid:
-# about 0.02 USD at the published prices of the price table (6 calls; an estimate from the Gemini
+# 0.015 USD at the published prices of the price table (6 calls; an estimate from the Gemini
 # token counts, not measured). The checks stop above the 2 USD of gate G0.
 python -m pitchvlm.cli doctor --models openrouter:qwen/qwen3-vl-235b-a22b-instruct \
     --coords xy_1000 --thinking-level model_default \
@@ -1202,10 +1202,12 @@ python -m pitchvlm.cli doctor --models openrouter:qwen/qwen3-vl-235b-a22b-instru
   that served each call), `reported cost` (fails when an answer reports no cost; its detail
   compares the reported cost with the price table: above 1 means that the table price is too
   low). The line `store flag` and `served tier` are for Gemini only.
-- When the status 503 ends the doctor, no provider of the model meets the privacy settings. When
-  the status 400 ends it, a provider refused a part of the request, for example a keyword of the
-  answer schema in its strict mode (`minItems`, `maxItems`). Tell the owner; do not change the
-  routing settings.
+- A request that fails makes its check fail, and the doctor goes on with the next check. The
+  status 503 after all 4 attempts can mean that no provider of the model meets the privacy
+  settings, or only that the service was busy: run the doctor again later before you take it for
+  the first. The status 400 means that a provider refused a part of the request, for example a
+  keyword of the answer schema in its strict mode (`minItems`, `maxItems`). Tell the owner; do
+  not change the routing settings.
 - Write into `docs/DECISIONS.md`: the convention that passed, the two accuracy values, the
   served providers, the reported cost against the estimate, and the mean tokens of the measured
   cost lines. Image tokens of other models differ from those of Gemini, so the token estimates
@@ -1353,23 +1355,24 @@ Data:
   SoccerNet tracking video (behind an NDA).
 - The valid split (probe, dev, reserve groups) and the test split are never training data.
 
-Steps (the converter is not built):
+Steps (none of them is built: the command `data` takes only `--split valid` and `--split test`
+and refuses `train`, the converter does not exist, and the training has no job in
+`tools/run_tool.py`):
 
 ```bash
-# 1. Download the train split into the data folder (its size is not known here; check the free disk first).
-python -m pitchvlm.cli data --root ~/pitchvlm-data --split train \
-    --manifest configs/splits.json --seed 20261113
+# 1. To build: a download of the train split into the data folder (its size is not known here;
+#    check the free disk first). The command `data` refuses `--split train` now.
 
 # 2. To build: a converter that writes the COCO layout that RF-DETR trains on, with links to the
 #    frame images (no copy): ~/pitchvlm-data/finetune/coco/{train,valid}/_annotations.coco.json.
 #    Classes: 0 player, 1 goalkeeper, 2 referee, 3 ball; "other" is left out. Every 5th frame of
 #    each train clip; 10% of the train clips (by clip, never by frame) as its valid folder.
 
-# 3. Training on the GPU machine, in the RF-DETR environment (API of rfdetr 1.12.1).
-env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python -c '
-from rfdetr import RFDETRMedium
-RFDETRMedium().train(dataset_dir="<home>/pitchvlm-data/finetune/coco", epochs=50, batch_size=8,
-                     grad_accum_steps=2, lr=1e-4, output_dir="<home>/pitchvlm-data/weights/rfdetr-soccer")'
+# 3. To build: a training job of `tools/run_tool.py` (rule 4 of `CLAUDE.md`: only that script
+#    imports a tool), run on the GPU machine in the RF-DETR environment without the model keys
+#    (`env -u GEMINI_API_KEY -u OPENROUTER_API_KEY`). The job calls, with the API of rfdetr
+#    1.12.1: RFDETRMedium().train(dataset_dir=<the coco folder of step 2>, epochs=50,
+#    batch_size=8, grad_accum_steps=2, lr=1e-4, output_dir=~/pitchvlm-data/weights/rfdetr-soccer).
 ```
 
 - Weights live in `~/pitchvlm-data/weights/rfdetr-soccer` on the machine that trains, and are
