@@ -2973,6 +2973,9 @@ def test_run_whose_estimate_fits_exactly_under_the_hard_stop_starts(tmp_path: Pa
 
     # 1 USD in the ledger and an estimate of 1 USD reach the hard stop of 2 USD and do not pass it.
     assert cli.start_meter(cache, budget, "run-1", 1.0).run_id == "run-1"
+    # Half a cent more does not fit.
+    with pytest.raises(BudgetExceeded, match="the estimate of this run is 1.005 USD: together more than the hard stop"):
+        cli.start_meter(cache, budget, "run-1c", 1.005)
     with pytest.raises(BudgetExceeded, match="the estimate of this run is 1.250 USD: together more than the hard stop"):
         cli.start_meter(cache, budget, "run-2", 1.25)
     assert cli.start_meter(cache, budget, "run-3", 1.25, over_budget=True).run_id == "run-3"

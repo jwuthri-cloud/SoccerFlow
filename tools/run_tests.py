@@ -70,6 +70,7 @@ STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 #: Exit codes of pytest that mean a normal end: all passed, or some tests failed.
 PYTEST_NORMAL_ENDS = (0, 1)
 
+_SKIPPED_AT_COLLECTION = re.compile(r"^SKIPPED \[(\d+)\] (.+?):\d+: ")
 _COLLECTED = re.compile(r"^(?:(\d+)/)?(\d+) tests? collected(?: \((\d+) deselected\))? in ")
 _WORKER_COLLECTED = re.compile(r"^(?:collecting \.\.\. )?collected (\d+) items?\s*$", re.MULTILINE)
 
@@ -102,6 +103,8 @@ class Options:
 class Collection:
     ids: tuple[str, ...]
     deselected: int
+    #: Files that skipped themselves at collection (a module-level skip): they give no test id.
+    skipped_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -219,7 +222,7 @@ def collect(options: Options, root: Path, run_folder: Path) -> Collection:
     folder = run_folder / "collect"
     folder.mkdir()
     command = pytest_command(
-        "--collect-only", "--verbosity=-1", *private_folders(folder), *options.selection(), *options.paths
+        "--collect-only", "--verbosity=-1", "-rs", *private_folders(folder), *options.selection(), *options.paths
     )
     done = subprocess.run(command, cwd=root, capture_output=True, encoding="utf-8", errors="replace", check=False)
     if done.returncode != 0:
@@ -236,13 +239,20 @@ def collect(options: Options, root: Path, run_folder: Path) -> Collection:
             raise RunnerError(f"the collection printed a line that is not a test id: {test_id!r}")
     if len(set(ids)) != len(ids):
         raise RunnerError("the collection gave a test id two times")
+    skipped_files: list[str] = []
     for line in lines[end:]:
+        skip = _SKIPPED_AT_COLLECTION.match(line)
+        if skip:
+            skipped_files.append(skip.group(2))
+            continue
         match = _COLLECTED.match(line)
         if match:
             selected = int(match.group(1) or match.group(2))
             if selected != len(ids):
                 raise RunnerError(f"the collection says {selected} tests but listed {len(ids)}")
-            return Collection(ids=ids, deselected=int(match.group(3) or 0))
+            return Collection(
+                ids=ids, deselected=int(match.group(3) or 0), skipped_files=tuple(sorted(set(skipped_files)))
+            )
     raise RunnerError(f"the output of the collection has no count line:\n{done.stdout}")
 
 
@@ -348,6 +358,29 @@ def start(worker: Worker, options: Options, root: Path) -> None:
     worker.started = worker.last_output = time.monotonic()
 
 
+class _SignalsHeld:
+    """Hold the stop signals back: a signal that comes inside is raised as ``KeyboardInterrupt`` at the end.
+
+    A Ctrl-C inside ``subprocess.Popen`` would leave a started worker that the runner does
+    not know, so it would not stop it. Only Python's handlers change; the signal mask that
+    the workers inherit stays as it is.
+    """
+
+    def __enter__(self) -> None:
+        self.held: int | None = None
+        self.earlier = {number: signal.signal(number, self._hold) for number in STOP_SIGNALS}
+
+    def _hold(self, number: int, frame: object) -> None:
+        if self.held is None:
+            self.held = number
+
+    def __exit__(self, *exc_info: object) -> None:
+        for number, handler in self.earlier.items():
+            signal.signal(number, handler)
+        if self.held is not None and exc_info[0] is None:
+            raise KeyboardInterrupt
+
+
 def stop(workers: Sequence[Worker]) -> None:
     """End the process groups of running workers: SIGTERM to all, then SIGKILL after the grace time.
 
@@ -423,9 +456,15 @@ def watch(workers: list[Worker], options: Options) -> None:
 
 
 def read_results(worker: Worker, keys: dict[tuple[str, str], str]) -> list[Result]:
-    """Read the results of a worker from its JUnit XML file."""
+    """Read the results of a worker from its JUnit XML file: one result per test.
+
+    pytest writes two entries for one test that fails and then has an error in its teardown.
+    They are joined: the error wins, the texts and the times are added. So a test that runs two
+    times inside one worker counts once (only a rerun plugin does that, and none is used); a test
+    that runs in two workers still fails the id check, and a missing test the count check.
+    """
     root = ET.parse(worker.junit).getroot()
-    results = []
+    results: dict[str, Result] = {}
     for case in root.iter("testcase"):
         key = (case.get("classname", ""), case.get("name", ""))
         test_id = keys.get(key)
@@ -448,8 +487,18 @@ def read_results(worker: Worker, keys: dict[tuple[str, str], str]) -> list[Resul
             for name in ("system-out", "system-err"):
                 parts += [element.text for element in case.findall(name) if element.text]
             text = "\n".join(part.rstrip() for part in parts if part)
-        results.append(Result(test_id, outcome, float(case.get("time", "0")), text))
-    return results
+        result = Result(test_id, outcome, float(case.get("time", "0")), text)
+        earlier = results.get(test_id)
+        if earlier is not None:
+            rank = ("passed", "skipped", "failed", "error")
+            result = Result(
+                test_id,
+                max(earlier.outcome, outcome, key=rank.index),
+                earlier.seconds + result.seconds,
+                "\n".join(part for part in (earlier.text, text) if part),
+            )
+        results[test_id] = result
+    return list(results.values())
 
 
 def check_worker(worker: Worker, keys: dict[tuple[str, str], str], options: Options) -> None:
@@ -528,11 +577,14 @@ def report(
     not_run = len(collection.ids) - len(results)
     slowest = max(workers, key=lambda worker: worker.seconds)
     fastest = min(worker.seconds for worker in workers)
+    if collection.skipped_files:
+        print(f"skipped at collection: {', '.join(collection.skipped_files)}")
     print(f"\nworkers took {fastest:.1f} to {slowest.seconds:.1f} s; the slowest: {slowest.where()}")
     summary = (
         f"{counts['passed']} passed, {counts['failed']} failed, {counts['error']} errors, "
         f"{counts['skipped']} skipped, {collection.deselected} deselected"
         + (f", {not_run} not run" if not_run else "")
+        + (f", {_files(len(collection.skipped_files))} skipped at collection" if collection.skipped_files else "")
         + f" in {wall_s:.1f} s ({len(workers)} workers)"
     )
     print(f"\n{f' {summary} ':=^100}")
@@ -545,6 +597,10 @@ def report(
     if counts["failed"] or counts["error"]:
         return EXIT_FAILED
     return EXIT_PASSED
+
+
+def _files(count: int) -> str:
+    return f"{count} file" if count == 1 else f"{count} files"
 
 
 def run(options: Options, root: Path = ROOT) -> int:
@@ -567,7 +623,8 @@ def run(options: Options, root: Path = ROOT) -> int:
         print(f"{len(collection.ids)} tests collected in {collected_s:.1f} s, run in {len(bins)} workers; {source}", flush=True)
         workers = [Worker(number, ids, run_folder / f"worker-{number}") for number, ids in enumerate(bins, start=1)]
         for worker in workers:
-            start(worker, options, root)
+            with _SignalsHeld():
+                start(worker, options, root)
         watch(workers, options)
         for worker in workers:
             check_worker(worker, keys, options)

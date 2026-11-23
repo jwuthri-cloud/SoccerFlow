@@ -2612,6 +2612,161 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
       (25.1) s. The machine was slower for both. Process starts were not the cause: 450 starts of
       `/usr/bin/true` per second in this window, against 180 in the first.
 
+## 2026-11-23 — A planted-bug check of the money guards, and a second read of the test runner
+
+1. **Question.** Which small bugs in the money code (rule 6 of `CLAUDE.md`: estimate first,
+   measured cost after, a run stops at 1.3 times its estimate, the doctor at 2 USD, hard stop at
+   135 USD) pass every offline test? In round 4 one bug did: a default hard stop of 136 USD (fault
+   P05 of the entry "The offline tests in several processes"). No hypothesis: the measure is the
+   share of planted bugs that the tests find, and the list of the others.
+
+2. **Method.** 89 bugs were written down, one line each, before any test file of the money code
+   was read (a list kept in the scratch folder of the session, not committed; one later edit fixed
+   the indentation of the old text of M22, the bug itself unchanged). Each bug was planted alone in
+   a git clone of `main` 3587a58, and the money test files ran with `tools/run_tests.py -j 12`:
+   `test_vlm_cost.py`, `test_vlm_client.py`, `test_vlm_openrouter.py`, `test_vlm_cache.py`,
+   `test_cli.py`, `test_pipeline.py`, `test_probes.py`, `test_fake_backend.py` (973 tests). A bug
+   is killed when the run ends with exit code 1. Control: the clone without a bug, 973 passed,
+   exit 0. Every survivor ran again on the whole default run (3,254 tests): it survived there too.
+   Then each survivor ran with the new tests of this entry. Scope: `vlm/cost.py` (guard, ledger,
+   prices, estimates: 42 bugs, M01 to M42), the spend window and the price checks of
+   `vlm/client.py` (12, K01 to K12), the start of a run, the cost meter and the session of
+   `cli.py` (26, L01 to L26), the spend check and the plan of `doctor.py` (4, D01 to D04), the cost
+   report of `vlm/cache.py` (4, H01 to H04), and the stop after a failure in `pipeline.py` (1, P01).
+
+3. **Result.** 83 of 89 killed by the old tests; the 6 others are killed by 5 new tests (each
+   survivor: exactly 1 failed test with the new tests). By kind:
+
+   | Kind | Planted | Killed, old tests | Killed, with the new tests |
+   |---|---|---|---|
+   | removed check | 25 | 24 | 25 |
+   | constant changed | 13 | 11 | 13 |
+   | boundary (`>` against `>=`, plus one cent) | 13 | 10 | 13 |
+   | estimate part missing | 10 | 10 | 10 |
+   | removed call | 7 | 7 | 7 |
+   | skipped part of a sum | 5 | 5 | 5 |
+   | swapped (min/max, sign, factor) | 5 | 5 | 5 |
+   | wrong run id | 4 | 4 | 4 |
+   | skipped ledger write | 4 | 4 | 4 |
+   | check after the call, not before | 2 | 2 | 2 |
+   | estimate part counted twice | 1 | 1 | 1 |
+   | **All** | **89** | **83** | **89** |
+
+   The survivors, why each matters, and the test that kills it now:
+
+   | Bug | Change | Rule 6? | New test |
+   |---|---|---|---|
+   | M01 | default hard stop of `BudgetGuard` 136 USD | the default only: the command line takes 135 from `configs/gates.yaml`, and a test pins that file | `test_default_hard_stop_stops_at_exactly_135_usd_and_not_one_cent_before` |
+   | M02 | default hard stop 135.01 USD | as M01 | the same test |
+   | M39 | estimate of a number request: 40 output tokens, not 400 | yes: the printed estimate of a clip falls from 2.3448 to 2.1648 USD, and the run limit with it | `test_default_token_estimates_give_the_costs_that_the_runbook_names` |
+   | K02 | the spend window ignores a wait of 1 s or less | the limit of 8 USD per 10 minutes, not rule 6: a call goes out while the window is full | `test_spend_limiter_waits_also_when_the_window_has_room_in_less_than_a_second` |
+   | K10 | a negative cost reported by OpenRouter is read as a cost | yes: it lowers the ledger total that the hard stop reads (the spend window refuses it, with a `ValueError` and no ledger line) | a case of `test_an_answer_without_a_cost_is_a_call_whose_cost_is_unknown` |
+   | L02 | a run starts when the ledger and its estimate pass the hard stop by up to 1 cent | weak: the guard still stops at 135 during the run | half a cent over the hard stop in `test_run_whose_estimate_fits_exactly_under_the_hard_stop_starts` |
+
+   The test of M39 does not pin the default token table (the module says why it is not pinned).
+   It ties the table to the two costs that `docs/RUNBOOK.md` names for the owner before a paid run
+   (about 2.3 USD for a clip, about 0.009 USD for one number request, gemini-4-argon at the November
+   price): a new table must change those two numbers too. 18 of the 83 bugs killed by the old tests
+   are killed by exactly one test (M16, M18, M26, M27, M28, M36, M37, K04, K07, K12, L10, L18, L19,
+   L20, L24, D01, H03, H04): no gap, but thin. A second reader planted each survivor again in a
+   copy, confirmed that the new test fails for it and passes on the real code, and found no float
+   trap (134.99 plus 0.01 is 135.0 exactly in the ledger: 67,495,000 and 5,000 tokens at 2 USD per
+   million, `math.fsum`).
+
+4. **Which side of "at 135" stops.** The guard stops when the ledger total reaches the hard stop
+   (`total >= 135`): 134.99 USD goes on, 135.00 USD stops. This agrees with rule 6 ("Hard stop at
+   135 USD in total") and with the code's own text. Two other limits do not agree with the words
+   of rule 6; the code is not changed here:
+   - The run limit stops when a run spent **more than** 1.3 times its estimate (`spent > limit`,
+     and the meter's `paid + stored > limit`); a run at exactly 1.3 times goes on. Rule 6 says "A
+     run stops at 1.3x its estimate", and so does the list of rules in `docs/RUNBOOK.md`; the code, the budget line
+     ("this run stops above"), `ARCHITECTURE.md` and `test_run_stops_above_1_3_times_its_estimate`
+     say "above".
+   - The doctor stops when it spent more than 2 USD, and its spend check passes at 2 USD or less.
+     Rule 6 says it "stops at the spend limit of gate G0 (2 USD)"; `configs/gates.yaml` says "it
+     stops above".
+   The difference is one exact amount of money, and a stop comes after the answer that crosses a
+   limit, so it costs at most nothing in practice. Owner decision (proposed text for rule 6, the
+   behaviour stays): "6. Money: every paid run prints its estimate first and the measured cost
+   after. A run stops when it costs more than 1.3x its estimate. The contract checks of `doctor`
+   are the one exception: each doctor run stops when it costs more than the spend limit of gate G0
+   (2 USD). Hard stop when all runs together reach 135 USD. Do not start a paid run without the
+   owner's go-ahead."
+
+5. **Second read of `tools/run_tests.py`.** Each finding was reproduced on a small project in a
+   temporary folder, fixed, and given a test that fails without the fix:
+   - **R1. A test that fails and then has an error in its teardown made the run untrusted.**
+     pytest writes two JUnit entries for it (the failure, then the error). The runner counted two
+     results for one id: "ran 2 tests of its 1", "-1 not run", exit code 2, where one process ends
+     with exit code 1. Now entries with the same id inside one worker are one result (the error
+     wins, the texts are joined). A test that runs in two workers still fails the id check.
+     Test: `test_a_test_that_fails_and_then_errors_in_teardown_counts_once`.
+   - **R2. A file that skips itself at collection disappeared from the totals.** A module-level
+     `pytest.importorskip` gives no test id, so the runner said "0 skipped" where one process says
+     "1 skipped". The collection now runs with `-rs`; the summary line adds "1 file skipped at
+     collection" and a line names the files. The exit code does not change (it is 0 in both).
+     This matters on the run machine, where a missing package can skip a whole file. Test:
+     `test_a_file_skipped_at_collection_is_counted`.
+   - **R3. A Ctrl-C while the workers start left a worker running.** A `KeyboardInterrupt` inside
+     `subprocess.Popen` comes after the process was made but before the runner holds it, so the
+     clean-up does not know it, and the run still prints "every worker was stopped". Measured: 12
+     test files, `-j 12`, SIGINT at a random time of 0 to 30 ms after the collection line: a
+     worker was left in 20 of 25 runs before the fix, 0 of 25 after. The runner now holds the stop
+     signals while it makes each worker (`_SignalsHeld`: Python handlers only, so the workers keep
+     their signal mask) and raises the held signal right after. Test:
+     `test_ctrl_c_while_the_workers_start_stops_the_worker_that_just_started`.
+   - Repeated Ctrl-C during the clean-up (2 to 4 signals, gaps of 0 to 1 s, 7 patterns): no
+     process left, exit code 130 each time.
+   - Refuted, no change: a worker that ends early with exit code 0 (`pytest.exit(returncode=0)`)
+     makes the run untrusted (exit code 2), where one process passes; parametrised ids with spaces,
+     `::`, `/`, `[`, non-ASCII or an empty value, and two equal ids, run and match; stored test
+     times of tests that no longer exist only weigh the plan, they never select a test; a
+     selection that leaves no test ends the collection with pytest's exit code 5, and the run with
+     exit code 2; a hook that deselects by position gives the same ids, or a collection count that
+     the worker check refuses.
+   - The 120 s silence limit against a slow test: the slowest stored test time of the full run is
+     51.0 s, measured at a high load. A worker is killed only after 60 s of silence (pytest's
+     `faulthandler` prints the stack of the test then, which counts as output) plus 120 s, so a
+     single test must run about 180 s without output: 3.5 times the slowest one.
+
+6. **Flaky tests of the runner.** The runner's own tests ran 20 times in one process and 20 times
+   with the runner (33 tests each; load average 18 to 61, other sessions running). The `-x` test,
+   its order test and the Ctrl-C test failed 0 times in 40 runs. One test failed: in one process 2
+   of 20 runs, with the runner 11 of 20 runs, always
+   `test_a_silent_worker_is_killed_and_named_with_its_file`. Its silence limit of 1 s was shorter
+   than the start of pytest on the loaded machine: both workers were killed ("no test started"),
+   not only the silent one. The same failure was reported by session C in a full run at a load
+   average near 50. The runner did what the limit said; the test was too tight. It now uses a
+   limit of 10 s with 2 workers, so it still shows that the healthy worker survives; it takes
+   about 15 s.
+
+7. **To check on the run machine (Linux; not possible here, read only).**
+   - `python tools/run_tests.py tests/test_run_tests.py`: the process group kill, the Ctrl-C test
+     and the new start test on Linux. The `PermissionError` branch of `_signal_group` is a macOS
+     case; on Linux `killpg` of a group of exiting processes succeeds.
+   - `os.cpu_count()` counts every processor of the host, not the share of a container or a CPU
+     quota: compare `nproc` with `python -c "import os; print(os.cpu_count())"`, and pass `-j`
+     when they differ.
+   - The size of the system's temporary folder (`df -h /tmp`): every worker writes its pytest
+     folders there.
+   - The pytest version: `pyproject.toml` allows `pytest>=8.0`; the JUnit names, the collection
+     output and the `-rs` lines are read in the format of pytest 9.2. Another version fails the run
+     with exit code 2 (it cannot pass a wrong one).
+   - A full run with the runner and one in one process: the same totals.
+
+8. **Not verified.** The kill test of R3 forces the signal inside `Popen` by a stand-in of
+   `Popen`; the race itself was measured with real signals (item 5). No run on Linux. The planted
+   bugs cover the money code as it was at 3587a58; the video estimates of `main` af02f53 are
+   item 9.
+
+9. **Owner decisions.**
+   - The text of rule 6 (item 4).
+   - `docs/RUNBOOK.md` names "about 2.3 USD for a clip of 30 seconds", at the November price of
+     gemini-4-argon. From 1 December 2026 that model costs twice as much, so the printed estimate
+     of a clip will be about 4.7 USD (2.3448 x 2 = 4.6896, computed, not measured). The new test of
+     M39 is fixed to a November day, so it does not fail then; the runbook sentence should say
+     both prices.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

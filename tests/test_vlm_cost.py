@@ -2,7 +2,8 @@
 
 The sums of the estimate tests come from the token table of this file (``ESTIMATES``), not from
 ``DEFAULT_TOKEN_ESTIMATES``. That table changes when real token counts are measured, and no test
-here pins its values.
+here pins its values. One test ties it to the costs that ``docs/RUNBOOK.md`` prints for the owner
+before a paid run, so that the table and those numbers change together.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -357,6 +359,23 @@ def test_default_token_estimates_name_every_model_step_with_counts_above_zero() 
         assert isinstance(estimate, TokenEstimate)
         assert estimate.input_tokens > 0
         assert estimate.output_tokens > 0
+
+
+def test_default_token_estimates_give_the_costs_that_the_runbook_names() -> None:
+    """The owner reads these costs in the runbook before a paid run: about 2.3 USD for a clip, 0.009 USD for one
+    number request (gemini-4-argon, November prices). A changed default table must change the runbook too."""
+    runbook = (REPO / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
+    clip_line = re.search(r"About (\d+\.\d+) USD for a clip of 30 seconds", runbook)
+    number_line = re.search(r"about (\d+\.\d+) USD each with the default token estimates", runbook)
+    assert clip_line and number_line, "the runbook no longer names the cost of a clip and of a number request"
+    clip_usd, number_usd = float(clip_line.group(1)), float(number_line.group(1))
+    requests = [request for request, _ in plan_of_one_clip()]
+
+    clip = estimate_usd(requests, DEFAULT_TOKEN_ESTIMATES, NOVEMBER)
+    number = estimate_usd([make_request("number", frame=None)], DEFAULT_TOKEN_ESTIMATES, NOVEMBER)
+
+    assert round(clip, 1) == clip_usd
+    assert round(number, 3) == number_usd
 
 
 def test_estimate_adds_the_requests_by_step_model_and_tier() -> None:
@@ -1223,6 +1242,23 @@ def test_default_hard_stop_is_135_usd(tmp_path: Path) -> None:
     guard.check("run-1")
     spend(ledger, "run-1", 2.0)
     with pytest.raises(BudgetExceeded):
+        guard.check("run-1")
+
+
+def test_default_hard_stop_stops_at_exactly_135_usd_and_not_one_cent_before(tmp_path: Path) -> None:
+    """Rule 6: hard stop at 135 USD in total. 134.99 USD goes on; a total of exactly 135 USD stops.
+
+    The spends 134 and 2 of the test above cannot tell a hard stop of 135 from one of 136.
+    """
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    guard = BudgetGuard(ledger)
+    guard.start_run("run-1", 1000.0)
+
+    spend(ledger, "run-1", 134.99)
+    guard.check("run-1")  # one cent under the hard stop
+    spend(ledger, "run-1", 0.01)
+    assert ledger.total_usd() == 135.0
+    with pytest.raises(BudgetExceeded, match=r"hard stop: the ledger total is 135\.00 USD, the limit is 135\.00 USD"):
         guard.check("run-1")
 
 

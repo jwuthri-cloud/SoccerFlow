@@ -1114,6 +1114,19 @@ def test_spend_limiter_blocks_at_exactly_the_limit() -> None:
     assert limiter.spent_usd() == 0.0
 
 
+def test_spend_limiter_waits_also_when_the_window_has_room_in_less_than_a_second() -> None:
+    """A full window is waited for, however short the wait: no call is sent while it is full."""
+    fake_time = FakeTime(start=1000.0)
+    limiter = SpendRateLimiter(1.0, window_s=600.0, clock=fake_time.clock, sleep=fake_time.sleep)
+    limiter.record(1.0)
+    fake_time.now = 1599.5
+
+    limiter.wait_for_room()
+
+    assert fake_time.sleeps == [0.5]
+    assert limiter.spent_usd() == 0.0
+
+
 def test_spend_limiter_forgets_costs_that_left_the_window() -> None:
     fake_time = FakeTime(start=1000.0)
     limiter = SpendRateLimiter(1.0, window_s=600.0, clock=fake_time.clock, sleep=fake_time.sleep)
