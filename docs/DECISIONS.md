@@ -3047,9 +3047,9 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
    of rule 6; the code is not changed here:
    - The run limit stops when a run spent **more than** 1.3 times its estimate (`spent > limit`,
      and the meter's `paid + stored > limit`); a run at exactly 1.3 times goes on. Rule 6 says "A
-     run stops at 1.3x its estimate", and so does the list of rules in `docs/RUNBOOK.md`; the code, the budget line
-     ("this run stops above"), `ARCHITECTURE.md` and `test_run_stops_above_1_3_times_its_estimate`
-     say "above".
+     run stops at 1.3x its estimate", and so does the list of rules in `docs/RUNBOOK.md`; the
+     code, the budget line ("this run stops above"), `ARCHITECTURE.md` and
+     `test_run_stops_above_1_3_times_its_estimate` say "above".
    - The doctor stops when it spent more than 2 USD, and its spend check passes at 2 USD or less.
      Rule 6 says it "stops at the spend limit of gate G0 (2 USD)"; `configs/gates.yaml` says "it
      stops above".
@@ -3123,11 +3123,46 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
    - A full run with the runner and one in one process: the same totals.
 
 8. **Not verified.** The kill test of R3 forces the signal inside `Popen` by a stand-in of
-   `Popen`; the race itself was measured with real signals (item 5). No run on Linux. The planted
-   bugs cover the money code as it was at 3587a58; the video estimates of `main` af02f53 are
-   item 9.
+   `Popen`; the race itself was measured with real signals (item 5). No run on Linux.
 
-9. **Owner decisions.**
+9. **The video money paths of `main` af02f53** (native video input, merged during this work).
+   16 more bugs were written down from the code of af02f53 before any of its video tests was read
+   (one edit before the first run: the quoting of V16), planted one at a time in a clone of the
+   merge commit of this branch, and each ran with the whole default run (3,381 tests; control
+   without a bug: 3,381 passed, 1 skipped, exit 0). 13 of 16 were killed by the tests of af02f53;
+   3 new tests kill the 3 others (each: exactly 1 failed test).
+
+   | Bug | Change | Old tests |
+   |---|---|---|
+   | V01 | sampled frames of a video part rounded down, not up | killed |
+   | V02 | one sampled frame fewer | killed |
+   | V03 | sound tokens not counted | killed |
+   | V04 | a Gemini frame at high resolution counted at 70 tokens, not 280 | killed |
+   | V05 | default sampling rate of Gemini 0.5 frames per second, not 1 | killed |
+   | V06 | the tier factor not applied to the video part of a Gemini estimate | killed |
+   | V07 | the output of `people_video` counted once, not once per target frame | killed |
+   | V08 | the video part of an OpenRouter request not estimated | killed |
+   | V09 | OpenRouter sound priced at the input price, not at its own price | killed |
+   | V10 | OpenRouter video priced at the input price, not at its own price | killed |
+   | V11 | Gemini sends a video for a model without a video rate | killed |
+   | V12 | a range or a sampling rate sent to a provider that reads whole files | killed |
+   | V13 | the estimate of the doctor leaves out its video request | **survived** |
+   | V14 | the estimate of a session (the video probe) leaves out its built video requests | killed |
+   | V15 | a new video rate holds from the day after its start day | **survived** |
+   | V16 | the doctor looks up the video rate of every model in the Gemini table | **survived** |
+
+   - V13 matters for rule 6: the doctor printed 0.097 USD where its checks with video cost
+     0.144 USD by the estimate (one Gemini model; the video request alone 0.048 USD), and the
+     doctor refuses to start only when its estimate is above 2 USD. Killed by new lines in
+     `test_doctor_video_check_with_a_fake_model`: the printed estimate must hold the video request.
+   - V15 matters on the day a new rate starts (no table has a second dated rate today): the
+     estimate would use the old rate for one day. Test:
+     `test_a_new_video_rate_holds_from_its_first_day`.
+   - V16 drops the video check of an OpenRouter model that has a video rate in the price file
+     (it spends less, but the check is silently not done). Test:
+     `test_doctor_plans_a_video_request_for_an_openrouter_model_from_the_rates_of_the_price_file`.
+
+10. **Owner decisions.**
    - The text of rule 6 (item 4).
    - `docs/RUNBOOK.md` names "about 2.3 USD for a clip of 30 seconds", at the November price of
      gemini-4-argon. From 1 December 2026 that model costs twice as much, so the printed estimate

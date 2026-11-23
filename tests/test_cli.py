@@ -6130,6 +6130,14 @@ def test_doctor_video_check_with_a_fake_model(
     assert [request.meta.step for request in backend.requests].count("people_video") == 1
     output = capsys.readouterr().out
     assert "people_video 1" in output.split("cost estimate", 1)[1].splitlines()[0]
+    # The printed estimate holds the video request too: its cost is about half of the image checks of one model,
+    # and the doctor does not start when its estimate is above the spend limit of gate G0.
+    models = cli.doctor_models(cli.build_parser().parse_args(["doctor"]))
+    image_plan = [calls for settings in models for calls in doctor.contract_plan(settings)]
+    video_request = next(request for request in backend.requests if request.meta.step == "people_video")
+    expected = cli.estimated_usd(contract_scene.info.clip_id, image_plan) + cli.estimated_requests_usd([video_request])
+    assert cli.estimated_requests_usd([video_request]) > 0.01
+    assert f"cost estimate: {cli.usd(expected)} for " in output
     # The video of the check was written to a temporary folder, which is gone.
     assert not backend.requests[-1].videos[0].path.exists()
 
