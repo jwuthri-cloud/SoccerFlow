@@ -19,7 +19,7 @@ keywords = ["sk-"]
 [[rules]]
 id = "openrouter-key"
 description = "OpenRouter API key: the prefix sk-or-v1- and 64 hex digits"
-regex = '''(?:\b|\\[abfnrtv])(sk-or-v1-[0-9a-f]{64})(?:[^0-9a-f]|$)'''
+regex = '''(sk-or-v1-[0-9a-f]{64})(?:[^0-9a-f]|$)'''
 keywords = ["sk-or-v1-"]
 
 [[rules]]

@@ -5909,6 +5909,8 @@ def test_data_policy_and_reported_cost_fail_for_a_call_that_breaks_them() -> Non
     assert policy.status == "fail" and "1 of 1 recorded calls were sent without them" in policy.detail
     cost = doctor.check_reported_cost([call], ())
     assert cost.status == "fail" and "1 of 1 answers report no cost" in cost.detail
+    free = doctor.check_reported_cost([dataclasses.replace(call, reported_usd=0.0)], ())
+    assert free.status == "fail" and "1 of 1 answers report no cost or a cost of 0" in free.detail
 
 
 def test_doctor_checks_an_openrouter_model_without_the_gemini_key_and_sdk(
