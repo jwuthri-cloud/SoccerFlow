@@ -64,9 +64,12 @@ GOAL_ZONE_MIN_X_M = HALF_LENGTH - PENALTY_AREA_DEPTH
 TWO_PEOPLE_MARGIN_M = 6.0
 #: A change of the team key inside a track counts only when each side of it holds at least this
 #: many observations with a team key. A shorter run of the other key is a wrong answer of the
-#: model, not another person. 4 observations are 1.9 s at the default keyframe interval. The
-#: value is an estimate: with wrong keys that come one by one at a rate of 10 %, a run of 4 has a
-#: chance of about 0.6 % per track of 60 observations.
+#: model, not another person. 4 observations are 1.9 s at the default keyframe interval; for the
+#: people of every frame (detector engine) the pipeline asks for the same time, 4 keyframe
+#: intervals of frames. The value is an estimate. The weaker runs join their neighbours, so the 4
+#: votes need not come in a row: with wrong keys at 10 % and no key at 10 %, one by one, a track of
+#: 60 observations shows a change in about 2 % of tracks, a track of 250 in about 9 % (Monte Carlo,
+#: 2,000 tracks per length, second review of 2026-11-22). A cut also needs a contact.
 SWAP_MIN_VOTES = 4
 #: A track whose team key changes took over another person only when a person of the other team
 #: was this close to it in the image at the change: foot point distance in box heights (the mean
@@ -178,6 +181,7 @@ def associate(
     warp: MotionWarp,
     to_pitch: PitchMap,
     config: TrackingConfig = TrackingConfig(),
+    keyframe_frames: int = 1,
 ) -> list[Track]:
     """Link the people of the keyframes into tracks.
 
@@ -205,7 +209,10 @@ def associate(
       ``vote_role_team``). The team key ``none``, on the track or on the
       detection, is no difference: the team is not known there. The penalty
       counts once more for every keyframe that the track has missed since
-      its newest observation. A model that changes a label of a person it
+      its newest observation. ``keyframe_frames`` is the number of entries
+      of ``keyframes`` that stand for one keyframe interval: 1 for keyframes,
+      the frames of one interval when the people of every frame are given
+      (the detector engine), so the penalty grows with the same time. A model that changes a label of a person it
       sees in every keyframe costs little. But after a wait, a detection with
       other labels is mostly another person who came to that place, for
       example an opponent who enters the image where a player left it.
@@ -226,6 +233,8 @@ def associate(
     set here.
     """
     _check_fps(fps)
+    if keyframe_frames < 1:
+        raise ValueError(f"keyframe_frames must be at least 1, got {keyframe_frames}")
     ordered = sorted(keyframes, key=lambda people: people.frame)
     if len({people.frame for people in ordered}) != len(ordered):
         raise ValueError("two keyframes have the same frame index")
@@ -234,7 +243,7 @@ def associate(
     ended: list[_LiveTrack] = []
     for people in ordered:
         pitch = _pitch_points(to_pitch, people.frame, _feet(people.people))
-        pairs = _match(live, people, pitch, fps=fps, warp=warp, config=config)
+        pairs = _match(live, people, pitch, fps=fps, warp=warp, config=config, keyframe_frames=keyframe_frames)
         for track_index, det_index, still_foot in pairs:
             observation = _observation(people.frame, people.people[det_index])
             live[track_index].take(observation, pitch[det_index], still_foot)
@@ -288,6 +297,7 @@ def _match(
     fps: float,
     warp: MotionWarp,
     config: TrackingConfig,
+    keyframe_frames: int,
 ) -> list[tuple[int, int, np.ndarray]]:
     """Match the live tracks to the detections of one keyframe.
 
@@ -298,7 +308,7 @@ def _match(
     if not live or not people.people:
         return []
     moved = [_moved_feet(track, people.frame, warp) for track in live]
-    cost = _image_cost(live, moved, people, config.mismatch_penalty)
+    cost = _image_cost(live, moved, people, config.mismatch_penalty, keyframe_frames)
     allowed = (cost <= config.max_image_jump) & ~_out_of_reach(live, det_pitch, people.frame, fps, config)
     # A forbidden pair stands for "no match": it is removed after the solver. Its cost
     # is just above the limit, as in DeepSORT. So every allowed pair is cheaper, but the
@@ -311,7 +321,11 @@ def _match(
 
 
 def _image_cost(
-    live: Sequence[_LiveTrack], moved: Sequence[np.ndarray | None], people: FramePeople, mismatch_penalty: float
+    live: Sequence[_LiveTrack],
+    moved: Sequence[np.ndarray | None],
+    people: FramePeople,
+    mismatch_penalty: float,
+    keyframe_frames: int,
 ) -> np.ndarray:
     """Return the cost of every (live track, detection) pair, shape (m, n).
 
@@ -319,7 +333,7 @@ def _image_cost(
     the foot point of the detection, in units of box height (the mean of the
     two boxes), plus the penalty when role or team key differ from the vote of
     the track. The penalty is counted one time, and one more time for every
-    keyframe that the track missed. The cost is infinite for a track that
+    keyframe interval (``keyframe_frames`` entries) that the track missed. The cost is infinite for a track that
     cannot be compared with the frame.
     """
     detections = people.people
@@ -333,7 +347,7 @@ def _image_cost(
         unit = (track.last.box.height + det_heights) / 2.0  # (n,)
         role, team_key = track.votes.result()
         differ = np.array([_labels_differ(role, team_key, person) for person in detections])  # (n,)
-        cost[row] = distance / unit + mismatch_penalty * (1 + track.missed) * differ
+        cost[row] = distance / unit + mismatch_penalty * (1 + track.missed // keyframe_frames) * differ
     return cost
 
 
@@ -577,15 +591,16 @@ class TeamRun:
     stop: int
 
 
-def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]:
+def team_key_runs(observations: Sequence[TrackObs], *, min_votes: int = SWAP_MIN_VOTES) -> list[TeamRun]:
     """Split the observations of a track into runs of one team key, without the outliers of the model.
 
     Only the observations with the team key ``A`` or ``B`` vote. Votes in a
     row with the same key form a run. The strength of a run is the number of
-    its votes for its own key. While a run is weaker than ``SWAP_MIN_VOTES``,
+    its votes for its own key. While a run is weaker than ``min_votes``
+    (``SWAP_MIN_VOTES`` for keyframes; its time for the people of every frame),
     the weakest run (the first one in a tie) takes the key of its neighbours
     and joins them; its votes then count against the joined run. So every run
-    that is left holds at least ``SWAP_MIN_VOTES`` votes for its key, or one
+    that is left holds at least ``min_votes`` votes for its key, or one
     run holds all votes; that run has the key of most votes (``A`` in a tie).
     Each change between two runs that are left is a change of the team key
     that held on both sides, not some wrong answers.
@@ -594,6 +609,8 @@ def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]:
     first observation, and the last run ends at the last observation. The
     result is empty when no observation has a team key.
     """
+    if min_votes < 1:
+        raise ValueError(f"min_votes must be at least 1, got {min_votes}")
     votes = [(index, observation.team_key) for index, observation in enumerate(observations)]
     votes = [(index, key) for index, key in votes if key in _SIDE_KEYS]
     # Each run: its team key, its number of votes, and its number of votes for its own key.
@@ -611,7 +628,7 @@ def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]:
             strengths.append(1)
     while len(keys) > 1:
         weakest = min(range(len(keys)), key=lambda position: (strengths[position], position))
-        if strengths[weakest] >= SWAP_MIN_VOTES:
+        if strengths[weakest] >= min_votes:
             break
         low, high = max(weakest - 1, 0), min(weakest + 1, len(keys) - 1)
         key = keys[high] if weakest == low else keys[low]
@@ -633,13 +650,13 @@ def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]:
     return runs
 
 
-def split_team_swaps(tracks: Sequence[Track]) -> list[Track]:
+def split_team_swaps(tracks: Sequence[Track], *, min_votes: int = SWAP_MIN_VOTES) -> list[Track]:
     """Split a track where it took over a person of the other team.
 
     When two people of different teams come close, the matching can give the
     track of one of them to the other. Then the team key of the track flips
     and stays flipped. A track of a player or a goalkeeper (voted role) is cut
-    between two of its runs (``team_key_runs``) when, at that change, a person
+    between two of its runs (``team_key_runs`` with ``min_votes``) when, at that change, a person
     of the other team was in contact with it. The change spans the
     observations from the last vote of the run before it to the first vote of
     the run after it. In contact means: in the frame of one of these
@@ -655,7 +672,7 @@ def split_team_swaps(tracks: Sequence[Track]) -> list[Track]:
 
     - Two people of the same team who swap their tracks show no change of the
       team key, so the swap stays.
-    - A change that holds for fewer than ``SWAP_MIN_VOTES`` votes on a side
+    - A change that holds for fewer than ``min_votes`` votes on a side
       (a swap shortly before the track ends) is not seen.
     - A model that names the wrong team for a person for some seconds next to
       an opponent gives a cut that is wrong. The pieces then have different
@@ -665,7 +682,7 @@ def split_team_swaps(tracks: Sequence[Track]) -> list[Track]:
     the input in a tie). A track without a cut keeps its observations. The
     attribute fields of the result are not set.
     """
-    runs = [team_key_runs(track.observations) for track in tracks]
+    runs = [team_key_runs(track.observations, min_votes=min_votes) for track in tracks]
     #: Frame -> (track index, observation, team key of its run) of every observation that lies in a run.
     at_frame: dict[int, list[tuple[int, TrackObs, TeamKey]]] = {}
     for index, (track, track_runs) in enumerate(zip(tracks, runs, strict=True)):
@@ -912,7 +929,9 @@ def finalize_tracks(
       between the first observation of the track that starts later and the
       observation of the other track that is nearest to it in time, with the
       pitch positions of ``to_pitch``; ``dt`` is the time between the two.
-      Without both positions this cannot be told.
+      Without both positions this cannot be told. Across a cut (``cuts``)
+      a position says nothing about the next shot: two tracks that follow
+      each other in different shots are not two people by their positions.
     - Tracks of a group that overlap in time (the first frame of one is not
       after the last frame of the other) are never linked. The track with
       the most observations keeps the number (the lower track id wins a tie),
@@ -927,8 +946,9 @@ def finalize_tracks(
       group is linked.
     - In a group without two people, two of the kept tracks that follow each
       other become one track when they have the same role and both pitch
-      positions are known: they are one person who was out of the image in
-      between. The track has the id and the place of the earliest of them,
+      positions are known, or when they lie in different shots: they are one
+      person who was out of the image in between. Across a cut the shown
+      number alone joins them: identity, not position. The track has the id and the place of the earliest of them,
       the observations of all of them, and a team key voted over all
       observations. Without a known position the way between two tracks
       cannot be tested, so they stay two tracks that show the same number.
@@ -950,7 +970,9 @@ def finalize_tracks(
     decided = [
         _decided(track, readings.get(track.track_id), sides, _known_mean_x(track, mean_pitch_x)) for track in tracks
     ]
-    linked = _one_person_per_number(decided, fps, to_pitch, config)
+    if any(later <= earlier for earlier, later in zip(cuts, cuts[1:])):
+        raise ValueError("the cuts must be strictly increasing")
+    linked = _one_person_per_number(decided, fps, to_pitch, config, cuts)
     if config.team_slots:
         linked = link_team_slots(linked, fps=fps, to_pitch=to_pitch, config=config, cuts=cuts)
     if roster is None:
@@ -1014,7 +1036,7 @@ def _in_time_order(tracks: Sequence[Track]) -> list[Track]:
 
 
 def _one_person_per_number(
-    tracks: Sequence[Track], fps: float, to_pitch: PitchMap, config: TrackingConfig
+    tracks: Sequence[Track], fps: float, to_pitch: PitchMap, config: TrackingConfig, cuts: Sequence[int]
 ) -> list[Track]:
     """Make one track of the fragments of one person, and let one person only show a number (see ``finalize_tracks``).
 
@@ -1046,7 +1068,12 @@ def _one_person_per_number(
                 if _two_people(*_in_time_order([other, track]), fps, to_pitch, config):
                     two_people = True
         kept = _in_time_order(kept)
-        steps = [_two_people(earlier, later, fps, to_pitch, config) for earlier, later in zip(kept, kept[1:])]
+        steps = [
+            False
+            if _shot_of(earlier.last_frame, cuts) != _shot_of(later.first_frame, cuts)
+            else _two_people(earlier, later, fps, to_pitch, config)
+            for earlier, later in zip(kept, kept[1:])
+        ]
         if two_people or True in steps:
             second_tracks = by_length[1:]
         else:
@@ -1106,7 +1133,10 @@ def link_team_slots(
     ``max_speed_mps * dt + reach_margin_m``. The links are taken in the order
     of that distance (then of the time between the two, then of the track
     ids), each track with at most one link to an earlier and one to a later
-    track, until the group holds ``s`` tracks or no link is left. A group with
+    track, until the group holds ``s`` tracks or no link is left. A link is
+    also refused when the chain that it would make shows two different
+    displayed or most frequent per-frame numbers: a
+    track without a number between a 7 and a 9 must not join the two. A group with
     ``s`` tracks or fewer does not change. So the rule links no more tracks
     than the slots need: a group in which fewer than ``s`` people appeared
     keeps some of its fragments.
@@ -1119,6 +1149,9 @@ def link_team_slots(
     Limits: the distance is the only evidence, so two players who leave the
     view and come back where the other one left are linked the wrong way. A
     clip with a substitution or a red card can hold more people of a side.
+    A track that is no person of its own (a second box of one person, a piece
+    of a track with the wrong team, a referee with a team key) counts as one,
+    so each such track can force one link between two people.
 
     Hard cuts: ``cuts`` holds the frames that start a new shot, in increasing
     order. A position before a cut says nothing about a position after it, so
@@ -1189,7 +1222,7 @@ def _slot_links(
     ends = [_foot_on_pitch(to_pitch, track.observations[-1]) for track in members]
     starts = [_foot_on_pitch(to_pitch, track.observations[0]) for track in members]
     numbers = [_frame_number(track) for track in members]
-    candidates: list[tuple[float, int, int, int]] = []
+    candidates: list[tuple[float, int, int, int, int]] = []
     for earlier, end in enumerate(ends):
         for later, start in enumerate(starts):
             gap = members[later].first_frame - members[earlier].last_frame
@@ -1209,12 +1242,41 @@ def _slot_links(
     successor: dict[int, int] = {}
     has_earlier: set[int] = set()
     left = dict(budgets)
+    # The numbers that each chain shows, by the id of every track in it: a link joins two
+    # chains, so a track without a number between two numbers would join two people.
+    shown = {
+        track.track_id: (_numbers({track.number_display}), _numbers({numbers[index]}))
+        for index, track in enumerate(members)
+    }
     for _distance_m, _gap, earlier_id, later_id, shot in sorted(candidates):
-        if left[shot] > 0 and earlier_id not in successor and later_id not in has_earlier:
-            successor[earlier_id] = later_id
-            has_earlier.add(later_id)
-            left[shot] -= 1
+        if left[shot] <= 0 or earlier_id in successor or later_id in has_earlier:
+            continue
+        joined = tuple(first | second for first, second in zip(shown[earlier_id], shown[later_id], strict=True))
+        if any(len(chain_numbers) > 1 for chain_numbers in joined):
+            continue
+        successor[earlier_id] = later_id
+        has_earlier.add(later_id)
+        left[shot] -= 1
+        for track_id in _chain_ids(earlier_id, successor, has_earlier):
+            shown[track_id] = joined
     return successor
+
+
+def _numbers(values: set[int | None]) -> frozenset[int]:
+    """Return the shirt numbers of a set, without None."""
+    return frozenset(value for value in values if value is not None)
+
+
+def _chain_ids(track_id: int, successor: Mapping[int, int], has_earlier: set[int]) -> list[int]:
+    """Return the ids of the chain of slot links that holds a track, from its earliest track on."""
+    earlier_of = {later: earlier for earlier, later in successor.items()}
+    head = track_id
+    while head in has_earlier:
+        head = earlier_of[head]
+    chain = [head]
+    while chain[-1] in successor:
+        chain.append(successor[chain[-1]])
+    return chain
 
 
 def _slot_chain(chain: Sequence[Track]) -> Track:

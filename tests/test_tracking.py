@@ -324,6 +324,31 @@ def test_label_penalty_counts_once_more_for_every_missed_keyframe(empty_keyframe
     assert [frames_of(track) for track in tracks] == expected
 
 
+@pytest.mark.parametrize("empty_frames", [11, 23])
+def test_label_penalty_of_every_frame_grows_per_keyframe_interval(empty_frames: int) -> None:
+    # The people of every frame (detector engine): 12 frames stand for one keyframe interval. A
+    # player of team A is not seen for 11 frames (less than one interval) or 23 frames (one
+    # interval and 11 frames); then a person of team B stands 1.1 box heights beside the place.
+    start = [keyframe(frame, person(600.0, 400.0, team_key="A")) for frame in range(2)]
+    empty = [keyframe(2 + index) for index in range(empty_frames)]
+    last_frame = 2 + empty_frames
+    other_team = [*start, *empty, keyframe(last_frame, person(644.0, 400.0, team_key="B"))]
+    every_frame = TrackingConfig(max_missed_keyframes=48)
+
+    tracks = associate(
+        other_team, fps=FPS, warp=no_motion, to_pitch=flat_pitch, config=every_frame, keyframe_frames=STEP
+    )
+
+    # 1.1 + 1 * 0.5 after less than one interval, 1.1 + 2 * 0.5 = 2.1 after one: both below 2.5.
+    # Counted per frame, the penalty would be 1.1 + 12 * 0.5 after 11 frames: the player is lost.
+    assert [frames_of(track) for track in tracks] == [[0, 1, last_frame]]
+
+
+def test_associate_refuses_a_keyframe_interval_below_one_frame() -> None:
+    with pytest.raises(ValueError, match="keyframe_frames"):
+        associate([], **STILL_CAMERA, keyframe_frames=0)
+
+
 def test_team_key_none_is_no_mismatch_but_another_role_is() -> None:
     track_start = keyframe(0, person(600.0, 400.0, team_key="A"))
 
@@ -2224,6 +2249,34 @@ def test_a_referee_track_is_never_cut() -> None:
     assert len(split_team_swaps([track_of(0, referee), other])) == 2
 
 
+def test_a_short_flip_next_to_an_opponent_is_no_change_when_the_votes_are_frames() -> None:
+    # The people of every frame: the torso window of player 0 shows the shirt of the opponent
+    # next to it for 4 frames (0.16 s at 25 fps). As keyframes, 4 votes are a change; as frames,
+    # a change must hold for 4 keyframe intervals of 12 frames.
+    frames = list(range(50))
+    flipped = [
+        observation.model_copy(update={"team_key": "B"}) if 20 <= observation.frame < 24 else observation
+        for observation in walker(frames, 300.0, 0.0, "A")
+    ]
+    tracks = [track_of(0, flipped), track_of(1, walker(frames, 320.0, 0.0, "B"))]
+
+    assert len(split_team_swaps(tracks)) == 4
+    assert len(split_team_swaps(tracks, min_votes=4 * STEP)) == 2
+
+
+def test_a_swap_of_every_frame_is_cut_when_it_holds_for_four_intervals() -> None:
+    frames = list(range(120))
+    first = walker(frames[:60], 300.0, 0.0, "A") + walker(frames[60:], 300.0, 0.0, "B")
+    second = walker(frames[:60], 320.0, 0.0, "B") + walker(frames[60:], 320.0, 0.0, "A")
+
+    assert len(split_team_swaps([track_of(0, first), track_of(1, second)], min_votes=4 * STEP)) == 4
+
+
+def test_team_key_runs_refuse_a_vote_limit_below_one() -> None:
+    with pytest.raises(ValueError, match="min_votes"):
+        team_key_runs([], min_votes=0)
+
+
 def test_split_without_tracks_gives_no_tracks() -> None:
     assert split_team_swaps([]) == []
 
@@ -2324,6 +2377,20 @@ def test_team_slots_do_not_link_tracks_that_show_different_numbers() -> None:
     assert frames_of(next(track for track in linked if track.track_id == 3)) == list(range(0, 97, 12))
 
 
+def test_team_slots_do_not_chain_two_numbers_through_a_track_without_one() -> None:
+    # One goalkeeper slot, three fragments: 1, no number, 13. Each link alone shows no two
+    # numbers, but both links together would make the goalkeeper 1 and the goalkeeper 13 one.
+    keepers = [
+        decided_track(0, [0, 12], 640.0, role="goalkeeper", display=1),
+        decided_track(1, [100, 112], 640.0, role="goalkeeper"),
+        decided_track(2, [200, 212], 640.0, role="goalkeeper", display=13),
+    ]
+
+    linked = link_team_slots(keepers, **ON_THE_FLAT_PITCH)
+
+    assert sorted(track.number_display for track in linked) == [1, 13]
+
+
 def test_team_slots_do_not_link_tracks_with_different_per_frame_numbers() -> None:
     keepers = [
         decided_track(track_id, frames, 400.0, role="goalkeeper").model_copy(
@@ -2422,6 +2489,42 @@ def test_team_slots_count_the_slots_in_each_shot() -> None:
     assert [track.track_id for track in linked] == list(range(20))
     assert frames_of(linked[19]) == [200, 212, 224, 272, 284, 296]
     assert not any(track.first_frame < 200 <= track.last_frame for track in linked)
+
+
+@pytest.mark.parametrize("x_after", [210.0, 1200.0])
+def test_a_shown_number_joins_tracks_across_a_cut_wherever_the_person_stands(x_after: float) -> None:
+    # Number 7 of one side before the cut at frame 54 at x = 200 px, and after it at the same place
+    # or 50 m away (another camera, a replay). A position before a cut says nothing about the next
+    # shot, so only the number decides: one person.
+    before = still_track(0, [0, 12, 24, 36, 48], 200.0)
+    after = still_track(1, [60, 72, 84], x_after)
+
+    decided = finalize_tracks(
+        [before, after],
+        readings={0: high_reading(7), 1: high_reading(7)},
+        mean_pitch_x={0: -10.0, 1: -10.0},
+        fps=FPS,
+        to_pitch=flat_pitch,
+        cuts=(54,),
+    )
+
+    assert [(frames_of(track), track.number_display) for track in decided] == [([0, 12, 24, 36, 48, 60, 72, 84], 7)]
+
+
+def test_a_number_join_inside_a_shot_still_needs_the_way_to_be_possible() -> None:
+    # Without a cut the same two tracks 50 m apart in 0.48 s are two people: number 7 stays on one.
+    before = still_track(0, [0, 12, 24, 36, 48], 200.0)
+    after = still_track(1, [60, 72, 84], 1200.0)
+
+    decided = finalize_tracks(
+        [before, after],
+        readings={0: high_reading(7), 1: high_reading(7)},
+        mean_pitch_x={0: -10.0, 1: -10.0},
+        fps=FPS,
+        to_pitch=flat_pitch,
+    )
+
+    assert [track.number_display for track in decided] == [7, None]
 
 
 def test_team_slots_refuse_cuts_out_of_order() -> None:

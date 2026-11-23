@@ -1332,23 +1332,24 @@ Data:
   SoccerNet tracking video (behind an NDA).
 - The valid split (probe, dev, reserve groups) and the test split are never training data.
 
-Steps (the converter is not built):
+Steps (none of them is built: the command `data` takes only `--split valid` and `--split test`
+and refuses `train`, the converter does not exist, and the training has no job in
+`tools/run_tool.py`):
 
 ```bash
-# 1. Download the train split into the data folder (its size is not known here; check the free disk first).
-python -m pitchvlm.cli data --root ~/pitchvlm-data --split train \
-    --manifest configs/splits.json --seed 20261113
+# 1. To build: a download of the train split into the data folder (its size is not known here;
+#    check the free disk first). The command `data` refuses `--split train` now.
 
 # 2. To build: a converter that writes the COCO layout that RF-DETR trains on, with links to the
 #    frame images (no copy): ~/pitchvlm-data/finetune/coco/{train,valid}/_annotations.coco.json.
 #    Classes: 0 player, 1 goalkeeper, 2 referee, 3 ball; "other" is left out. Every 5th frame of
 #    each train clip; 10% of the train clips (by clip, never by frame) as its valid folder.
 
-# 3. Training on the GPU machine, in the RF-DETR environment (API of rfdetr 1.12.1).
-env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python -c '
-from rfdetr import RFDETRMedium
-RFDETRMedium().train(dataset_dir="<home>/pitchvlm-data/finetune/coco", epochs=50, batch_size=8,
-                     grad_accum_steps=2, lr=1e-4, output_dir="<home>/pitchvlm-data/weights/rfdetr-soccer")'
+# 3. To build: a training job of `tools/run_tool.py` (rule 4 of `CLAUDE.md`: only that script
+#    imports a tool), run on the GPU machine in the RF-DETR environment without the model keys
+#    (`env -u GEMINI_API_KEY -u OPENROUTER_API_KEY`). The job calls, with the API of rfdetr
+#    1.12.1: RFDETRMedium().train(dataset_dir=<the coco folder of step 2>, epochs=50,
+#    batch_size=8, grad_accum_steps=2, lr=1e-4, output_dir=~/pitchvlm-data/weights/rfdetr-soccer).
 ```
 
 - Weights live in `~/pitchvlm-data/weights/rfdetr-soccer` on the machine that trains, and are

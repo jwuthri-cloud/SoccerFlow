@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import pytest
 
-from pitchvlm import cli, pipeline
+from pitchvlm import cli, kitcolour, pipeline
 from pitchvlm.config import EngineSettings, PipelineConfig, TrackingConfig, load_config
 from pitchvlm.evalx.metrics import identity_scores, position_errors_m, summarize
 from pitchvlm.export_gsr import check_predictions, prediction_items
@@ -236,12 +236,14 @@ def test_split_of_team_swaps_runs_per_shot_after_the_kit_roles(
 ) -> None:
     """The split gets the fragments of one shot, whose goalkeepers and referees have no team key."""
     calls: list[tuple[set[bool], set[tuple[str, str]]]] = []
+    min_votes: list[int] = []
 
-    def watched(tracks: Sequence[Track]) -> list[Track]:
+    def watched(tracks: Sequence[Track], **options: int) -> list[Track]:
         shots = {obs.frame >= CUT for track in tracks for obs in track.observations}
         roles = {(obs.role, obs.team_key) for track in tracks for obs in track.observations}
         calls.append((shots, roles))
-        return split_team_swaps(tracks)
+        min_votes.append(options["min_votes"])
+        return split_team_swaps(tracks, **options)
 
     monkeypatch.setattr(pipeline, "split_team_swaps", watched)
     tools = tools_of(cut_scene, DETECTOR_ONLY)
@@ -249,6 +251,8 @@ def test_split_of_team_swaps_runs_per_shot_after_the_kit_roles(
     assert calls == []
     repaired = run_clip(SyntheticSource(cut_scene), None, DETECTOR_REPAIRS, tools=tools)
     assert [shots for shots, _ in calls] == [{False}, {True}]
+    # A team-key change must hold for 4 keyframe intervals of 0.48 s, 12 frames each at 25 fps.
+    assert min_votes == [48, 48]
     # kit_roles ran first: a goalkeeper carries the team key none, so the split never cuts it.
     roles = set().union(*(roles for _, roles in calls))
     assert ("goalkeeper", "none") in roles
@@ -390,6 +394,68 @@ def test_every_frame_tracking_keeps_the_time_of_the_keyframe_limits() -> None:
     assert every_frame_tracking(config, 25.0).max_missed_keyframes == 48
     assert every_frame_tracking(config, 50.0).max_missed_keyframes == 96
     assert every_frame_tracking(config, 25.0).max_stitch_gap_s == config.tracking.max_stitch_gap_s
+
+
+def test_the_kit_clusters_are_the_two_teams_and_the_referee_is_an_outlier() -> None:
+    # On this clip one k-means start ends in the referee against both teams: the referee got the
+    # key A and the players of one team the key none. The fit with the smallest cost does not.
+    scene = SyntheticScene(n_frames=50, seed=0)
+    keyed = pipeline._kit_team_keys(SyntheticSource(scene), fake_detector_answers(scene)[0])
+    keys: dict[str, Counter[str]] = {}
+    for frame_people in keyed:
+        truth = {(person.box.x1, person.box.y1): person for person in scene.frame_state(frame_people.frame).players}
+        for person in frame_people.people:
+            true_person = truth[(person.box.x1, person.box.y1)]
+            keys.setdefault(true_person.role + true_person.team_key, Counter())[person.team_key] += 1
+
+    assert set(keys["referee" + "none"]) == {"none"}
+    team_keys = {keys["playerA"].most_common(1)[0][0], keys["playerB"].most_common(1)[0][0]}
+    assert team_keys == {"A", "B"}
+
+
+def test_without_kit_clusters_no_track_becomes_a_referee_or_a_goalkeeper(
+    scene: SyntheticScene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A clip without two kit colours: every person keeps the team key none. That is no outlier
+    # kit, so the kit roles must not make every track a referee or a goalkeeper.
+    monkeypatch.setattr(
+        pipeline,
+        "_kit_team_keys",
+        lambda source, people: [
+            frame_people.model_copy(
+                update={
+                    "people": tuple(person.model_copy(update={"team_key": "none"}) for person in frame_people.people)
+                }
+            )
+            for frame_people in people
+        ],
+    )
+    tools = tools_of(scene, DETECTOR_ONLY)
+    result = run_clip(SyntheticSource(scene), None, PipelineConfig(engines=DETECTOR_ONLY), tools=tools)
+
+    assert result.tracks
+    assert {track.role for track in result.tracks} == {"player"}
+
+
+def test_clip_of_one_kit_colour_gives_no_team_key_and_warns(
+    scene: SyntheticScene, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Every torso shows the same blue kit with a little noise, as crops of one kit do.
+    rng = np.random.default_rng(0)
+    blue = np.zeros(kitcolour.FEATURE_SIZE)
+    blue[7] = 1.0
+
+    def one_kit(image: np.ndarray, box: Box) -> np.ndarray:
+        row = np.abs(blue + rng.normal(0.0, 0.03, size=blue.shape))
+        return row / np.linalg.norm(row)
+
+    monkeypatch.setattr(pipeline, "torso_feature", one_kit)
+    people = fake_detector_answers(scene)[0]
+
+    keyed = pipeline._kit_team_keys(SyntheticSource(scene), people)
+
+    assert {person.team_key for frame_people in keyed for person in frame_people.people} == {"none"}
+    assert "one kit colour, not two" in caplog.text
 
 
 def test_clip_without_two_kit_colours_gives_no_team_key_and_warns(
@@ -549,6 +615,8 @@ def test_run_reads_the_clip_runs_of_both_tools_and_makes_no_model_call(
     assert "this run makes no model call and costs nothing" in printed
     assert "no player of this clip has a number" in printed
     document = json.loads((out / CLIP_ID / "result.json").read_text(encoding="utf-8"))
+    n_ball = sum(frame["ball"] is not None for frame in document["result"]["frames"])
+    assert f"ball: {n_ball} of {N_FRAMES} frames" in printed
     assert document["provenance"]["cost"] is None
     assert document["prediction_file"]["problems"] == []
     assert document["prediction_file"]["scored_frames_without_prediction"] == 0

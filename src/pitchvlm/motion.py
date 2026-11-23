@@ -182,7 +182,7 @@ def _block_correlation(moved: np.ndarray, target: np.ndarray) -> float | None:
             columns = slice(column * width // CUT_TEST_GRID, (column + 1) * width // CUT_TEST_GRID)
             block = moved[rows, columns]
             covered = np.isfinite(block)
-            if covered.mean() < MIN_CUT_TEST_BLOCK_COVER:
+            if block.size == 0 or covered.mean() < MIN_CUT_TEST_BLOCK_COVER:  # A very flat image has empty blocks.
                 continue
             first = block[covered]
             second = target[rows, columns][covered]
