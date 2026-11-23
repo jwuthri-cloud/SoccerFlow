@@ -27,6 +27,14 @@ How a request is sent (API pages and SDK source read again on 2026-11-14, SDK 3.
 - No sampling parameter. Gemini 4 models ignore temperature, top_p and top_k.
 - The answer is JSON text that follows the request's schema.
 - Images go inline as base64 text, each with its own resolution.
+- A video goes inline as base64 text too, with its resolution, and with the
+  part ``processing`` of the type ``static`` when it names a range or a
+  sampling rate: ``start_offset`` and ``end_offset`` as seconds with the
+  ending "s", and ``fps`` (video page, read on 2026-11-23). The Files API is
+  never used: it keeps an uploaded file for 48 hours, against the intent of
+  ``store=False``. So a request whose inline data would pass
+  ``INLINE_REQUEST_MAX_BYTES`` is refused before any call
+  (``VideoInputError``), and so is a video of a model without a video rate.
 - The SDK makes one attempt per call. This module does the retries, so that it
   can count the attempts. This needs SDK 3.0 or later: an older SDK reads the
   setting as one repeat and sends a failed call a second time by itself.
@@ -81,6 +89,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import http.client
 import importlib.metadata
 import json
@@ -99,7 +108,17 @@ from datetime import UTC, date, datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, get_args
 
-from pitchvlm.vlm.cost import FREE_MODEL_SUFFIX, HIGHEST_PRICE_TIER, Price, cost_usd, has_flex_tier, price_for
+from pitchvlm.vlm.cost import (
+    FREE_MODEL_SUFFIX,
+    GEMINI_VIDEO_RATES,
+    HIGHEST_PRICE_TIER,
+    Price,
+    VideoRate,
+    cost_usd,
+    has_flex_tier,
+    price_for,
+    video_rate_for,
+)
 from pitchvlm.vlm.types import (
     Backend,
     BackendError,
@@ -113,6 +132,8 @@ from pitchvlm.vlm.types import (
     TextPart,
     UnconfirmedCallError,
     Usage,
+    VideoInputError,
+    VideoPart,
     VLMRequest,
     VLMResponse,
 )
@@ -157,6 +178,12 @@ SPEND_WINDOW_S = 600.0
 USAGE_TOLERANCE = 0.01
 #: Longest SDK error text that is copied into a log line or an error message, characters.
 MAX_ERROR_CHARS = 500
+#: Largest size of the inline data of one request, bytes: the base64 text of its images and videos.
+#: The video page of Gemini says "Always use the Files API when the total request size ... is larger
+#: than 20 MB"; the files page says 100 MB. The smaller value is taken, read as 20,000,000 bytes
+#: (published, not measured). The OpenRouter pages state no size; the same limit is used for it
+#: (chosen, not published). A video of 20 MB as base64 text is about 15 MB of file.
+INLINE_REQUEST_MAX_BYTES = 20_000_000
 #: The service tiers that have a price. An answer can report one of them as the tier that served the call.
 BILLED_TIERS: tuple[BilledTier, ...] = get_args(BilledTier)
 
@@ -182,10 +209,95 @@ class InteractionsClient(Protocol):
 # --- Request ---------------------------------------------------------------------
 
 
-def _input_item(part: TextPart | ImagePart) -> dict[str, str]:
+def video_bytes(part: VideoPart) -> bytes:
+    """Read the bytes of the file of a video part and check them against its hash.
+
+    Raises ``VideoInputError`` when the file cannot be read or has other bytes: the
+    cache key holds the hash, so a changed file must not be sent under the old key.
+    """
+    try:
+        data = part.path.read_bytes()
+    except OSError as error:
+        raise VideoInputError(f"the video file of a video part cannot be read: {type(error).__name__}") from None
+    found = hashlib.sha256(data).hexdigest()
+    if found != part.sha256:
+        raise VideoInputError(
+            f"the video file has other bytes than its video part: hash {found[:12]}..., the part names "
+            f"{part.sha256[:12]}.... The file changed after the request was built; build the request again."
+        )
+    return data
+
+
+def _seconds_text(value: float) -> str:
+    """Write a time for the offsets of the Interactions API: seconds with the ending "s", e.g. ``12.48s``."""
+    return f"{value:.3f}".rstrip("0").rstrip(".") + "s"
+
+
+def _video_item(part: VideoPart) -> dict[str, Any]:
+    """Turn a video part into one input item of the Interactions API: inline bytes, and the range when it has one."""
+    item: dict[str, Any] = {
+        "type": "video",
+        "data": base64.b64encode(video_bytes(part)).decode("ascii"),
+        "mime_type": part.mime_type,
+        "resolution": part.resolution,
+    }
+    if part.clipped:
+        processing: dict[str, Any] = {"type": "static"}
+        if part.start_s is not None:
+            processing["start_offset"] = _seconds_text(part.start_s)
+        if part.end_s is not None:
+            processing["end_offset"] = _seconds_text(part.end_s)
+        if part.fps is not None:
+            processing["fps"] = part.fps
+        item["processing"] = processing
+    return item
+
+
+def _inline_bytes(items: Sequence[Mapping[str, Any]]) -> int:
+    """Return the size of the inline data of the parts of a request: the base64 text of its images and videos."""
+    return sum(len(item["data"]) for item in items if "data" in item)
+
+
+def check_inline_size(n_bytes: int, label: str) -> None:
+    """Raise ``VideoInputError`` when the inline data of a request is larger than ``INLINE_REQUEST_MAX_BYTES``."""
+    if n_bytes > INLINE_REQUEST_MAX_BYTES:
+        raise VideoInputError(
+            f"{label}: the inline data of the request is {n_bytes:,} bytes, more than the limit of "
+            f"{INLINE_REQUEST_MAX_BYTES:,} bytes. A larger request needs an upload API that keeps the file at the "
+            "provider, and this client never uploads (owner decision). Send a shorter range as its own file."
+        )
+
+
+def require_video_rate(request: VLMRequest, table: Sequence[VideoRate], on: date) -> VideoRate | None:
+    """Return the video rate of the model of a request with video parts, or None for a request without one.
+
+    Raises ``VideoInputError`` before any call when the model has no video rate on the
+    day (it takes no video here), and when a part names a range or a sampling rate that
+    the provider cannot take (``VideoRate.takes_clips``).
+    """
+    if not request.videos:
+        return None
+    try:
+        rate = video_rate_for(request.model, on, table)
+    except KeyError as error:
+        raise VideoInputError(
+            f"{_request_label(request)}: {error.args[0]}. A request with a video part is sent only to a model "
+            "with a published video rate in the price table; nothing was sent."
+        ) from None
+    if not rate.takes_clips and any(part.clipped for part in request.videos):
+        raise VideoInputError(
+            f"{_request_label(request)}: the provider of {request.model} takes no range and no sampling rate of a "
+            "video, so a video part must be a whole file without start, end and fps. Write the range as its own file."
+        )
+    return rate
+
+
+def _input_item(part: TextPart | ImagePart | VideoPart) -> dict[str, Any]:
     """Turn one request part into one input item of the Interactions API."""
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
+    if isinstance(part, VideoPart):
+        return _video_item(part)
     return {
         "type": "image",
         "data": base64.b64encode(part.data).decode("ascii"),
@@ -197,16 +309,25 @@ def _input_item(part: TextPart | ImagePart) -> dict[str, str]:
 def build_interaction_kwargs(request: VLMRequest) -> dict[str, Any]:
     """Turn a request into the keyword arguments of ``client.interactions.create``.
 
-    Text and image parts keep their order. Image bytes are sent inline as base64
-    text, each image with its own resolution. The answer must be JSON that follows
+    Text, image and video parts keep their order. Image and video bytes are sent
+    inline as base64 text, each part with its own resolution, and a video with its
+    range and sampling rate (``_video_item``). The answer must be JSON that follows
     the request's schema. The call is never stored on the provider's side, and it
     carries no sampling parameter. ``request.context`` is never sent.
+
+    Raises ``VideoInputError`` when a video file cannot be read, has other bytes than
+    its part, or makes the inline data larger than ``INLINE_REQUEST_MAX_BYTES``. The
+    size limit holds for a request with a video part; a request of images only is
+    built as before video parts were added.
     """
     if not request.parts:
         raise ValueError("a request needs at least one text or image part")
+    items = [_input_item(part) for part in request.parts]
+    if request.videos:
+        check_inline_size(_inline_bytes(items), _request_label(request))
     return {
         "model": request.model,
-        "input": [_input_item(part) for part in request.parts],
+        "input": items,
         "generation_config": {"thinking_level": request.thinking_level},
         "response_format": {
             "type": "text",
@@ -755,11 +876,17 @@ class GeminiBackend:
         already in the spend window. This backend writes no cost ledger: the
         wrapper that keeps the ledger records the cost one time.
 
+        Raises ``VideoInputError`` before any call when the request has a video part
+        and the model has no video rate (``cost.GEMINI_VIDEO_RATES``), or when the video
+        cannot go inline (``build_interaction_kwargs``).
+
         A request without parts raises ``ValueError``.
         """
+        today = datetime.now(UTC).date()
+        require_video_rate(request, GEMINI_VIDEO_RATES, today)
         kwargs = build_interaction_kwargs(request)
         label = _request_label(request)
-        _require_price(request.model, request.service_tier, datetime.now(UTC).date())
+        _require_price(request.model, request.service_tier, today)
         client = self._client_for_call()
         interaction, attempts, latency_s = self._create_with_retries(client, kwargs, label, request.service_tier)
         answered_at = datetime.now(UTC)
@@ -932,6 +1059,12 @@ class LazySdkClient:
 #   module needs no SDK for OpenRouter, so rule 4 keeps its meaning (only this module talks to a
 #   model service).
 # - One user message: the prompt text, then each image as a base64 data URL with its ``detail``.
+# - A video goes as a ``video_url`` part with a base64 data URL ("The video_url can be either a URL
+#   or a base64-encoded data URL", video page, read on 2026-11-23). It has no ``detail``. The page
+#   says that only Gemini reads the ``processing`` field, so an OpenRouter video is a whole file:
+#   a part with a range or a sampling rate is refused (``require_video_rate``). A model takes video
+#   only with a ``video`` rate in the price table file; the inline data has the size limit
+#   ``INLINE_REQUEST_MAX_BYTES``.
 # - The answer must follow the JSON schema of the request (``response_format`` of the type
 #   ``json_schema``, strict). Each object of the schema gets ``additionalProperties: false``, as
 #   the strict mode of several providers requires.
@@ -978,10 +1111,17 @@ def _strict_schema(schema: Any) -> Any:
     return copy.deepcopy(schema)
 
 
-def _content_part(part: TextPart | ImagePart) -> dict[str, Any]:
+def _content_part(part: TextPart | ImagePart | VideoPart) -> dict[str, Any]:
     """Turn one request part into one content part of a chat message."""
     if isinstance(part, TextPart):
         return {"type": "text", "text": part.text}
+    if isinstance(part, VideoPart):
+        if part.clipped:
+            raise VideoInputError(
+                "an OpenRouter video part must be a whole file: the provider reads no start, end or fps"
+            )
+        data = base64.b64encode(video_bytes(part)).decode("ascii")
+        return {"type": "video_url", "video_url": {"url": f"data:{part.mime_type};base64,{data}"}}
     if part.resolution not in OPENROUTER_RESOLUTIONS:
         raise ValueError(
             f"an OpenRouter image has no resolution {part.resolution!r}: use {' or '.join(OPENROUTER_RESOLUTIONS)}"
@@ -999,7 +1139,10 @@ def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
 
     Raises ValueError for a request without parts, for a request of another
     provider, for a free model (rule 5), for a service tier other than the
-    standard one and for an image resolution without a ``detail``.
+    standard one and for an image resolution without a ``detail``. Raises
+    ``VideoInputError`` for a video part with a range or a sampling rate, for a
+    video file that cannot be read or has other bytes than its part, and, for a
+    request with a video part, for inline data larger than ``INLINE_REQUEST_MAX_BYTES``.
     """
     if request.provider != "openrouter":
         raise ValueError(f"an OpenRouter body cannot be built for a {request.provider} request")
@@ -1009,9 +1152,13 @@ def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
         raise ValueError(f"{request.model} is a free model: only paid models are allowed (rule 5)")
     if request.service_tier != "standard":
         raise ValueError(f"an OpenRouter request has no service tier {request.service_tier!r}: use standard")
+    content = [_content_part(part) for part in request.parts]
+    if request.videos:
+        inline = sum(len(part[kind]["url"]) for part in content for kind in ("image_url", "video_url") if kind in part)
+        check_inline_size(inline, _request_label(request))
     body: dict[str, Any] = {
         "model": request.model,
-        "messages": [{"role": "user", "content": [_content_part(part) for part in request.parts]}],
+        "messages": [{"role": "user", "content": content}],
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -1032,8 +1179,15 @@ def keeps_inputs_private(request: VLMRequest) -> bool:
     """Say whether the call that a request gives keeps its inputs private (rule 5).
 
     A Gemini call must carry ``store=False``. An OpenRouter call must carry the
-    routing settings of ``OPENROUTER_ROUTING``.
+    routing settings of ``OPENROUTER_ROUTING``. The video parts are left out of
+    the call that is built for this answer: the privacy settings do not depend on
+    them, and a video file that cannot be sent any more must not make this check
+    fail (its request has failed before any call already).
     """
+    if request.videos:
+        request = request.model_copy(
+            update={"parts": tuple(part for part in request.parts if not isinstance(part, VideoPart))}
+        )
     if request.provider == "openrouter":
         return routing_keeps_inputs_private(build_openrouter_body(request).get("provider"))
     return build_interaction_kwargs(request).get("store") is False
@@ -1277,6 +1431,9 @@ class OpenRouterBackend:
     ``prices`` is the price table of the OpenRouter models
     (``cost.load_price_table``). A request for a model without a price on the
     day is not sent. The cost of an answer is the cost that the API reports.
+    ``video_rates`` are the video rates of the price table file
+    (``cost.load_video_rates``): a request with a video part for a model
+    without a video rate is not sent (``VideoInputError``).
 
     A failed call is tried again after the status codes 408, 409, 429 and 5xx
     and after a lost connection, at most ``max_attempts`` times in total, with a
@@ -1294,6 +1451,7 @@ class OpenRouterBackend:
         self,
         *,
         prices: Sequence[Price],
+        video_rates: Sequence[VideoRate] = (),
         api_key_env: str = OPENROUTER_KEY_VARIABLE,
         timeout_s: float = STANDARD_TIMEOUT_S,
         max_attempts: int = 4,
@@ -1310,6 +1468,7 @@ class OpenRouterBackend:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self._prices = tuple(prices)
+        self._video_rates = tuple(video_rates)
         self._api_key_env = api_key_env
         self._timeout_s = float(timeout_s)
         self._max_attempts = max_attempts
@@ -1328,6 +1487,9 @@ class OpenRouterBackend:
         provider that served the call. The cost goes into the spend window.
 
         Raises ``ValueError`` for a request that cannot be sent (``build_openrouter_body``).
+        Raises ``VideoInputError`` before any call for a video part that cannot be
+        sent: a model without a video rate, a range or a sampling rate, a changed
+        file, or inline data above the size limit.
         Raises ``BackendError`` when the key is missing, the model has no price, the
         call fails or the stop event is set before an attempt is sent. Raises
         ``UnconfirmedCallError`` for a call without an answer that can be read, without
@@ -1335,9 +1497,11 @@ class OpenRouterBackend:
         ``BilledAnswerError`` with the cost record when the answer was billed but
         cannot be used.
         """
+        today = datetime.now(UTC).date()
+        require_video_rate(request, self._video_rates, today)
         body = json.dumps(build_openrouter_body(request)).encode("utf-8")
         label = _request_label(request)
-        _require_openrouter_price(request.model, self._prices, datetime.now(UTC).date())
+        _require_openrouter_price(request.model, self._prices, today)
         answer, attempts, latency_s = self._post_with_retries(body, label)
         answered_at = datetime.now(UTC)
         data = _json_object(answer.body)

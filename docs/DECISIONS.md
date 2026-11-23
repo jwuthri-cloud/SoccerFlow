@@ -2612,6 +2612,182 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
       (25.1) s. The machine was slower for both. Process starts were not the cause: 450 starts of
       `/usr/bin/true` per second in this window, against 180 in the first.
 
+## 2026-11-23 — Video input for the model steps (session A of round 5)
+
+1. **The goal** (owner request: "any img/video llm" must work). A model step can send a video
+   file, or a time range of it, in the place of a list of images, through Gemini and through
+   OpenRouter. Built on the build machine, offline: no model call, no key, no footage, no
+   install. Nothing here ran against a real model or a real video of the dataset.
+2. **Documentation pages read on 2026-11-23** (public pages, no sign-in, no API call; every value
+   below is published, not measured). The pages of `ai.google.dev/gemini-api/docs/...` answered
+   with a redirect to the same paths on `aistudio.google.com/docs/...`.
+   - https://aistudio.google.com/docs/video-understanding — inline data for "shorter videos
+     under 20MB total request size"; "Always use the Files API when the total request size ... is
+     larger than 20 MB"; File API 20 GB (paid). Video part of the Interactions API:
+     `{"type": "video", "data": <base64>, "mime_type": "video/mp4"}`. Clipping and rate in
+     `"processing": {"type": "static", "start_offset": "1200s", "end_offset": "1500s"}`, `fps` in
+     `(0, 24]`; "extracting frames at 1 FPS" by default. Types `video/mp4`, `video/mpeg`,
+     `video/mov`, `video/webm` (the type list and the `fps` inside `processing` were read from a
+     cut copy of the page: to confirm). Up to 10 videos per request (Gemini 2.5 and later).
+   - https://aistudio.google.com/docs/files — "Files are automatically deleted after 48 hours";
+     the Files API is for requests "larger than 100 MB" (this conflicts with the 20 MB above).
+   - https://aistudio.google.com/docs/media-resolution — Gemini 4 and 3 models: video tokens per
+     frame 70 at unspecified, low and medium, 280 at high; sound 25 tokens per second; the
+     resolution can be set "for individual media objects (content items)" (the example is an
+     image part). The video page gives 66 and 258 per frame; the tokens page
+     (https://aistudio.google.com/docs/tokens) gives "263 tokens per second", "~100 (default low
+     resolution) / ~300 (high resolution)" per second and "32 tokens per second" for sound. Three
+     sets of numbers that do not agree.
+   - https://aistudio.google.com/docs/pricing — one input price for all inputs of gemini-4-argon,
+     gemini-4-carbon, gemini-4-hydrogen and gemini-3.8-flash (no separate video or sound price);
+     the robotics model: the same price for text, image, video and sound (read from a cut copy).
+   - https://openrouter.ai/docs/features/multimodal/videos — chat completions part
+     `{"type": "video_url", "video_url": {"url": ...}}`; "The video_url can be either a URL or a
+     base64-encoded data URL"; "Google Gemini (AI Studio): Only supports YouTube links"; "Google
+     Gemini (Vertex AI): ... Use base64-encoded data URLs instead"; other providers: check the
+     model; `processing` is read by Gemini only ("Other providers ignore the `processing`
+     field"). No size limit is stated.
+   - https://openrouter.ai/docs/features/multimodal/overview — "Video: Priced as input tokens
+     based on duration and resolution". https://openrouter.ai/docs/guides/overview/models — the
+     models list names the input types under `architecture.input_modalities`; no video price key.
+   - https://openrouter.ai/api/v1/models/google/gemini-2.5-flash/endpoints — `input_modalities`
+     holds `video`; its three endpoints are all "Google AI Studio" (which takes YouTube links
+     only, by the video page), with an `audio` price above the `prompt` price (1.0 against 0.3
+     USD per million at the standard endpoint) and no video price. The model pages of
+     `qwen/qwen3-vl-235b-a22b-instruct` and `qwen/qwen2.5-vl-72b-instruct` name no input types.
+     The public list https://openrouter.ai/api/v1/models answered in another shape than its page
+     documents (no `architecture`, no `pricing`), so the video models could not be listed.
+   - Item 7 of the entry "Image models through OpenRouter" (2026-11-22) said that no page showed
+     base64 video in chat completions. The video page now says it in words (above), so the part is
+     built; no example on the page shows it.
+3. **What was built** (each with tests; `tests/test_vlm_video.py` and new tests in
+   `tests/test_cli.py`):
+   - `VideoPart` (`vlm/types.py`): path, SHA-256, type, length, optional start, end and rate,
+     resolution (`low`, `medium`, `high`). No bytes. `identity()` (no path) goes into the cache
+     key and into the cassette (`videos`). A request without video parts has neither entry: its
+     key and cassette are those of before (the 15 frozen values of `tests/test_vlm_openrouter.py`
+     still pass).
+   - Gemini (`vlm/client.py`): inline base64 with `resolution`, and `processing` of the type
+     `static` when the part names a range or a rate. The bytes are checked against the hash
+     before the call. No upload: the Files API keeps a file at the provider for 48 hours, against
+     the intent of `store=False`. A request with a video whose inline data is above 20,000,000
+     bytes (the smaller published limit) is refused before any call (`VideoInputError`). A request
+     of images only has no such limit, as before.
+   - OpenRouter: a `video_url` part with a base64 data URL through the `urllib` transport, the
+     same private routing; a part with a range or a rate is refused (the provider would ignore
+     it), and so is inline data above the same 20,000,000 bytes (chosen, not published).
+   - Money (`vlm/cost.py`): `VideoRate` and `GEMINI_VIDEO_RATES` (4 Gemini models; frame tokens
+     70 / 70 / 280, the larger of each published pair; 32 sound tokens per second, the larger
+     value; default rate 1 per second; billed at the input price). The OpenRouter rates are the
+     optional `video` entries of `configs/openrouter_prices.yaml` (`load_video_rates`); none is
+     filled (item 7). A model without a rate takes no video: the estimate raises `KeyError`
+     before a run, and both backends raise `VideoInputError` before any call. The estimate of a
+     video request is the text estimate of its step plus `frames x tokens_per_frame + seconds x
+     sound tokens` per part; `people_video` counts its output once per target frame. The billed
+     cost comes from the measured usage, so the 1.3 times stop and the hard stop work as for
+     images. `Ledger` and `BudgetGuard` are not changed, and session D needs to change nothing for
+     this: a Gemini video line is priced from its measured tokens at the input price; an
+     OpenRouter line takes the reported cost.
+   - Video files (`vlm/video.py`): the chosen frames of a frame source, written with OpenCV at the
+     sampling rate (H.264 `avc1`, else MPEG-4 Part 2 `mp4v`), so frame `k` is at `k / fps`
+     seconds and the model samples each written frame. A file that is there is kept, because its
+     hash is in the key; its name holds a hash of the decoded pixels of its frames, so new footage
+     under an old clip name gets new files (the image path has `OtherImagesError` for this case). Measured on the build machine (OpenCV 5.0.0): two writes of the same 5
+     frames, 1 s apart, gave the same bytes, for `avc1` and for `mp4v` (1 trial each); OpenCV
+     reads a written file back with its frame count, size and a rate of 2.083 for 2.0833.
+   - Steps (`vlm/steps.py`, prompts `people_video/v1`, `kit_legend_video/v1`): the people prompt
+     lists the target frames by their time in the file and asks one entry per target with
+     `time_s`; `parse_people_video` takes an entry only when its time is within half a frame
+     interval of its target and counts the others. Both video prompts keep rule 5: kit colours
+     and shirt numbers only, "Do not use faces and do not give names".
+   - `FakeBackend` answers both video steps from the request context; it never opens the file.
+     The image answers draw the same random numbers as before (the tests of the fake pass
+     unchanged).
+   - Probe (`probes.VideoProbe`, the section `video` of an experiment file: `fps`,
+     `context_frames`, `targets_per_request`; option `probe --video-dir`, default
+     `~/pitchvlm-data/video-input`): the frames, the labels and the scorer of the image probe;
+     the videos are written before the estimate; the result adds `n_people_requests`,
+     `n_entries_wrong_time` and the video settings. Three experiment files:
+     `people_probe_video.yaml`, `people_probe_video_low.yaml`, `people_probe_video_batch.yaml`.
+   - Doctor (`doctor --video`): one video request per model, a 7 s video of 7 frames of the
+     synthetic scene, 3 targets; checks `video boxes`, `video box accuracy`, `video times`,
+     `video tokens` (measured input against the estimate). A model without a rate gets a failed
+     `video boxes` line and no call. Estimated 0.048 USD for gemini-4-argon until 2026-11-30 and
+     0.095 USD from 2026-12-01, inside the 2 USD of gate G0.
+   - No default changed: `StepSettings`, `configs/default.yaml`, the pipeline and `demo` are as
+     before; only the probe and the doctor send video.
+4. **Measured offline with the fake model.** The video people probe on the synthetic clip of the
+   probe tests (100 frames, 5 frames, seed 1) gives the same recall, precision, counts and foot
+   errors as the image probe with one request per frame and with 5 frames per request
+   (`test_video_people_probe_measures_the_frames_of_the_image_probe`). This proves the plumbing
+   (frames, times, parsing, scoring), not the model: the fake answers from the truth.
+5. **The experiment for the run machine.** Hypothesis: video input reaches gate G2 at a lower
+   estimated cost per keyframe than image input. Baseline: `people_probe.yaml` (images, the same
+   model). Controls: the same 24 clips of the group `probe`, the same 5 frames per clip (seed
+   20261113), the same labels, the same scorer, the same model and thinking level; each video
+   arm changes one thing (resolution `high` / `low`; one or five frames per request). Sample: 120
+   frames per arm, the size of gate G2. Estimated costs (printed by the code, prices of the
+   table, not measured):
+
+   | Arm | Calls | To 2026-11-30 | From 2026-12-01 | Per keyframe |
+   |---|---|---|---|---|
+   | images (`people_probe.yaml`) | 144 | 2.357 USD | 4.714 USD | 0.0196 / 0.0393 |
+   | video, high, 1 frame per request | 144 | 2.390 USD | 4.780 USD | 0.0199 / 0.0398 |
+   | video, low, 1 frame per request | 144 | 2.108 USD | 4.215 USD | 0.0176 / 0.0351 |
+   | video, high, 5 frames per request | 48 | 2.275 USD | 4.549 USD | 0.0190 / 0.0379 |
+
+   The estimates differ by at most 11 % because the output estimate of a video frame is set to
+   the 1,400 tokens of an image frame, and output is about 80 % of the cost. So the hypothesis
+   is a question about measured output and thinking tokens and about recall at 70 tokens per
+   frame, not about the estimate. The measured cost per keyframe is the measured cost of a run
+   divided by its `n_frames`.
+6. **Risks** (inferred, not measured):
+   - Frame sampling: the mapping assumes that the provider samples at `0, 1/fps, 2/fps, ...` of
+     the file. If it samples elsewhere, an answer describes another frame; `video times` and
+     `n_entries_wrong_time` show a model that names other times, but not a model that names the
+     right time for the wrong picture. The boxes of the doctor would then fail on the moving
+     camera of the synthetic scene.
+   - Timestamps: the model must copy the listed times; an answer that writes `1.4` for `1.44`
+     is within the tolerance (0.25 s at 2 per second).
+   - Coordinates: a box is given in the frame of its time; the convention is that of the step.
+     With 5 frames per request the model can mix the boxes of two windows.
+   - Pixels: the video arm sees H.264 (or MPEG-4 Part 2) frames, the image arm JPEG at quality
+     90 of the same frames. A difference in recall can come from the codec, not from the
+     input type.
+   - Token rate: the three published sets of numbers differ by up to 3.7 times at low resolution
+     (70 + 32 against 263 per second); a rate that is too low lets the 1.3 times stop end a probe
+     early (it never lets it pay more than 1.3 times the estimate).
+   - Codec: the run machine may write `mp4v` only, which a provider may refuse.
+7. **Owner decisions (open).**
+   - Uploads: a video above 20,000,000 bytes of inline data would need the Files API, which keeps
+     the file for 48 hours. Not built; the client refuses such a request. Decide whether an upload
+     followed by a delete is acceptable, or keep the refusal.
+   - OpenRouter video rates: no page publishes a video token rate for an OpenRouter model, and the
+     only Gemini model checked there serves through AI Studio (YouTube links only). So no
+     `video` entry is in `configs/openrouter_prices.yaml`, and every OpenRouter video request is
+     refused before any call. To enable one model, the owner adds, for example:
+     `video: [{valid_from: <day>, tokens_per_frame: <n>, audio_tokens_per_second: <n>,
+     frames_per_second: <n>, video_usd_per_million: <price>, audio_usd_per_million: <price>}]`
+     from its model card, and runs `doctor --video` with it.
+   - Video in the pipeline (`run`): not built. Decide after the probes, with both metrics files.
+   - Rule 5 text of `CLAUDE.md` (not applied): add "Video goes inline only; no file is uploaded
+     to a provider." after the routing sentence of the text proposed in the entry of 2026-11-22,
+     item 9.
+8. **Not verified (only the run machine can):** every request shape against the real APIs (the
+   Interactions video part with `resolution` and `processing`; the OpenRouter `video_url` data
+   URL); the token counts of video; the cost of a video call against its estimate; whether
+   OpenCV of the run machine writes H.264; whether the same frames give the same bytes there;
+   the sampling times of the provider; recall and precision of video input on real frames.
+9. **Second read** (a subagent, before the commit): no high finding; 6 medium or low, all
+   confirmed and fixed with a test where code changed. `probe --video-dir` is refused inside the
+   repository and inside or above the cache folder (medium, rule 2). The privacy check of the
+   doctor builds its call without the video parts, so a video that failed before its call no
+   longer stops the doctor with a traceback. An estimate that raises `ValueError` (flex for a
+   model without flex) gives one error line. The runbook says that `video times` shows only that
+   the model copies the listed times; `video boxes` on the moving synthetic camera is the check of
+   the sampling times. A plain doctor run no longer reads the video rates. Dead code and one test
+   that passed without its fix were removed. Its recomputed numbers match items 3 and 5.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

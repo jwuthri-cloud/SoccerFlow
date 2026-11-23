@@ -350,7 +350,14 @@ def test_billed_usd_is_the_cost_of_an_answer_on_its_utc_day() -> None:
 
 def test_default_token_estimates_name_every_model_step_with_counts_above_zero() -> None:
     """The values of the default table are not pinned: they change when real token counts are measured."""
-    assert set(DEFAULT_TOKEN_ESTIMATES) == {"kit_legend", "people", "landmarks", "number"}
+    assert set(DEFAULT_TOKEN_ESTIMATES) == {
+        "kit_legend",
+        "people",
+        "landmarks",
+        "number",
+        "kit_legend_video",
+        "people_video",
+    }
     # Every step that has a prompt has an estimate, so the cost of every request can be estimated.
     assert set(DEFAULT_TOKEN_ESTIMATES) == set(PROMPT_NAMES)
     for estimate in DEFAULT_TOKEN_ESTIMATES.values():
@@ -399,7 +406,9 @@ def test_estimate_follows_the_token_table_that_it_gets() -> None:
 
 
 def test_estimate_with_the_default_table_is_above_zero() -> None:
-    requests = [make_request(step) for step in DEFAULT_TOKEN_ESTIMATES]
+    requests = [
+        make_request(step).model_copy(update={"context": {"frames": [12]}}) for step in DEFAULT_TOKEN_ESTIMATES
+    ]
 
     assert estimate_usd(requests, DEFAULT_TOKEN_ESTIMATES, NOVEMBER) > 0.0
 

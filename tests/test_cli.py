@@ -48,7 +48,7 @@ import numpy as np
 import pytest
 import yaml
 
-from pitchvlm import cli, doctor, pipeline
+from pitchvlm import cli, doctor, pipeline, probes
 from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig
 from pitchvlm.datasets import make_split_manifest
 from pitchvlm.evalx.oracle import TeamSideFacts
@@ -60,7 +60,17 @@ from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import GeminiBackend
 from pitchvlm.vlm.cost import BudgetExceeded, BudgetGuard, Ledger, TokenEstimate, cost_usd, has_flex_tier
 from pitchvlm.vlm.fake import STEP_USAGE, FakeBackend
-from pitchvlm.vlm.types import Backend, BackendError, BilledAnswerError, FlexBusyError, VLMRequest, VLMResponse
+from pitchvlm.vlm.types import (
+    Backend,
+    BackendError,
+    BilledAnswerError,
+    FlexBusyError,
+    RequestMeta,
+    TextPart,
+    VideoPart,
+    VLMRequest,
+    VLMResponse,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 EXPERIMENTS = REPO / "configs" / "experiments"
@@ -5978,3 +5988,178 @@ def test_doctor_without_the_api_names_the_keys_of_both_providers(
     line = next(line for line in capsys.readouterr().out.splitlines() if "API key" in line)
     assert "[info]" in line
     assert "the variable OPENROUTER_API_KEY is not set; the variable GEMINI_API_KEY is set" in line
+
+
+# --- video input ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("file_name", "resolution", "per_request"),
+    [
+        ("people_probe_video.yaml", "high", 1),
+        ("people_probe_video_low.yaml", "low", 1),
+        ("people_probe_video_batch.yaml", "high", 5),
+    ],
+)
+def test_video_experiment_files_measure_the_frames_of_the_people_probe(
+    file_name: str, resolution: str, per_request: int
+) -> None:
+    experiment = cli.load_experiment(EXPERIMENTS / file_name)
+    images = cli.load_experiment(EXPERIMENTS / "people_probe.yaml")
+
+    assert experiment.name == Path(file_name).stem
+    assert (experiment.probe, experiment.group, experiment.seed, experiment.frames_per_clip) == (
+        images.probe,
+        images.group,
+        images.seed,
+        images.frames_per_clip,
+    )
+    assert experiment.step == images.step.model_copy(update={"resolution": resolution})
+    assert experiment.video == probes.VideoProbe(fps=2.0, context_frames=2, targets_per_request=per_request)
+    assert images.video is None
+    # The video requests are built before the run, so the plan of fixed counts is empty.
+    assert cli.probe_plan(experiment, 3) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Video input in a pitch probe, a Gemini video step without its rate, a rate above 24, an unknown key.
+        "name: x\nprobe: pitch\ngroup: probe\nframes_per_clip: 5\nseed: 1\nrepeat: 0\nstep: {}\nvideo: {fps: 2}\n",
+        "name: x\nprobe: people\ngroup: probe\nframes_per_clip: 5\nseed: 1\nrepeat: 0\nstep: {}\nvideo: {}\n",
+        "name: x\nprobe: people\ngroup: probe\nframes_per_clip: 5\nseed: 1\nrepeat: 0\nstep: {}\nvideo: {fps: 30}\n",
+        "name: x\nprobe: people\ngroup: probe\nframes_per_clip: 5\nseed: 1\nrepeat: 0\nstep: {}\nvideo: {fsp: 2}\n",
+        "name: x\nprobe: people\ngroup: probe\nframes_per_clip: 5\nseed: 1\nrepeat: 0\n"
+        "step: {resolution: ultra_high}\nvideo: {fps: 2}\n",
+    ],
+)
+def test_load_experiment_refuses_wrong_video_sections(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "experiment.yaml"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(cli.CliError, match="experiment.yaml"):
+        cli.load_experiment(path)
+
+
+def test_probe_people_with_video_input_and_a_fake_model_and_then_from_the_cache(
+    clip_on_disk: tuple[SyntheticScene, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A video request end to end: the videos are written outside the cache, the estimate counts them."""
+    scene, root = clip_on_disk
+    manifest = tmp_path / "splits.json"
+    manifest.write_text(json.dumps({"seed": 7, "valid": {"probe": [CLIP_ID]}}), encoding="utf-8")
+    backend = use_fake_model(monkeypatch, scene)
+    metrics = tmp_path / "metrics" / "people_probe_video.json"
+    videos, cache = tmp_path / "videos", tmp_path / "cache"
+    arguments = [
+        "probe",
+        "people",
+        "--experiment",
+        str(EXPERIMENTS / "people_probe_video.yaml"),
+        "--root",
+        str(root),
+        "--manifest",
+        str(manifest),
+        "--out",
+        str(metrics),
+        "--cache",
+        str(cache),
+        "--video-dir",
+        str(videos),
+        "--allow-dirty",
+    ]
+
+    assert cli.main(arguments) == 0
+
+    first = read_json(metrics)
+    assert (first["n_clips"], first["n_frames"], first["n_people_requests"]) == (1, 5, 5)
+    assert first["recall"] > 0.85 and first["n_entries_wrong_time"] == 0
+    assert [request.meta.step for request in backend.requests] == ["kit_legend_video"] + ["people_video"] * 5
+    assert first["provenance"]["cost"]["new_answers"] == 6
+    # One video per request, outside the cache folder; the cache and the metrics hold no video and no path.
+    assert len(list((videos / CLIP_ID).glob("*.mp4"))) == 6
+    assert not [path for path in cache.rglob("*") if path.suffix == ".mp4"]
+    for text in [metrics.read_text(encoding="utf-8"), *(path.read_text() for path in cache.rglob("*.json"))]:
+        assert str(tmp_path) not in text
+    output = capsys.readouterr().out
+    assert "cost estimate" in output and "people_video 5" in output and "kit_legend_video 1" in output
+    assert output.index("cost estimate") < output.index("measured cost")
+
+    assert cli.main([*arguments, "--replay"]) == 0
+
+    second = read_json(metrics)
+    assert second["provenance"]["cost"]["new_answers"] == 0
+    assert second["recall"] == first["recall"]
+
+
+def test_doctor_video_check_with_a_fake_model(
+    private_git: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    contract_scene: SyntheticScene,
+) -> None:
+    repo = tmp_path / "repo"
+    set_up_clone(repo)
+    (repo / "configs").mkdir()
+    shutil.copy(GATES, repo / "configs" / "gates.yaml")
+    monkeypatch.setattr(cli, "repository_root", lambda: repo)
+    monkeypatch.setenv(cli.KEY_VARIABLE, "not-a-real-value")
+    monkeypatch.setattr(doctor, "installed_sdk_version", lambda: "3.0.test")
+    recorder = doctor.RecordingClient(SimpleNamespace(interactions=None))
+    backend = CountingBackend(FakeBackend(contract_scene))
+    monkeypatch.setattr(cli, "recording_backend", lambda max_usd_per_10_min: (backend, recorder))
+    report_path = tmp_path / "doctor.json"
+
+    code = cli.main(
+        ["doctor", "--video", "--allow-dirty", "--cache", str(tmp_path / "cache"), "--out", str(report_path)]
+    )
+
+    assert code == 0
+    report = read_json(report_path)
+    checks = {check["name"]: check["status"] for check in report["contract"]["gemini-4-argon"]["checks"]}
+    assert (checks[doctor.VIDEO_BOXES], checks[doctor.VIDEO_TIMES]) == ("ok", "ok")
+    assert report["provenance"]["video"] is True
+    assert report["provenance"]["prompts"]["people_video"] == "people_video/v1"
+    assert [request.meta.step for request in backend.requests].count("people_video") == 1
+    output = capsys.readouterr().out
+    assert "people_video 1" in output.split("cost estimate", 1)[1].splitlines()[0]
+    # The video of the check was written to a temporary folder, which is gone.
+    assert not backend.requests[-1].videos[0].path.exists()
+
+
+def test_doctor_video_needs_the_api(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["doctor", "--no-api", "--video"]) != 0
+    assert "--video sends a video request" in capsys.readouterr().err
+
+
+def test_probe_refuses_a_video_folder_in_the_cache_or_in_the_repository(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    for folder in (cache, cache / "videos", tmp_path):
+        with pytest.raises(cli.CliError, match="text only"):
+            cli.refuse_video_folder(folder, cache)
+    with pytest.raises(cli.CliError, match="rule 2"):
+        cli.refuse_video_folder(REPO / "outputs" / "videos", cache)
+    cli.refuse_video_folder(tmp_path / "videos", cache)
+
+
+def test_estimate_of_a_video_request_that_cannot_be_priced_is_a_command_error(tmp_path: Path) -> None:
+    """A flex video request of a model without a flex tier is refused with one error line, not a traceback."""
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"stand-in")
+    part = VideoPart(path=video, sha256=hashlib.sha256(b"stand-in").hexdigest(), duration_s=1.0, fps=1.0)
+    request = VLMRequest(
+        model="gemini-robotics-er-2-preview",
+        thinking_level="low",
+        parts=(TextPart(text="x"), part),
+        response_schema={},
+        prompt_name="people_video/v1",
+        meta=RequestMeta(clip_id="c", step="people_video"),
+        service_tier="flex",
+        context={"frames": [0]},
+    )
+    with pytest.raises(cli.CliError, match="cannot be estimated"):
+        cli.estimated_requests_usd([request])

@@ -13,6 +13,14 @@ Two groups of checks live here.
   every call: the ``store`` flag or the routing settings, the service tier or the
   provider that served the call, the token counts and the reported cost.
 
+With ``video_folder``, the contract checks also send one video request (the
+video form of the people step, ``vlm.steps.build_people_video_request``): a
+short video of frames of the synthetic scene, with three target frames. Its
+checks are ``VIDEO_BOXES`` and ``VIDEO_BOX_ACCURACY`` (as for the images),
+``VIDEO_TIMES`` (every entry of the answer names the time of its target frame)
+and ``VIDEO_TOKENS`` (the measured input tokens next to the estimate). A model
+without a video rate gets no such request: its check fails before any call.
+
 The contract checks give two kinds of results for the boxes and the landmarks.
 A contract verdict (``BOXES``, ``LANDMARKS``) fails for a fault of the client:
 a wrong order or a wrong scale of the coordinates. It does not fail for a model
@@ -53,8 +61,10 @@ from pitchvlm.config import StepSettings
 from pitchvlm.evalx.metrics import match_boxes
 from pitchvlm.geometry import apply_homography
 from pitchvlm.pitch import landmark_xy
-from pitchvlm.synth import SyntheticScene
+from pitchvlm.schemas import FramePeople
+from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.vlm import steps
+from pitchvlm.vlm.video import DEFAULT_WRITE_FPS, frames_video_part
 from pitchvlm.vlm.client import (
     SDK_DISTRIBUTION,
     HttpAnswer,
@@ -66,8 +76,24 @@ from pitchvlm.vlm.client import (
     routing_keeps_inputs_private,
     usage_accounting,
 )
-from pitchvlm.vlm.cost import Price, has_flex_tier, price_for
-from pitchvlm.vlm.types import Backend, BackendError, FlexBusyError, VLMRequest, VLMResponse
+from pitchvlm.vlm.cost import (
+    DEFAULT_TOKEN_ESTIMATES,
+    Price,
+    VideoRate,
+    has_flex_tier,
+    price_for,
+    video_input_tokens,
+    video_rate_for,
+    video_rates_of,
+)
+from pitchvlm.vlm.types import (
+    VIDEO_RESOLUTIONS,
+    Backend,
+    BackendError,
+    FlexBusyError,
+    VLMRequest,
+    VLMResponse,
+)
 
 #: ``ok`` and ``fail`` are verdicts. ``info`` is a fact without a verdict.
 Status = Literal["ok", "fail", "info"]
@@ -93,6 +119,10 @@ SPEND = "spend"
 DATA_POLICY = "data policy"
 SERVED_BY = "served by"
 REPORTED_COST = "reported cost"
+VIDEO_BOXES = "video boxes"
+VIDEO_BOX_ACCURACY = "video box accuracy"
+VIDEO_TIMES = "video times"
+VIDEO_TOKENS = "video tokens"
 
 # --- Environment ---------------------------------------------------------------------
 
@@ -129,6 +159,11 @@ FLEX_REQUESTS = 1
 #: An answered box and a true box count as the same person when their IoU is at least this.
 #: The value is low on purpose: a badly placed box must lower the IoU values, not leave them.
 MATCH_MIN_IOU = 0.1
+#: Frames of the synthetic clip that the video of the video check holds, one second apart at
+#: ``VIDEO_CONTRACT_FPS``. Its target frames are ``CONTRACT_FRAMES``.
+VIDEO_CONTRACT_FRAMES: tuple[int, ...] = (0, 25, 50, 75, 100, 125, 150)
+#: Rate at which the frames of the video check are written and sampled: the default rate of Gemini.
+VIDEO_CONTRACT_FPS = DEFAULT_WRITE_FPS
 #: Limits of the contract verdict of the boxes: the smallest share of the possible pairs
 #: that must exist, and the smallest median IoU of the pairs. Measured on the contract
 #: frames: answers with x and y swapped pair 2 of 44 boxes, with an IoU of 0.13. Answers
@@ -684,6 +719,138 @@ def flex_settings(settings: StepSettings) -> StepSettings:
     return settings.model_copy(update={"service_tier": "flex"})
 
 
+def video_settings(settings: StepSettings) -> StepSettings:
+    """Return the settings of the video check: those of the model, at a video resolution.
+
+    A resolution that a video part cannot have (``ultra_high``) becomes ``high``.
+    """
+    if settings.resolution in VIDEO_RESOLUTIONS:
+        return settings
+    return settings.model_copy(update={"resolution": "high"})
+
+
+def video_contract_request(
+    settings: StepSettings, scene: SyntheticScene, folder: Path, openrouter_video_rates: Sequence[VideoRate] = ()
+) -> VLMRequest | None:
+    """Write the video of the video check into ``folder`` and return its request, or None for a model without video.
+
+    The video holds the frames ``VIDEO_CONTRACT_FRAMES`` of the scene at
+    ``VIDEO_CONTRACT_FPS``; the targets are ``CONTRACT_FRAMES``. A Gemini request
+    asks for that rate; an OpenRouter request sends the whole file without a rate. A
+    model without a video rate today gives None: it takes no video, and no video is
+    written for it.
+    """
+    table = video_rates_of(settings.provider, openrouter_video_rates)
+    try:
+        video_rate_for(settings.model, datetime.now(UTC).date(), table)
+    except KeyError:
+        return None
+    checked = video_settings(settings)
+    info = scene.info
+    video = frames_video_part(
+        SyntheticSource(scene),
+        VIDEO_CONTRACT_FRAMES,
+        folder=folder,
+        step="people_video",
+        fps=VIDEO_CONTRACT_FPS,
+        resolution=checked.resolution,
+        send_fps=settings.provider == "gemini",
+    )
+    return steps.build_people_video_request(
+        video,
+        scene.kit_legend(),
+        clip_id=info.clip_id,
+        video_frames=VIDEO_CONTRACT_FRAMES,
+        targets=CONTRACT_FRAMES,
+        fps=VIDEO_CONTRACT_FPS,
+        width=info.width,
+        height=info.height,
+        settings=checked,
+    )
+
+
+def check_video(
+    backend: Backend,
+    scene: SyntheticScene,
+    settings: StepSettings,
+    request: VLMRequest | None,
+    *,
+    min_mean_iou: float,
+    openrouter_video_rates: Sequence[VideoRate] = (),
+) -> list[CheckResult]:
+    """Send the video request of the video check and compare its answer with the truth of the scene.
+
+    ``request`` is the request of ``video_contract_request``; None means that the
+    model takes no video, and the result is one failed check without any call. The
+    checks are:
+
+    - ``VIDEO_BOXES`` and ``VIDEO_BOX_ACCURACY``: the boxes of each target frame
+      against its true boxes, with the limits of ``check_boxes``;
+    - ``VIDEO_TIMES``: every entry of the answer names the time of its target frame
+      (``steps.parse_people_video``). An entry with another time counts as no people,
+      so the boxes check also fails when the model mixes up the frames;
+    - ``VIDEO_TOKENS``: the measured input tokens of the call next to the estimate (the
+      text estimate of the step and the video tokens of ``vlm.cost``), as a fact
+      without a verdict. It is the first measurement of the video rate of the model.
+    """
+    if request is None:
+        return [
+            CheckResult(
+                VIDEO_BOXES,
+                "fail",
+                f"the model {settings.model} has no video rate in the price table, so it takes no video here; "
+                "no video request was sent",
+            )
+        ]
+    try:
+        response = backend.generate(request)
+        answers, n_wrong_time = steps.parse_people_video(
+            response.text,
+            targets=request.context["frames"],
+            times_s=request.context["times_s"],
+            fps=VIDEO_CONTRACT_FPS,
+            width=scene.info.width,
+            height=scene.info.height,
+            coords=settings.coords,
+        )
+    except BackendError as error:
+        return [CheckResult(VIDEO_BOXES, "fail", f"the request failed: {error}")]
+    except steps.ParseError as error:
+        return [CheckResult(VIDEO_BOXES, "fail", f"the answer cannot be parsed: {error}")]
+    n_targets = len(answers)
+    times = CheckResult(
+        VIDEO_TIMES,
+        "ok" if n_wrong_time == 0 else "fail",
+        f"{n_targets - n_wrong_time} of {n_targets} answer entries name the time of their target frame "
+        f"(within {steps.VIDEO_TIME_TOLERANCE:g} frame intervals of {1 / VIDEO_CONTRACT_FPS:g} s)",
+        value=float(n_targets - n_wrong_time),
+        limit=float(n_targets),
+    )
+    estimate = _video_input_estimate(request, openrouter_video_rates)
+    measured = response.usage.input_tokens
+    tokens = CheckResult(
+        VIDEO_TOKENS,
+        "info",
+        f"measured {measured} input tokens for the video request; the estimate is {estimate} "
+        f"({DEFAULT_TOKEN_ESTIMATES[request.meta.step].input_tokens} for the text and the rest for "
+        f"{len(VIDEO_CONTRACT_FRAMES)} frames of {len(VIDEO_CONTRACT_FRAMES) / VIDEO_CONTRACT_FPS:g} s at the "
+        f"resolution {request.videos[0].resolution}). A measured count far above the estimate means that the "
+        "video rate of the price table is too low",
+        value=float(measured),
+        limit=float(estimate),
+    )
+    boxes = _box_verdicts(answers, scene, min_mean_iou=min_mean_iou, names=(VIDEO_BOXES, VIDEO_BOX_ACCURACY))
+    return [*boxes, times, tokens]
+
+
+def _video_input_estimate(request: VLMRequest, openrouter_video_rates: Sequence[VideoRate]) -> int:
+    """Return the estimated input tokens of a video request: the text estimate of its step and its video tokens."""
+    table = video_rates_of(request.provider, openrouter_video_rates)
+    rate = video_rate_for(request.model, datetime.now(UTC).date(), table)
+    video_tokens = sum(sum(video_input_tokens(part, rate)) for part in request.videos)
+    return DEFAULT_TOKEN_ESTIMATES[request.meta.step].input_tokens + video_tokens
+
+
 def contract_plan(
     settings: StepSettings, frames: Sequence[int] = CONTRACT_FRAMES
 ) -> list[tuple[str, StepSettings, int]]:
@@ -707,6 +874,9 @@ def contract_checks(
     recorder: CallRecorder | None = None,
     frames: Sequence[int] = CONTRACT_FRAMES,
     openrouter_prices: Sequence[Price] = (),
+    video_request: VLMRequest | None = None,
+    check_video_input: bool = False,
+    openrouter_video_rates: Sequence[VideoRate] = (),
 ) -> ContractResult:
     """Run the contract checks of gate G0 for one model, with requests for frames of a synthetic scene.
 
@@ -739,6 +909,10 @@ def contract_checks(
     the calls that it records during this function are used. Without a recorder the
     checks of the raw calls give a fact without a verdict.
 
+    With ``check_video_input``, the video check runs too (``check_video``) with
+    ``video_request`` (``video_contract_request``; None for a model without video).
+    Its call counts in the checks of the raw calls like every other call.
+
     A request that fails and an answer that cannot be parsed make their check fail. Any
     other error, for example a reached budget limit, is raised.
     """
@@ -764,6 +938,15 @@ def contract_checks(
         owner = "OpenRouter" if settings.provider == "openrouter" else f"the model {settings.model}"
         detail = f"not checked: {owner} has no flex tier, so no request used it"
         checks.append(CheckResult(FLEX, "info", detail))
+    if check_video_input:
+        checks += check_video(
+            log,
+            scene,
+            settings,
+            video_request,
+            min_mean_iou=limits.box_mean_iou_min,
+            openrouter_video_rates=openrouter_video_rates,
+        )
     calls = [] if recorder is None else recorder.calls[first_call:]
     usage_sums = check_usage_sums(calls, tolerance=limits.usage_sum_tolerance)
     if settings.provider == "openrouter":
@@ -841,22 +1024,44 @@ def check_boxes(
     _need_frames(frames)
     info = scene.info
     legend = scene.kit_legend()
-    ious: list[float] = []
-    n_true = n_possible = 0
+    answers: list[FramePeople] = []
     for frame in frames:
         request = steps.build_people_request(
             scene.image(frame), legend, clip_id=info.clip_id, frame=frame, settings=settings
         )
-        answer = steps.parse_people(
-            backend.generate(request).text, frame=frame, width=info.width, height=info.height, coords=settings.coords
+        answers.append(
+            steps.parse_people(
+                backend.generate(request).text,
+                frame=frame,
+                width=info.width,
+                height=info.height,
+                coords=settings.coords,
+            )
         )
+    return _box_verdicts(answers, scene, min_mean_iou=min_mean_iou, names=(BOXES, BOX_ACCURACY))
+
+
+def _box_verdicts(
+    answers: Sequence[FramePeople], scene: SyntheticScene, *, min_mean_iou: float, names: tuple[str, str]
+) -> list[CheckResult]:
+    """Compare the answered people of some frames with the true boxes: the contract verdict and the accuracy fact.
+
+    ``names`` are the names of the two checks (``check_boxes`` describes them). A
+    frame without any pair gives the failed contract verdict only.
+    """
+    contract_name, accuracy_name = names
+    frames = [answer.frame for answer in answers]
+    ious: list[float] = []
+    n_true = n_possible = 0
+    for answer in answers:
+        frame = answer.frame
         answered = [person.box for person in answer.people]
         true_boxes = [person.box for person in scene.people(frame).people]
         pairs = match_boxes(answered, true_boxes, MATCH_MIN_IOU)  # (index in answered, index in true_boxes)
         if not pairs:
             return [
                 CheckResult(
-                    BOXES,
+                    contract_name,
                     "fail",
                     f"frame {frame}: none of the {len(answered)} answered boxes overlaps one of the "
                     f"{len(true_boxes)} true boxes",
@@ -869,7 +1074,7 @@ def check_boxes(
     median_iou = float(np.median(ious))
     follows_contract = paired_share >= CONTRACT_MIN_PAIRED_SHARE and median_iou >= CONTRACT_MIN_MEDIAN_IOU
     contract = CheckResult(
-        BOXES,
+        contract_name,
         "ok" if follows_contract else "fail",
         f"{len(ious)} of {n_possible} possible pairs of an answered box and a true box exist in {len(frames)} frames "
         f"(limit: a share of at least {CONTRACT_MIN_PAIRED_SHARE:g}), and their median IoU is {median_iou:.3f} "
@@ -880,7 +1085,7 @@ def check_boxes(
     mean_iou = math.fsum(ious) / len(ious)
     reached = "reaches" if mean_iou >= min_mean_iou else "does not reach"
     accuracy = CheckResult(
-        BOX_ACCURACY,
+        accuracy_name,
         "info",
         f"mean IoU {mean_iou:.3f} over {len(ious)} paired boxes: it {reached} the accuracy value of the gate file "
         f"(at least {min_mean_iou:g}). This is no verdict: the boxes check is the verdict on the client. "

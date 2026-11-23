@@ -25,6 +25,13 @@ Rules that all probes share:
   counts these answers in ``n_answers_not_parsed``. A kit legend answer that
   cannot be parsed raises ``ParseError``. Errors of the backend are not caught.
 
+The people probe can send video in place of images (with a ``VideoProbe``): the same frames, the same labels and the same
+values, so an experiment of each kind can be compared on one gate (G2). Each
+request then sends a short video of the target frames and of ``context_frames``
+frames before and after each one (``vlm.video``), and the answer lists the
+people of each target frame by its time in the video. The kit legend is asked
+from a video of the same three frames as with images.
+
 Every result holds ``probe``, ``n_clips``, ``n_frames`` or ``n_tracks``,
 ``settings`` (all values that define the measurement), ``prompts`` (the prompt
 names of the steps), ``main_metric`` (the mean of the per-clip values with its
@@ -55,6 +62,7 @@ from typing import Any, TypeVar
 
 import cv2
 import numpy as np
+from pydantic import Field
 
 from pitchvlm import __version__
 from pitchvlm.config import PipelineConfig, StepSettings
@@ -80,10 +88,20 @@ from pitchvlm.geometry import (
 from pitchvlm.labels import GsrAthlete, GsrLabels, gsr_frame_people
 from pitchvlm.pipeline import MIN_CROP_GAP_S, crop_choice, fit_problems
 from pitchvlm.pitch import inside_pitch
-from pitchvlm.schemas import Box, FrameLandmarks, FramePeople, HomographyRecord, KitLegend, TeamKey
+from pitchvlm.schemas import (
+    Box,
+    FrameLandmarks,
+    FramePeople,
+    HomographyRecord,
+    KitDescription,
+    KitLegend,
+    Record,
+    TeamKey,
+)
 from pitchvlm.vlm import steps
 from pitchvlm.vlm.prompts import PROMPT_NAMES
-from pitchvlm.vlm.types import Backend, VLMRequest
+from pitchvlm.vlm.types import MAX_VIDEO_FPS, VIDEO_RESOLUTIONS, Backend, VideoPart, VLMRequest
+from pitchvlm.vlm.video import DEFAULT_WRITE_FPS, context_frames, frames_video_part
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +172,192 @@ class LabelledClip:
             )
         if differences:
             raise ValueError("the frame source and the labels do not belong together: " + "; ".join(differences))
+
+
+class VideoProbe(Record):
+    """How a people probe sends video in place of images: the section ``video`` of its experiment file.
+
+    A people probe with this section sends video; one without it sends the images of
+    the pipeline. The pipeline itself sends images only: video input is measured by
+    the probe first (docs/DECISIONS.md, entry of 2026-11-23).
+
+    ``fps`` is the rate at which the frames of each video are written, frames per
+    second, so the model sees every written frame. A Gemini step sends it as the
+    ``fps`` of the video, and needs it. An OpenRouter step cannot send a rate (the
+    video page says that only Gemini reads it), so it has none: its frames are
+    written at ``vlm.video.DEFAULT_WRITE_FPS`` and the provider samples at its own
+    rate. ``context_frames`` frames before and after each target frame are written
+    into its video, ``round(clip fps / fps)`` frames of the clip apart
+    (``vlm.video.context_frames``). ``targets_per_request`` target frames of a clip
+    share one request, in frame order: their windows go into one video. The value 1
+    gives one request per target frame. The media resolution of the video is the
+    ``resolution`` of the step; it must be one of ``VIDEO_RESOLUTIONS``.
+    """
+
+    fps: float | None = Field(default=None, gt=0, le=MAX_VIDEO_FPS, allow_inf_nan=False)
+    context_frames: int = Field(default=2, ge=0)
+    targets_per_request: int = Field(default=1, ge=1)
+
+    @property
+    def write_fps(self) -> float:
+        """Return the rate at which the frames are written: ``fps``, or ``DEFAULT_WRITE_FPS`` without one."""
+        return self.fps if self.fps is not None else DEFAULT_WRITE_FPS
+
+
+def check_video_settings(settings: StepSettings, video: VideoProbe) -> None:
+    """Raise ``ValueError`` when the video settings do not fit the step settings or their provider.
+
+    A Gemini step needs a rate (``VideoProbe.fps``); an OpenRouter step must not have
+    one. The resolution of the step must be a video resolution (``VIDEO_RESOLUTIONS``).
+    """
+    if settings.resolution not in VIDEO_RESOLUTIONS:
+        raise ValueError(
+            f"a video step has no resolution {settings.resolution}: use {', '.join(VIDEO_RESOLUTIONS)}"
+        )
+    if settings.provider == "gemini" and video.fps is None:
+        raise ValueError("a Gemini video step needs the rate fps, at which its frames are written and sampled")
+    if settings.provider != "gemini" and video.fps is not None:
+        raise ValueError("an OpenRouter video step cannot send a sampling rate (only Gemini reads it): remove fps")
+
+
+@dataclass(frozen=True)
+class _VideoRequestPlan:
+    """The frames of one video request of the people probe: its target frames and all frames of its video."""
+
+    targets: tuple[int, ...]
+    video_frames: tuple[int, ...]
+    video: VideoPart
+
+
+@dataclass(frozen=True)
+class _VideoClipPlan:
+    """The videos of one clip of a video people probe: the kit legend video and the people requests."""
+
+    legend_frames: tuple[int, ...]
+    legend_video: VideoPart
+    requests: tuple[_VideoRequestPlan, ...]
+
+
+#: The kit legend of the requests that ``plan_people_video`` builds for the cost estimate. The real
+#: legend comes from the model; the estimate counts a fixed number of text tokens for the prompt.
+_ESTIMATE_LEGEND = KitLegend(
+    team_a=KitDescription(shirt="unknown", shorts="unknown", socks="unknown"),
+    team_b=KitDescription(shirt="unknown", shorts="unknown", socks="unknown"),
+    referee_kit="unknown",
+)
+
+
+def _video_clip_plan(
+    clip: LabelledClip, targets: Sequence[int], settings: StepSettings, video: VideoProbe, folder: Path
+) -> _VideoClipPlan:
+    """Write (or reuse) the videos of one clip and return their plan. No model is called here."""
+    info = clip.source.info
+    fps = video.write_fps
+
+    def part(step: str, frames: Sequence[int]) -> VideoPart:
+        return frames_video_part(
+            clip.source,
+            frames,
+            folder=folder,
+            step=step,
+            fps=fps,
+            resolution=settings.resolution,
+            send_fps=video.fps is not None,
+        )
+
+    legend_frames = tuple(_legend_frames(clip.labels))
+    requests: list[_VideoRequestPlan] = []
+    for start in range(0, len(targets), video.targets_per_request):
+        chunk = tuple(targets[start : start + video.targets_per_request])
+        around = (
+            context_frames(
+                frame, n_frames=info.n_frames, clip_fps=info.fps, video_fps=fps, context=video.context_frames
+            )
+            for frame in chunk
+        )
+        video_frames = tuple(sorted({frame for window in around for frame in window}))
+        requests.append(_VideoRequestPlan(chunk, video_frames, part("people_video", video_frames)))
+    return _VideoClipPlan(legend_frames, part("kit_legend_video", legend_frames), tuple(requests))
+
+
+def _check_video_probe(settings: StepSettings, video: VideoProbe | None, folder: Path | None) -> None:
+    """Refuse a video probe without the folder of its videos, and video settings that do not fit the step."""
+    if video is None:
+        return
+    if folder is None:
+        raise ValueError("a people probe with video input needs the folder of its videos")
+    check_video_settings(settings, video)
+
+
+def plan_people_video(
+    clips: Sequence[LabelledClip],
+    settings: StepSettings,
+    *,
+    frames_per_clip: int,
+    seed: int,
+    video: VideoProbe,
+    folder: Path,
+    repeat: int = 0,
+) -> list[VLMRequest]:
+    """Write the videos of a video people probe and return its requests, for the cost estimate before the run.
+
+    The requests are those of ``probe_people`` with a placeholder kit legend in the
+    people prompts: the same steps, video parts and target frames, and the same kit
+    legend requests, but other prompt texts, so the people requests have other cache
+    keys than the sent ones. The estimate counts the video parts and a fixed number
+    of text tokens, not the text, so it is the same. They are never sent. The videos are the ones that the probe
+    sends: a file that is already there is used as it is.
+    """
+    _check_clips(clips)
+    _check_video_probe(settings, video, folder)
+    requests: list[VLMRequest] = []
+    for clip in clips:
+        info = clip.source.info
+        plan = _video_clip_plan(clip, sample_frames(clip.labels, frames_per_clip, seed), settings, video, folder)
+        requests.append(_legend_video_request(clip, plan, settings, video, repeat))
+        requests.extend(
+            _people_video_request(clip, entry, _ESTIMATE_LEGEND, settings, video, repeat) for entry in plan.requests
+        )
+        logger.info("video people probe: clip %s, %d people requests", info.clip_id, len(plan.requests))
+    return requests
+
+
+def _legend_video_request(
+    clip: LabelledClip, plan: _VideoClipPlan, settings: StepSettings, video: VideoProbe, repeat: int
+) -> VLMRequest:
+    """Build the kit legend request of a clip from its legend video."""
+    return steps.build_kit_legend_video_request(
+        plan.legend_video,
+        clip_id=clip.source.info.clip_id,
+        video_frames=plan.legend_frames,
+        fps=video.write_fps,
+        settings=settings,
+        repeat=repeat,
+    )
+
+
+def _people_video_request(
+    clip: LabelledClip,
+    entry: _VideoRequestPlan,
+    legend: KitLegend,
+    settings: StepSettings,
+    video: VideoProbe,
+    repeat: int,
+) -> VLMRequest:
+    """Build one people request of the video probe."""
+    info = clip.source.info
+    return steps.build_people_video_request(
+        entry.video,
+        legend,
+        clip_id=info.clip_id,
+        video_frames=entry.video_frames,
+        targets=entry.targets,
+        fps=video.write_fps,
+        width=info.width,
+        height=info.height,
+        settings=settings,
+        repeat=repeat,
+    )
 
 
 # --- Frame choice --------------------------------------------------------------------
@@ -364,6 +568,8 @@ def probe_people(
     seed: int,
     small_box_max_height_px: float,
     repeat: int = 0,
+    video: VideoProbe | None = None,
+    video_folder: Path | None = None,
 ) -> dict[str, Any]:
     """Measure the people step on sampled frames of labelled clips.
 
@@ -391,20 +597,49 @@ def probe_people(
       give no mapping are left out and counted in
       ``n_frames_without_label_mapping``.
     - ``main_metric`` and ``per_clip``: the recall per clip.
+
+    With ``video`` (``VideoProbe``) the probe sends video, and ``video_folder`` is
+    needed: the videos are written to ``video_folder`` for all clips before the
+    first request (``plan_people_video``), the requests are the video requests of
+    the same frames, and the result also holds ``video`` (its settings and the
+    number of requests) and ``n_entries_wrong_time``: the answer entries whose time
+    did not name their target frame, which count as no people
+    (``steps.parse_people_video``).
     """
     _check_clips(clips)
     _check_at_least("frames_per_clip", frames_per_clip, 1)
     _check_at_least("repeat", repeat, 0)
     _check_above_zero("small_box_max_height_px", small_box_max_height_px)
-    used_settings = _settings(settings, seed, repeat, **_people_measurement(frames_per_clip, small_box_max_height_px))
+    _check_video_probe(settings, video, video_folder)
+    measurement = _people_measurement(frames_per_clip, small_box_max_height_px)
+    if video is not None:
+        measurement["video"] = {**video.model_dump(), "write_fps": video.write_fps}
+    used_settings = _settings(settings, seed, repeat, **measurement)
     tasks = [_people_task(clip, frames_per_clip, seed) for clip in clips]
-    results: list[_PeopleResult] = []
-    n_not_parsed = 0
-    for task in tasks:
-        answers, not_parsed = _ask_people(task, backend, settings, repeat)
+    if video is None or video_folder is None:
+        results: list[_PeopleResult] = []
+        n_not_parsed = 0
+        for task in tasks:
+            answers, not_parsed = _ask_people(task, backend, settings, repeat)
+            results.append(_score_people(task, answers, small_box_max_height_px))
+            n_not_parsed += not_parsed
+        step_facts = {"prompts": _prompt_names("kit_legend", "people"), "n_answers_not_parsed": n_not_parsed}
+        return _people_report(results, used_settings, step_facts)
+    plans = [_video_clip_plan(task.clip, task.frames, settings, video, video_folder) for task in tasks]
+    results = []
+    n_not_parsed = n_wrong_time = n_requests = 0
+    for task, plan in zip(tasks, plans, strict=True):
+        answers, not_parsed, wrong_time = _ask_people_video(task, plan, backend, settings, video, repeat)
         results.append(_score_people(task, answers, small_box_max_height_px))
         n_not_parsed += not_parsed
-    step_facts = {"prompts": _prompt_names("kit_legend", "people"), "n_answers_not_parsed": n_not_parsed}
+        n_wrong_time += wrong_time
+        n_requests += len(plan.requests)
+    step_facts = {
+        "prompts": _prompt_names("kit_legend_video", "people_video"),
+        "n_answers_not_parsed": n_not_parsed,
+        "n_entries_wrong_time": n_wrong_time,
+        "n_people_requests": n_requests,
+    }
     return _people_report(results, used_settings, step_facts)
 
 
@@ -534,6 +769,52 @@ def _ask_people(
             people = FramePeople(frame=frame)
         answers.append(people)
     return answers, n_not_parsed
+
+
+def _ask_people_video(
+    task: _PeopleTask,
+    plan: _VideoClipPlan,
+    backend: Backend,
+    settings: StepSettings,
+    video: VideoProbe,
+    repeat: int,
+) -> tuple[list[FramePeople], int, int]:
+    """Ask the kit legend and the people of every frame of one clip with video requests.
+
+    The result is the answer of each frame, in the order of the frames, the number of
+    answers that could not be parsed (all their target frames count as no people) and
+    the number of answer entries whose time did not name their target frame.
+    """
+    clip = task.clip
+    info = clip.source.info
+    legend_request = _legend_video_request(clip, plan, settings, video, repeat)
+    text = backend.generate(legend_request).text
+    try:
+        legend = steps.parse_kit_legend(text)
+    except steps.ParseError as error:
+        raise steps.ParseError(f"{_describe(legend_request)} cannot be parsed: {error}") from error
+    fps = video.write_fps
+    by_frame: dict[int, FramePeople] = {}
+    n_not_parsed = n_wrong_time = 0
+    for entry in plan.requests:
+        request = _people_video_request(clip, entry, legend, settings, video, repeat)
+        parse = partial(
+            steps.parse_people_video,
+            targets=entry.targets,
+            times_s=request.context["times_s"],
+            fps=fps,
+            width=info.width,
+            height=info.height,
+            coords=settings.coords,
+        )
+        parsed = _parsed(request, backend, parse)
+        if parsed is None:
+            n_not_parsed += 1
+            parsed = ([FramePeople(frame=frame) for frame in entry.targets], 0)
+        people, wrong_time = parsed
+        n_wrong_time += wrong_time
+        by_frame.update((answer.frame, answer) for answer in people)
+    return [by_frame[frame] for frame in task.frames], n_not_parsed, n_wrong_time
 
 
 def _score_people(task: _PeopleTask, answers: Sequence[FramePeople], small_box_max_height_px: float) -> _PeopleResult:

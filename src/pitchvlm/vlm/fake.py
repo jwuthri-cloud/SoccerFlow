@@ -1,8 +1,10 @@
 """A fake model backend that answers from the ground truth of a synthetic scene.
 
-It needs no network, no key and no model SDK. It answers the four pipeline steps in the
-answer formats of the real model, so the whole pipeline can run in tests and in the
-offline demo. Misses and noise can be switched on to make the answers imperfect in a
+It needs no network, no key and no model SDK. It answers the four pipeline steps and the
+two video steps in the answer formats of the real model, so the whole pipeline and the
+probe of video input can run in tests and in the offline demo. A video request is
+answered from its context (the frames and their times), not from the file: the fake
+backend never opens the video, so a test may give it a stand-in file. Misses and noise can be switched on to make the answers imperfect in a
 controlled and repeatable way.
 """
 
@@ -27,6 +29,8 @@ STEP_USAGE: dict[str, Usage] = {
     "people": Usage(input_tokens=1500, output_tokens=900, thought_tokens=500),
     "landmarks": Usage(input_tokens=2200, output_tokens=400, thought_tokens=400),
     "number": Usage(input_tokens=2500, output_tokens=100, thought_tokens=300),
+    "kit_legend_video": Usage(input_tokens=800, output_tokens=200, thought_tokens=400),
+    "people_video": Usage(input_tokens=1200, output_tokens=900, thought_tokens=500),
 }
 #: The price at which the fake backend reports the cost of an OpenRouter request, USD per million
 #: tokens (input, output). A real OpenRouter answer reports its cost; a Gemini answer reports none.
@@ -80,6 +84,8 @@ class FakeBackend:
             "people": self._people,
             "landmarks": self._landmarks,
             "number": self._number,
+            "kit_legend_video": self._kit_legend,
+            "people_video": self._people_video,
         }
 
     def generate(self, request: VLMRequest) -> VLMResponse:
@@ -117,8 +123,28 @@ class FakeBackend:
 
     def _people(self, request: VLMRequest) -> dict[str, Any]:
         """List the true people of the frame, with misses and box noise."""
-        truth = self._scene.people(self._frame(request)).people
+        return {"people": self._frame_people(self._frame(request), self._generator(request))}
+
+    def _people_video(self, request: VLMRequest) -> dict[str, Any]:
+        """List the true people of each target frame of a video request, with its time, misses and box noise.
+
+        The targets and their times are the context lists ``frames`` and ``times_s``.
+        """
+        frames = request.context.get("frames")
+        times = request.context.get("times_s")
+        if not isinstance(frames, list) or not isinstance(times, list) or len(frames) != len(times) or not frames:
+            raise BackendError("a 'people_video' request needs the context lists 'frames' and 'times_s' of one length")
         rng = self._generator(request)
+        return {
+            "frames": [
+                {"time_s": time_s, "people": self._frame_people(self._checked_frame(frame), rng)}
+                for frame, time_s in zip(frames, times, strict=True)
+            ]
+        }
+
+    def _frame_people(self, frame: int, rng: np.random.Generator) -> list[dict[str, Any]]:
+        """Return the true people of one frame as answer entries, with misses and box noise drawn from ``rng``."""
+        truth = self._scene.people(frame).people
         missed = (rng.random(len(truth)) < self._miss_rate).tolist()
         shifts = rng.normal(0.0, self._box_noise_px, size=(len(truth), 4)).tolist()
         width, height = self._scene.info.width, self._scene.info.height
@@ -136,7 +162,7 @@ class FakeBackend:
                     "number": person.number,
                 }
             )
-        return {"people": people}
+        return people
 
     def _landmarks(self, request: VLMRequest) -> dict[str, Any]:
         """List the true visible landmarks of the frame, with point noise, and the view."""
