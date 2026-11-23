@@ -258,6 +258,7 @@ class MotionField:
     cuts: tuple[int, ...]                                      # frames that start a new shot
     def shot_of(self, frame: int) -> int                       # 0 before the first cut, 1 after it, ...
     def same_shot(self, first: int, second: int) -> bool
+    def transition_frames(self) -> frozenset[int]              # shots of one frame next to a cut: they carry nothing
     def between(self, src: int, dst: int) -> np.ndarray | None # 3x3 src px -> dst px, both directions
     def warp(self, src: int, dst: int, xy: np.ndarray) -> np.ndarray | None
     @classmethod
@@ -267,6 +268,12 @@ class MotionField:
 def bridged_warp(motion: MotionField, homographies: Sequence[HomographyRecord]) -> MotionWarp
 def compute_motion_field(source: FrameSource, *, people: Mapping[int, Sequence[Box]] | None = None,
                          downscale: float = 0.5) -> MotionField
+def measure_shots(source: FrameSource, *, people: Mapping[int, Sequence[Box]] | None = None,
+                  downscale: float = 0.5) -> ShotTests     # steps, pair values, hard cuts, window values, transitions
+class ShotTests:                                           # frozen dataclass; def cuts(self) -> tuple[int, ...]
+def window_correlations(images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None]) -> list[float | None]
+def find_transitions(images: Sequence[np.ndarray], steps: Sequence[np.ndarray | None],
+                     values: Sequence[float | None]) -> list[tuple[int, int]]   # (start, stop): blends start..stop-1
 def propagate_homographies(key_fits: Mapping[int, HomographyRecord], motion: MotionField, n_frames: int,
                            *, max_gap_frames: int = 75) -> list[HomographyRecord]
 def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None
@@ -309,12 +316,41 @@ Hard cuts (2026-11-22):
   optical flow can reach) is not found: the test compares the picture of the camera, not the
   people. A dissolve is not found either: each frame differs from the next by a small blend step
   (a dissolve of 5 frames keeps every pair at 0.900 or more on the synthetic clip), so the
-  motion chain, the tracks and the fill run through it.
+  motion chain, the tracks and the fill run through it; the window test below finds it.
 - `compute_motion_field` tests every pair of neighbouring frames with the measured motion and
-  the last measured motion of the same shot. A cut gets a missing step, also when a motion was
-  measured, and goes into `MotionField.cuts`.
+  the last measured motion of the same shot (`measure_shots`). A cut gets a missing step, also
+  when a motion was measured, and goes into `MotionField.cuts`.
 - `bridged_warp` returns None across a cut, so no track link and no box warp cross it.
   `propagate_homographies` carries no mapping across it, because its step is missing.
+
+Dissolves (2026-11-22, `docs/DECISIONS.md` entry "A dissolve is a transition, not a shot"):
+
+- A dissolve blends two shots over some frames; each pair of neighbouring frames passes the pair
+  test. `window_correlations` compares frame `t - 30` (`DISSOLVE_WINDOW_FRAMES`) with frame `t`:
+  the first frame is moved with the chained steps of the window (no identity) and the median
+  block correlation is taken, on the 160-pixel test images. The chain takes the measured motion
+  of a pair when it passes the pair test alone, else the motion of the pair test that explains
+  the pair best (`ShotTests.test_steps`). A window is not judged (None) when a step is missing
+  (also a hard cut inside it) or when the moved frame covers too little (a fast pan).
+- `find_transitions`: each run of windows below 0.18 (`MAX_TRANSITION_CORRELATION`) holds one
+  transition. Its first window's first frame shows the old shot alone, its last window's last
+  frame the new shot alone (for a dissolve shorter than the window). The transition starts at
+  the first frame that the old anchor, moved with the chain, no longer explains with a
+  regression slope of 0.95 (`MIN_SHOT_SHARE`), and ends after the last frame that the new anchor
+  does not explain. The answer `(start, stop)`: frames `start` to `stop - 1` blend the shots,
+  frame `stop` starts the new shot; `start == stop` is a cut without a blend frame.
+- `compute_motion_field` makes every frame of a transition a cut, and the frame after it
+  (`ShotTests.cuts`), so each blend frame is a shot of one frame and nothing crosses the
+  transition. This is the only representation: `MotionField`, `to_json` and every consumer of
+  `MotionField.cuts` stay as they were.
+- `MotionField.transition_frames` returns the shots of one frame next to a cut: the frames of a
+  dissolve and a lone frame between two hard cuts (also the first or last frame of a clip cut off
+  by a cut). A clip without a cut has none. `pipeline.run_clip` drops the people, the ball
+  candidates and the pitch mapping of these frames, so they get no state, no track and no ball.
+- Not found: a fade through black is found as hard cuts at the dark frames (no contrast); a
+  wipe, a picture-in-picture replay, a dissolve during a pan the chain cannot follow for a whole
+  window, and a dissolve between two moments of one camera that a chained motion happens to
+  explain. The numbers are in the decision entry.
 
 ### `tracking.py` — tracks, votes, team side, numbers
 
@@ -1146,6 +1182,13 @@ sends its requests with `httpx2`.
   in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
   shirt number of one team; the positions on the two sides of a cut do not decide whether such
   tracks are two people (the test of the way applies inside a shot only). `ClipResult.cuts` names the cuts.
+- Dissolves (2026-11-22): every frame of a dissolve is a cut, and so is the frame after it. Right
+  after the camera motion, `run_clip` empties the people of every frame of
+  `MotionField.transition_frames` (both engines), and after the pitch mapping it replaces the
+  mapping of these frames with an empty record (landmark fits and calibration cameras alike);
+  the ball candidates of these frames are dropped before the ball tracker. The paint score of a
+  keyframe on such a frame is still computed (a diagnostic). A model keyframe on such a frame is
+  still asked (the motion is measured after the people requests) and its answer is dropped.
 - Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
   `geometry.paint_alignment` on its keyframe (with the pitch engine `calibration`, the camera
   of the tool at each keyframe, also before its check), in `ClipResult.paint` (`schemas.PaintCheck`:
