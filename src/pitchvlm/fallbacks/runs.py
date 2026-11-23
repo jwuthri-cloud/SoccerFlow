@@ -59,11 +59,15 @@ Clip job::
       "format": "pitchvlm-clip-job-1",
       "clip": "SNGS-021",
       "tool": {"name": "rfdetr", "model": "RFDETRMedium", "min_score": 0.5, "antialias": false},
-      "images": ["SoccerNetGS-valid/SNGS-021/img1/000001.jpg", "..."]
+      "images": ["SoccerNetGS-valid/SNGS-021/img1/000001.jpg", "..."],
+      "video_sha256": null
     }
 
 - ``images``: the image file of every frame of the clip, below the data folder, with forward
   slashes. Frame ``i`` is ``images[i]``.
+- ``video_sha256``: the SHA-256 of the video file whose frames the images are, when the
+  command ``video-frames`` wrote them (``frames.write_video_frames``); null for a folder of
+  images that came as images, like a clip of the dataset. A job without the key reads as null.
 
 Clip run: one or more part files. The first part is the file that the script was told to
 write, for example ``detections.json``; part ``k`` from 2 on has the name of the first part
@@ -77,6 +81,7 @@ part passes the guard like a ledger file. A part::
       "tool": {"name": "rfdetr", "model": "RFDETRMedium", "min_score": 0.5, "antialias": false},
       "n_frames": 750,
       "job_sha256": "<SHA-256 of the clip job file>",
+      "video_sha256": null,
       "runner": {"device": "cuda:0", "tool_version": "1.12.1"},
       "part": 1,
       "parts": 2,
@@ -84,7 +89,9 @@ part passes the guard like a ledger file. A part::
     }
 
 - Every part repeats the head (all keys but ``part`` and ``frames``). ``job_sha256`` ties
-  the parts of one run together.
+  the parts of one run together. ``video_sha256`` is copied from the clip job: ``run`` reads
+  the clip run only with the video of that check sum (or, for null, only with a folder of
+  images), so a run of the tool on other pixels is refused. A part without the key reads as null.
 - ``frames``: ``[frame, seconds, payload]`` per frame, in frame order over the parts. The
   parts together hold every frame from 0 to ``n_frames - 1`` exactly once.
 - The payload of the calibration is the payload of ``fallbacks.pnlcalib``. The payload of the
@@ -116,6 +123,8 @@ CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"
 CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"
 #: Largest size of one part of a clip run, bytes: half of the size limit of the guard.
 CLIP_RUN_PART_MAX_BYTES = 1_000_000
+#: The SHA-256 of a video file: 64 small hexadecimal digits.
+VideoSha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 #: Model classes of the ``rfdetr`` package that come with pretrained weights for the 80 everyday classes.
@@ -238,6 +247,8 @@ class ClipJob(Record):
     tool: ToolSettings
     #: Image file of every frame below the data folder, with forward slashes. Frame i is ``images[i]``.
     images: tuple[str, ...] = Field(min_length=1)
+    #: SHA-256 of the video whose frames the images are, or None for images that came as images.
+    video_sha256: VideoSha256 | None = None
 
 
 class ClipRunFrame(Record):
@@ -257,6 +268,8 @@ class ClipRun(Record):
     tool: ToolSettings
     n_frames: StrictInt = Field(gt=0)
     job_sha256: str = Field(min_length=1)
+    #: SHA-256 of the video whose frames the tool read (from the clip job), or None for images.
+    video_sha256: VideoSha256 | None = None
     #: Facts of the run that the script reports, as plain JSON types.
     runner: dict[str, Any]
     #: One answer per frame, in frame order: ``frames[i].frame == i``.
@@ -288,6 +301,7 @@ class _ClipRunPart(Record):
     tool: ToolSettings
     n_frames: StrictInt = Field(gt=0)
     job_sha256: str = Field(min_length=1)
+    video_sha256: VideoSha256 | None = None
     runner: dict[str, Any]
     part: StrictInt = Field(ge=1)
     parts: StrictInt = Field(ge=1)
@@ -339,7 +353,7 @@ def load_clip_run(first: Path) -> ClipRun:
         )
     return ClipRun.model_validate(
         {
-            **{key: head[key] for key in ("clip", "tool", "n_frames", "job_sha256", "runner")},
+            **{key: head[key] for key in ("clip", "tool", "n_frames", "job_sha256", "video_sha256", "runner")},
             "frames": [{"frame": frame, "seconds": seconds, "payload": payload} for frame, seconds, payload in frames],
         }
     )

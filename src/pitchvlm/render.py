@@ -1,4 +1,5 @@
-"""Drawing: boxes and labels on the frame, the pitch radar with trails, and the output video.
+"""Drawing: boxes and labels on the frame, the pitch radar with trails, the output video, and the
+check image of a pitch mapping (the pitch lines that it projects into its frame).
 
 Colours are BGR tuples. Image points are (x, y) pixels with the origin at the
 top-left corner. The radar is a top-down view of the pitch: the far touchline
@@ -20,6 +21,7 @@ import cv2
 import numpy as np
 
 from pitchvlm.frames import FrameSource
+from pitchvlm.geometry import projected_line_pixels
 from pitchvlm.pitch import PitchCanvas
 from pitchvlm.schemas import BallState, Box, ClipResult, FrameState, PlayerState, TeamKey
 
@@ -40,6 +42,15 @@ _TRAIL_WIDTH_M = 0.3
 #: Radius of the ball on the radar, metres, and its smallest circle on the frame, pixels.
 _BALL_RADIUS_M = 0.6
 _BALL_MIN_RADIUS_PX = 4
+#: The pitch lines of a mapping check image: magenta, a colour that neither grass nor paint has,
+#: one pixel wide per this many pixels of the frame width (at least one pixel), and this opaque,
+#: so that the white paint stays visible beside and below a line.
+_MAPPING_LINE_BGR: Colour = (255, 0, 255)
+_MAPPING_LINE_WIDTH_OF = 1280
+_MAPPING_LINE_OPACITY = 0.7
+#: The caption band of a mapping check image: white text on black, font scale per pixel of the frame width.
+_CAPTION_FONT_PER_WIDTH = 1 / 1600
+_CAPTION_MIN_FONT = 0.5
 
 
 @dataclass(frozen=True)
@@ -464,3 +475,45 @@ def render_clip(source: FrameSource, result: ClipResult, out_path: Path, style: 
         partial.unlink(missing_ok=True)
         raise
     return out_path
+
+
+def draw_mapping_check(image: np.ndarray, H: np.ndarray, caption: Sequence[str]) -> np.ndarray:
+    """Return the check image of a pitch mapping: the frame with the pitch lines that the mapping projects into it.
+
+    ``H`` maps the pixels of ``image`` to pitch metres. The lines are the pixels of
+    ``geometry.projected_line_pixels``, the same pixels that the paint alignment score
+    measures, 1 pixel wide in a frame of 1280 pixels and 2 in a frame of 1920 pixels, in
+    magenta that is 70 % opaque. A painted line of a broadcast frame is wider, so a good
+    mapping draws a thin magenta line inside the white paint, and a person sees by eye where
+    it does not.
+    The caption goes on a black band above the frame, one line of ASCII text per entry, so
+    that no text hides a pixel of the frame. ``ValueError`` is raised for an image that is
+    not a BGR ``uint8`` image and for a mapping without a usable inverse.
+    """
+    _check_image(image)
+    height, width = image.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    pixels = projected_line_pixels(H, (width, height))
+    mask[pixels[:, 1], pixels[:, 0]] = 1
+    line_width = max(1, round(width / _MAPPING_LINE_WIDTH_OF))
+    if line_width > 1:
+        mask = cv2.dilate(mask, np.ones((line_width, line_width), dtype=np.uint8))
+    framed = image.copy()
+    on_line = mask > 0
+    blended = (1.0 - _MAPPING_LINE_OPACITY) * framed[on_line] + _MAPPING_LINE_OPACITY * np.array(_MAPPING_LINE_BGR)
+    framed[on_line] = np.round(blended).astype(np.uint8)
+    font_scale = max(_CAPTION_MIN_FONT, width * _CAPTION_FONT_PER_WIDTH)
+    texts = [_to_ascii(line) for line in caption]
+    (_, text_h), baseline = cv2.getTextSize("Ag", _FONT, font_scale, _TEXT_THICKNESS)
+    line_h = text_h + baseline + 2 * _LABEL_PAD
+    band = np.zeros((line_h * len(texts) + 2 * _LABEL_PAD, width, 3), dtype=np.uint8)
+    for index, text in enumerate(texts):
+        origin = (2 * _LABEL_PAD, _LABEL_PAD + index * line_h + _LABEL_PAD + text_h)
+        cv2.putText(band, text, origin, _FONT, font_scale, (255, 255, 255), _TEXT_THICKNESS, cv2.LINE_AA)
+    return np.vstack([band, framed])
+
+
+def write_png(path: Path, image: np.ndarray) -> None:
+    """Write an image as a PNG file. ``OSError`` is raised when it cannot be written."""
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"cannot write the image {path}")

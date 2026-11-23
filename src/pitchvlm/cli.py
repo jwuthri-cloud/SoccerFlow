@@ -12,6 +12,9 @@ Commands:
 - ``probe``: measure one model step on labelled frames.
 - ``tool-job``: write the frames and the settings that an external tool must run on.
 - ``tool-score``: measure the answers of an external tool on the frames of a probe.
+- ``clip-job``: write every frame of one clip and the settings that an external tool must run on.
+- ``video-frames``: write every frame of a video file as an image below the data folder, for ``clip-job``.
+- ``overlay``: draw the pitch lines of mappings on their frames, for the check by eye of gate G3.
 - ``eval``: run the scorer on prediction files.
 - ``sync``: check text result files and print the git commands that send them back.
 
@@ -61,6 +64,8 @@ Rules that the commands share:
 - ``sync`` checks the result files with the guard and with the secret scan of the git hooks,
   so that a commit of the files is not refused later.
 - No output file holds an absolute path, so the text results can go to the results branch.
+- A command that writes images (``video-frames``, ``overlay``) refuses a folder inside a work
+  tree of the repository: images stay below the data folder (rule 2 of ``CLAUDE.md``).
 
 The package must run from its source checkout: the gate file, the guard script and the git
 state of the code are found from the place of this file. An install in editable mode does
@@ -144,6 +149,7 @@ from pitchvlm.fallbacks.runs import (
     ClipJob,
     ClipRun,
     JobFrame,
+    PnlcalibSettings,
     RfdetrSettings,
     RunFrame,
     ToolJob,
@@ -153,13 +159,23 @@ from pitchvlm.fallbacks.runs import (
     load_clip_run,
     load_tool_run,
 )
-from pitchvlm.frames import FrameSource, ImageFolderSource, VideoFileSource, keyframe_indices
+from pitchvlm.frames import (
+    FRAME_FOLDER,
+    FrameSource,
+    ImageFolderSource,
+    VideoFileSource,
+    keyframe_indices,
+    read_video_record,
+    write_video_frames,
+)
+from pitchvlm.geometry import matrix_from_record, paint_alignment
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
+from pitchvlm.overlays import MappedFrame, caption, choose_frames, image_name, list_document
 from pitchvlm.pipeline import ToolAnswers, keyframe_frames, run_clip
 from pitchvlm.probes import LabelledClip, write_metrics
-from pitchvlm.render import render_clip
+from pitchvlm.render import draw_mapping_check, render_clip, write_png
 from pitchvlm.roster import Roster, load_roster
-from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, PaintCheck, Record
+from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, HomographyRecord, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.timing import StageClock
 from pitchvlm.tracking import SWAP_MIN_VOTES
@@ -218,6 +234,11 @@ KEY_VARIABLES = tuple(PROVIDER_KEY_VARIABLES.values())
 PRICE_TABLE_FILE = Path("configs") / "openrouter_prices.yaml"
 #: Data folder of the run machine. It lies outside the repository.
 DATA_DIR = Path("~/pitchvlm-data")
+#: Default folders below the data folder: the frame images of videos, and the check images of pitch mappings.
+VIDEO_FRAMES_DIR = DATA_DIR / "videos"
+OVERLAYS_DIR = DATA_DIR / "overlays"
+#: Read size of a check sum of a file, bytes.
+HASH_CHUNK_BYTES = 1 << 20
 #: Files of the repository, relative to its folder.
 GATES_FILE = Path("configs") / "gates.yaml"
 SPLIT_LIST_FILE = Path("configs") / "splits.json"
@@ -237,8 +258,6 @@ TOOL_SCRIPT = Path("tools") / "run_tool.py"
 LEDGER_NAME = "ledger.jsonl"
 #: Commit text of a repository without any commit.
 UNCOMMITTED = "uncommitted"
-#: Folder of the frame images inside a clip folder of the dataset.
-FRAME_FOLDER = "img1"
 DEFAULT_SPLIT = "valid"
 DEFAULT_TRACKER = "pitchvlm"
 #: Output names.
@@ -1515,12 +1534,14 @@ def check_tool_inputs(config: PipelineConfig, detections: Path | None, calibrati
             raise CliError(f"{option} is given, but the settings do not name {engine}")
 
 
-def read_clip_run(path: Path, settings: ToolSettings, info: ClipInfo) -> ClipRun:
+def read_clip_run(path: Path, settings: ToolSettings, info: ClipInfo, video_sha256: str | None) -> ClipRun:
     """Read all parts of a clip run, and check that it was made for this clip with the tool settings of the run.
 
     ``CliError`` is raised for a part that cannot be read, for wrong content, for other tool
-    settings than the settings file names, and for a run of another clip or another
-    number of frames.
+    settings than the settings file names, for a run of another clip or another number of
+    frames, and for a run on other pixels: ``video_sha256`` is the SHA-256 of the video file
+    that the run reads, or None for a folder of images, and the clip run must name the same
+    (``check_clip_run_video``).
     """
     try:
         run = load_clip_run(path)
@@ -1539,13 +1560,47 @@ def read_clip_run(path: Path, settings: ToolSettings, info: ClipInfo) -> ClipRun
             f"the clip run file {path} is a run of the clip {run.clip} with {run.n_frames} frames, "
             f"not of the clip {info.clip_id} with {info.n_frames} frames"
         )
+    check_clip_run_video(run, path, video_sha256)
     return run
 
 
+def check_clip_run_video(run: ClipRun, path: Path, video_sha256: str | None) -> None:
+    """Raise ``CliError`` unless a clip run was made from the pixels that the run reads.
+
+    A tool that ran on the frames of a video (written by ``video-frames``) is used only with
+    that video file, named by its SHA-256. A tool that ran on a folder of images that came as
+    images is used only with a folder of images.
+    """
+    if run.video_sha256 == video_sha256:
+        return
+    if run.video_sha256 is None:
+        raise CliError(
+            f"the clip run file {path} was made from a folder of images, not from this video: write the frames of "
+            "the video with the command video-frames, and run the tool on them"
+        )
+    if video_sha256 is None:
+        raise CliError(
+            f"the clip run file {path} was made from the frames of a video (SHA-256 {run.video_sha256}): give that "
+            "video file with --clip"
+        )
+    raise CliError(
+        f"the clip run file {path} was made from the frames of another video (SHA-256 {run.video_sha256}, this "
+        f"video has {video_sha256}): write the frames of this video with video-frames and run the tool again"
+    )
+
+
 def tool_answers(
-    config: PipelineConfig, info: ClipInfo, detections: Path | None, calibration: Path | None, clock: StageClock
+    config: PipelineConfig,
+    info: ClipInfo,
+    detections: Path | None,
+    calibration: Path | None,
+    clock: StageClock,
+    video_sha256: str | None,
 ) -> tuple[ToolAnswers, dict[str, Any]]:
     """Read the clip run files of the engines of a run. Return the answers and the facts of each run.
+
+    ``video_sha256`` names the video file of the run, or is None for a folder of images
+    (``read_clip_run``).
 
     The time of each tool on the frames of the clip goes to ``clock`` as the stage
     ``detector`` or ``calibration``: the script measured it per frame. A payload that cannot
@@ -1554,7 +1609,7 @@ def tool_answers(
     facts: dict[str, Any] = {}
     people = balls = cameras = None
     if detections is not None:
-        run = read_clip_run(detections, config.detector, info)
+        run = read_clip_run(detections, config.detector, info, video_sha256)
         try:
             people, balls = detector_answers(run)
         except ValueError as error:
@@ -1562,7 +1617,7 @@ def tool_answers(
         clock.add("detector", math.fsum(run.seconds()))
         facts["detections"] = clip_run_facts(run, detections)
     if calibration is not None:
-        run = read_clip_run(calibration, config.calibration, info)
+        run = read_clip_run(calibration, config.calibration, info, video_sha256)
         try:
             cameras = calibration_answers(run)
         except ValueError as error:
@@ -1581,6 +1636,7 @@ def clip_run_facts(run: ClipRun, path: Path) -> dict[str, Any]:
         "file": path.name,
         "parts": n_parts,
         "job_sha256": run.job_sha256,
+        "video_sha256": run.video_sha256,
         "runner": run.runner,
         "script_is_current": run.runner.get("script_sha256") == file_sha256(repository_root() / TOOL_SCRIPT),
         "seconds_per_frame": summarize(np.array(run.seconds(), dtype=np.float64)),
@@ -1618,7 +1674,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if config.engines.people == "model":
         require_enough_keyframes(len(keyframes), config)
     clock = StageClock()
-    tools, tool_runs = tool_answers(config, info, args.detections, args.calibration, clock)
+    uses_tools = args.detections is not None or args.calibration is not None
+    video_sha256 = file_sha256(args.clip) if uses_tools and args.clip.is_file() else None
+    tools, tool_runs = tool_answers(config, info, args.detections, args.calibration, clock, video_sha256)
     plan = model_plan(config, len(keyframes))
     session = None
     if plan:
@@ -2493,7 +2551,11 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
     The tool settings come from the settings file of the run (``detector`` or
     ``calibration``), so that ``run`` with the same file accepts the clip run. The clip is a
     folder of frame images below the data folder; the job names each image by its path below
-    that folder. A video file is refused: its frames must be written as images first.
+    that folder. A video file is refused: its frames must be written as images first, with
+    ``video-frames``. The clip folder that command writes holds the record of the video
+    (``frames.read_video_record``); the job then names the video by its SHA-256, so that
+    ``run`` reads the clip run only with that video. A record that does not fit the images
+    of the folder (another number of frames or another size) is refused.
     """
     if args.config is not None:
         refuse_input_as_output(args.out, {"--config": args.config})
@@ -2501,10 +2563,11 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
     if not args.clip.is_dir():
         raise CliError(
             f"{args.clip} is not a folder of frame images: a clip job names image files, so write the frames "
-            "of a video as images below the data folder first"
+            "of a video as images below the data folder first, with the command video-frames"
         )
     folder = frame_folder(args.clip)
     source = ImageFolderSource(folder, clip_id_of_folder(folder))
+    video_sha256 = video_of_folder(folder, source.info)
     root = args.root.resolve()
     try:
         images = tuple(source.path(frame).relative_to(root).as_posix() for frame in range(source.info.n_frames))
@@ -2514,11 +2577,39 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
             "path below the data folder"
         ) from error
     settings: ToolSettings = config.detector if args.tool == "rfdetr" else config.calibration
-    job = ClipJob(format=CLIP_JOB_FORMAT, clip=source.info.clip_id, tool=settings, images=images)
+    job = ClipJob(
+        format=CLIP_JOB_FORMAT, clip=source.info.clip_id, tool=settings, images=images, video_sha256=video_sha256
+    )
     write_json(args.out, job.model_dump(mode="json"))
     print(f"clip job of the tool {args.tool}: {len(images)} frames of the clip {source.info.clip_id}")
+    if video_sha256 is not None:
+        print(f"the frames of the video with the SHA-256 {video_sha256}: run reads the clip run only with that video")
     print(f"job file: {args.out}")
     return EXIT_OK
+
+
+def video_of_folder(folder: Path, info: ClipInfo) -> str | None:
+    """Return the SHA-256 of the video whose frames a folder of frame images holds, or None for images of no video.
+
+    The record of the video lies in the clip folder (``frames.read_video_record``): the
+    folder above the frame folder ``img1``, else the folder itself. A record that does not
+    follow its format, or that names another number of frames or another image size than
+    the folder holds, raises ``CliError``.
+    """
+    clip_folder = folder.parent if folder.name == FRAME_FOLDER else folder
+    try:
+        record = read_video_record(clip_folder)
+    except ValueError as error:
+        raise wrong_file("video record", clip_folder, error) from error
+    if record is None:
+        return None
+    if (record.n_frames, record.width, record.height) != (info.n_frames, info.width, info.height):
+        raise CliError(
+            f"the record of the video {record.video} in {clip_folder} names {record.n_frames} frames of "
+            f"{record.width} x {record.height} pixels, but the folder holds {info.n_frames} images of "
+            f"{info.width} x {info.height} pixels: write the frames of the video again into a new folder"
+        )
+    return record.video_sha256
 
 
 def refuse_input_as_output(out: Path, inputs: Mapping[str, Path]) -> None:
@@ -2547,8 +2638,12 @@ def frames_of_probe(clips: Sequence[LabelledClip], experiment: ToolExperiment) -
 
 
 def file_sha256(path: Path) -> str:
-    """Return the SHA-256 of a file as hexadecimal text."""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Return the SHA-256 of a file as hexadecimal text. The file is read in parts, so a large video fits."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def print_axis_check(check: Mapping[str, float]) -> int:
@@ -2738,6 +2833,341 @@ def _cmd_tool_score(args: argparse.Namespace) -> int:
     print(f"tool time per frame: median {payload['seconds_per_frame']['median']:.3f} s")
     print(f"metrics file: {args.out}")
     return code
+
+
+# --- video-frames and overlay: images below the data folder -----------------------
+
+
+def repository_work_trees() -> list[Path]:
+    """Return the top folder of every work tree of the repository of the code: the main one and each linked one.
+
+    The work tree of the results branch is one of them. ``CliError`` is raised when git
+    cannot list them: then a folder for images cannot be checked.
+    """
+    listing = git_output(repository_root(), "worktree", "list", "--porcelain")
+    if listing is None:
+        raise CliError(
+            f"git cannot list the work trees of the repository {repository_root()}, so a folder for images cannot "
+            "be checked: the package must run from its git checkout"
+        )
+    return [Path(line.removeprefix("worktree ")) for line in listing.splitlines() if line.startswith("worktree ")]
+
+
+def refuse_pixels_in_repository(path: Path, option: str) -> None:
+    """Raise ``CliError`` when a folder for images lies inside a work tree of the repository (rule 2 of ``CLAUDE.md``).
+
+    The folder and each folder above it that exists are compared with the top folder of
+    every work tree as places on the disk, so another letter case or a link does not pass.
+    """
+    target = path.resolve()
+    existing = [folder for folder in (target, *target.parents) if folder.exists()]
+    for tree in [repository_root(), *repository_work_trees()]:
+        if tree.exists() and any(os.path.samefile(folder, tree) for folder in existing):
+            raise CliError(
+                f"{option} {path} lies inside the work tree {tree} of the repository: images never go into the "
+                f"repository (rule 2 of CLAUDE.md). Write them below the data folder, for example {DATA_DIR}"
+            )
+
+
+def _cmd_video_frames(args: argparse.Namespace) -> int:
+    """Write every frame of a video file as a PNG image into a new clip folder below ``--out``.
+
+    The clip folder has the name of the clip id of the video, as ``run`` gives it: the name
+    of the file without its ending. It holds the frame folder ``img1`` and the record of the
+    video with its SHA-256 (``frames.write_video_frames``). ``clip-job`` reads the folder,
+    and ``run`` reads the video itself: both see the same frames. A video whose frames are
+    not sure (``frames.check_frame_times``) is refused before any image is written.
+    """
+    refuse_pixels_in_repository(args.out, "--out")
+    if not args.video.is_file():
+        raise CliError(f"{args.video} is not a video file")
+    video = disk_spelling(args.video.absolute())
+    video_sha256 = file_sha256(video)
+    source = VideoFileSource(video)
+    info = source.info
+    print(
+        f"video {video.name}: {info.n_frames} frames, {info.fps:g} frames per second, "
+        f"{info.width} x {info.height} pixels, SHA-256 {video_sha256}"
+    )
+    clip_folder = args.out / info.clip_id
+    try:
+        record = write_video_frames(source, video_sha256, clip_folder)
+    except FileExistsError as error:
+        raise CliError(str(error)) from error
+    size = sum(path.stat().st_size for path in (clip_folder / FRAME_FOLDER).iterdir())
+    print(f"frames: {record.n_frames} PNG images, {size / 1e6:.1f} MB, in {clip_folder / FRAME_FOLDER}")
+    print(f"clip folder for clip-job: {clip_folder}")
+    return EXIT_OK
+
+
+@dataclass(frozen=True)
+class MappingSource:
+    """The pitch mappings of one source of the command ``overlay``, ready for the choice of frames."""
+
+    #: Name of the source: the experiment, or the clip of a run.
+    name: str
+    #: The engine of the mappings, as a result file names engines.
+    engine: str
+    #: Number of frames that the source covers.
+    n_frames: int
+    #: The frames with a mapping, with their paint alignment.
+    mapped: list[MappedFrame]
+    #: The frames of each clip.
+    sources: dict[str, FrameSource]
+    #: What the list file records about the source: file names, check sums, group.
+    facts: dict[str, Any]
+
+
+def mapped_frames(
+    source: FrameSource, records: Sequence[HomographyRecord], origin: Callable[[HomographyRecord], str]
+) -> list[MappedFrame]:
+    """Return the frames of a clip that have a mapping, each with the paint alignment of its mapping in its frame."""
+    mapped: list[MappedFrame] = []
+    for record in records:
+        if not record.valid:
+            continue
+        matrix = matrix_from_record(record)
+        alignment = paint_alignment(source.read(record.frame), matrix)
+        mapped.append(
+            MappedFrame(
+                clip=source.info.clip_id,
+                frame=record.frame,
+                matrix=matrix,
+                origin=origin(record),
+                score=alignment.score,
+                reason=alignment.reason,
+            )
+        )
+    return mapped
+
+
+def probe_mappings(args: argparse.Namespace) -> MappingSource:
+    """Return the landmark fits of a pitch probe, from its stored answers only (``probes.pitch_probe_fits``).
+
+    The backend only replays: a frame without a stored answer stops the command, and no model
+    is called. The fit uses the RANSAC threshold of the pipeline, as the probe does.
+    """
+    experiment = load_experiment(args.experiment)
+    if experiment.probe != "pitch":
+        raise CliError(
+            f"the experiment file {args.experiment} describes a {experiment.probe} probe: an overlay needs the pitch "
+            "probe, whose landmarks give the mappings"
+        )
+    group = clips_of_group(args, experiment.group)
+    clips = [labelled_clip(args.root, group.split, clip) for clip in group.clips]
+    cache = _cache_dir(args)
+    print(f"cache folder: {cache} (stored answers only: no model call)")
+    backend = CachedBackend(CassetteStore(cache, allow_other_images=args.allow_other_images))
+    fits = probes.pitch_probe_fits(
+        clips,
+        backend,
+        experiment.step,
+        frames_per_clip=experiment.per_clip,
+        seed=experiment.seed,
+        ransac_px=PipelineConfig().ransac_px,
+        repeat=experiment.repeat,
+    )
+    sources = {clip.source.info.clip_id: clip.source for clip in clips}
+    mapped = [
+        item
+        for clip_id, records in fits.items()
+        for item in mapped_frames(sources[clip_id], records, lambda record: "landmark fit of this frame")
+    ]
+    return MappingSource(
+        name=experiment.name,
+        engine=f"model:{model_label(experiment.step.provider, experiment.step.model)} landmarks, fit by code",
+        n_frames=sum(len(records) for records in fits.values()),
+        mapped=mapped,
+        sources=sources,
+        facts={**group_facts(args, group, experiment.group), "experiment_file": args.experiment.name},
+    )
+
+
+def tool_mappings(args: argparse.Namespace) -> MappingSource:
+    """Return the cameras of a calibration tool on the frames of its probe, from its run file (as ``tool-score``)."""
+    experiment = load_tool_experiment(args.experiment)
+    if not isinstance(experiment.tool, PnlcalibSettings):
+        raise CliError(
+            f"the experiment file {args.experiment} measures the tool {experiment.tool.name}: an overlay needs a "
+            "calibration tool, whose cameras are the mappings"
+        )
+    group = clips_of_group(args, experiment.group)
+    clips = [labelled_clip(args.root, group.split, clip) for clip in group.clips]
+    run = read_tool_run(args.run)
+    answers = probe_answers(run, experiment, frames_of_probe(clips, experiment), args.run)
+    camera_of = _adapted(homography_from_payload, answers, args.run)
+    sources = {clip.source.info.clip_id: clip.source for clip in clips}
+    mapped = [
+        item
+        for clip_id, source in sources.items()
+        for item in mapped_frames(
+            source,
+            [camera_of(key_clip, frame) for key_clip, frame in answers if key_clip == clip_id],
+            lambda record: "camera of the tool for this frame",
+        )
+    ]
+    return MappingSource(
+        name=experiment.name,
+        engine=f"tool:{experiment.tool.name}",
+        n_frames=len(answers),
+        mapped=mapped,
+        sources=sources,
+        facts={
+            **group_facts(args, group, experiment.group),
+            "experiment_file": args.experiment.name,
+            "run_file": args.run.name,
+            "run_file_sha256": file_sha256(args.run),
+        },
+    )
+
+
+def group_facts(args: argparse.Namespace, group: GroupClips, name: str) -> dict[str, Any]:
+    """Return what the list file of an overlay records about the clips of a group."""
+    return {
+        "split_list": group.manifest_path.name,
+        "split_list_seed": group.manifest_seed,
+        "group": name,
+        "split": group.split,
+        "max_clips": args.max_clips,
+        "clips": group.clips,
+    }
+
+
+def run_mappings(args: argparse.Namespace) -> MappingSource:
+    """Return the mappings that a run used on its keyframes, from its result file and the frames of its clip.
+
+    The mapping of a keyframe is the one of the result file (``ClipResult.homographies``):
+    the landmark fit or the camera of the tool of that frame when the run kept it, else the
+    mapping of another frame carried with the camera motion. A keyframe without a mapping is
+    not drawn. The keyframes come from the settings of the run (its provenance). The clip
+    must be the clip of the result file: the same clip id, frame count and image size.
+    """
+    try:
+        document = json.loads(args.result.read_text(encoding="utf-8"))
+        result = ClipResult.model_validate(document["result"])
+        config = PipelineConfig.model_validate(document["provenance"]["config"])
+    except OSError as error:
+        raise CliError(f"the result file {args.result} cannot be read: {error}") from error
+    except (ValueError, KeyError, TypeError) as error:
+        raise wrong_file("result file", args.result, error) from error
+    info = result.info
+    source = open_clip(args.clip, fps=None if args.clip.is_file() else info.fps, labels=None)
+    seen = source.info
+    if (seen.clip_id, seen.n_frames, seen.width, seen.height) != (info.clip_id, info.n_frames, info.width, info.height):
+        raise CliError(
+            f"--clip {args.clip} is the clip {seen.clip_id} with {seen.n_frames} frames of {seen.width} x "
+            f"{seen.height} pixels, but the result file {args.result} is of the clip {info.clip_id} with "
+            f"{info.n_frames} frames of {info.width} x {info.height} pixels"
+        )
+    pitch_engine = result.engines.get("pitch_mapping")
+    if pitch_engine is None:
+        raise CliError(f"the result file {args.result} names no engine of the pitch mapping")
+    engine = f"{result.engines.get('landmarks')} landmarks, fit by code" if pitch_engine == "code" else pitch_engine
+    by_frame = {record.frame: record for record in result.homographies}
+    keyframes = keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)
+    records = [by_frame[frame] for frame in keyframes if frame in by_frame]
+
+    def origin(record: HomographyRecord) -> str:
+        if record.source == "propagated":
+            return "carried from another frame with the camera motion"
+        return "landmark fit of this frame" if pitch_engine == "code" else "camera of the tool for this frame"
+
+    return MappingSource(
+        name=info.clip_id,
+        engine=engine,
+        n_frames=len(keyframes),
+        mapped=mapped_frames(source, records, origin),
+        sources={info.clip_id: source},
+        facts={
+            "result_file": args.result.name,
+            "result_file_sha256": file_sha256(args.result),
+            "run_commit": document["provenance"].get("commit"),
+            "clip": info.clip_id,
+        },
+    )
+
+
+#: The function that collects the mappings of each source of the command ``overlay``.
+OVERLAY_SOURCES: dict[str, Callable[[argparse.Namespace], MappingSource]] = {
+    "probe": probe_mappings,
+    "tool": tool_mappings,
+    "run": run_mappings,
+}
+
+
+def _cmd_overlay(args: argparse.Namespace) -> int:
+    """Draw the pitch lines of chosen mappings on their frames, for the check by eye of gate G3.
+
+    The source gives every mapping it has (``OVERLAY_SOURCES``) with its paint alignment;
+    ``overlays.choose_frames`` chooses ``--count`` of them with ``--seed``. Each chosen frame
+    becomes one PNG image (``render.draw_mapping_check``) in a new folder below ``--out``,
+    and the list of the chosen frames goes to ``--list`` as text without pixels and without
+    label data (``overlays.list_document``), for the results branch. A list file that is
+    already there is not replaced: it may hold the verdicts of a check by eye.
+    """
+    refuse_pixels_in_repository(args.out, "--out")
+    if args.list.exists():
+        raise CliError(
+            f"the list file {args.list} is already there and may hold the verdicts of a check by eye: give another "
+            "--list"
+        )
+    state = code_state(repository_root())
+    mappings = OVERLAY_SOURCES[args.source](args)
+    if not mappings.mapped:
+        raise CliError(
+            f"none of the {mappings.n_frames} frames of {mappings.name} has a pitch mapping: nothing to draw"
+        )
+    chosen = choose_frames(mappings.mapped, count=args.count, seed=args.seed)
+    folder = args.out / f"{mappings.name}-seed{args.seed}-count{args.count}"
+    if folder.exists():
+        raise CliError(f"{folder} is already there: remove it, or give another --out")
+    print(
+        f"overlay of {mappings.name} ({mappings.engine}): {len(mappings.mapped)} of {mappings.n_frames} frames have a "
+        f"mapping; {len(chosen)} chosen with the seed {args.seed}"
+    )
+    if len(chosen) < args.count:
+        print(f"only {len(chosen)} frames have a mapping, fewer than the count {args.count}: all of them are drawn")
+    partial = folder.with_name(f".{folder.name}.partial-{secrets.token_hex(4)}")
+    partial.mkdir(parents=True)
+    try:
+        for position, item in enumerate(chosen):
+            image = draw_mapping_check(
+                mappings.sources[item.clip].read(item.frame),
+                item.matrix,
+                caption(item, engine=mappings.engine, position=position, count=len(chosen)),
+            )
+            write_png(partial / image_name(position, item), image)
+        os.rename(partial, folder)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    provenance = {
+        "command": f"overlay {args.source}",
+        "commit": state.commit,
+        "dirty": state.dirty,
+        "package_version": __version__,
+        "written_at": utc_now_text(),
+        **mappings.facts,
+    }
+    document = list_document(
+        chosen,
+        source=args.source,
+        name=mappings.name,
+        engine=mappings.engine,
+        seed=args.seed,
+        count=args.count,
+        n_frames=mappings.n_frames,
+        n_mapped=len(mappings.mapped),
+        provenance=provenance,
+    )
+    write_json(args.list, document)
+    for position, item in enumerate(chosen):
+        paint = f"paint score {item.score:.3f}" if item.score is not None else f"cannot judge ({item.reason})"
+        print(f"  {image_name(position, item)}: clip {item.clip}, frame {item.frame}, {item.origin}, {paint}")
+    print(f"images: {folder}")
+    print(f"list file: {args.list}")
+    print("write the verdict of each image, right or wrong, into its field by_eye in the list file")
+    return EXIT_OK
 
 
 # --- eval ----------------------------------------------------------------------------
@@ -3318,6 +3748,69 @@ def _add_clip_job(commands: Any) -> None:
     parser.set_defaults(handler=_cmd_clip_job)
 
 
+def _add_video_frames(commands: Any) -> None:
+    """Add the command ``video-frames`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "video-frames", help="write every frame of a video file as a PNG image below the data folder, for clip-job"
+    )
+    parser.add_argument("--video", type=_path, required=True, metavar="FILE", help="the video file")
+    parser.add_argument(
+        "--out",
+        type=_path,
+        default=VIDEO_FRAMES_DIR.expanduser(),
+        metavar="DIR",
+        help=f"folder of the clip folders, outside the repository (default: {VIDEO_FRAMES_DIR})",
+    )
+    parser.set_defaults(handler=_cmd_video_frames)
+
+
+def _add_overlay(commands: Any) -> None:
+    """Add the command ``overlay`` with one sub-command per source of pitch mappings."""
+    parser = commands.add_parser(
+        "overlay", help="draw the pitch lines of chosen mappings on their frames, for the check by eye of gate G3"
+    )
+    sources = parser.add_subparsers(dest="source", metavar="SOURCE", required=True)
+    probe = sources.add_parser("probe", help="the landmark fits of a pitch probe, from its stored answers")
+    probe.add_argument("--experiment", type=_path, required=True, metavar="FILE", help="experiment file of the probe")
+    probe.add_argument("--root", type=_path, required=True, metavar="DIR", help="data folder")
+    _add_group_options(probe, "use only the first N clips of the group, as the probe did")
+    probe.add_argument(
+        "--cache",
+        type=_path,
+        metavar="DIR",
+        help=f"folder of the stored model answers (default: ../{RESULTS_WORKTREE}/{RESULTS_FOLDER}/{CACHE_FOLDER})",
+    )
+    probe.add_argument(
+        "--allow-other-images",
+        action="store_true",
+        help="use a stored answer although it was recorded with other image bytes than the clip shows now",
+    )
+    tool = sources.add_parser("tool", help="the cameras of a calibration tool, from its run file (as tool-score)")
+    tool.add_argument("--experiment", type=_path, required=True, metavar="FILE", help="experiment file of the tool")
+    tool.add_argument("--root", type=_path, required=True, metavar="DIR", help="data folder")
+    tool.add_argument("--run", type=_path, required=True, metavar="FILE", help="run file of tools/run_tool.py")
+    _add_group_options(tool, "use only the first N clips of the group, as tool-score did")
+    run = sources.add_parser("run", help="the mappings that a run used on its keyframes, from its result file")
+    run.add_argument("--result", type=_path, required=True, metavar="FILE", help="result.json of the run")
+    run.add_argument(
+        "--clip", type=_path, required=True, metavar="PATH", help="the clip of the run: its video file or its folder"
+    )
+    for sub in (probe, tool, run):
+        sub.add_argument("--seed", type=int, required=True, help="seed of the choice of frames")
+        sub.add_argument("--count", type=_positive_int, required=True, metavar="N", help="number of frames to draw")
+        sub.add_argument(
+            "--list", type=_path, required=True, metavar="FILE", help="list file of the chosen frames to write (JSON)"
+        )
+        sub.add_argument(
+            "--out",
+            type=_path,
+            default=OVERLAYS_DIR.expanduser(),
+            metavar="DIR",
+            help=f"folder of the image folders, outside the repository (default: {OVERLAYS_DIR})",
+        )
+        sub.set_defaults(handler=_cmd_overlay)
+
+
 def _add_tool_score(commands: Any) -> None:
     """Add the command ``tool-score`` to the sub-parsers object of argparse."""
     parser = commands.add_parser(
@@ -3392,6 +3885,8 @@ def build_parser() -> argparse.ArgumentParser:
         _add_tool_job,
         _add_tool_score,
         _add_clip_job,
+        _add_video_frames,
+        _add_overlay,
         _add_eval,
         _add_sync,
     ):

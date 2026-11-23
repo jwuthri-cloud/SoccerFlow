@@ -142,7 +142,18 @@ a calibration tool on every frame. A tool runs in its own environment through
     `path(frame)` gives the image file of a frame: the job file of an external tool names it.
   - `VideoFileSource` decodes a frame when it is read and keeps only a few frames, so the memory
     use does not grow with the clip. The decoder runs forward: a read of an earlier frame starts
-    it again at the first frame. Read frames in increasing order where you can.
+    it again at the first frame. Read frames in increasing order where you can. The source decodes
+    the whole file once when it is made and refuses (`OSError`, one line) a video whose frames are
+    not sure (`check_frame_times`): a header without a frame count, a frame more than half a frame
+    away from its time at the constant rate (a variable rate, or a frame that the decoder dropped
+    or repeated), and a header count that differs from the decoded frames. `path` is the file.
+  - `write_video_frames(source, video_sha256, clip_folder) -> VideoRecord` writes every frame of a
+    video as PNG (`clip_folder/img1/000001.png` = frame 0) and the record `clip_folder/video.json`
+    (`VideoRecord`: format `pitchvlm-video-frames-1`, the file name of the video, its SHA-256, frame
+    count, frame rate, size; no path). PNG keeps every pixel, so `ImageFolderSource` gives the
+    frames of the video. The folder is written under a hidden name and renamed when complete; a
+    folder that is there raises `FileExistsError`. `read_video_record(clip_folder)` gives the
+    record or None, and `ValueError` for wrong content.
   - `keyframe_indices` raises `ValueError` unless the frame count, the frame rate and the
     interval are above zero.
 
@@ -1052,6 +1063,10 @@ def table_lines(results: Sequence[CaseResult]) -> list[str]
 @dataclass(frozen=True)
 class RenderStyle: ...   # colours per team side / role, trail seconds (4.0), radar scale, font sizes
 def draw_overlay(image: np.ndarray, players: Sequence[PlayerState], style: RenderStyle = RenderStyle()) -> np.ndarray
+def draw_mapping_check(image: np.ndarray, H: np.ndarray, caption: Sequence[str]) -> np.ndarray
+    # caption band (black, ASCII text) above the frame; the pixels of geometry.projected_line_pixels
+    # in 70 % magenta, width/1280 pixels wide (at least 1); ValueError for a wrong image or a mapping without inverse
+def write_png(path: Path, image: np.ndarray) -> None   # OSError when it cannot be written
 class RadarRenderer:
     def __init__(self, fps: float, style: RenderStyle = RenderStyle(), *, cuts: Sequence[int] = ())
     def draw(self, state: FrameState) -> np.ndarray          # keeps trails per track id; a trail ends at a cut
@@ -1082,10 +1097,10 @@ def crop_choice(boxes: Sequence[tuple[int, Box]], fps: float, max_crops: int) ->
 ```
 
 CLI commands: `demo` (synthetic clip, fake backend or stand-ins of the tools, no network), `run`,
-`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`, `clip-job`, `eval`, `sync`. Exit code 0 means done, 1 means
-that a check or a gate failed, 2 means that the command could not run. Fallback adapters convert
-the JSON output of external tools (RF-DETR boxes, PnLCalib mappings) into `FramePeople` and
-`HomographyRecord`.
+`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`, `clip-job`, `video-frames`,
+`overlay`, `eval`, `sync`. Exit code 0 means done, 1 means that a check or a gate failed, 2
+means that the command could not run. Fallback adapters convert the JSON output of external
+tools (RF-DETR boxes, PnLCalib mappings) into `FramePeople` and `HomographyRecord`.
 
 Stop signals: SIGINT (Ctrl-C), SIGTERM and SIGHUP stop a command with exit code 2. The handler
 sets the event `cli.STOP_REQUESTED`, which the real backend gets as its stop event, so no
@@ -1445,8 +1460,9 @@ class BallState(Record): box: Box; pitch_x: float | None = None; pitch_y: float 
 
 # fallbacks/runs.py
 CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"; CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"; CLIP_RUN_PART_MAX_BYTES = 1_000_000
-class ClipJob(Record): format; clip: str; tool: ToolSettings; images: tuple[str, ...]
-class ClipRun(Record): clip; tool; n_frames; job_sha256; runner; frames: tuple[ClipRunFrame, ...]   # frames[i].frame == i
+class ClipJob(Record): format; clip: str; tool: ToolSettings; images: tuple[str, ...]; video_sha256: str | None = None
+class ClipRun(Record): clip; tool; n_frames; job_sha256; video_sha256: str | None = None; runner
+    frames: tuple[ClipRunFrame, ...]   # frames[i].frame == i
 def clip_run_part_path(first: Path, part: int) -> Path
 def load_clip_run(first: Path) -> ClipRun
 
@@ -1529,20 +1545,68 @@ Command line:
 
 - `clip-job --tool rfdetr|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]` writes
   the clip job with the tool section of the settings file. A video file is refused, and so is a
-  clip folder that is not below the data folder.
+  clip folder that is not below the data folder. A clip folder of `video-frames` holds the record
+  of its video: the job gets `video_sha256`, and a record that names another frame count or size
+  than the folder holds is refused.
+- `video-frames --video FILE [--out DIR]` (default `~/pitchvlm-data/videos`) writes the clip
+  folder `<out>/<clip id>` of a video (`write_video_frames`); the clip id is the name of the
+  file without its ending, as `run` gives it. A folder inside a work tree of the repository is
+  refused (`refuse_pixels_in_repository`, below).
 - `run --detections FILE --calibration FILE`: each is needed when the settings name its engine,
   and refused otherwise. A clip run with other tool settings than the settings file, or of
-  another clip or frame count, is refused. The plan of model calls (`model_plan`) holds only the
+  another clip or frame count, is refused. So is a clip run on other pixels
+  (`check_clip_run_video`): the clip run must name the SHA-256 of the video file of `--clip`, or
+  null when `--clip` is a folder of images. The plan of model calls (`model_plan`) holds only the
   steps whose engine is `model`, each with its provider. A run without a model step opens no
   model session, builds no model backend, needs no key of any provider and no cache folder, and
   prints that it costs nothing; its cost record is `null`. `result.json` gets
   `timing` (the stages of the package, plus `detector` and `calibration`: the sum of the times
   per frame that the script measured) and `provenance.tool_runs` (file, parts, job SHA-256,
-  `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the
+  video SHA-256, `runner`, `script_is_current`, the summary of the seconds per frame). The command prints the
   engine of every step, a line when no step reads shirt numbers, and the time of each stage.
 - `demo --engine model|detector`: the detector demo runs the people engine `detector` and the
   pitch engine `calibration` with the stand-ins of `fallbacks/fake.py` and no model step. Its
   summary holds the engines, the frames with a ball and the timing.
+
+### Check images of pitch mappings for gate G3 (2026-11-22)
+
+```python
+# overlays.py (no pixel I/O)
+LIST_FORMAT = "pitchvlm-overlay-list-1"; VERDICTS = ("right", "wrong"); CHOICE_RULE: str
+@dataclass(frozen=True, eq=False)
+class MappedFrame: clip: str; frame: int; matrix: np.ndarray; origin: str; score: float | None; reason: str | None
+def choose_frames(frames: Sequence[MappedFrame], *, count: int, seed: int) -> list[MappedFrame]
+def image_name(position: int, item: MappedFrame) -> str          # "01_<clip>_<frame + 1:06d>.png"
+def caption(item, *, engine: str, position: int, count: int) -> list[str]
+def list_document(chosen, *, source, name, engine, seed, count, n_frames, n_mapped, provenance) -> dict
+
+# probes.py
+def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_px, repeat=0)
+    -> dict[str, list[HomographyRecord]]   # the frames, requests and fits of probe_pitch
+```
+
+- `choose_frames`: the frames are ordered by paint score (cannot judge first, then rising; a
+  tie by a SHA-256 of seed, clip and frame), cut into `count` parts of equal size, and from each
+  part the frame of the clip with the fewest picks so far is taken (a tie by a second hash). With
+  at most `count` frames all are taken. A count below 1 and a frame given twice raise `ValueError`.
+- `overlay probe|tool|run ... --seed S --count N --list FILE [--out DIR]` (`cli._cmd_overlay`):
+  - `probe --experiment E --root DATA [--manifest] [--max-clips] [--cache] [--allow-other-images]`:
+    the landmark fits of the pitch probe from the stored answers only (`CachedBackend` without an
+    inner backend: a missing answer stops with one line, no model call).
+  - `tool --experiment E --root DATA --run RUN [--manifest] [--max-clips]`: the cameras of a
+    calibration run file on the frames of its probe, read as `tool-score` reads them.
+  - `run --result result.json --clip PATH`: the mapping that the run used on each keyframe
+    (`ClipResult.homographies`; the keyframes from the settings in its provenance); `--clip` must
+    be the clip of the result (clip id, frame count, size).
+  - Every frame with a mapping gets its paint alignment; `choose_frames` picks; each pick is drawn
+    with `draw_mapping_check` into `<out>/<name>-seed<S>-count<N>/` (written under a hidden name,
+    renamed when complete; a folder that is there is refused) and listed in `--list`
+    (`list_document`: no path, no pixel, no label data; `by_eye` null in each entry). A list file
+    that is there is refused, and so is a source without any mapping.
+- `refuse_pixels_in_repository(path, option)`: the path and each existing folder above it are
+  compared (`os.path.samefile`) with the top folder of the repository and of every work tree that
+  `git worktree list` names (the results work tree is one); a match raises `CliError`. Git that
+  cannot list the work trees raises `CliError` too.
 
 ## 5. Tests
 
