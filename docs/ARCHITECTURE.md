@@ -914,7 +914,8 @@ Contracts:
 - Gemini sends a video inline (`type: video`, base64 `data`, `mime_type`, `resolution`, and
   `processing: {type: static, start_offset, end_offset, fps}` when the part names one of them).
   OpenRouter sends a `video_url` part with a data URL and refuses a part with a range or a rate.
-  Both refuse inline data above `client.INLINE_REQUEST_MAX_BYTES` (20,000,000 bytes) and never
+  Both refuse a request above `client.INLINE_REQUEST_MAX_BYTES` (20,000,000 bytes as JSON text,
+  `client.request_size_bytes`) and never
   upload a file. Rule 5 holds: `store=False` or the private routing, no sampling parameter, and
   the video prompts identify players by shirt number and kit, never by face.
 - A model takes video only with a video rate on the day of the call: `GEMINI_VIDEO_RATES` for
@@ -1458,9 +1459,12 @@ the family, the focal loss and the classes `person` and `sports ball`. `detectio
 turns the output of one frame (class scores per query, boxes as centre, width and height in parts
 of the square input) into the payload of `fallbacks.rfdetr`: the logistic function, the best
 pairs of query and class (as many as queries), corners in pixels of the frame, the classes of
-`KEPT_LABELS` from `min_score` on. On the warm-up call the script compares its boxes with
-`post_process_object_detection` of the installed package and stops when they differ
-(`check_against_tool`). Frames go to a tool in batches (`answer_frames(job, root, answer,
+`KEPT_LABELS` from `min_score` on; class places must be 0 to the number of classes minus 1. On
+the warm-up call the script compares its boxes with `post_process_object_detection` of the
+installed package, from the score `SELF_CHECK_MIN_SCORE` (0.001) whatever `min_score` (when the
+cut to the best pairs decided, only the pairs above the lowest kept score: tied pairs at the cut
+may differ, `self_check_floor`), and stops when they differ (`check_against_tool`); the run facts count the compared detections
+(`self_check_detections`). Frames go to a tool in batches (`answer_frames(job, root, answer,
 batch)`; `one_at_a_time` for RF-DETR and PnLCalib): the time of a frame is the time of its batch
 divided by its frames, and a transformers run adds `stage_ms_per_frame` (median milliseconds per
 frame of the image processor, the model after a device synchronisation, and the conversion) to

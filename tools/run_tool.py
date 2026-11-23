@@ -53,7 +53,8 @@ What each tool gets, and what the script takes from it:
   input); ``detections_of_queries`` turns them into boxes in pixels of the frame, like the
   ``post_process_object_detection`` of the image processor, and keeps the classes ``person``
   and ``sports ball`` (``KEPT_LABELS``). On the first call the script checks its boxes against
-  that function of the tool and stops when they differ.
+  that function of the tool, from the low score ``SELF_CHECK_MIN_SCORE``, and stops when they
+  differ; ``self_check_detections`` of the run facts counts the compared detections.
 - PnLCalib (a clone of its repository at the commit ``PNLCALIB_COMMIT``): the script follows
   the steps of ``inference.py`` of the clone. It takes the projection matrix of the camera and
   writes the mapping of the grass (pitch metres to pixels of the frame). The world frame of
@@ -143,6 +144,10 @@ KEPT_LABELS = ("person", "sports ball")
 #: between their scores.
 SELF_CHECK_BOX_PX = 0.01
 SELF_CHECK_SCORE = 1e-5
+#: Score from which the self-check compares the detections of the script and of the tool, whatever the
+#: ``min_score`` of the job. With ``min_score`` itself, a first frame without a detection above it gave
+#: an empty check that a changed tool passed. No stand-in score of the tests lies on this value.
+SELF_CHECK_MIN_SCORE = 0.001
 #: Keys of the tool section of a job, by tool.
 TOOL_KEYS = {
     "rfdetr": frozenset({"name", "model", "min_score", "antialias"}),
@@ -604,8 +609,9 @@ def detections_of_queries(
     score above its threshold, so the two differ only for a score equal to it. The detections
     are in the order of their scores, best first.
 
-    ``RunnerError`` is raised for an output with a value that is not a finite number and for
-    shapes that do not fit together or do not fit ``labels``.
+    ``RunnerError`` is raised for an output with a value that is not a finite number, for
+    shapes that do not fit together or do not fit ``labels``, and for ``labels`` whose places are
+    not 0 to the number of classes minus 1 (the place of a score is its class place).
     """
     if logits.ndim != 2 or boxes.shape != (logits.shape[0], 4):
         raise RunnerError(
@@ -616,6 +622,11 @@ def detections_of_queries(
     if classes != len(labels):
         raise RunnerError(
             f"the detector gave {classes} class scores per query, and its weights name {len(labels)} classes"
+        )
+    if set(labels) != set(range(classes)):
+        raise RunnerError(
+            f"the class places of the weights are not 0 to {classes - 1}: the score of place k is the score of "
+            "class k, so each box would get the name of another class"
         )
     if not (np.isfinite(logits).all() and np.isfinite(boxes).all()):
         raise RunnerError("the detector gave a box or a score that is not a finite number")
@@ -696,6 +707,21 @@ def check_against_tool(
     )
 
 
+def self_check_floor(result: Mapping[str, Any], queries: int) -> float:
+    """Return the score above which the self-check compares the detections of one frame.
+
+    It is ``SELF_CHECK_MIN_SCORE``, unless the tool kept as many pairs as there are queries:
+    then the cut to the best pairs decided, and the pairs whose score equals the lowest kept one
+    may be other pairs on the two sides (``torch.topk`` gives no order for equal scores, and
+    half precision gives many equal scores). The check then compares only the pairs more than
+    ``SELF_CHECK_SCORE`` above the lowest kept score.
+    """
+    scores = result["scores"].tolist()
+    if len(scores) < queries:
+        return SELF_CHECK_MIN_SCORE
+    return max(SELF_CHECK_MIN_SCORE, min(scores) + SELF_CHECK_SCORE)
+
+
 def synchronize(torch: ModuleType, device: str) -> None:
     """Wait until the device has done the work that was given to it, so that a clock reads its time."""
     if device.startswith("cuda"):
@@ -758,9 +784,10 @@ def transformers_engine(
         raise RunnerError(f"the weights of {repository} have no class {', '.join(missing)}")
     times: list[tuple[float, float, float, int]] = []
     checked = False
+    n_checked = 0
 
     def answer(images: Sequence[np.ndarray]) -> list[dict[str, Any]]:
-        nonlocal checked
+        nonlocal checked, n_checked
         start = time.perf_counter()
         inputs = processor(images=list(images), size={"height": input_size, "width": input_size}, return_tensors="pt")
         pixel_values = inputs["pixel_values"].to(device=device, dtype=dtype)
@@ -786,13 +813,27 @@ def transformers_engine(
         done = time.perf_counter()
         if not checked:
             # The first call is the warm-up call, which is not measured. Check the boxes of the script
-            # against those of the tool on it.
+            # against those of the tool on it, from the low score SELF_CHECK_MIN_SCORE: so the check
+            # compares boxes also on a first frame without a detection above min_score.
             # The function of the tool reads only these two fields, and it gets them as float32 like the script.
             output = SimpleNamespace(logits=outputs.logits.float(), pred_boxes=outputs.pred_boxes.float())
             sizes = [(image.shape[0], image.shape[1]) for image in images]
-            results = processor.post_process_object_detection(output, threshold=min_score, target_sizes=sizes)
-            for payload, result in zip(payloads, results, strict=True):
-                check_against_tool(payload, tool_detections(result, labels, min_score), min_score)
+            results = processor.post_process_object_detection(
+                output, threshold=SELF_CHECK_MIN_SCORE, target_sizes=sizes
+            )
+            for index, (image, result) in enumerate(zip(images, results, strict=True)):
+                own = detections_of_queries(
+                    logits[index],
+                    boxes[index],
+                    width=image.shape[1],
+                    height=image.shape[0],
+                    labels=labels,
+                    min_score=SELF_CHECK_MIN_SCORE,
+                )
+                floor = self_check_floor(result, len(logits[index]))
+                tool = tool_detections(result, labels, floor)
+                check_against_tool(own, tool, floor)
+                n_checked += len(tool)
             checked = True
         else:
             times.append((prepared - start, modelled - prepared, done - modelled, len(images)))
@@ -806,7 +847,8 @@ def transformers_engine(
         return {
             "stage_ms_per_frame": {
                 name: round(1000 * statistics.median(values), 4) for name, values in per_frame.items()
-            }
+            },
+            "self_check_detections": n_checked,
         }
 
     facts = {

@@ -32,7 +32,8 @@ How a request is sent (API pages and SDK source read again on 2026-11-14, SDK 3.
   sampling rate: ``start_offset`` and ``end_offset`` as seconds with the
   ending "s", and ``fps`` (video page, read on 2026-11-23). The Files API is
   never used: it keeps an uploaded file for 48 hours, against the intent of
-  ``store=False``. So a request whose inline data would pass
+  ``store=False``. So a request with a video whose size as JSON text (its
+  inline data, its text, its schema and its settings) would pass
   ``INLINE_REQUEST_MAX_BYTES`` is refused before any call
   (``VideoInputError``), and so is a video of a model without a video rate.
 - The SDK makes one attempt per call. This module does the retries, so that it
@@ -178,10 +179,11 @@ SPEND_WINDOW_S = 600.0
 USAGE_TOLERANCE = 0.01
 #: Longest SDK error text that is copied into a log line or an error message, characters.
 MAX_ERROR_CHARS = 500
-#: Largest size of the inline data of one request, bytes: the base64 text of its images and videos.
-#: The video page of Gemini says "Always use the Files API when the total request size ... is larger
-#: than 20 MB"; the files page says 100 MB. The smaller value is taken, read as 20,000,000 bytes
-#: (published, not measured). The OpenRouter pages state no size; the same limit is used for it
+#: Largest size of one request with a video part, bytes: the whole request as JSON text
+#: (``request_size_bytes``), so the base64 text of its images and videos, its text, its schema and
+#: its settings. The video page of Gemini says "Always use the Files API when the total request size
+#: ... is larger than 20 MB"; the files page says 100 MB. The smaller value is taken, read as
+#: 20,000,000 bytes (published, not measured; 20 MiB would be 20,971,520 bytes). The OpenRouter pages state no size; the same limit is used for it
 #: (chosen, not published). A video of 20 MB as base64 text is about 15 MB of file.
 INLINE_REQUEST_MAX_BYTES = 20_000_000
 #: The service tiers that have a price. An answer can report one of them as the tier that served the call.
@@ -253,16 +255,20 @@ def _video_item(part: VideoPart) -> dict[str, Any]:
     return item
 
 
-def _inline_bytes(items: Sequence[Mapping[str, Any]]) -> int:
-    """Return the size of the inline data of the parts of a request: the base64 text of its images and videos."""
-    return sum(len(item["data"]) for item in items if "data" in item)
+def request_size_bytes(payload: Mapping[str, Any]) -> int:
+    """Return the size of a request as JSON text in bytes: its inline data, its text, its schema and its settings.
+
+    The video page names the "total request size", not only the size of the inline data,
+    so the limit ``INLINE_REQUEST_MAX_BYTES`` is checked on this number.
+    """
+    return len(json.dumps(payload).encode("utf-8"))
 
 
 def check_inline_size(n_bytes: int, label: str) -> None:
-    """Raise ``VideoInputError`` when the inline data of a request is larger than ``INLINE_REQUEST_MAX_BYTES``."""
+    """Raise ``VideoInputError`` when a request is larger than ``INLINE_REQUEST_MAX_BYTES`` (``request_size_bytes``)."""
     if n_bytes > INLINE_REQUEST_MAX_BYTES:
         raise VideoInputError(
-            f"{label}: the inline data of the request is {n_bytes:,} bytes, more than the limit of "
+            f"{label}: the request is {n_bytes:,} bytes as JSON text, more than the limit of "
             f"{INLINE_REQUEST_MAX_BYTES:,} bytes. A larger request needs an upload API that keeps the file at the "
             "provider, and this client never uploads (owner decision). Send a shorter range as its own file."
         )
@@ -316,16 +322,14 @@ def build_interaction_kwargs(request: VLMRequest) -> dict[str, Any]:
     carries no sampling parameter. ``request.context`` is never sent.
 
     Raises ``VideoInputError`` when a video file cannot be read, has other bytes than
-    its part, or makes the inline data larger than ``INLINE_REQUEST_MAX_BYTES``. The
+    its part, or makes the request larger than ``INLINE_REQUEST_MAX_BYTES``. The
     size limit holds for a request with a video part; a request of images only is
     built as before video parts were added.
     """
     if not request.parts:
         raise ValueError("a request needs at least one text or image part")
     items = [_input_item(part) for part in request.parts]
-    if request.videos:
-        check_inline_size(_inline_bytes(items), _request_label(request))
-    return {
+    kwargs = {
         "model": request.model,
         "input": items,
         "generation_config": {"thinking_level": request.thinking_level},
@@ -337,6 +341,9 @@ def build_interaction_kwargs(request: VLMRequest) -> dict[str, Any]:
         "store": False,
         "service_tier": request.service_tier,
     }
+    if request.videos:
+        check_inline_size(request_size_bytes(kwargs), _request_label(request))
+    return kwargs
 
 
 def _request_label(request: VLMRequest) -> str:
@@ -1063,7 +1070,7 @@ class LazySdkClient:
 #   or a base64-encoded data URL", video page, read on 2026-11-23). It has no ``detail``. The page
 #   says that only Gemini reads the ``processing`` field, so an OpenRouter video is a whole file:
 #   a part with a range or a sampling rate is refused (``require_video_rate``). A model takes video
-#   only with a ``video`` rate in the price table file; the inline data has the size limit
+#   only with a ``video`` rate in the price table file; the whole body has the size limit
 #   ``INLINE_REQUEST_MAX_BYTES``.
 # - The answer must follow the JSON schema of the request (``response_format`` of the type
 #   ``json_schema``, strict). Each object of the schema gets ``additionalProperties: false``, as
@@ -1142,7 +1149,7 @@ def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
     standard one and for an image resolution without a ``detail``. Raises
     ``VideoInputError`` for a video part with a range or a sampling rate, for a
     video file that cannot be read or has other bytes than its part, and, for a
-    request with a video part, for inline data larger than ``INLINE_REQUEST_MAX_BYTES``.
+    request with a video part, for a body larger than ``INLINE_REQUEST_MAX_BYTES``.
     """
     if request.provider != "openrouter":
         raise ValueError(f"an OpenRouter body cannot be built for a {request.provider} request")
@@ -1153,9 +1160,6 @@ def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
     if request.service_tier != "standard":
         raise ValueError(f"an OpenRouter request has no service tier {request.service_tier!r}: use standard")
     content = [_content_part(part) for part in request.parts]
-    if request.videos:
-        inline = sum(len(part[kind]["url"]) for part in content for kind in ("image_url", "video_url") if kind in part)
-        check_inline_size(inline, _request_label(request))
     body: dict[str, Any] = {
         "model": request.model,
         "messages": [{"role": "user", "content": content}],
@@ -1172,6 +1176,8 @@ def build_openrouter_body(request: VLMRequest) -> dict[str, Any]:
     }
     if request.thinking_level != "model_default":
         body["reasoning"] = {"effort": request.thinking_level}
+    if request.videos:
+        check_inline_size(request_size_bytes(body), _request_label(request))
     return body
 
 
