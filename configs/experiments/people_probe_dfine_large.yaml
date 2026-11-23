@@ -1,0 +1,12 @@
+# Measures D-FINE Large (COCO-only weights, through Hugging Face transformers) on the frames of the people probe. It serves gate G2.
+name: people_probe_dfine_large
+group: probe
+frames_per_clip: 5
+seed: 20261113
+tool:
+  name: dfine
+  model: large
+  min_score: 0.5
+  input_size: 640
+  batch: 1
+  half: false

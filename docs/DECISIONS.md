@@ -2612,6 +2612,374 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
       (25.1) s. The machine was slower for both. Process starts were not the cause: 450 starts of
       `/usr/bin/true` per second in this window, against 180 in the first.
 
+## 2026-11-23 — Video input for the model steps (session A of round 5)
+
+1. **The goal** (owner request: "any img/video llm" must work). A model step can send a video
+   file, or a time range of it, in the place of a list of images, through Gemini and through
+   OpenRouter. Built on the build machine, offline: no model call, no key, no footage, no
+   install. Nothing here ran against a real model or a real video of the dataset.
+2. **Documentation pages read on 2026-11-23** (public pages, no sign-in, no API call; every value
+   below is published, not measured). The pages of `ai.google.dev/gemini-api/docs/...` answered
+   with a redirect to the same paths on `aistudio.google.com/docs/...`.
+   - https://aistudio.google.com/docs/video-understanding — inline data for "shorter videos
+     under 20MB total request size"; "Always use the Files API when the total request size ... is
+     larger than 20 MB"; File API 20 GB (paid). Video part of the Interactions API:
+     `{"type": "video", "data": <base64>, "mime_type": "video/mp4"}`. Clipping and rate in
+     `"processing": {"type": "static", "start_offset": "1200s", "end_offset": "1500s"}`, `fps` in
+     `(0, 24]`; "extracting frames at 1 FPS" by default. Types `video/mp4`, `video/mpeg`,
+     `video/mov`, `video/webm` (the type list and the `fps` inside `processing` were read from a
+     cut copy of the page: to confirm). Up to 10 videos per request (Gemini 2.5 and later).
+   - https://aistudio.google.com/docs/files — "Files are automatically deleted after 48 hours";
+     the Files API is for requests "larger than 100 MB" (this conflicts with the 20 MB above).
+   - https://aistudio.google.com/docs/media-resolution — Gemini 4 and 3 models: video tokens per
+     frame 70 at unspecified, low and medium, 280 at high; sound 25 tokens per second; the
+     resolution can be set "for individual media objects (content items)" (the example is an
+     image part). The video page gives 66 and 258 per frame; the tokens page
+     (https://aistudio.google.com/docs/tokens) gives "263 tokens per second", "~100 (default low
+     resolution) / ~300 (high resolution)" per second and "32 tokens per second" for sound. Three
+     sets of numbers that do not agree.
+   - https://aistudio.google.com/docs/pricing — one input price for all inputs of gemini-4-argon,
+     gemini-4-carbon, gemini-4-hydrogen and gemini-3.8-flash (no separate video or sound price);
+     the robotics model: the same price for text, image, video and sound (read from a cut copy).
+   - https://openrouter.ai/docs/features/multimodal/videos — chat completions part
+     `{"type": "video_url", "video_url": {"url": ...}}`; "The video_url can be either a URL or a
+     base64-encoded data URL"; "Google Gemini (AI Studio): Only supports YouTube links"; "Google
+     Gemini (Vertex AI): ... Use base64-encoded data URLs instead"; other providers: check the
+     model; `processing` is read by Gemini only ("Other providers ignore the `processing`
+     field"). No size limit is stated.
+   - https://openrouter.ai/docs/features/multimodal/overview — "Video: Priced as input tokens
+     based on duration and resolution". https://openrouter.ai/docs/guides/overview/models — the
+     models list names the input types under `architecture.input_modalities`; no video price key.
+   - https://openrouter.ai/api/v1/models/google/gemini-2.5-flash/endpoints — `input_modalities`
+     holds `video`; its three endpoints are all "Google AI Studio" (which takes YouTube links
+     only, by the video page), with an `audio` price above the `prompt` price (1.0 against 0.3
+     USD per million at the standard endpoint) and no video price. The model pages of
+     `qwen/qwen3-vl-235b-a22b-instruct` and `qwen/qwen2.5-vl-72b-instruct` name no input types.
+     The public list https://openrouter.ai/api/v1/models answered in another shape than its page
+     documents (no `architecture`, no `pricing`), so the video models could not be listed.
+   - Item 7 of the entry "Image models through OpenRouter" (2026-11-22) said that no page showed
+     base64 video in chat completions. The video page now says it in words (above), so the part is
+     built; no example on the page shows it.
+3. **What was built** (each with tests; `tests/test_vlm_video.py` and new tests in
+   `tests/test_cli.py`):
+   - `VideoPart` (`vlm/types.py`): path, SHA-256, type, length, optional start, end and rate,
+     resolution (`low`, `medium`, `high`). No bytes. `identity()` (no path) goes into the cache
+     key and into the cassette (`videos`). A request without video parts has neither entry: its
+     key and cassette are those of before (the 15 frozen values of `tests/test_vlm_openrouter.py`
+     still pass).
+   - Gemini (`vlm/client.py`): inline base64 with `resolution`, and `processing` of the type
+     `static` when the part names a range or a rate. The bytes are checked against the hash
+     before the call. No upload: the Files API keeps a file at the provider for 48 hours, against
+     the intent of `store=False`. A request with a video whose inline data is above 20,000,000
+     bytes (the smaller published limit) is refused before any call (`VideoInputError`). A request
+     of images only has no such limit, as before.
+   - OpenRouter: a `video_url` part with a base64 data URL through the `urllib` transport, the
+     same private routing; a part with a range or a rate is refused (the provider would ignore
+     it), and so is inline data above the same 20,000,000 bytes (chosen, not published).
+   - Money (`vlm/cost.py`): `VideoRate` and `GEMINI_VIDEO_RATES` (4 Gemini models; frame tokens
+     70 / 70 / 280, the larger of each published pair; 32 sound tokens per second, the larger
+     value; default rate 1 per second; billed at the input price). The OpenRouter rates are the
+     optional `video` entries of `configs/openrouter_prices.yaml` (`load_video_rates`); none is
+     filled (item 7). A model without a rate takes no video: the estimate raises `KeyError`
+     before a run, and both backends raise `VideoInputError` before any call. The estimate of a
+     video request is the text estimate of its step plus `frames x tokens_per_frame + seconds x
+     sound tokens` per part; `people_video` counts its output once per target frame. The billed
+     cost comes from the measured usage, so the 1.3 times stop and the hard stop work as for
+     images. `Ledger` and `BudgetGuard` are not changed, and session D needs to change nothing for
+     this: a Gemini video line is priced from its measured tokens at the input price; an
+     OpenRouter line takes the reported cost.
+   - Video files (`vlm/video.py`): the chosen frames of a frame source, written with OpenCV at the
+     sampling rate (H.264 `avc1`, else MPEG-4 Part 2 `mp4v`), so frame `k` is at `k / fps`
+     seconds and the model samples each written frame. A file that is there is kept, because its
+     hash is in the key; its name holds a hash of the decoded pixels of its frames, so new footage
+     under an old clip name gets new files (the image path has `OtherImagesError` for this case). Measured on the build machine (OpenCV 5.0.0): two writes of the same 5
+     frames, 1 s apart, gave the same bytes, for `avc1` and for `mp4v` (1 trial each); OpenCV
+     reads a written file back with its frame count, size and a rate of 2.083 for 2.0833.
+   - Steps (`vlm/steps.py`, prompts `people_video/v1`, `kit_legend_video/v1`): the people prompt
+     lists the target frames by their time in the file and asks one entry per target with
+     `time_s`; `parse_people_video` takes an entry only when its time is within half a frame
+     interval of its target and counts the others. Both video prompts keep rule 5: kit colours
+     and shirt numbers only, "Do not use faces and do not give names".
+   - `FakeBackend` answers both video steps from the request context; it never opens the file.
+     The image answers draw the same random numbers as before (the tests of the fake pass
+     unchanged).
+   - Probe (`probes.VideoProbe`, the section `video` of an experiment file: `fps`,
+     `context_frames`, `targets_per_request`; option `probe --video-dir`, default
+     `~/pitchvlm-data/video-input`): the frames, the labels and the scorer of the image probe;
+     the videos are written before the estimate; the result adds `n_people_requests`,
+     `n_entries_wrong_time` and the video settings. Three experiment files:
+     `people_probe_video.yaml`, `people_probe_video_low.yaml`, `people_probe_video_batch.yaml`.
+   - Doctor (`doctor --video`): one video request per model, a 7 s video of 7 frames of the
+     synthetic scene, 3 targets; checks `video boxes`, `video box accuracy`, `video times`,
+     `video tokens` (measured input against the estimate). A model without a rate gets a failed
+     `video boxes` line and no call. Estimated 0.048 USD for gemini-4-argon until 2026-11-30 and
+     0.095 USD from 2026-12-01, inside the 2 USD of gate G0.
+   - No default changed: `StepSettings`, `configs/default.yaml`, the pipeline and `demo` are as
+     before; only the probe and the doctor send video.
+4. **Measured offline with the fake model.** The video people probe on the synthetic clip of the
+   probe tests (100 frames, 5 frames, seed 1) gives the same recall, precision, counts and foot
+   errors as the image probe with one request per frame and with 5 frames per request
+   (`test_video_people_probe_measures_the_frames_of_the_image_probe`). This proves the plumbing
+   (frames, times, parsing, scoring), not the model: the fake answers from the truth.
+5. **The experiment for the run machine.** Hypothesis: video input reaches gate G2 at a lower
+   estimated cost per keyframe than image input. Baseline: `people_probe.yaml` (images, the same
+   model). Controls: the same 24 clips of the group `probe`, the same 5 frames per clip (seed
+   20261113), the same labels, the same scorer, the same model and thinking level; each video
+   arm changes one thing (resolution `high` / `low`; one or five frames per request). Sample: 120
+   frames per arm, the size of gate G2. Estimated costs (printed by the code, prices of the
+   table, not measured):
+
+   | Arm | Calls | To 2026-11-30 | From 2026-12-01 | Per keyframe |
+   |---|---|---|---|---|
+   | images (`people_probe.yaml`) | 144 | 2.357 USD | 4.714 USD | 0.0196 / 0.0393 |
+   | video, high, 1 frame per request | 144 | 2.390 USD | 4.780 USD | 0.0199 / 0.0398 |
+   | video, low, 1 frame per request | 144 | 2.108 USD | 4.215 USD | 0.0176 / 0.0351 |
+   | video, high, 5 frames per request | 48 | 2.275 USD | 4.549 USD | 0.0190 / 0.0379 |
+
+   The estimates differ by at most 11 % because the output estimate of a video frame is set to
+   the 1,400 tokens of an image frame, and output is about 80 % of the cost. So the hypothesis
+   is a question about measured output and thinking tokens and about recall at 70 tokens per
+   frame, not about the estimate. The measured cost per keyframe is the measured cost of a run
+   divided by its `n_frames`.
+6. **Risks** (inferred, not measured):
+   - Frame sampling: the mapping assumes that the provider samples at `0, 1/fps, 2/fps, ...` of
+     the file. If it samples elsewhere, an answer describes another frame; `video times` and
+     `n_entries_wrong_time` show a model that names other times, but not a model that names the
+     right time for the wrong picture. The boxes of the doctor would then fail on the moving
+     camera of the synthetic scene.
+   - Timestamps: the model must copy the listed times; an answer that writes `1.4` for `1.44`
+     is within the tolerance (0.25 s at 2 per second).
+   - Coordinates: a box is given in the frame of its time; the convention is that of the step.
+     With 5 frames per request the model can mix the boxes of two windows.
+   - Pixels: the video arm sees H.264 (or MPEG-4 Part 2) frames, the image arm JPEG at quality
+     90 of the same frames. A difference in recall can come from the codec, not from the
+     input type.
+   - Token rate: the three published sets of numbers differ by up to 3.7 times at low resolution
+     (70 + 32 against 263 per second); a rate that is too low lets the 1.3 times stop end a probe
+     early (it never lets it pay more than 1.3 times the estimate).
+   - Codec: the run machine may write `mp4v` only, which a provider may refuse.
+7. **Owner decisions (open).**
+   - Uploads: a video above 20,000,000 bytes of inline data would need the Files API, which keeps
+     the file for 48 hours. Not built; the client refuses such a request. Decide whether an upload
+     followed by a delete is acceptable, or keep the refusal.
+   - OpenRouter video rates: no page publishes a video token rate for an OpenRouter model, and the
+     only Gemini model checked there serves through AI Studio (YouTube links only). So no
+     `video` entry is in `configs/openrouter_prices.yaml`, and every OpenRouter video request is
+     refused before any call. To enable one model, the owner adds, for example:
+     `video: [{valid_from: <day>, tokens_per_frame: <n>, audio_tokens_per_second: <n>,
+     frames_per_second: <n>, video_usd_per_million: <price>, audio_usd_per_million: <price>}]`
+     from its model card, and runs `doctor --video` with it.
+   - Video in the pipeline (`run`): not built. Decide after the probes, with both metrics files.
+   - Rule 5 text of `CLAUDE.md` (not applied): add "Video goes inline only; no file is uploaded
+     to a provider." after the routing sentence of the text proposed in the entry of 2026-11-22,
+     item 9.
+8. **Not verified (only the run machine can):** every request shape against the real APIs (the
+   Interactions video part with `resolution` and `processing`; the OpenRouter `video_url` data
+   URL); the token counts of video; the cost of a video call against its estimate; whether
+   OpenCV of the run machine writes H.264; whether the same frames give the same bytes there;
+   the sampling times of the provider; recall and precision of video input on real frames.
+9. **Second read** (a subagent, before the commit): no high finding; 6 medium or low, all
+   confirmed and fixed with a test where code changed. `probe --video-dir` is refused inside the
+   repository and inside or above the cache folder (medium, rule 2). The privacy check of the
+   doctor builds its call without the video parts, so a video that failed before its call no
+   longer stops the doctor with a traceback. An estimate that raises `ValueError` (flex for a
+   model without flex) gives one error line. The runbook says that `video times` shows only that
+   the model copies the listed times; `video boxes` on the moving synthetic camera is the check of
+   the sampling times. A plain doctor run no longer reads the video rates. Dead code and one test
+   that passed without its fix were removed. Its recomputed numbers match items 3 and 5.
+
+## 2026-11-23 — A second detector family: D-FINE and RT-DETRv2 through transformers
+
+1. **Goal.** The owner can run the same gate (G2 on the frames of the people probe, then the dev
+   clips) with a second detector family and choose by measurement (rule 8: same frames, same
+   gate, same scorer). Point 3 of the entry "A real-time detector engine next to the model
+   engine" named D-FINE with its COCO-only weights through the Apache-2.0 code of Hugging Face
+   transformers, "added only after the licence of each weight file is read". Ultralytics YOLO is
+   not added (AGPL-3.0; open owner decision). No code, config text or weights of any project
+   were copied. Hypothesis for the run machine: a family of the same published latency as an
+   RF-DETR size has a G2 recall within the noise of the 5-frame probe; baseline: the five
+   RF-DETR files; nothing was measured here.
+2. **Licences, read on 2026-11-23** (one reader, this session; pages read as text with `curl`,
+   not checked by a second reader):
+
+   | What | Page | What it says |
+   |---|---|---|
+   | Code path: transformers 5.23.0 | `LICENSE` and `src/transformers/models/rt_detr/image_processing_rt_detr.py` of https://github.com/huggingface/transformers at tag v5.23.0; PyPI page of `transformers` | Apache License 2.0; the file headers say Apache-2.0; PyPI: "Apache 2.0 License" |
+   | D-FINE upstream code and weights | `LICENSE` and `README.md` of https://github.com/Peterande/D-FINE (master, commit `956d1709`) | Apache-2.0. The README: checkpoints trained or pretrained on Objects365 (`*_obj365`, `*_obj2coco`) "may be subject to the Objects365 dataset terms" and are not to be assumed commercially cleared |
+   | RT-DETRv2 upstream code and weights | `LICENSE` and `rtdetrv2_pytorch/README.md` of https://github.com/lyuwenyu/RT-DETR (main, commit `df2a96c8`) | Apache-2.0; the COCO+Objects365 weights are a separate table |
+   | 5 D-FINE checkpoints `ustc-community/dfine-{nano,small,medium,large,xlarge}-coco` | model card (README.md) and API page of each on huggingface.co, at the commits of `TRANSFORMERS_CHECKPOINTS` in `tools/run_tool.py` | licence `apache-2.0`, dataset `coco`; the card: "_coco -> model trained on COCO", "trained on COCO (Lin et al. [2014]) train2017"; weights as `model.safetensors` |
+   | 4 RT-DETRv2 checkpoints `PekingU/rtdetr_v2_{r18vd,r34vd,r50vd,r101vd}` | same, at the commits of the script | licence `apache-2.0`, dataset `coco`; the card: "trained on COCO (Lin et al. [2014]) train2017"; no mention of Objects365; `model.safetensors` |
+   | COCO, the training data of the 9 checkpoints | https://cocodataset.org/#termsofuse (text of `dataset/termsofuse.htm`) | annotations CC BY 4.0; the consortium does not own the images, "Use of the images must abide by the Flickr Terms of Use", and users "accept full responsibility" |
+
+   Not usable until read: the 8 D-FINE checkpoints `*-obj365` and `*-obj2coco` of
+   `ustc-community` (Objects365 terms not read; the hub tags `dataset: coco` on the `obj2coco`
+   cards, but their README says Objects365 then COCO: the tag is not enough), the RT-DETRv2
+   COCO+Objects365 weights of the upstream README, and the RT-DETR (v1) checkpoints
+   `PekingU/rtdetr_*_coco_o365`. Not read at all: the data on which the backbones were
+   pretrained before COCO (HGNetv2 for D-FINE, ResNet-vd for RT-DETRv2); the cards do not name
+   it. The same question holds for the backbone of RF-DETR, which the entry of 2026-11-22 did not
+   ask.
+3. **Published values, not measured here** (COCO val2017 AP50:95; latency on one NVIDIA T4,
+   batch 1, FP16; D-FINE with TensorRT 10.4.0, RT-DETRv2 with TensorRT 8.5.1 or newer, given as
+   frames per second and converted here as 1000 / fps):
+
+   | Checkpoint (size key) | Upstream model | AP | Latency, ms | Parameters (hub page) |
+   |---|---|---|---|---|
+   | dfine nano | D-FINE-N | 42.8 | 2.12 | 3.80 M |
+   | dfine small | D-FINE-S | 48.5 | 3.49 | 10.35 M |
+   | dfine medium | D-FINE-M | 52.3 | 5.62 | 19.64 M |
+   | dfine large | D-FINE-L | 54.0 | 8.07 | 31.36 M |
+   | dfine xlarge | D-FINE-X | 55.8 | 12.89 | 62.85 M |
+   | rtdetrv2 r18vd | RT-DETRv2-S | 48.1 | 4.61 (217 fps) | 20.21 M |
+   | rtdetrv2 r34vd | RT-DETRv2-M* | 49.9 | 6.21 (161 fps) | 31.47 M |
+   | rtdetrv2 r50vd | RT-DETRv2-L (inferred) | 53.4 | 9.26 (108 fps) | 43.02 M |
+   | rtdetrv2 r101vd | RT-DETRv2-X | 54.3 | 13.51 (74 fps) | 76.80 M |
+
+   The card of `rtdetr_v2_r50vd` does not say which of the two upstream r50vd models it is
+   (M 51.9 AP, 36 M parameters; L 53.4 AP, 42 M). Its configuration (encoder expansion 1.0, 6
+   decoder layers) and its 43.0 M parameters fit L: inferred, not stated. The entry of
+   2026-11-22 gave RT-DETRv2 M as 6.9 ms: that is the upstream r50vd-M, which has no checkpoint
+   in transformers.
+4. **The interface, read from the source of transformers 5.23.0** (tag v5.23.0, read on
+   2026-11-23) and from the `config.json` and `preprocessor_config.json` of each of the 9
+   checkpoints at its commit:
+   - All 9 use `RTDetrImageProcessor`: resize to 640 x 640 pixels without keeping the aspect
+     ratio (`size: {height, width}`), no padding, values times 1/255, no normalisation. In 5.23.0
+     the processor runs on torchvision (`TorchvisionBackend`).
+   - `post_process_object_detection(outputs, threshold, target_sizes, use_focal_loss=True)`:
+     the corners from the centre format, times (width, height, width, height) of each target
+     size given as (height, width); the logistic function of the logits, the best `queries`
+     values over all pairs of query and class (`topk` on the flattened scores), class = index
+     modulo the classes, and the scores above the threshold (strictly).
+   - The output classes `DFineObjectDetectionOutput` and `RTDetrV2ObjectDetectionOutput` hold
+     `logits` and `pred_boxes` (normalised centre x, centre y, width, height). Their docstring
+     says `num_classes + 1` for the logits; every configuration has 80 labels and the focal
+     loss, and the post-processing takes the last dimension as the classes: the script reads the
+     shape and refuses one that does not fit `id2label`.
+   - All 9 configurations: `num_queries` 300, `use_focal_loss` true, `id2label` 0 `person`,
+     32 `sports ball`, `eval_size` and `anchor_image_size` null. With both null the models build
+     their position embeddings and anchors for the size of the input (`modeling_d_fine.py`,
+     `modeling_rt_detr_v2.py`), so another `input_size` runs; how well the weights do at
+     another size is not known.
+   - `from_pretrained(..., dtype=...)`: `torch_dtype` is deprecated in 5.23.0.
+5. **What was built** (build machine, offline, stand-ins only):
+   - Settings: the `name` of the section `detector` is the family: `rfdetr` (default, unchanged),
+     `dfine` or `rtdetrv2` (`fallbacks.runs.DETECTOR_FAMILIES`). The two new families share
+     `TransformersDetectorSettings`: `model` (a size of `TRANSFORMERS_MODELS`), `min_score`,
+     `input_size` (320 to 1280, a multiple of 32), `batch` (1 to 64), `half`. One class serves
+     RT-DETRv2 without an extra code path: the same processor, the same output, the same
+     post-processing; only the checkpoint table and the model type differ. A settings file that
+     names a family is laid over the defaults of that family (`config.DEFAULT_DETECTORS`: D-FINE
+     Medium and RT-DETRv2 r18vd, 0.5, 640, batch 1, float32), because the families have other
+     keys. The device stays an option of the script (`--device`), as for RF-DETR: in the
+     settings it would tie the clip run to one machine, and the run facts name it.
+   - Script (`tools/run_tool.py`, sub-commands `dfine` and `rtdetrv2`): lazy import of `torch` and
+     `transformers`, the version check (`TRANSFORMERS_VERSIONS`), the checkpoint and its commit
+     by size (`TRANSFORMERS_CHECKPOINTS`), safetensors only, float16 when `half` (refused on the
+     device `cpu`), the checks of the configuration (model type of the family, focal loss, the
+     classes `person` and `sports ball`). `detections_of_queries` converts the output in NumPy
+     like the post-processing of the tool, from `min_score` on (the tool: above it), and keeps
+     only `person` and `sports ball` (RF-DETR keeps every class; the package reads only these
+     two). On the warm-up call the script compares its boxes with the post-processing of the
+     installed tool and stops when they differ by more than 0.01 pixel or 1e-5 in score. The
+     detections are matched by these tolerances, not by their order (item 9).
+   - Time per frame: frames go to a tool in batches (`answer_frames(job, root, answer, batch)`;
+     RF-DETR and PnLCalib through `one_at_a_time`, batch 1, as before). `seconds` of a frame is
+     the whole call (image processor, model, conversion) divided by the frames of the batch:
+     the same meaning as the `predict` time of RF-DETR. A transformers run adds
+     `runner.stage_ms_per_frame` (median per frame of `preprocess`, `model` after a device
+     synchronisation, `postprocess`) and prints it. The per-frame loop of `answer_frames` is the
+     place for a line per frame of a live feed (session B): each entry is complete when it is
+     appended.
+   - Package: the clip run format does not change; `answers.detector_answers`, `tool-score` and
+     `clip-job` take every family (`runs.is_detector`); `clip-job --tool <family>` refuses a family
+     other than that of the settings file. The engine name is `detector:<family>:<size>`
+     (`detector:rfdetr:RFDETRMedium` as before, `detector:dfine:medium`); `pipeline._engines` is
+     the only place that writes it, and nothing parses it.
+   - Experiment files of G2 with the frames of the five RF-DETR files (group `probe`, 5 frames
+     per clip, seed 20261113), `min_score` 0.5, 640 pixels, batch 1, float32: D-FINE Small,
+     Medium, Large and RT-DETRv2 r18vd, r50vd. They bracket RF-DETR Small to Large by published
+     latency (3.5 to 6.8 ms): D-FINE 3.49, 5.62, 8.07 ms; RT-DETRv2 4.61, 9.26 ms (RT-DETRv2 has
+     no size below 4.61 ms).
+   - RUNBOOK section 11 (subsection "A second detector family"), the install proposal with
+     pinned versions, all at least 7 days old on 2026-11-23: transformers 5.23.0 (2026-11-13),
+     torch 2.15.0 (2026-10-28), torchvision 0.29.2 (2026-10-28, needs torch 2.14.0 or newer),
+     huggingface-hub 2.4.0 (2026-10-29), safetensors 0.8.0 (2026-06-09), numpy 2.5.4
+     (2026-10-10), pillow 13.0.0 (2026-10-16); dates of the PyPI pages. The requirement file of
+     `locks/` is written on the run machine. Section 12 says how the plan applies to a fine-tune
+     of these families.
+6. **Measured on the build machine** (offline, stand-ins of `torch` and `transformers`):
+   - `tests/test_detector_families.py`: 51 tests (the conversion by hand: centre format against
+     corners, parts of the input against pixels on a frame of 200 x 100 pixels; the class filter
+     and the limit; the best pairs; values that are not finite; the script with the stand-ins:
+     checkpoint, commit, dtype, safetensors, input size, synchronisation, batches, the self-check,
+     the refusals; the clip run read by the package; `tool-score` of a D-FINE run on the 5 probe
+     frames of one synthetic clip: recall 1.0, precision 1.0; the settings, the defaults, the engine
+     name, the experiment files, `clip-job`).
+   - Each fix has a test that fails without it: 15 changes of the code were made one at a time
+     and each made a test fail (width and height swapped in the scale; no limit on the pairs;
+     strict limit; boxes read as corners; no class filter; the target size as (width, height);
+     no compact rows for the new families; batch time not divided; no synchronisation; no
+     family defaults in `load_config`; no family check in `clip-job`; `tool-score` only for
+     RF-DETR; and the three fixes of the second read in item 9).
+   - Test runs: see item 9.
+7. **Assumptions that only the run machine can check** (each one is a line of RUNBOOK section 8
+   to add after the first run):
+   (a) `AutoImageProcessor.from_pretrained` and `AutoModelForObjectDetection.from_pretrained`
+   take `revision=`, and the model takes `dtype=` and `use_safetensors=True` as in the source
+   read; (b) the processor takes a list of NumPy arrays of shape (height, width, 3) in RGB and
+   the keyword `size={"height": s, "width": s}` in its call, and gives `pixel_values` of shape
+   (batch, 3, s, s); (c) the model takes `pixel_values` alone (no `pixel_mask` without padding)
+   and gives `logits` of shape (batch, 300, 80) and `pred_boxes` (batch, 300, 4); (d)
+   `post_process_object_detection` takes `target_sizes` as a list of (height, width) and a plain
+   object with `logits` and `pred_boxes`; (e) the self-check passes on the first frame; (f)
+   `torch.cuda.synchronize(device)` and `torch.mps.synchronize()` exist in torch 2.15.0; (g)
+   half precision runs on the device of the run machine (`mps` or `cuda`); (h) the pinned
+   versions install together for the Python and the platform of the run machine; (i) the hub
+   still serves the 9 commits; (j) the time per frame: nothing here says how fast either family
+   is on the run machine, and the published values are TensorRT, which the script does not use.
+8. **Not verified.** No real model, no weights, no footage, no timing. The licence pages were
+   read by one reader. The terms of Objects365, of the Flickr images of COCO and of the backbone
+   pretraining data were not read.
+9. **Second read** (a subagent of this session that was given the code, not these conclusions).
+   It confirmed the conversion against the source of `post_process_object_detection` of
+   5.23.0 (box format, the order (height, width), the best pairs, the threshold) and the batch
+   loop (RF-DETR and PnLCalib unchanged at batch 1), and read the configuration of
+   `dfine-medium-coco` and two of the 9 commits on the hub again. Its findings, each fixed with a
+   test that fails without the fix:
+   - Medium, confirmed: the self-check paired the detections by sorted order. Two scores that
+     are equal in float32 (the tool) and differ in float64 (the script) sort differently, so a
+     correct run could stop (reproduced with two logits one float32 step apart near 4.0). Fix:
+     each detection of the tool is matched to its own detection of the script by the
+     tolerances.
+   - Low, confirmed: `detector: {name: [dfine]}` raised `TypeError` in `load_config` instead of a
+     settings error. Fix: the family must be text before it names defaults.
+   - Low, confirmed: the batch test could not see a warm-up call counted in the stage times (the
+     median hid it). Fix: a test of one frame whose warm-up call is 100 times slower.
+   - Low: one assertion compared a value with itself; a branch for an empty list of times could
+     not run; an import out of order. Fixed.
+   - Not changed: the script does not check the types of `batch` and `input_size` again (the
+     package validates both, as for `min_score` of RF-DETR); a float32 score that rounds onto
+     the threshold could change the count of the self-check (chance estimated at about 1e-5 per
+     detection, not measured).
+10. **Test runs** (build machine, `tools/run_tests.py`, 14 workers, after the fixes of item 9):
+    default run 3,310 passed, 1 skipped, 9 deselected, exit 0, 111.5 s (load 28.8 at the start);
+    full run (`-m "slow or not slow"`) 3,319 passed, 1 skipped, exit 0, 102.2 s (load 61.8). An
+    earlier full run at load 50 had one failure in `tests/test_run_tests.py` (a worker
+    watchdog of 1 s killed a second, passing worker as well); that test passed alone, and the
+    file is not part of this change.
+11. **Owner decisions, proposed.**
+    - Install the transformers environment (RUNBOOK section 11) and run the five new files with
+      the five RF-DETR files, `--max-clips 2` first. Recommendation: keep RF-DETR Medium as the
+      default until G2 has numbers of both families on the same frames.
+    - Licence of the training data: the COCO images carry the Flickr Terms of Use for every
+      detector here, RF-DETR too; the backbone pretraining data is not named on any card.
+      Recommendation: decide both with the licence of the repository (last list), before a
+      demo is shown outside research.
+    - Proposed text for rule 4 of `CLAUDE.md` (not applied): "Only `tools/run_tool.py` imports an
+      external tool (RF-DETR, Hugging Face transformers for D-FINE and RT-DETRv2, PnLCalib). It
+      runs in the environment of that tool, and the package never imports it."
+
 ## 2026-11-23 — A planted-bug check of the money guards, and a second read of the test runner
 
 1. **Question.** Which small bugs in the money code (rule 6 of `CLAUDE.md`: estimate first,

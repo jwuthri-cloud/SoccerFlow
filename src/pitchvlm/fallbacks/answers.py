@@ -12,7 +12,7 @@ from __future__ import annotations
 from pitchvlm.ball import BallCandidate
 from pitchvlm.fallbacks.pnlcalib import homography_from_payload
 from pitchvlm.fallbacks.rfdetr import ball_candidates, expand_rows, people_from_detections
-from pitchvlm.fallbacks.runs import ClipRun, PnlcalibSettings, RfdetrSettings
+from pitchvlm.fallbacks.runs import ClipRun, PnlcalibSettings, is_detector
 from pitchvlm.schemas import FramePeople, HomographyRecord
 
 
@@ -23,11 +23,13 @@ class AnswerError(ValueError):
 def detector_answers(run: ClipRun) -> tuple[list[FramePeople], dict[int, tuple[BallCandidate, ...]]]:
     """Return the people of every frame and the ball candidates of the frames that have any.
 
-    The score limit is the one that the detector ran with (``min_score`` of its settings).
-    ``ValueError`` is raised for a run of another tool, and ``AnswerError`` for a payload
-    that does not follow the compact format of a clip run or the format of the adapter.
+    The detector can be of any family (``fallbacks.runs.DETECTOR_FAMILIES``): all of them give
+    the payload of ``fallbacks.rfdetr``. The score limit is the one that the detector ran with
+    (``min_score`` of its settings). ``ValueError`` is raised for a run of another tool, and
+    ``AnswerError`` for a payload that does not follow the compact format of a clip run or the
+    format of the adapter.
     """
-    if not isinstance(run.tool, RfdetrSettings):
+    if not is_detector(run.tool):
         raise ValueError(f"the clip run of clip {run.clip} is a run of {run.tool.name}, not of a detector")
     people: list[FramePeople] = []
     balls: dict[int, tuple[BallCandidate, ...]] = {}

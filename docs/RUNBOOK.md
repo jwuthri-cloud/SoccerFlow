@@ -1334,8 +1334,8 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
 - Another OpenRouter model: add its price to `configs/openrouter_prices.yaml` from its model page
   (the highest price of its providers, with the day as `valid_from`), commit, and run its doctor
   first.
-- Video input is not built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of
-  2026-11-22, item 7).
+- Video input through OpenRouter is built, but no OpenRouter model has a video rate yet, so it
+  is refused before any call (section 13).
 
 What was never tested before this machine, for OpenRouter:
 
@@ -1490,10 +1490,93 @@ Measurement, fixed before any run (rule 7):
    files of section 3, with `tool-job`, `tools/run_tool.py` and `tool-score` as in section 3. The
    detector engine adds no box: its boxes are those of the tool, kept by the same score limit,
    so G2 measures the boxes of the engine. Compare only with the people probe of the same frames.
+   The files of the second family (D-FINE, RT-DETRv2; subsection below) take the same frames,
+   the same gate and the same scorer, so the owner chooses the family by these numbers.
 2. End to end on the dev clips with the same scorer: run every clip of the group `dev` with
    the commands above, each engine with its own `--tracker` name, then `eval` for each tracker
    (section 5) on the same clips. Compare GS-HOTA, DetA and AssA clip by clip, and the role and
    team-side accuracy of gate G5b. The settings of both runs are fixed before the first clip.
+
+### A second detector family: D-FINE and RT-DETRv2 (2026-11-23)
+
+The owner chooses the detector family by measurement (`docs/DECISIONS.md`, entry "A second
+detector family: D-FINE and RT-DETRv2 through transformers" of 2026-11-23). The section
+`detector` of the settings names the family in `name`: `rfdetr` (the default), `dfine` or
+`rtdetrv2`. The two new families run through Hugging Face transformers in one environment of
+their own, with COCO-only weights under Apache-2.0. Their keys are `model` (the size),
+`min_score`, `input_size` (pixels of the square input, a multiple of 32), `batch` (frames per
+call of the model) and `half` (float16; not on the device `cpu`). A section that names only the
+family takes the defaults of that family: `detector: {name: dfine}` is D-FINE Medium, 0.5, 640
+pixels, batch 1, float32. The package does not care which family made a clip run: the clip run
+format is the same, `run` checks the tool section like that of RF-DETR, and the engine table of
+`result.json` names the family (`detector:dfine:medium`).
+
+Install, a proposal for the owner (nothing of it ran; every version was at least 7 days old on
+2026-11-23; `uv` takes no package newer than the date):
+
+```bash
+uv venv --python 3.12 ~/pitchvlm-data/envs/transformers
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv pip install --python ~/pitchvlm-data/envs/transformers/bin/python \
+    --exclude-newer 2026-11-16 \
+    "transformers==5.23.0" "torch==2.15.0" "torchvision==0.29.2" "huggingface-hub==2.4.0" \
+    "safetensors==0.8.0" "numpy==2.5.4" "pillow==13.0.0"
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv pip freeze --python ~/pitchvlm-data/envs/transformers/bin/python
+```
+
+- Write the requirements file of this environment on the run machine from that freeze
+  (`locks/`), as for the other tool environments; it is not written on the build machine.
+- The first run of a size downloads its checkpoint, at the commit that the script names
+  (`TRANSFORMERS_CHECKPOINTS`), into the cache folder `HF_HOME`. The commands below set it to
+  `~/pitchvlm-data/hf`, outside the repository. Sizes, estimated from the parameter counts of
+  the model pages (float32, 4 bytes each): D-FINE Small 41 MB, Medium 79 MB, Large 125 MB;
+  RT-DETRv2 r18vd 81 MB, r50vd 172 MB.
+- `HF_HUB_DISABLE_TELEMETRY=1` stops the usage reports of the hub library.
+
+Gate G2 on the frames of the people probe, the same frames and the same scorer as the five
+RF-DETR files of section 3 (rule 8): the same group, frames per clip and seed, the score limit
+0.5, float32 and batch 1, so that the time per frame compares with that of RF-DETR. The sizes
+bracket the RF-DETR sizes Small to Large by their published latency (T4, TensorRT, FP16: RF-DETR
+S 3.5 ms, M 4.4 ms, L 6.8 ms; published, not measured):
+
+| Detector | Experiment file | Published latency, ms | Published COCO AP |
+|---|---|---|---|
+| D-FINE Small | `configs/experiments/people_probe_dfine_small.yaml` | 3.49 | 48.5 |
+| D-FINE Medium | `configs/experiments/people_probe_dfine_medium.yaml` | 5.62 | 52.3 |
+| D-FINE Large | `configs/experiments/people_probe_dfine_large.yaml` | 8.07 | 54.0 |
+| RT-DETRv2 r18vd | `configs/experiments/people_probe_rtdetrv2_r18vd.yaml` | 4.61 (217 fps) | 48.1 |
+| RT-DETRv2 r50vd | `configs/experiments/people_probe_rtdetrv2_r50vd.yaml` | 9.26 (108 fps) | 53.4 |
+
+```bash
+python -m pitchvlm.cli tool-job --experiment configs/experiments/people_probe_dfine_medium.yaml \
+    --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/people_probe_dfine_medium.json
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY HF_HOME=~/pitchvlm-data/hf HF_HUB_DISABLE_TELEMETRY=1 \
+    ~/pitchvlm-data/envs/transformers/bin/python tools/run_tool.py dfine --device mps \
+    --job ~/pitchvlm-data/jobs/people_probe_dfine_medium.json --root ~/pitchvlm-data \
+    --out ../pitchvlm-results/results/tools/people_probe_dfine_medium.json
+python -m pitchvlm.cli tool-score --experiment configs/experiments/people_probe_dfine_medium.yaml \
+    --root ~/pitchvlm-data --run ../pitchvlm-results/results/tools/people_probe_dfine_medium.json \
+    --out ../pitchvlm-results/results/metrics/people_probe_dfine_medium.json
+```
+
+- The same three commands for each file of the table; the sub-command of the script is the
+  family (`dfine` or `rtdetrv2`). First run: `--max-clips 2` on `tool-job` and `tool-score`.
+- On its first call (not measured) the script compares its boxes with
+  `post_process_object_detection` of the installed transformers and stops with a line when they
+  differ. A stop there means that the output of the model is not the one that the script was
+  written for: tell the owner, do not loosen the check.
+- `seconds_per_frame` is the whole call (image processor, model, conversion), like the plain
+  `predict` of RF-DETR. The script also prints and stores the median of each part
+  (`runner.stage_ms_per_frame`: `preprocess`, `model`, `postprocess`); the model time is read
+  after a synchronisation of the device. Measure each family back to back in both orders (A B,
+  then B A) on the same machine, with the load average noted, before a timing claim.
+- `half: true` and `batch` above 1 are settings for later measurements of speed: they change
+  what is measured, so they get their own experiment file, fixed before the run.
+
+End to end on a clip with another family: a settings file with the `engines` section of
+`configs/engines/detector_calibration.yaml` and the section `detector: {name: dfine}` (commit
+it before the run, rule 7), then the three commands of this section with `clip-job --tool dfine`
+and `tools/run_tool.py dfine` in the transformers environment. `clip-job` refuses a family other
+than the one of the settings file.
 
 ## 12 Plan: a detector trained on soccer (not done; no download, no training yet)
 
@@ -1541,7 +1624,111 @@ and refuses `train`, the converter does not exist, and the training has no job i
   `tools/run_tool.py` (the source of rfdetr 1.12.1 says how a model class takes its own
   weights; to confirm), and the class names of the trained weights in `fallbacks/rfdetr.py`
   (`player`, `goalkeeper`, `referee` give a role; `ball` is a ball candidate).
+- The same plan holds for D-FINE or RT-DETRv2 if one of them passes G2 better than RF-DETR: the
+  fine-tune then runs through transformers (its object-detection training interface; not read
+  for this plan), the trained weights get a size of their own in `TRANSFORMERS_CHECKPOINTS`
+  with the SHA-256 of the file, and the class names go to `KEPT_LABELS` and `fallbacks/rfdetr.py`.
+  The licence rule stays: start only from COCO-only weights (the Objects365 weights of both
+  families are "not usable until read", `docs/DECISIONS.md`, entry of 2026-11-23).
 - Measure the trained detector like the others: gate G2 on the probe frames, then end to end on
   the dev clips (section 11). Ultralytics weights are not an option for this repository: their
   code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time
   detector engine next to the model engine" of 2026-11-22).
+
+## 13 Video input (built 2026-11-23, not run yet)
+
+A model step can send a video file in the place of a list of images (`docs/DECISIONS.md`, entry
+"Video input for the model steps" of 2026-11-23). Nothing here ran against a real model or a real
+video of the dataset before this machine. The pipeline (`run`) still sends images: video input is
+measured by the people probe first, against gate G2, on the frames of the image probe. No default
+changed.
+
+How it works, in short:
+
+- The probe writes a short MP4 file for each request with OpenCV: the target frame and
+  `context_frames` frames before and after it, 12 frames of the clip apart, written at `fps`
+  frames per second. So frame `k` of the file is at `k / fps` seconds, the model samples every
+  written frame, and its answer names each target frame by that time. An entry with another time
+  counts as no people (`n_entries_wrong_time` in the metrics file).
+- The files go to `~/pitchvlm-data/video-input` (option `--video-dir`), never to the cache
+  folder: the results branch is text only. A file that is there already is used as it is, because
+  its SHA-256 is in the cache key: a file written again with other bytes would be paid again.
+  Do not delete this folder between a paid run and its replay.
+- Gemini: the bytes go inline with the media resolution of the step and `fps`. There is no upload
+  (the Files API keeps a file for 48 hours, against the intent of `store=False`): a request whose
+  inline data is above 20,000,000 bytes is refused before any call. A 2.5 s file of 1080p frames
+  is far below it; the error says to send a shorter range.
+- OpenRouter: a `video_url` part with a base64 data URL, no range and no rate. A model takes video
+  only with a `video` entry in `configs/openrouter_prices.yaml`; no model has one yet (owner
+  decision), so every OpenRouter video request is refused before any call.
+- Money: the estimate adds the video tokens of each file (published rates of Gemini 4: 70 tokens
+  per frame at `low` and `medium`, 280 at `high`, and 32 sound tokens per second), at the input
+  price of the model. The cost after the call comes from the measured tokens, as for images, and
+  the 1.3 times stop and the hard stop hold.
+
+First check, gate G0, inside its 2 USD. Ask the owner first: it is paid.
+
+```bash
+# Contract checks of Gemini with the video check: 7 image calls and 1 video call. The video check
+# alone is estimated at 0.048 USD for gemini-4-argon until 2026-11-30, 0.095 USD from 2026-12-01
+# (the price change of the table), 0.018 USD for gemini-3.8-flash: estimated, not measured.
+python -m pitchvlm.cli doctor --video \
+    --out ../pitchvlm-results/results/metrics/doctor_video.json
+```
+
+- New lines: `video boxes` (the contract verdict of the boxes of the 3 target frames of a 7 s
+  video of the synthetic scene, with the limits of `boxes`), `video box accuracy` (a fact),
+  `video times` (every answer entry names the time of its target frame) and `video tokens` (the
+  measured input tokens next to the estimate: 600 text tokens, 7 x 280 frame tokens, 7 x 32
+  sound tokens, together 2,784).
+- `video tokens` far above 2,784 means that the published rate is too low (the tokens page of
+  Gemini also gives "263 tokens per second"): tell the owner, and write the measured count into
+  `docs/DECISIONS.md` before any video probe; the rate is `vlm.cost.GEMINI_VIDEO_RATES`.
+- A status 400 on the video call can mean that the Interactions API takes no `resolution` on a
+  video part, or no `processing` object (the pages are not clear about both). Tell the owner; do
+  not change the request by hand.
+- An OpenRouter model in `--models` gets a failed `video boxes` line without a call: it has no
+  video rate.
+
+People probe with video input, on the frames of `people_probe.yaml` (same group, seed and frames
+per clip), against gate G2. Ask the owner first: it is paid. Run the image probe of the same
+model first, so that both metrics files exist.
+
+| Experiment file | What | Estimate, 24 clips (to 2026-11-30 / from 2026-12-01) | Per keyframe |
+|---|---|---|---|
+| `people_probe.yaml` | images, the baseline | 2.357 / 4.714 USD, 144 calls | 0.0196 / 0.0393 USD |
+| `people_probe_video.yaml` | one 2.5 s video per frame, `high` (280 tokens per frame) | 2.390 / 4.780 USD, 144 calls | 0.0199 / 0.0398 USD |
+| `people_probe_video_low.yaml` | the same at `low` (70 tokens per frame) | 2.108 / 4.215 USD, 144 calls | 0.0176 / 0.0351 USD |
+| `people_probe_video_batch.yaml` | the 5 frames of a clip in one 12.5 s video, `high` | 2.275 / 4.549 USD, 48 calls | 0.0190 / 0.0379 USD |
+
+These are estimates, not measurements: the output of a video frame is taken to be the 1,400 tokens
+of an image frame, and the output tokens are most of the cost. The printed estimate of a run is
+the number that counts.
+
+```bash
+# Cost pilot first: 2 clips. The videos are written before the estimate is printed.
+python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe_video_low.yaml \
+    --root ~/pitchvlm-data --max-clips 2 --out ../pitchvlm-results/results/metrics/pilot_people_video_low.json
+# Then the whole probe group. The answers of the pilot are used again.
+python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe_video_low.yaml \
+    --root ~/pitchvlm-data --out ../pitchvlm-results/results/metrics/people_probe_video_low.json
+```
+
+- Compare each metrics file with the one of `people_probe.yaml`: the same frames, the same
+  labels, the same scorer. The values of gate G2 decide; `n_entries_wrong_time` above 0 means that
+  the model did not answer the listed times (0 does not prove that it saw the right pictures). The measured cost per keyframe is the measured cost
+  of the run divided by its `n_frames`.
+- Run one paid command at a time (rule of `CLAUDE.md`). The three video files share their kit
+  legend video and their answers only when their settings are the same.
+- Which input a step uses is the owner's decision, written into `docs/DECISIONS.md` with the
+  numbers of both metrics files. The pipeline sends video only after that decision and new code.
+
+What was never tested before this machine, for video input:
+
+| Part | First check | When it fails |
+|---|---|---|
+| Video part of the Interactions API (`type: video`, inline `data`, `resolution`, `processing` with `start_offset`, `end_offset`, `fps`) | `doctor --video`: the video call answers and `video boxes` passes | A status 400: the shape of the part differs from the pages. Tell the owner. |
+| Token rate of video | `video tokens` of the doctor | Far above the estimate: the rate of `GEMINI_VIDEO_RATES` is too low; the 1.3 times stop can end a probe early. |
+| Codec of the written files | the first doctor: the video call answers | OpenCV of this machine may not write H.264 (`avc1`) and fall back to MPEG-4 Part 2 (`mp4v`); a provider may refuse that. Tell the owner. |
+| Time of the sampled frames | `video boxes` passes on the moving camera of the synthetic scene (`video times` only shows that the model copies the listed times) | The provider samples at other times than `k / fps`: the boxes land on other frames and `video boxes` fails although `video times` passes. Stop the video probes and tell the owner. |
+| The same bytes for the same frames | a second probe run of the pilot pays nothing | The cache misses although the files were kept: something rewrote them. |

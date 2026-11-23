@@ -13,6 +13,8 @@ Its subclasses name the cases that need their own handling:
   whole time that the backend waits for it.
 - ``CacheMiss``: replay mode found no stored answer.
 - ``OtherImagesError``: a stored answer was recorded with other image bytes.
+- ``VideoInputError``: a video part cannot be sent: its file changed, it is too
+  large to go inline, or the model or its provider does not take video.
 
 All types are records (see ``schemas.Record``): frozen, unknown fields are an
 error, and ``model_copy(update=...)`` validates the copy.
@@ -22,9 +24,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from pitchvlm.schemas import Record
 
@@ -69,6 +73,99 @@ class ImagePart(Record):
         return hashlib.sha256(self.data).hexdigest()
 
 
+#: The resolutions of a video part. The media-resolution page of Gemini lists tokens per video
+#: frame for these levels only (``vlm.cost.GEMINI_VIDEO_RATES``); it lists none for ``ultra_high``.
+VIDEO_RESOLUTIONS: tuple[Resolution, ...] = ("low", "medium", "high")
+#: Largest sampling rate of a video part, frames per second: the range ``(0, 24]`` of the video
+#: page of Gemini (published, not measured).
+MAX_VIDEO_FPS = 24.0
+#: The video file types that a video part can name: the types that both video pages list.
+VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/mpeg", "video/mov", "video/webm"})
+
+
+class VideoPart(Record):
+    """A reference to a video file, or to a time range of it, that a request sends to a model.
+
+    The part holds no bytes: the backend reads the file when it sends the
+    request, and it refuses the call when the bytes do not have the hash
+    ``sha256`` (``vlm.client``). ``path`` is the place of the file on the run
+    machine, outside the repository. It is never written to a cassette, a
+    ledger line or a result file: ``identity`` is what a stored answer keeps.
+
+    ``duration_s`` is the length of the whole file in seconds. ``start_s`` and
+    ``end_s`` cut a range of it, ``fps`` is the sampling rate that the model is
+    asked for (None: the default of the provider), and ``resolution`` is the
+    media resolution of each sampled frame. The time 0 is the first frame of the
+    file. The cost estimate counts the sampled frames of the range (``vlm.cost``).
+    """
+
+    kind: Literal["video"] = "video"
+    path: Path = Field(repr=False)
+    #: SHA-256 of the bytes of the file, as 64 small hexadecimal digits.
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime_type: str = "video/mp4"
+    duration_s: float = Field(gt=0, allow_inf_nan=False)
+    start_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    end_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    fps: float | None = Field(default=None, gt=0, le=MAX_VIDEO_FPS, allow_inf_nan=False)
+    resolution: Resolution = "high"
+
+    @model_validator(mode="after")
+    def _check_part(self) -> VideoPart:
+        """Refuse an unknown file type, a resolution without a video rate, and a range that is empty or too long."""
+        if self.mime_type not in VIDEO_MIME_TYPES:
+            raise ValueError(f"a video part has no file type {self.mime_type!r}: use one of {sorted(VIDEO_MIME_TYPES)}")
+        if self.resolution not in VIDEO_RESOLUTIONS:
+            raise ValueError(f"a video part has no resolution {self.resolution!r}: use {', '.join(VIDEO_RESOLUTIONS)}")
+        start, end = self.range_s
+        if end > self.duration_s:
+            raise ValueError(f"the range of a video part ends at {end:g} s, after the end of its file at {self.duration_s:g} s")
+        if not start < end:
+            raise ValueError(f"the range of a video part is empty: {start:g} s to {end:g} s")
+        return self
+
+    @property
+    def range_s(self) -> tuple[float, float]:
+        """Return the start and the end of the range that the model sees, in seconds of the file."""
+        start = 0.0 if self.start_s is None else self.start_s
+        end = self.duration_s if self.end_s is None else self.end_s
+        return start, end
+
+    @property
+    def clipped(self) -> bool:
+        """Say whether the part asks the provider for a range or a sampling rate of its own."""
+        return self.start_s is not None or self.end_s is not None or self.fps is not None
+
+    def sampled_frames(self, default_fps: float) -> int:
+        """Return how many frames the model samples from the range: one at its start, then one every ``1 / fps`` s.
+
+        ``default_fps`` is the rate of the provider, used when the part names
+        none. The count is rounded up, so the estimate never counts too few.
+        """
+        rate = self.fps if self.fps is not None else default_fps
+        if not 0 < rate < math.inf:
+            raise ValueError(f"a sampling rate must be a number above 0, got {rate!r}")
+        start, end = self.range_s
+        return max(1, math.ceil((end - start) * rate - 1e-9))
+
+    def identity(self) -> dict[str, Any]:
+        """Return what tells this video part apart, as plain JSON data: no path and no bytes.
+
+        It is part of the cache key and of a cassette. The hash stands for the
+        bytes of the file, so another file, range, rate or resolution gives
+        another key.
+        """
+        return {
+            "sha256": self.sha256,
+            "mime_type": self.mime_type,
+            "duration_s": self.duration_s,
+            "start_s": self.start_s,
+            "end_s": self.end_s,
+            "fps": self.fps,
+            "resolution": self.resolution,
+        }
+
+
 class RequestMeta(Record):
     """Where a request belongs. Part of the cache key."""
 
@@ -88,7 +185,7 @@ class VLMRequest(Record):
     #: The name of the model at that service: a Gemini model name, or an OpenRouter model slug.
     model: str
     thinking_level: ThinkingLevel
-    parts: tuple[TextPart | ImagePart, ...]
+    parts: tuple[TextPart | ImagePart | VideoPart, ...]
     #: JSON schema that the answer must follow.
     response_schema: dict[str, Any]
     #: Human-readable prompt name, e.g. "people/v1".
@@ -142,6 +239,11 @@ class VLMRequest(Record):
     def resolutions(self) -> tuple[Resolution, ...]:
         return tuple(part.resolution for part in self.parts if isinstance(part, ImagePart))
 
+    @property
+    def videos(self) -> tuple[VideoPart, ...]:
+        """Return the video parts of the request, in their order."""
+        return tuple(part for part in self.parts if isinstance(part, VideoPart))
+
     def cache_key(self) -> str:
         """Key of the stored answer.
 
@@ -164,6 +266,13 @@ class VLMRequest(Record):
         before providers were added, and its stored answers stay valid. The
         coordinate convention of a step is not in the key: it changes the
         prompt text and the answer schema, and both are in the key.
+
+        A request with video parts has their identities in the key: the hash of
+        each file, its range, its sampling rate and its resolution
+        (``VideoPart.identity``). Unlike an image, a video file is sent as it is,
+        so its hash does not change with a library version. A request without
+        video parts has no such entry, so its key is the one of before video
+        parts were added.
         """
         identity = {
             "clip_id": self.meta.clip_id,
@@ -182,6 +291,8 @@ class VLMRequest(Record):
         }
         if self.provider != DEFAULT_PROVIDER:
             identity["provider"] = self.provider
+        if self.videos:
+            identity["videos"] = [video.identity() for video in self.videos]
         return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:32]
 
 
@@ -285,4 +396,14 @@ class OtherImagesError(BackendError):
     pixels: for example the clip was replaced under the same name. The answer
     is not used, and the model is not asked. The message names the two ways
     out.
+    """
+
+
+class VideoInputError(BackendError):
+    """A video part cannot be sent, so no call was made and nothing is billed.
+
+    The cases: the model or its provider does not take video (no video rate in
+    its price table), the file is missing or has other bytes than its hash, the
+    request is too large to go inline, or the provider cannot take the range or
+    the sampling rate of the part.
     """

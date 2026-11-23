@@ -1,10 +1,14 @@
-"""Adapter for the people boxes of the RF-DETR detector.
+"""Adapter for the people boxes of a detector: RF-DETR, D-FINE or RT-DETRv2.
 
-RF-DETR is an object detector. It is the fallback of the people step. The detector is not
-imported here. It runs as its own process on the run machine, and the script
-``tools/run_tool.py`` writes its result as one JSON payload per frame (``fallbacks.runs``
-describes the file that holds them). This module turns such a payload into the ``FramePeople``
-record of the people step.
+A detector is the fallback of the people step, and the people engine ``detector`` of the
+pipeline. Three families have a place in the settings (``fallbacks.runs.DETECTOR_FAMILIES``):
+RF-DETR through its own package, D-FINE and RT-DETRv2 through the object-detection interface of
+Hugging Face transformers. No detector is imported here. Each one runs as its own process on the
+run machine, and the script ``tools/run_tool.py`` writes its result as one JSON payload per
+frame (``fallbacks.runs`` describes the file that holds them). Every family gives the payload
+below, so this module and the pipeline do not care which family made a run: the settings of
+the run name it, and the engine table names it as ``detector:<family>:<size>``. This module
+turns such a payload into the ``FramePeople`` record of the people step.
 
 Payload format (one frame)::
 
@@ -22,7 +26,10 @@ Payload format (one frame)::
 - Other keys are ignored.
 
 The payload holds class names, not class numbers, and boxes in pixels of the full frame, also
-when the detector worked on a smaller image. The detector gives both in this form.
+when the detector worked on a smaller image. RF-DETR gives both in this form. D-FINE and
+RT-DETRv2 give a class score per query and a box as its centre, width and height in parts of
+the model input; the script turns them into this form (``detections_of_queries`` of the script)
+and keeps only the classes ``person`` and ``sports ball``.
 
 A detector with weights for the everyday classes does not know roles, teams or shirt
 numbers. So every person gets the role ``player``, the team key ``none`` and no number. The

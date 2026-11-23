@@ -1,0 +1,11 @@
+The video shows {n_video_frames} frames of the same soccer broadcast clip, so all frames show the same match.
+
+Task: describe the kits (the clothes) of this match by colour. Later requests use your answer to tell the teams apart.
+
+Rules:
+- Use colours and patterns only, for example "white", "dark blue" or "red and black stripes". Do not describe faces or bodies. Do not give names of people, clubs or sponsors.
+- "team_a" and "team_b": the kits of the outfield players of the two teams. Give the colour of the shirt, the shorts and the socks. Team A is the team with the lighter shirt.
+- "goalkeepers": one entry for each goalkeeper kit that you see. A goalkeeper kit is different from both team kits. "kit" is its colour. "team" is "A" or "B" when you can see which team the goalkeeper plays for. If you cannot, use "none".
+- "referee_kit": the colour of the kit of the referees. Use an empty text when you see no referee.
+- "uncertain": short notes about what you cannot see well, for example "socks of team B not visible". Use an empty list when everything is clear.
+- When you cannot see a part of a kit, write "unknown" for this part and add a note to "uncertain".

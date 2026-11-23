@@ -1,0 +1,15 @@
+The video is a short part of a soccer broadcast. It has {n_video_frames} frames, at {fps_text} frames per second.
+
+Kit legend of this match:
+{legend}
+
+Task: find every person on the pitch and next to the pitch in each of these frames of the video, given by their time from the start of the video: {target_times}.
+
+Rules:
+- Give one entry in "frames" for each of these times, in the same order. "time_s" is the time of the frame, in seconds, as listed above. "people" lists the people of that frame only: use the other frames of the video only to see a person better, never to add a person who is not in that frame.
+- Give one entry in "people" for each person: players, goalkeepers, referees, and other people next to the pitch, for example coaches, substitutes and staff. Include people who are small, far away or partly hidden. Do not include the spectators.
+- "box_2d": a tight box around the whole visible person in that frame, from the head to the feet. The feet must be inside the box. {box_format}
+- "role": "player" for an outfield player, "goalkeeper", "referee" for the referee and the assistant referees, or "other" for any other person.
+- "team": "A" or "B" from the kit legend, for players and goalkeepers. Use "none" for referees, for other people, and when the kit does not match a team.
+- "number": the shirt number, but only when you can read it clearly in that frame. If you cannot, use null. Do not guess.
+- Decide by the colours of the kit only. Do not use faces and do not give names.

@@ -17,6 +17,7 @@ brew.sh
 
 # Models, datasets and papers
 huggingface.co
+cocodataset.org
 arxiv.org
 doi.org
 zenodo.org

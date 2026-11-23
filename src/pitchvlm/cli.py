@@ -146,17 +146,18 @@ from pitchvlm.fallbacks.pnlcalib import homography_from_payload
 from pitchvlm.fallbacks.rfdetr import people_from_detections
 from pitchvlm.fallbacks.runs import (
     CLIP_JOB_FORMAT,
+    DETECTOR_FAMILIES,
     JOB_FORMAT,
     ClipJob,
     ClipRun,
     JobFrame,
     PnlcalibSettings,
-    RfdetrSettings,
     RunFrame,
     ToolJob,
     ToolRun,
     ToolSettings,
     clip_run_part_path,
+    is_detector,
     load_clip_run,
     load_tool_run,
 )
@@ -202,9 +203,11 @@ from pitchvlm.vlm.cost import (
     billed_usd,
     estimate_usd,
     Price,
+    VideoRate,
     has_flex_tier,
     ledger_file_number,
     load_price_table,
+    load_video_rates,
 )
 from pitchvlm.vlm.fake import FakeBackend
 from pitchvlm.vlm.prompts import PROMPT_NAMES
@@ -238,6 +241,8 @@ PRICE_TABLE_FILE = Path("configs") / "openrouter_prices.yaml"
 DATA_DIR = Path("~/pitchvlm-data")
 #: Default folders below the data folder: the frame images of videos, and the check images of pitch mappings.
 VIDEO_FRAMES_DIR = DATA_DIR / "videos"
+#: Default folder of the videos that a model step with video input sends (``vlm.video``).
+VIDEO_INPUT_DIR = DATA_DIR / "video-input"
 OVERLAYS_DIR = DATA_DIR / "overlays"
 #: Read size of a check sum of a file, bytes.
 HASH_CHUNK_BYTES = 1 << 20
@@ -322,8 +327,8 @@ ProbeKind = Literal["people", "pitch", "number"]
 PROBE_KINDS: tuple[ProbeKind, ...] = ("people", "pitch", "number")
 #: Model calls of one kind in a plan: (step, settings, number of requests).
 PlannedCalls = tuple[str, StepSettings, int]
-#: The probe whose frames and values measure each external tool.
-TOOL_PROBES: dict[str, ProbeKind] = {"rfdetr": "people", "pnlcalib": "pitch"}
+#: The probe whose frames and values measure each external tool: every detector family, and the calibration.
+TOOL_PROBES: dict[str, ProbeKind] = {**dict.fromkeys(DETECTOR_FAMILIES, "people"), "pnlcalib": "pitch"}
 #: The record that the adapter of an external tool makes from the payload of one frame.
 _Adapted = TypeVar("_Adapted")
 
@@ -552,6 +557,36 @@ def openrouter_prices() -> tuple[Price, ...]:
         raise CliError(f"the price table {PRICE_TABLE_FILE.as_posix()} cannot be read: {error}") from error
 
 
+def openrouter_video_rates() -> tuple[VideoRate, ...]:
+    """Read the video rates of the OpenRouter models (``PRICE_TABLE_FILE``). Wrong content raises ``CliError``."""
+    path = repository_root() / PRICE_TABLE_FILE
+    try:
+        return load_video_rates(path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        raise CliError(f"the price table {PRICE_TABLE_FILE.as_posix()} cannot be read: {error}") from error
+
+
+def estimated_requests_usd(requests: Sequence[VLMRequest]) -> float:
+    """Return the expected cost of built requests in USD, with the tokens of their video parts (``vlm.cost``).
+
+    ``CliError`` is raised for a model without a price, and for a request with a video
+    part for a model without a video rate: such a model takes no video.
+    """
+    if not requests:
+        return 0.0
+    openrouter = any(request.provider != "gemini" for request in requests)
+    try:
+        return estimate_usd(
+            requests,
+            DEFAULT_TOKEN_ESTIMATES,
+            datetime.now(UTC).date(),
+            openrouter_prices=openrouter_prices() if openrouter else (),
+            openrouter_video_rates=openrouter_video_rates() if openrouter else (),
+        )
+    except (KeyError, ValueError) as error:
+        raise CliError(f"the cost cannot be estimated: {error.args[0]}") from error
+
+
 def estimated_usd(clip_id: str, plan: Sequence[PlannedCalls]) -> float:
     """Return the expected cost of planned model calls in USD, at the prices of today (UTC).
 
@@ -596,11 +631,13 @@ def estimated_usd(clip_id: str, plan: Sequence[PlannedCalls]) -> float:
         raise CliError(f"the cost cannot be estimated: {error.args[0]}") from error
 
 
-def print_estimate(estimate: float, plan: Sequence[PlannedCalls]) -> None:
-    """Print the cost estimate of planned model calls."""
+def print_estimate(estimate: float, plan: Sequence[PlannedCalls], requests: Sequence[VLMRequest] = ()) -> None:
+    """Print the cost estimate of planned model calls and of built requests (``estimated_requests_usd``)."""
     counts: Counter[str] = Counter()
     for step, _, count in plan:
         counts[step] += count
+    for request in requests:
+        counts[request.meta.step] += 1
     listed = ", ".join(f"{step} {count}" for step, count in counts.items())
     print(
         f"cost estimate: {usd(estimate)} for {sum(counts.values())} planned model calls ({listed}), "
@@ -942,6 +979,7 @@ def model_backend(max_usd_per_10_min: float) -> Backend:
     gemini = GeminiBackend(api_key_env=KEY_VARIABLE, max_usd_per_10_min=max_usd_per_10_min, stop=STOP_REQUESTED)
     openrouter = OpenRouterBackend(
         prices=openrouter_prices(),
+        video_rates=openrouter_video_rates(),
         api_key_env=OPENROUTER_KEY_VARIABLE,
         max_usd_per_10_min=max_usd_per_10_min,
         stop=STOP_REQUESTED,
@@ -964,6 +1002,7 @@ def recording_backend(max_usd_per_10_min: float) -> tuple[Backend, doctor.CallRe
     )
     openrouter = OpenRouterBackend(
         prices=openrouter_prices(),
+        video_rates=openrouter_video_rates(),
         api_key_env=OPENROUTER_KEY_VARIABLE,
         max_usd_per_10_min=max_usd_per_10_min,
         stop=STOP_REQUESTED,
@@ -993,6 +1032,7 @@ def open_session(
     repeat: int,
     over_budget: bool = False,
     allow_other_images: bool = False,
+    planned_requests: Sequence[VLMRequest] = (),
 ) -> ModelSession:
     """Build the cached backend of a command and print the cost estimate, before the first model call.
 
@@ -1006,12 +1046,16 @@ def open_session(
     what an index above 0 means for the cost. ``allow_other_images`` lets the store give
     a stored answer that was recorded with other image bytes than the clip shows now
     (``CassetteStore``). Without it such an answer stops the command.
+
+    ``planned_requests`` are built requests that the estimate counts next to ``plan``:
+    the requests with video parts, whose tokens depend on the videos
+    (``estimated_requests_usd``).
     """
     run_id = new_run_id(command, label)
-    estimate = estimated_usd(label, plan)
+    estimate = estimated_usd(label, plan) + estimated_requests_usd(planned_requests)
     store = CassetteStore(cache_dir, allow_other_images=allow_other_images)
     print(f"cache folder: {cache_dir}")
-    print_estimate(estimate, plan)
+    print_estimate(estimate, plan, planned_requests)
     if repeat > 0:
         print(
             f"repeat index {repeat}: the stored answers of other repeat indexes are not used, "
@@ -1815,6 +1859,7 @@ def contract_stage(
     *,
     spend_limit_usd: float,
     over_budget: bool = False,
+    video: bool = False,
 ) -> tuple[dict[str, doctor.ContractResult], dict[str, Any], BudgetExceeded | None]:
     """Run the contract checks of gate G0 for every model with the real backend.
 
@@ -1833,13 +1878,48 @@ def contract_stage(
     1.3 times their estimate like every other paid run. Their estimate is the least
     certain one: the first real answers of a model come from these checks. The checks do
     not start when their estimate is above the spend limit (``start_meter``).
+
+    With ``video``, each model also gets the video check (``doctor.check_video``). Its
+    video is written to a temporary folder that is removed at the end, and its request
+    is part of the estimate. A model without a video rate gets no video request.
     """
+    with tempfile.TemporaryDirectory(prefix="pitchvlm-video-check-") as folder:
+        return _contract_stage(
+            models,
+            gates,
+            cache_dir,
+            spend_limit_usd=spend_limit_usd,
+            over_budget=over_budget,
+            video_folder=Path(folder) if video else None,
+        )
+
+
+def _contract_stage(
+    models: Sequence[StepSettings],
+    gates: Mapping[str, Any],
+    cache_dir: Path,
+    *,
+    spend_limit_usd: float,
+    over_budget: bool,
+    video_folder: Path | None,
+) -> tuple[dict[str, doctor.ContractResult], dict[str, Any], BudgetExceeded | None]:
+    """Run the contract checks of ``contract_stage``; with ``video_folder``, the video check too."""
     budget = budget_limits(gates)
     limits = contract_limits(gates)
     scene = doctor.contract_scene()
     plan = [calls for settings in models for calls in doctor.contract_plan(settings)]
-    estimate = estimated_usd(scene.info.clip_id, plan)
-    print_estimate(estimate, plan)
+    openrouter = any(settings.provider != "gemini" for settings in models)
+    video_rates = openrouter_video_rates() if video_folder is not None and openrouter else ()
+    video_requests: dict[str, VLMRequest | None] = {}
+    if video_folder is not None:
+        for settings in models:
+            label = model_label(settings.provider, settings.model)
+            video_requests[label] = doctor.video_contract_request(settings, scene, video_folder, video_rates)
+            if video_requests[label] is None:
+                print(f"video check of {label}: the model has no video rate, so no video request is planned")
+    planned = [request for request in video_requests.values() if request is not None]
+    estimate = estimated_usd(scene.info.clip_id, plan) + estimated_requests_usd(planned)
+    print_estimate(estimate, plan, planned)
     meter = start_meter(
         cache_dir,
         budget,
@@ -1857,7 +1937,15 @@ def contract_stage(
         for settings in models:
             label = model_label(settings.provider, settings.model)
             results[label] = doctor.contract_checks(
-                metered, scene, settings, limits, recorder=recorder, openrouter_prices=prices
+                metered,
+                scene,
+                settings,
+                limits,
+                recorder=recorder,
+                openrouter_prices=prices,
+                video_request=video_requests.get(label),
+                check_video_input=video_folder is not None,
+                openrouter_video_rates=video_rates,
             )
             print_checks(
                 f"contract checks of gate G0, model {label} (coordinates {settings.coords})", results[label].checks
@@ -1896,6 +1984,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     call_api = not args.no_api
     if args.out is not None and not call_api:
         raise CliError("--out holds the report of the contract checks, so it cannot be used with --no-api")
+    if args.video and not call_api:
+        raise CliError("--video sends a video request, so it cannot be used with --no-api")
     models = doctor_models(args)
     providers = [settings.provider for settings in models] if call_api else list(PROVIDER_KEY_VARIABLES)
     environment = doctor.environment_checks(
@@ -1920,7 +2010,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"{GATES_FILE.as_posix()}: {G0_SECTION}.spend_usd_max must be a number above 0, found {spend_limit!r}"
         )
     contract, cost, stopped = contract_stage(
-        models, gates, _cache_dir(args), spend_limit_usd=spend_limit, over_budget=args.start_over_budget
+        models,
+        gates,
+        _cache_dir(args),
+        spend_limit_usd=spend_limit,
+        over_budget=args.start_over_budget,
+        video=args.video,
     )
     spend = doctor.check_spend(cost["measured_usd"], spend_limit)
     print_checks("cost", [spend])
@@ -1943,7 +2038,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "commit": state.commit,
             "dirty": state.dirty,
             "sdk_version": installed_sdk_version(),
-            "prompts": {step: PROMPT_NAMES[step] for step in ("people", "landmarks")},
+            "prompts": {
+                step: PROMPT_NAMES[step] for step in ("people", "landmarks", *(("people_video",) if args.video else ()))
+            },
+            "video": args.video,
             "models": list(args.models),
             "coords": args.coords,
             "thinking_level": args.thinking_level,
@@ -2255,6 +2353,8 @@ class Experiment(Record):
     #: How the model step is called. A section that leaves a key out keeps the default
     #: of the step that the probe measures (``default_step_settings``).
     step: StepSettings
+    #: With this section a people probe sends video in place of images (``probes.VideoProbe``).
+    video: probes.VideoProbe | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -2284,6 +2384,16 @@ class Experiment(Record):
             wanted, other = "frames_per_clip", "tracks_per_clip"
         if getattr(self, wanted) is None or getattr(self, other) is not None:
             raise ValueError(f"a {self.probe} probe needs '{wanted}' and must not have '{other}'")
+        return self
+
+    @model_validator(mode="after")
+    def _check_video(self) -> Experiment:
+        """Allow video input in a people probe only, with video settings that fit its step."""
+        if self.video is None:
+            return self
+        if self.probe != "people":
+            raise ValueError(f"a {self.probe} probe sends images only: video input is built for the people probe")
+        probes.check_video_settings(self.step, self.video)
         return self
 
     @property
@@ -2428,6 +2538,9 @@ def probe_plan(experiment: Experiment, n_clips: int) -> list[PlannedCalls]:
     A people probe and a number probe ask the kit legend one time per clip.
     """
     per_step = n_clips * experiment.per_clip
+    if experiment.video is not None:
+        # The video requests are built before the run and estimated from their videos (``_cmd_probe``).
+        return []
     if experiment.probe == "people":
         return [("kit_legend", experiment.step, n_clips), ("people", experiment.step, per_step)]
     if experiment.probe == "pitch":
@@ -2436,13 +2549,18 @@ def probe_plan(experiment: Experiment, n_clips: int) -> list[PlannedCalls]:
 
 
 def run_probe(
-    experiment: Experiment, clips: Sequence[LabelledClip], backend: Backend, gates: Mapping[str, Any]
+    experiment: Experiment,
+    clips: Sequence[LabelledClip],
+    backend: Backend,
+    gates: Mapping[str, Any],
+    video_folder: Path | None = None,
 ) -> dict[str, Any]:
     """Run the probe of an experiment and return its measured values.
 
     The settings that the experiment file does not hold are fixed elsewhere: the height
     of a small box is the one of gate G2, and the RANSAC threshold, the crops per track
-    and the enlargement of a crop are the defaults of the pipeline.
+    and the enlargement of a crop are the defaults of the pipeline. ``video_folder``
+    holds the videos of a people probe with video input.
     """
     pipeline = PipelineConfig()
     if experiment.probe == "people":
@@ -2454,6 +2572,8 @@ def run_probe(
             seed=experiment.seed,
             small_box_max_height_px=gate_number(gates, G2_SECTION, "small_box_max_height_px"),
             repeat=experiment.repeat,
+            video=experiment.video,
+            video_folder=video_folder,
         )
     if experiment.probe == "pitch":
         return probes.probe_pitch(
@@ -2491,6 +2611,21 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         f"{experiment.probe} probe {experiment.name}: {len(clips)} clips of the group {experiment.group} "
         f"({group.split})"
     )
+    video_folder: Path | None = None
+    planned: list[VLMRequest] = []
+    if experiment.video is not None:
+        video_folder = args.video_dir.expanduser()
+        refuse_video_folder(video_folder, _cache_dir(args))
+        planned = probes.plan_people_video(
+            clips,
+            experiment.step,
+            frames_per_clip=experiment.per_clip,
+            seed=experiment.seed,
+            video=experiment.video,
+            folder=video_folder,
+            repeat=experiment.repeat,
+        )
+        print(f"video folder: {video_folder} ({len(planned)} videos of the requests, outside the repository)")
     session = open_session(
         "probe",
         experiment.name,
@@ -2500,9 +2635,10 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         repeat=experiment.repeat,
         over_budget=args.start_over_budget,
         allow_other_images=args.allow_other_images,
+        planned_requests=planned,
     )
     try:
-        payload = run_probe(experiment, clips, session.backend, load_gates())
+        payload = run_probe(experiment, clips, session.backend, load_gates(), video_folder)
     finally:
         cost = close_session(session)
     provenance = {
@@ -2577,6 +2713,12 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
     if args.config is not None:
         refuse_input_as_output(args.out, {"--config": args.config})
     config = PipelineConfig() if args.config is None else read_settings(args.config)
+    settings: ToolSettings = config.detector if args.tool in DETECTOR_FAMILIES else config.calibration
+    if settings.name != args.tool:
+        raise CliError(
+            f"the settings name the detector {settings.name}, not {args.tool}: give --tool {settings.name}, "
+            f"or a settings file whose section detector names {args.tool}"
+        )
     if not args.clip.is_dir():
         raise CliError(
             f"{args.clip} is not a folder of frame images: a clip job names image files, so write the frames "
@@ -2593,7 +2735,6 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
             f"the clip folder {folder} does not lie below the data folder {root}: the job names each image by its "
             "path below the data folder"
         ) from error
-    settings: ToolSettings = config.detector if args.tool == "rfdetr" else config.calibration
     job = ClipJob(
         format=CLIP_JOB_FORMAT, clip=source.info.clip_id, tool=settings, images=images, video_sha256=video_sha256
     )
@@ -2749,7 +2890,7 @@ def score_tool(
     """
     tool = experiment.tool
     settings = tool.model_dump(mode="json")
-    if isinstance(tool, RfdetrSettings):
+    if is_detector(tool):
         return probes.score_people_answers(
             clips,
             _adapted(partial(people_from_detections, min_score=tool.min_score), answers, path),
@@ -2884,6 +3025,23 @@ def refuse_pixels_in_repository(path: Path, option: str) -> None:
                 f"{option} {path} lies inside the work tree {tree} of the repository: images never go into the "
                 f"repository (rule 2 of CLAUDE.md). Write them below the data folder, for example {DATA_DIR}"
             )
+
+
+def refuse_video_folder(folder: Path, cache_dir: Path) -> None:
+    """Raise ``CliError`` when the folder of the videos of a video step lies in the repository or in the cache folder.
+
+    The cache folder goes to the results branch, which is text only (rule 2 of
+    ``CLAUDE.md``), so no video may lie below it.
+    """
+    refuse_pixels_in_repository(folder, "--video-dir")
+    target = folder.resolve()
+    cache = cache_dir.resolve()
+    if target == cache or cache in target.parents or target in cache.parents:
+        raise CliError(
+            f"--video-dir {folder} and the cache folder {cache_dir} overlap: the cache goes to the results branch, "
+            f"which is text only (rule 2 of CLAUDE.md). Write the videos below the data folder, for example "
+            f"{VIDEO_INPUT_DIR}"
+        )
 
 
 def _cmd_video_frames(args: argparse.Namespace) -> int:
@@ -3760,6 +3918,11 @@ def _add_doctor(commands: Any) -> None:
     parser.add_argument(
         "--out", type=_path, metavar="FILE", help="write the report of the contract checks to this file (JSON)"
     )
+    parser.add_argument(
+        "--video",
+        action="store_true",
+        help="also send one video request per model (the video check); a model without a video rate gets none",
+    )
     _add_model_options(parser)
     parser.set_defaults(handler=_cmd_doctor)
 
@@ -3803,6 +3966,13 @@ def _add_probe(commands: Any) -> None:
     parser.add_argument("--experiment", type=_path, required=True, metavar="FILE", help="experiment file (YAML)")
     parser.add_argument("--root", type=_path, required=True, metavar="DIR", help="data folder")
     parser.add_argument("--out", type=_path, required=True, metavar="FILE", help="metrics file to write (JSON)")
+    parser.add_argument(
+        "--video-dir",
+        type=_path,
+        default=VIDEO_INPUT_DIR,
+        metavar="DIR",
+        help=f"folder of the videos of a probe with video input, outside the repository (default: {VIDEO_INPUT_DIR})",
+    )
     _add_group_options(
         parser, "use only the first N clips of the group, for example for a cost pilot; the answers stay in the cache"
     )

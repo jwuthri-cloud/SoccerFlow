@@ -1,0 +1,21 @@
+# The people probe of gate G2 with video input, with all 5 target frames of a clip in one request: one video
+# holds the windows of the 5 frames (each frame and 2 frames before and after it, 12 frames of the clip apart),
+# written and sampled at 2 frames per second, so the video jumps between the windows. It measures whether one
+# request per clip reaches the gate at a lower cost per keyframe than people_probe_video.yaml, on the same frames.
+name: people_probe_video_batch
+probe: people
+group: probe
+frames_per_clip: 5
+seed: 20261113
+repeat: 0
+step:
+  provider: gemini
+  model: gemini-4-argon
+  thinking_level: low
+  resolution: high
+  service_tier: standard
+  coords: yx_1000
+video:
+  fps: 2.0
+  context_frames: 2
+  targets_per_request: 5

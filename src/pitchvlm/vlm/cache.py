@@ -9,7 +9,9 @@ images, for example the frames of the crops of a shirt-number request
 never holds a box of the request context: the boxes of a probe request are
 boxes of the label files. The boxes that the model answers are part of the
 answer text. So cassettes can leave the machine that has the footage and the
-labels, and they can be read as text anywhere.
+labels, and they can be read as text anywhere. A video part is kept as the
+hash of its file with its range, its sampling rate and its resolution: never
+the path of the file and never its bytes.
 
 A replay is another thing: it builds every request again from the frames of
 the clip, so it runs on the machine that has the footage.
@@ -53,8 +55,12 @@ def _cassette(request: VLMRequest, response: VLMResponse) -> dict[str, Any]:
     Of the request context, only the stored part is written
     (``VLMRequest.stored_context``): the frame numbers, and never the boxes.
     The cache key stands for the whole context.
+
+    A video part is written as its identity (``VideoPart.identity``): the hash
+    of the file, its range, its sampling rate and its resolution. Its path and
+    its bytes are never written.
     """
-    return {
+    cassette = {
         "key": request.cache_key(),
         "meta": request.meta.model_dump(mode="json"),
         "context": request.stored_context(),
@@ -66,6 +72,10 @@ def _cassette(request: VLMRequest, response: VLMResponse) -> dict[str, Any]:
         "image_hashes": list(request.image_hashes),
         "response": response.model_dump(mode="json", exclude=_unset_provider_fields(response)),
     }
+    if request.videos:
+        # Only a request with video parts gets this entry, so an image cassette keeps the content of before.
+        cassette["videos"] = [video.identity() for video in request.videos]
+    return cassette
 
 
 #: Fields of an answer that only an OpenRouter answer fills.

@@ -862,8 +862,72 @@ cleaned of the key and cut. A success answer without a usage, without a cost abo
 `is_byok` raises `UnconfirmedCallError`; one with an error, a finish reason other than `stop` or no text
 raises `BilledAnswerError` with its reported cost. Reasoning tokens are a part of
 `completion_tokens`; `normalize_usage` moves them to `thought_tokens`. The response has
-`service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input is not
-built (`docs/DECISIONS.md`, entry "Image models through OpenRouter" of 2026-11-22).
+`service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input: see
+the next section.
+
+### Video input (`vlm/types.py`, `vlm/video.py`, `vlm/client.py`, `vlm/cost.py`; 2026-11-23)
+
+```python
+class VideoPart(Record):            # a part of VLMRequest.parts, next to TextPart and ImagePart
+    path: Path                      # the file on the run machine, outside the repository; never stored
+    sha256: str                     # of the file bytes; the backend refuses a file with other bytes
+    mime_type: str = "video/mp4"    # video/mp4, video/mpeg, video/mov, video/webm
+    duration_s: float               # length of the whole file
+    start_s: float | None; end_s: float | None   # a range of the file (Gemini only)
+    fps: float | None               # sampling rate asked from the provider, (0, 24]; Gemini only
+    resolution: Resolution          # low, medium or high (VIDEO_RESOLUTIONS)
+    def identity(self) -> dict      # hash, type, duration, range, rate, resolution: no path, no bytes
+
+# vlm/video.py
+def write_frames_video(source, frames, path, fps) -> None   # MP4 of chosen frames; a file that is there is kept
+def frames_video_part(source, frames, *, folder, step, fps, resolution, send_fps) -> VideoPart
+def context_frames(frame, *, n_frames, clip_fps, video_fps, context) -> list[int]
+
+# vlm/steps.py
+def build_kit_legend_video_request(video, *, clip_id, video_frames, fps, settings, repeat=0) -> VLMRequest
+def build_people_video_request(video, legend, *, clip_id, video_frames, targets, fps, width, height,
+                               settings, repeat=0) -> VLMRequest
+def parse_people_video(text, *, targets, times_s, fps, width, height, coords) -> tuple[list[FramePeople], int]
+
+# vlm/cost.py
+class VideoRate: model, valid_from, tokens_per_frame[resolution], audio_tokens_per_second,
+                 default_fps, takes_clips, video_usd_per_million | None, audio_usd_per_million | None
+GEMINI_VIDEO_RATES: tuple[VideoRate, ...]
+def load_video_rates(path) -> tuple[VideoRate, ...]        # the `video` entries of openrouter_prices.yaml
+def video_input_tokens(part, rate) -> tuple[int, int]      # (frame tokens, sound tokens)
+```
+
+Contracts:
+
+- No bytes and no path of a video reach a result file. The cache key of a request with video parts
+  holds `identity()` of each part; a cassette holds the same identities under `videos`. A request
+  without video parts has neither entry, so its key and its cassette are those of before.
+- A written file is frame `k` at `k / fps` seconds: the frames are written at the sampling rate,
+  so the model sees each written frame. A video request lists its target frames by these times;
+  `parse_people_video` takes entry `k` for target `k` only when its `time_s` is within half a
+  frame interval of that time, and counts the other entries. The context of the request holds
+  `frames` (the targets, kept in a cassette), `video_frames` and `times_s`.
+- A written file is never written again: its hash is in the cache key. Its name holds a hash of
+  the decoded pixels of its frames (`frames_digest`), so new footage under an old clip name gets
+  new files. The files go to a folder of the data folder (`probe --video-dir`, default
+  `~/pitchvlm-data/video-input`), never to the cache.
+- Gemini sends a video inline (`type: video`, base64 `data`, `mime_type`, `resolution`, and
+  `processing: {type: static, start_offset, end_offset, fps}` when the part names one of them).
+  OpenRouter sends a `video_url` part with a data URL and refuses a part with a range or a rate.
+  Both refuse inline data above `client.INLINE_REQUEST_MAX_BYTES` (20,000,000 bytes) and never
+  upload a file. Rule 5 holds: `store=False` or the private routing, no sampling parameter, and
+  the video prompts identify players by shirt number and kit, never by face.
+- A model takes video only with a video rate on the day of the call: `GEMINI_VIDEO_RATES` for
+  Gemini, the `video` entries of `configs/openrouter_prices.yaml` for OpenRouter. Without one, the
+  estimate raises `KeyError` and the backend raises `VideoInputError` before any call. The
+  estimate of a video request is the text estimate of its step (`people_video`: its output once per
+  target frame) plus `video_input_tokens` at the video and sound prices of the rate (the input
+  price when the rate names none). The billed cost comes from the measured usage, as for images.
+- `FakeBackend` answers `kit_legend_video` and `people_video` from the context; it never opens the
+  file, so a test can give it a stand-in file.
+- Only the people probe (`probes.VideoProbe`, section `video` of an experiment file) and the doctor
+  (`--video`, the check `doctor.check_video`) send video. `StepSettings` and the pipeline have no
+  video setting.
 
 ### `synth.py` and `vlm/fake.py` — test world
 
@@ -1358,10 +1422,15 @@ package:
   format of the adapter module of the tool). No frame may have two answers. The file is read
   strictly (`load_tool_run`): a key that comes twice is refused, a number must be written as a
   number and a truth value as true or false.
-- The tool section is `RfdetrSettings` (`name`, `model`, `min_score`, `antialias`) or
-  `PnlcalibSettings` (`name`, `kp_threshold`, `line_threshold`, `pnl_refine`); the key `name`
-  says which one. `antialias` and `pnl_refine` take only true and false.
-  `cli.TOOL_PROBES` names the probe of each tool: `rfdetr` people, `pnlcalib` pitch.
+- The tool section is `RfdetrSettings` (`name`, `model`, `min_score`, `antialias`),
+  `TransformersDetectorSettings` (`name` `dfine` or `rtdetrv2`, `model` a size of
+  `runs.TRANSFORMERS_MODELS`, `min_score`, `input_size` a multiple of 32 from 320 to 1280,
+  `batch` from 1 to 64, `half`) or `PnlcalibSettings` (`name`, `kp_threshold`,
+  `line_threshold`, `pnl_refine`); the key `name` says which one. The `name` of a detector is
+  its family (`runs.DETECTOR_FAMILIES`: `rfdetr`, `dfine`, `rtdetrv2`), and `runs.is_detector`
+  tells a detector section from the calibration. `antialias`, `half` and `pnl_refine` take only
+  true and false. `cli.TOOL_PROBES` names the probe of each tool: every detector family people,
+  `pnlcalib` pitch.
 - The command `tool-score` refuses a run file whose name or tool section differs from the
   experiment file, and a run file without an answer for a frame of the probe
   (`cli.probe_answers`). So the settings of the experiment file are those that the tool ran
@@ -1376,10 +1445,27 @@ package:
 - `fallbacks.rfdetr.people_from_detections` has no default score limit: the experiment file
   names it, and the script gives the same value to the tool as its threshold.
 
-`tools/run_tool.py` (`rfdetr` and `pnlcalib` sub-commands) reads a job file and writes a run
-file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`) and the commit of the PnLCalib clone
+`tools/run_tool.py` (`rfdetr`, `dfine`, `rtdetrv2` and `pnlcalib` sub-commands) reads a job
+file and writes a run file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`), of
+`transformers` (`TRANSFORMERS_VERSIONS`) and the commit of the PnLCalib clone
 (`PNLCALIB_COMMIT`) and refuses another one, and a clone with a changed tracked file, because it
-was written from the source of these versions and never ran with the tools. It takes the
+was written from the source of these versions and never ran with the tools. The two families of
+transformers share one engine (`transformers_engine`): the size of the job names a checkpoint and
+its commit (`TRANSFORMERS_CHECKPOINTS`; COCO-only weights whose model card was read), loaded with
+`AutoImageProcessor` and `AutoModelForObjectDetection` (safetensors only, float16 when `half`;
+refused on the device `cpu`). The configuration of the checkpoint must name the model type of
+the family, the focal loss and the classes `person` and `sports ball`. `detections_of_queries`
+turns the output of one frame (class scores per query, boxes as centre, width and height in parts
+of the square input) into the payload of `fallbacks.rfdetr`: the logistic function, the best
+pairs of query and class (as many as queries), corners in pixels of the frame, the classes of
+`KEPT_LABELS` from `min_score` on. On the warm-up call the script compares its boxes with
+`post_process_object_detection` of the installed package and stops when they differ
+(`check_against_tool`). Frames go to a tool in batches (`answer_frames(job, root, answer,
+batch)`; `one_at_a_time` for RF-DETR and PnLCalib): the time of a frame is the time of its batch
+divided by its frames, and a transformers run adds `stage_ms_per_frame` (median milliseconds per
+frame of the image processor, the model after a device synchronisation, and the conversion) to
+the facts of the run. A line per frame for a live feed would be written in the loop of
+`answer_frames`, where each frame entry is complete. It takes the
 variables `GEMINI_API_KEY` and `OPENROUTER_API_KEY` out of its environment before it loads a
 tool (`KEY_VARIABLES`), and it writes its own SHA-256 into the facts of the run. Before the tool is built it checks the place of the run
 file (`check_out_place`: no folder, write access, not the job file), so that the answers of a
@@ -1476,8 +1562,10 @@ python3 tools/guard.py (--staged | --push | --tracked | --paths FILE ...) [--rep
 PeopleEngine = Literal["model", "detector"]; PitchEngine = Literal["model", "calibration"]
 NumberEngine = Literal["model", "none"]
 class EngineSettings(Record): people: PeopleEngine = "model"; pitch_mapping: PitchEngine = "model"; number: NumberEngine = "model"
-# PipelineConfig gets: engines: EngineSettings; detector: RfdetrSettings = DEFAULT_DETECTOR (RFDETRMedium, 0.5,
+# PipelineConfig gets: engines: EngineSettings; detector: DetectorSettings = DEFAULT_DETECTOR (RFDETRMedium, 0.5,
 # no antialias); calibration: PnlcalibSettings = DEFAULT_CALIBRATION (the settings of the pitch probe of PnLCalib)
+# DEFAULT_DETECTORS: the settings that a family named in the section detector starts from (load_config):
+# rfdetr = DEFAULT_DETECTOR; dfine medium and rtdetrv2 r18vd, both 0.5, 640 pixels, batch 1, float32
 
 # pipeline.py
 @dataclass(frozen=True)
@@ -1570,7 +1658,8 @@ def load_clip_run(first: Path) -> ClipRun
   frame keeps a camera. The camera of each keyframe gets its paint-alignment score in
   `ClipResult.paint`, like a landmark fit, so both pitch engines are scored on the same frames.
 - `ClipResult.engines` names `kit_legend`, `people`, `team_role`, `landmarks`, `number`, `ball`,
-  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<tool>:<model class>`,
+  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<family>:<size>`
+  (`detector:rfdetr:RFDETRMedium`, `detector:dfine:medium`),
   `tool:<tool>`, `code`, `code:kit-colour`, `code:ball-tracker`, or `none` for a step that does
   not run. `<model>` is `config.model_label` of the step: the bare name for Gemini,
   `openrouter:<slug>` for OpenRouter.
@@ -1596,8 +1685,9 @@ to `--out`, and a frame whose answer does not fit into one part.
 
 Command line:
 
-- `clip-job --tool rfdetr|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]` writes
-  the clip job with the tool section of the settings file. A video file is refused, and so is a
+- `clip-job --tool rfdetr|dfine|rtdetrv2|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]`
+  writes the clip job with the tool section of the settings file. A detector family other than
+  the one of the settings file is refused. A video file is refused, and so is a
   clip folder that is not below the data folder. A clip folder of `video-frames` holds the record
   of its video: the job gets `video_sha256`, and a record that names another frame count or size
   than the folder holds is refused.
@@ -1688,7 +1778,8 @@ def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_
 - Test the sign conventions explicitly: a far-side point has negative y; model boxes are
   `[ymin, xmin, ymax, xmax]`.
 - No external tool is installed where the tests run. `tests/test_run_tool.py` replaces each
-  tool by a stand-in with the call signatures of the real one, and one test of the image reader
+  tool by a stand-in with the call signatures of the real one (`tests/test_detector_families.py`
+  does the same for `transformers` and `torch`), and one test of the image reader
   is skipped without Pillow. So these tests say what the script calls, and not that the real
   tools answer as the script expects.
 - No media files in the repository: build images in the test.
