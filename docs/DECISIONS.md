@@ -2099,7 +2099,103 @@ on real footage.
    - Not verified: any git other than 2.56 on macOS, the run machine, and Linux. The features
      used (`rev-parse` with two options, `cat-file --batch-check` reading one name at a time)
      are old, but the equality of the `HEAD` answers was tried on this git only.
-||||||| 81bb2d9
+
+## 2026-11-22 — Rehearsal of the handover and the runbook
+
+Nobody had walked `docs/HANDOVER.md` and `docs/RUNBOOK.md` from the first line to the last since
+ten pull requests of 22 Nov changed the package and each edited its own part of the documents.
+This entry records that walk on the build machine (base `main` fe4f316) and what it changed.
+
+1. **How.** A scratch clone of the repository, with a home folder of its own, so that
+   `~/pitchvlm-data` was a scratch folder; hooks, identity, deny-list (comments only) and the
+   work tree `../pitchvlm-results` were made there with the commands of the documents. The
+   environment of the main checkout (Python 3.13, no SDK, no Pillow), `PYTHONPATH=src`. The
+   data: a synthetic `valid.zip` of 34 clips (50 frames, 1280 x 720, JPEG, made from three
+   synthetic scenes) put into `~/pitchvlm-data/archives`, so the real `data` command only
+   extracted it and wrote the split list. The model: the fake model of the tests in the place of
+   the real backend. The scorer: the stand-in evaluator of `tests/test_cli.py` at the path of the
+   scorer script. The tools: `tools/run_tool.py` with only its two tool engines replaced by the
+   truth of the scene (its reading of the job, its checks of `--out` and its writers ran). The
+   estimates of the two doctor commands: the environment checks passed by hand and a backend
+   that stops at the first call. Every command that needs no key, no data download and no tool
+   ran this way; the others were parsed. The walk log (73 steps, each with the command, what the
+   document says, what happened and a verdict) is in the notes of this group of sessions, outside
+   the repository.
+2. **Counts** (78 verdicts on 73 steps; 5 steps have two): agrees 49, document wrong 18, code
+   wrong 1, cannot be checked on the build machine 10.
+3. **Measured on the synthetic data** (the commands print the same numbers on the run machine
+   for the same plans; the costs are estimates of the token table of 22 Nov, not measured):
+   doctor of the two Gemini models 0.133 USD for 14 calls; doctor of one OpenRouter model
+   0.015 USD for 6 calls; cost pilot 0.196 + 0.124 + 0.332 = 0.652 USD (12, 10 and 36 calls); the
+   pitch probe on 4 clips 0.248 USD for 20 calls; the whole pitch probe 1.488 USD for 120 calls;
+   a clip of 750 frames 2.345 USD (64 keyframes, 50 number requests), its run limit crossed at
+   the 129th number request; one number request 0.0090 USD; the detector engine with the number
+   step 0.463 USD per clip of 750 frames. The ledger had one line per new answer (56 after the
+   pilot), and a replay gave the same metrics for free.
+4. **Fixes of the documents** (one line each):
+   - HANDOVER 1: the state of 22 Nov (what was added, the full run of the offline tests, the
+     rehearsal).
+   - HANDOVER 2: marked as done; it stays as the record of the move.
+   - HANDOVER 4.2, step 13, and RUNBOOK 2: `doctor --no-api` checks the keys of both providers,
+     so with the Gemini key alone its key line is `[info]`, not `[ok  ]`.
+   - HANDOVER 6: replaced by the first session on the run machine, step by step (19 steps:
+     command, what it prints to pass, what to do when not, cost, estimate and go-ahead).
+   - HANDOVER 6 (old text): "the pipeline cannot use the answers of a tool yet" removed; the
+     detector engine is built.
+   - HANDOVER 7, 11: the OpenRouter parts of RUNBOOK 10; 28 open owner decisions, not twelve.
+   - HANDOVER 12 and PLAN "Milestones": a note that no date from M2 on holds.
+   - HANDOVER 13: a row for `pre-commit install` that finds a hook of a git template.
+   - RUNBOOK 2, command 4: `mkdir -p ../pitchvlm-results/results/metrics` before the copy of
+     `oracle.json` (the copy failed when no doctor report had made the folder).
+   - RUNBOOK 3: six tool experiment files, not five.
+   - RUNBOOK 3, paint alignment: every metrics file on the run machine already has the key; a
+     replay needs the `--max-clips` of the probe (without it, it stopped at the first frame
+     without a stored answer).
+   - RUNBOOK 3, `overlay run`: an `--out` per run folder (finding F1 below).
+   - RUNBOOK 11: the commands of the check of the pixels of a video frame read by Pillow in a
+     tool environment against the frame of `run` (it was only an open item of an entry).
+   - PLAN, M4: the tool engines are built; the switch stays an owner decision under rule 8.
+   - ARCHITECTURE 5: the new test.
+   - This file: a stray line of a merge conflict (`||||||| 81bb2d9`) before "Open questions"
+     removed.
+5. **A test keeps this from drifting again.** `tests/test_documented_commands.py` (default run)
+   reads every fenced block of `CLAUDE.md`, `docs/HANDOVER.md` and `docs/RUNBOOK.md`: every
+   shell command that calls the package, `tools/run_tool.py` or `tools/guard.py` must parse with
+   that parser; every file below `configs/` that a call of the package names must exist, an
+   experiment or settings file must load, and a probe must name the experiment file of its
+   kind; every name that a Python block imports from the package must exist; each sub-command
+   of the package must be documented at least once; and no document holds a line of a merge
+   conflict. It reads 60 calls today. Three drifts planted in the real documents (the
+   sub-command `tool-measure` in RUNBOOK 3, the file `configs/arms/g4_team_slot.yaml` in RUNBOOK
+   4, the option `--images` in the place of `--count` in HANDOVER 6) made it fail with one line
+   each; the same three kinds are kept as a unit test of the reader. The stray conflict line
+   above was found by it.
+6. **Finding for the review of the code, not fixed** (only a help text or an option name was
+   in the scope of this work):
+   - F1. `overlay run` names its image folder by the clip only
+     (`cli._cmd_overlay`: `folder = args.out / f"{mappings.name}-seed{args.seed}-count{args.count}"`,
+     where `mappings.name` is the clip id for the source `run`). Trace: `overlay run --result
+     ~/pitchvlm-data/runs/dev-detector/SNGS-116/result.json --clip .../SNGS-116 --seed 20261113
+     --count 5 --list .../SNGS-116_dev-detector.json` (exit 0), then the same with
+     `runs/dev/SNGS-116/result.json` and another `--list`: `error: .../overlays/SNGS-116-seed20261113-count5
+     is already there: remove it, or give another --out`, exit 2. Two engines on one clip are
+     exactly the comparison of RUNBOOK 11. The documents now give an `--out` per run folder; a
+     name with the run folder (or the engine) would remove the trap.
+7. **Not checkable on the build machine** (each is a step of HANDOVER 6 or of section 4): the
+   install with the extra `gemini` and the SDK version line; the pinned list and fact 19; the
+   prompt of the key and the form of the real key; the scorer environment and its clone; every
+   real model call (both doctors, the pilot) and the real costs; the download; the label reader
+   and the scorer on real files; the guard tests on the git of the run machine; the install of
+   the tools, their first run, `mps` against `cpu`; the Pillow read of a real video frame (the
+   check ran with OpenCV in the place of Pillow on a synthetic video: same pixels); the paint
+   alignment on real frames; the check images of real mappings.
+8. **Proposed text for `CLAUDE.md`** (section "Commands", last paragraph; the owner applies it):
+   "The run-machine commands (`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`,
+   `clip-job`, `video-frames`, `overlay`, `run`, `eval`, `sync`) are in `docs/RUNBOOK.md`; the
+   order of the first session is in `docs/HANDOVER.md`, section 6."
+9. **Owner decision added to the list below:** new dates of the schedule.
+10. **Checks of this work.** Full run of the offline tests: 3203 passed, 1 skipped (Pillow), 191 s,
+    exit code 0 (8 of them new). `python3 tools/guard.py --tracked`: exit code 0.
 
 ## Open questions (to settle with measurements)
 
@@ -2290,3 +2386,8 @@ Decisions for the owner that are open, each with its recommendation:
   clip of 30 s (estimated).
 - **Clip runs on the results branch.** They are tool runs (item "Run files of the tools on the
   results branch" above). Recommendation: decide both together; each part passes the guard.
+- **New dates of the schedule** (entry "Rehearsal of the handover and the runbook" of
+  2026-11-22). On 22 Nov no step of M2 has run, so every date of `docs/PLAN.md` from M2 on has
+  slipped by at least 5 days, and the standard prices end on 30 Nov. Recommendation: set the new
+  dates after the first session (HANDOVER, section 6) with the measured cost of the pilot; keep
+  the half-price tier for every clip run from 1 Dec, as the plan says.

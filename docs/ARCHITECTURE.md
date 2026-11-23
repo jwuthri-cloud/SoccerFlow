@@ -1675,3 +1675,11 @@ def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_
   is skipped without Pillow. So these tests say what the script calls, and not that the real
   tools answer as the script expects.
 - No media files in the repository: build images in the test.
+- `tests/test_documented_commands.py` reads the fenced blocks of `CLAUDE.md`,
+  `docs/HANDOVER.md` and `docs/RUNBOOK.md`. Every shell command that calls the package, the tool
+  script or the guard must parse with the argument parser of that program, every file below
+  `configs/` that a call of the package names must exist (an experiment file or a settings file
+  must also load, and a probe must name the experiment file of its kind), and a Python block
+  may import from the package only names that it has. Each sub-command of the package must have
+  at least one documented command line. A new option or a renamed file therefore needs the same
+  change in the documents.

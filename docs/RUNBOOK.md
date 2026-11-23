@@ -129,8 +129,9 @@ source .venv/bin/activate
 
 ## 2 Day 1
 
-Ask the owner before each paid command. A paid command prints its cost estimate first and the
-measured cost after. It refuses to start when the git work tree has changes: commit first.
+The order of the first session, with what each step must print and the checks of the code of
+22 Nov, is in `docs/HANDOVER.md`, section 6. Ask the owner before each paid command. A paid
+command prints its cost estimate first and the measured cost after. It refuses to start when the git work tree has changes: commit first.
 Run one paid command at a time (section 4, money).
 
 ```bash
@@ -161,6 +162,7 @@ python -m pitchvlm.cli oracle --root ~/pitchvlm-data --split valid \
     --scorer-python ~/pitchvlm-data/envs/scorer/bin/python \
     --scorer-script ~/pitchvlm-data/sn-trackeval/scripts/run_soccernet_gs.py \
     --out ~/pitchvlm-data/oracle/valid
+mkdir -p ../pitchvlm-results/results/metrics
 cp ~/pitchvlm-data/oracle/valid/oracle.json ../pitchvlm-results/results/metrics/oracle_valid.json
 
 # 5. Cost pilot: the first 2 clips of the probe group. Paid: about 0.7 USD for the three probes.
@@ -176,6 +178,10 @@ python -m pitchvlm.cli probe number --experiment configs/experiments/number_prob
   deny-list `.git/guard-deny.txt` is there (section 9). A hook file of another tool, a hook file
   without the executable bit, and a `core.hooksPath` setting that points to another folder all
   fail the check `guard hooks`.
+- `doctor --no-api` checks the keys of both providers. With the Gemini key alone its key line is
+  `[info] API key: the variable OPENROUTER_API_KEY is not set; the variable GEMINI_API_KEY is set`;
+  it is `[ok  ]` only when both keys are set (section 10). With `--models`, only the keys of the
+  named models count, and a missing one is `[fail]`.
 - The doctor prints two kinds of lines for the boxes and the landmarks. A failed check `boxes`
   or `landmarks` (and a failed check `store flag`, `token sum`, `served tier` or `flex tier`) is
   a fault of the client: repair it before any footage is sent. The lines `box accuracy` and
@@ -460,8 +466,8 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/pitch_probe_p
 - Another setting: copy the experiment file, change `name` and one value under `tool`, commit
   when the owner asks, and run the three commands again. Put each copy of a tool experiment
   file, also the one for the group `reserve`, into a sub-folder, for example
-  `configs/experiments/more/`: one offline test names the five tool files of
-  `configs/experiments` and fails for a sixth file there. For RF-DETR the values are the model
+  `configs/experiments/more/`: one offline test names the six tool files of
+  `configs/experiments` and fails for a seventh file there. For RF-DETR the values are the model
   class (`RFDETRNano`, `RFDETRSmall`, `RFDETRMedium`, `RFDETRLarge`), the score limit
   `min_score` (0.5 is the threshold that the tool uses by itself) and `antialias`. A low score
   limit makes the run file large. The guard refuses a file above 2,000,000 bytes (about 14,000
@@ -498,7 +504,13 @@ a median position error above 3 m from those at or below 2 m. It is a diagnostic
 it yet. The measurement needs no model call. It runs on the frames
 of the group `probe` of the split list, which are valid clips only; never run it on test clips.
 
-When the pitch probe ran before this code was there, replay it from the stored answers (free):
+On the run machine every pitch probe and every `tool-score` of PnLCalib runs with this code, so
+its metrics file already holds `paint_alignment`: read it there (for the cost pilot:
+`pilot_pitch.json`). A replay from the stored answers (free) writes the same key again. Use it to
+check that the score of a frame does not depend on the run (the third check below), or for a
+probe that ran before this code was there. Give the replay the same `--max-clips` as the probe
+(none for the whole group): a frame without a stored answer stops it with an error. `tool-score`
+needs a run file of the same `--max-clips` too:
 
 ```bash
 python -m pitchvlm.cli probe pitch --experiment configs/experiments/pitch_probe.yaml \
@@ -551,8 +563,13 @@ python -m pitchvlm.cli overlay tool --experiment configs/experiments/pitch_probe
 # The mappings that a run used on its keyframes (landmark fits or calibration cameras, section 11).
 python -m pitchvlm.cli overlay run --result ~/pitchvlm-data/runs/dev-detector/<clip>/result.json \
     --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> --seed 20261113 --count 5 \
-    --list ../pitchvlm-results/results/overlays/<clip>_dev-detector.json
+    --list ../pitchvlm-results/results/overlays/<clip>_dev-detector.json \
+    --out ~/pitchvlm-data/overlays/dev-detector
 ```
+
+- The image folder of `overlay run` is named by the clip only (`<clip>-seed<seed>-count<count>`).
+  So give each run folder its own `--out` (above: `~/pitchvlm-data/overlays/dev-detector`):
+  without it the second engine on the same clip is refused, because the folder is already there.
 
 - `overlay probe` reads the stored answers of the probe only (the cache folder of section 2): a
   frame without a stored answer stops the command with one line. Give the same `--max-clips` and
@@ -1432,6 +1449,22 @@ python -m pitchvlm.cli run --clip $VIDEO --config $SETTINGS \
 - `run` refuses the clip run of a video with the frame folder (`--clip ~/pitchvlm-data/videos/<clip>`),
   with another video, and the clip run of a dataset folder with a video. The line says which.
 - `--out` of `video-frames` must not lie inside a work tree of the repository (rule 2).
+
+Before the first tool run on a video, check once that the tools see the pixels that `run` sees
+(free; `docs/DECISIONS.md`, entry "A video file into the detector engine, and the check images
+of gate G3", item 9 (a)). The script reads a PNG frame with Pillow, in the environment of a
+tool; `run` decodes the video with OpenCV. The first command saves frame 0 as the script reads
+it, the second compares it with frame 0 of `run`:
+
+```bash
+mkdir -p ~/pitchvlm-data/checks
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python -c "import sys, numpy; from pathlib import Path; sys.path.insert(0, 'tools'); import run_tool; numpy.save(Path('~/pitchvlm-data/checks/frame-pillow.npy').expanduser(), run_tool.read_rgb(Path('~/pitchvlm-data/videos/<clip>/img1/000001.png').expanduser()))"
+python -c "import numpy; from pathlib import Path; from pitchvlm.frames import VideoFileSource; tool = numpy.load(Path('~/pitchvlm-data/checks/frame-pillow.npy').expanduser())[:, :, ::-1]; run = VideoFileSource(Path('~/pitchvlm-data/footage/<clip>.mp4').expanduser()).read(0); print('same pixels' if tool.shape == run.shape and (tool == run).all() else f'differ: {tool.shape} {run.shape}, {int((tool != run).any(axis=2).sum())} pixels')"
+```
+
+- `same pixels` passes. Any other line: tell the owner before a tool runs on the video. The
+  check never ran with Pillow: on the build machine it ran with OpenCV in the place of Pillow
+  and printed `same pixels` for a synthetic video.
 
 Measurement, fixed before any run (rule 7):
 
