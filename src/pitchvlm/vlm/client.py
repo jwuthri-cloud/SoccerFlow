@@ -1062,11 +1062,21 @@ class HttpConnectionError(Exception):
     """An HTTP request got no answer: the connection was refused or lost."""
 
 
+class HttpUnreadAnswerError(Exception):
+    """An HTTP request got a success status, but its body could not be read.
+
+    The provider has done the request, so it can bill it, and the cost in the lost
+    body is unknown. Such a request is not sent again: a new attempt could be billed
+    a second time.
+    """
+
+
 class HttpTransport(Protocol):
     """Anything that sends one POST request: ``UrllibTransport``, or a fake object in tests.
 
     An answer with an error status is returned, not raised. A request without an
-    answer raises ``HttpTimeoutError`` or ``HttpConnectionError``.
+    answer raises ``HttpTimeoutError`` or ``HttpConnectionError``, and a success status
+    whose body cannot be read raises ``HttpUnreadAnswerError``.
     """
 
     def post(self, url: str, headers: Mapping[str, str], body: bytes, timeout_s: float) -> HttpAnswer: ...
@@ -1082,18 +1092,30 @@ def _retry_after_s(headers: Any) -> float | None:
     return seconds if seconds is not None and math.isfinite(seconds) and seconds >= 0 else None
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect, so the ``Authorization`` header never goes to another address.
+
+    The redirect status then comes back as an ``HTTPError``, that is an answer with an
+    error status.
+    """
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        """Refuse every redirect."""
+        return None
+
+
 class UrllibTransport:
-    """Sends a POST request with ``urllib`` of the standard library."""
+    """Sends a POST request with ``urllib`` of the standard library. It follows no redirect."""
 
     def post(self, url: str, headers: Mapping[str, str], body: bytes, timeout_s: float) -> HttpAnswer:
         """Send one POST request and return its answer, also an answer with an error status."""
         request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout_s) as response:
-                return HttpAnswer(response.status, response.read(), _retry_after_s(response.headers))
+            with urllib.request.build_opener(_RefuseRedirect).open(request, timeout=timeout_s) as response:
+                return HttpAnswer(response.status, _success_body(response, timeout_s), _retry_after_s(response.headers))
         except urllib.error.HTTPError as error:
             with error:
-                return HttpAnswer(error.code, error.read(), _retry_after_s(error.headers))
+                return HttpAnswer(error.code, _error_body(error), _retry_after_s(error.headers))
         except TimeoutError as error:
             raise HttpTimeoutError(f"no complete answer within {timeout_s:g} s") from error
         except urllib.error.URLError as error:
@@ -1102,6 +1124,31 @@ class UrllibTransport:
             raise HttpConnectionError(f"the connection failed: {error.reason}") from error
         except (OSError, http.client.HTTPException) as error:
             raise HttpConnectionError(f"the connection failed: {type(error).__name__}: {error}") from error
+
+
+def _success_body(response: Any, timeout_s: float) -> bytes:
+    """Read the body of an answer with a success status. A failed read raises ``HttpUnreadAnswerError``."""
+    try:
+        return response.read()
+    except TimeoutError as error:
+        raise HttpTimeoutError(f"no complete answer within {timeout_s:g} s") from error
+    except (OSError, http.client.HTTPException) as error:
+        raise HttpUnreadAnswerError(
+            f"status {response.status}, but the body could not be read: {type(error).__name__}: {error}"
+        ) from error
+
+
+def _error_body(error: urllib.error.HTTPError) -> bytes:
+    """Read the body of an answer with an error status, or return no body when it cannot be read.
+
+    The status code decides what happens to the request; the body only gives the error
+    message. So a body that cannot be read is logged and left out.
+    """
+    try:
+        return error.read()
+    except (OSError, http.client.HTTPException) as exc:
+        logger.warning("status %d: the error body could not be read: %s: %s", error.code, type(exc).__name__, exc)
+        return b""
 
 
 def _json_object(body: bytes) -> dict[str, Any] | None:
@@ -1113,12 +1160,16 @@ def _json_object(body: bytes) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _error_message(data: dict[str, Any] | None) -> str:
-    """Return the code and the message of an error body of OpenRouter, or a short note when it has none."""
+def _error_message(data: dict[str, Any] | None, secret: str) -> str:
+    """Return the code and the message of an error body of OpenRouter, or a short note when it has none.
+
+    The text comes from the answer, so it goes through ``_clean_text``: without the key
+    value ``secret`` and cut to ``MAX_ERROR_CHARS``.
+    """
     error = None if data is None else data.get("error")
     if not isinstance(error, dict):
         return "no error message in the body"
-    return f"error code {error.get('code')!r}: {error.get('message')!r}"
+    return _clean_text(f"error code {error.get('code')!r}: {error.get('message')!r}", secret)
 
 
 def _count(container: Any, name: str, label: str, *, required: bool = False) -> int:
@@ -1139,7 +1190,7 @@ def read_openrouter_usage(data: dict[str, Any], label: str) -> tuple[Usage, floa
     Reasoning tokens are a part of ``completion_tokens`` (the reasoning page of the
     documentation); ``normalize_usage`` takes them out of the output count. Raises
     ``UnconfirmedCallError`` when the answer has no usage, no prompt token count or no
-    cost that is a number from 0, and when the call was served with a key of the owner
+    cost that is a number above 0, and when the call was served with a key of the owner
     at the provider (``is_byok``): the provider bills such a call itself, so the
     reported cost is not its whole cost.
     """
@@ -1155,6 +1206,11 @@ def read_openrouter_usage(data: dict[str, Any], label: str) -> tuple[Usage, floa
             f"directly and the reported cost is not its whole cost. Remove the provider key from the account "
             f"[{UNCONFIRMED_NOTE}]"
         )
+    if cost == 0:
+        raise UnconfirmedCallError(
+            f"{label}: the answer reports a cost of 0 USD for a paid model, so its real cost is unknown: "
+            f"a free route, or a call that the provider bills directly [{UNCONFIRMED_NOTE}]"
+        )
     total = usage.get("total_tokens")
     normalized = normalize_usage(
         input_tokens=_count(usage, "prompt_tokens", label, required=True),
@@ -1166,22 +1222,23 @@ def read_openrouter_usage(data: dict[str, Any], label: str) -> tuple[Usage, floa
     return normalized, float(cost)
 
 
-def read_openrouter_text(data: dict[str, Any], billed: VLMResponse, label: str) -> str:
+def read_openrouter_text(data: dict[str, Any], billed: VLMResponse, label: str, secret: str) -> str:
     """Return the answer text of an OpenRouter answer whose call was billed.
 
-    ``billed`` is the cost record of the call. Raises ``BilledAnswerError`` with that
+    ``billed`` is the cost record of the call. ``secret`` is the key value, which
+    never goes into an error message. An ``error`` that is null is no error. Raises ``BilledAnswerError`` with that
     record for an error in the body or in the choice, for a finish reason other than
     ``stop`` (also ``length``: the answer stopped at the token limit), for a missing
     or empty text and for a usage without output tokens.
     """
-    if "error" in data:
-        raise BilledAnswerError(f"{label}: the answer holds an error ({_error_message(data)})", billed)
+    if data.get("error") is not None:
+        raise BilledAnswerError(f"{label}: the answer holds an error ({_error_message(data, secret)})", billed)
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise BilledAnswerError(f"{label}: the answer has no choice", billed)
     choice = choices[0]
     if isinstance(choice.get("error"), dict):
-        raise BilledAnswerError(f"{label}: the choice holds an error ({_error_message(choice)})", billed)
+        raise BilledAnswerError(f"{label}: the choice holds an error ({_error_message(choice, secret)})", billed)
     finish = choice.get("finish_reason")
     if finish != OPENROUTER_FINISHED:
         raise BilledAnswerError(
@@ -1225,7 +1282,7 @@ class OpenRouterBackend:
     and after a lost connection, at most ``max_attempts`` times in total, with a
     growing random wait, or the longer wait of a ``Retry-After`` header (at most
     ``RETRY_AFTER_CAP_S``). Any other error ends the request at once, also a
-    timeout. Before every attempt the spend window is checked, as in
+    timeout and a success status whose body cannot be read. A redirect is not followed. Before every attempt the spend window is checked, as in
     ``GeminiBackend``. ``stop``, ``clock`` and ``sleep`` work as there.
 
     ``transport`` replaces the HTTP layer: a fake object in tests, or the
@@ -1288,11 +1345,12 @@ class OpenRouterBackend:
             message = f"{label}: status {answer.status}, but the answer is not a JSON object [{UNCONFIRMED_NOTE}]"
             logger.warning("%s", message)
             raise UnconfirmedCallError(message)
+        secret = os.environ.get(self._api_key_env, "").strip()
         try:
             usage, reported_usd = read_openrouter_usage(data, label)
         except UnconfirmedCallError as error:
-            if "error" in data:
-                error = UnconfirmedCallError(f"{error} The answer holds an error: {_error_message(data)}")
+            if data.get("error") is not None:
+                error = UnconfirmedCallError(f"{error} The answer holds an error: {_error_message(data, secret)}")
             logger.warning("%s", error)
             raise error from None
         self._limiter.record(reported_usd)
@@ -1309,7 +1367,7 @@ class OpenRouterBackend:
             reported_usd=reported_usd,
             served_by=served_by if isinstance(served_by, str) else None,
         )
-        text = read_openrouter_text(data, billed, label)
+        text = read_openrouter_text(data, billed, label, secret)
         return billed.model_copy(update={"text": text})
 
     def _headers(self) -> dict[str, str]:
@@ -1328,8 +1386,9 @@ class OpenRouterBackend:
         Returns the answer, the number of attempts and the time of the successful
         attempt in seconds. An attempt is tried again after a retryable status code
         and after a lost connection, as long as the request has attempts left. A
-        timeout ends the request with ``UnconfirmedCallError``, any other failure with
-        ``BackendError``. No attempt is sent while the stop event is set.
+        timeout and a success status whose body cannot be read end the request with
+        ``UnconfirmedCallError``: the call may be billed, so it is not sent again. Any
+        other failure ends it with ``BackendError``. No attempt is sent while the stop event is set.
         """
         attempt = 0
         while True:
@@ -1342,11 +1401,15 @@ class OpenRouterBackend:
             retry_after_s: float | None = None
             try:
                 answer = self._transport.post(OPENROUTER_URL, headers, body, self._timeout_s)
-            except HttpTimeoutError as exc:
+            except (HttpTimeoutError, HttpUnreadAnswerError) as exc:
+                reason = (
+                    f"no answer within the timeout of {self._timeout_s:g} s"
+                    if isinstance(exc, HttpTimeoutError)
+                    else "the answer could not be read"
+                )
                 message = (
                     f"{label}: the call failed on attempt {attempt} of {self._max_attempts} "
-                    f"(no answer within the timeout of {self._timeout_s:g} s): "
-                    f"{_error_text(exc, secret)} [{UNCONFIRMED_NOTE}]"
+                    f"({reason}): {_error_text(exc, secret)} [{UNCONFIRMED_NOTE}]"
                 )
                 logger.warning("%s", message)
                 raise UnconfirmedCallError(message) from None
@@ -1359,7 +1422,7 @@ class OpenRouterBackend:
             else:
                 if 200 <= answer.status <= 299:
                     return answer, attempt, self._clock() - started
-                failure = _clean_text(f"(status {answer.status}): {_error_message(_json_object(answer.body))}", secret)
+                failure = f"(status {answer.status}): {_error_message(_json_object(answer.body), secret)}"
                 if answer.status == 503:
                     failure += f"; {NO_PROVIDER_NOTE}"
                 retryable, unconfirmed = is_retryable_status(answer.status), False

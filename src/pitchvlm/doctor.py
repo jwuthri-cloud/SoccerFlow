@@ -1172,7 +1172,7 @@ def check_reported_cost(calls: Sequence[RawCall], prices: Sequence[Price], *, on
     """Check that every recorded OpenRouter answer reports its cost, and compare it with the price table.
 
     The cost ledger takes the reported cost of each answer, so an answer without one
-    makes the check fail. The value is the sum of the reported costs. The detail text
+    makes the check fail, and so does a cost of 0: a paid model never costs nothing. The value is the sum of the reported costs. The detail text
     also gives, for the calls of a model with a price in ``prices`` (on the day ``on``,
     today in UTC when None), the share of the reported cost in the cost at the table
     price: above 1 means that the table price is lower than the price that was billed,
@@ -1181,10 +1181,12 @@ def check_reported_cost(calls: Sequence[RawCall], prices: Sequence[Price], *, on
     """
     if not calls:
         return CheckResult(REPORTED_COST, "info", "not checked: no raw call was recorded")
-    missing = sum(1 for call in calls if call.reported_usd is None)
+    missing = sum(1 for call in calls if call.reported_usd is None or call.reported_usd == 0)
     if missing:
         return CheckResult(
-            REPORTED_COST, "fail", f"{missing} of {len(calls)} answers report no cost, so the ledger cannot price them"
+            REPORTED_COST,
+            "fail",
+            f"{missing} of {len(calls)} answers report no cost or a cost of 0, so the ledger cannot price them",
         )
     total = math.fsum(call.reported_usd or 0.0 for call in calls)
     day = datetime.now(UTC).date() if on is None else on
