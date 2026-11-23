@@ -1490,10 +1490,93 @@ Measurement, fixed before any run (rule 7):
    files of section 3, with `tool-job`, `tools/run_tool.py` and `tool-score` as in section 3. The
    detector engine adds no box: its boxes are those of the tool, kept by the same score limit,
    so G2 measures the boxes of the engine. Compare only with the people probe of the same frames.
+   The files of the second family (D-FINE, RT-DETRv2; subsection below) take the same frames,
+   the same gate and the same scorer, so the owner chooses the family by these numbers.
 2. End to end on the dev clips with the same scorer: run every clip of the group `dev` with
    the commands above, each engine with its own `--tracker` name, then `eval` for each tracker
    (section 5) on the same clips. Compare GS-HOTA, DetA and AssA clip by clip, and the role and
    team-side accuracy of gate G5b. The settings of both runs are fixed before the first clip.
+
+### A second detector family: D-FINE and RT-DETRv2 (2026-11-23)
+
+The owner chooses the detector family by measurement (`docs/DECISIONS.md`, entry "A second
+detector family: D-FINE and RT-DETRv2 through transformers" of 2026-11-23). The section
+`detector` of the settings names the family in `name`: `rfdetr` (the default), `dfine` or
+`rtdetrv2`. The two new families run through Hugging Face transformers in one environment of
+their own, with COCO-only weights under Apache-2.0. Their keys are `model` (the size),
+`min_score`, `input_size` (pixels of the square input, a multiple of 32), `batch` (frames per
+call of the model) and `half` (float16; not on the device `cpu`). A section that names only the
+family takes the defaults of that family: `detector: {name: dfine}` is D-FINE Medium, 0.5, 640
+pixels, batch 1, float32. The package does not care which family made a clip run: the clip run
+format is the same, `run` checks the tool section like that of RF-DETR, and the engine table of
+`result.json` names the family (`detector:dfine:medium`).
+
+Install, a proposal for the owner (nothing of it ran; every version was at least 7 days old on
+2026-11-23; `uv` takes no package newer than the date):
+
+```bash
+uv venv --python 3.12 ~/pitchvlm-data/envs/transformers
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv pip install --python ~/pitchvlm-data/envs/transformers/bin/python \
+    --exclude-newer 2026-11-16 \
+    "transformers==5.23.0" "torch==2.15.0" "torchvision==0.29.2" "huggingface-hub==2.4.0" \
+    "safetensors==0.8.0" "numpy==2.5.4" "pillow==13.0.0"
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY uv pip freeze --python ~/pitchvlm-data/envs/transformers/bin/python
+```
+
+- Write the requirements file of this environment on the run machine from that freeze
+  (`locks/`), as for the other tool environments; it is not written on the build machine.
+- The first run of a size downloads its checkpoint, at the commit that the script names
+  (`TRANSFORMERS_CHECKPOINTS`), into the cache folder `HF_HOME`. The commands below set it to
+  `~/pitchvlm-data/hf`, outside the repository. Sizes, estimated from the parameter counts of
+  the model pages (float32, 4 bytes each): D-FINE Small 41 MB, Medium 79 MB, Large 125 MB;
+  RT-DETRv2 r18vd 81 MB, r50vd 172 MB.
+- `HF_HUB_DISABLE_TELEMETRY=1` stops the usage reports of the hub library.
+
+Gate G2 on the frames of the people probe, the same frames and the same scorer as the five
+RF-DETR files of section 3 (rule 8): the same group, frames per clip and seed, the score limit
+0.5, float32 and batch 1, so that the time per frame compares with that of RF-DETR. The sizes
+bracket the RF-DETR sizes Small to Large by their published latency (T4, TensorRT, FP16: RF-DETR
+S 3.5 ms, M 4.4 ms, L 6.8 ms; published, not measured):
+
+| Detector | Experiment file | Published latency, ms | Published COCO AP |
+|---|---|---|---|
+| D-FINE Small | `configs/experiments/people_probe_dfine_small.yaml` | 3.49 | 48.5 |
+| D-FINE Medium | `configs/experiments/people_probe_dfine_medium.yaml` | 5.62 | 52.3 |
+| D-FINE Large | `configs/experiments/people_probe_dfine_large.yaml` | 8.07 | 54.0 |
+| RT-DETRv2 r18vd | `configs/experiments/people_probe_rtdetrv2_r18vd.yaml` | 4.61 (217 fps) | 48.1 |
+| RT-DETRv2 r50vd | `configs/experiments/people_probe_rtdetrv2_r50vd.yaml` | 9.26 (108 fps) | 53.4 |
+
+```bash
+python -m pitchvlm.cli tool-job --experiment configs/experiments/people_probe_dfine_medium.yaml \
+    --root ~/pitchvlm-data --out ~/pitchvlm-data/jobs/people_probe_dfine_medium.json
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY HF_HOME=~/pitchvlm-data/hf HF_HUB_DISABLE_TELEMETRY=1 \
+    ~/pitchvlm-data/envs/transformers/bin/python tools/run_tool.py dfine --device mps \
+    --job ~/pitchvlm-data/jobs/people_probe_dfine_medium.json --root ~/pitchvlm-data \
+    --out ../pitchvlm-results/results/tools/people_probe_dfine_medium.json
+python -m pitchvlm.cli tool-score --experiment configs/experiments/people_probe_dfine_medium.yaml \
+    --root ~/pitchvlm-data --run ../pitchvlm-results/results/tools/people_probe_dfine_medium.json \
+    --out ../pitchvlm-results/results/metrics/people_probe_dfine_medium.json
+```
+
+- The same three commands for each file of the table; the sub-command of the script is the
+  family (`dfine` or `rtdetrv2`). First run: `--max-clips 2` on `tool-job` and `tool-score`.
+- On its first call (not measured) the script compares its boxes with
+  `post_process_object_detection` of the installed transformers and stops with a line when they
+  differ. A stop there means that the output of the model is not the one that the script was
+  written for: tell the owner, do not loosen the check.
+- `seconds_per_frame` is the whole call (image processor, model, conversion), like the plain
+  `predict` of RF-DETR. The script also prints and stores the median of each part
+  (`runner.stage_ms_per_frame`: `preprocess`, `model`, `postprocess`); the model time is read
+  after a synchronisation of the device. Measure each family back to back in both orders (A B,
+  then B A) on the same machine, with the load average noted, before a timing claim.
+- `half: true` and `batch` above 1 are settings for later measurements of speed: they change
+  what is measured, so they get their own experiment file, fixed before the run.
+
+End to end on a clip with another family: a settings file with the `engines` section of
+`configs/engines/detector_calibration.yaml` and the section `detector: {name: dfine}` (commit
+it before the run, rule 7), then the three commands of this section with `clip-job --tool dfine`
+and `tools/run_tool.py dfine` in the transformers environment. `clip-job` refuses a family other
+than the one of the settings file.
 
 ## 12 Plan: a detector trained on soccer (not done; no download, no training yet)
 
@@ -1541,6 +1624,12 @@ and refuses `train`, the converter does not exist, and the training has no job i
   `tools/run_tool.py` (the source of rfdetr 1.12.1 says how a model class takes its own
   weights; to confirm), and the class names of the trained weights in `fallbacks/rfdetr.py`
   (`player`, `goalkeeper`, `referee` give a role; `ball` is a ball candidate).
+- The same plan holds for D-FINE or RT-DETRv2 if one of them passes G2 better than RF-DETR: the
+  fine-tune then runs through transformers (its object-detection training interface; not read
+  for this plan), the trained weights get a size of their own in `TRANSFORMERS_CHECKPOINTS`
+  with the SHA-256 of the file, and the class names go to `KEPT_LABELS` and `fallbacks/rfdetr.py`.
+  The licence rule stays: start only from COCO-only weights (the Objects365 weights of both
+  families are "not usable until read", `docs/DECISIONS.md`, entry of 2026-11-23).
 - Measure the trained detector like the others: gate G2 on the probe frames, then end to end on
   the dev clips (section 11). Ultralytics weights are not an option for this repository: their
   code and every model trained with it are AGPL-3.0 (`docs/DECISIONS.md`, entry "A real-time

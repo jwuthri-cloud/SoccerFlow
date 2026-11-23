@@ -1358,10 +1358,15 @@ package:
   format of the adapter module of the tool). No frame may have two answers. The file is read
   strictly (`load_tool_run`): a key that comes twice is refused, a number must be written as a
   number and a truth value as true or false.
-- The tool section is `RfdetrSettings` (`name`, `model`, `min_score`, `antialias`) or
-  `PnlcalibSettings` (`name`, `kp_threshold`, `line_threshold`, `pnl_refine`); the key `name`
-  says which one. `antialias` and `pnl_refine` take only true and false.
-  `cli.TOOL_PROBES` names the probe of each tool: `rfdetr` people, `pnlcalib` pitch.
+- The tool section is `RfdetrSettings` (`name`, `model`, `min_score`, `antialias`),
+  `TransformersDetectorSettings` (`name` `dfine` or `rtdetrv2`, `model` a size of
+  `runs.TRANSFORMERS_MODELS`, `min_score`, `input_size` a multiple of 32 from 320 to 1280,
+  `batch` from 1 to 64, `half`) or `PnlcalibSettings` (`name`, `kp_threshold`,
+  `line_threshold`, `pnl_refine`); the key `name` says which one. The `name` of a detector is
+  its family (`runs.DETECTOR_FAMILIES`: `rfdetr`, `dfine`, `rtdetrv2`), and `runs.is_detector`
+  tells a detector section from the calibration. `antialias`, `half` and `pnl_refine` take only
+  true and false. `cli.TOOL_PROBES` names the probe of each tool: every detector family people,
+  `pnlcalib` pitch.
 - The command `tool-score` refuses a run file whose name or tool section differs from the
   experiment file, and a run file without an answer for a frame of the probe
   (`cli.probe_answers`). So the settings of the experiment file are those that the tool ran
@@ -1376,10 +1381,27 @@ package:
 - `fallbacks.rfdetr.people_from_detections` has no default score limit: the experiment file
   names it, and the script gives the same value to the tool as its threshold.
 
-`tools/run_tool.py` (`rfdetr` and `pnlcalib` sub-commands) reads a job file and writes a run
-file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`) and the commit of the PnLCalib clone
+`tools/run_tool.py` (`rfdetr`, `dfine`, `rtdetrv2` and `pnlcalib` sub-commands) reads a job
+file and writes a run file. It checks the version of `rfdetr` (`RFDETR_VERSIONS`), of
+`transformers` (`TRANSFORMERS_VERSIONS`) and the commit of the PnLCalib clone
 (`PNLCALIB_COMMIT`) and refuses another one, and a clone with a changed tracked file, because it
-was written from the source of these versions and never ran with the tools. It takes the
+was written from the source of these versions and never ran with the tools. The two families of
+transformers share one engine (`transformers_engine`): the size of the job names a checkpoint and
+its commit (`TRANSFORMERS_CHECKPOINTS`; COCO-only weights whose model card was read), loaded with
+`AutoImageProcessor` and `AutoModelForObjectDetection` (safetensors only, float16 when `half`;
+refused on the device `cpu`). The configuration of the checkpoint must name the model type of
+the family, the focal loss and the classes `person` and `sports ball`. `detections_of_queries`
+turns the output of one frame (class scores per query, boxes as centre, width and height in parts
+of the square input) into the payload of `fallbacks.rfdetr`: the logistic function, the best
+pairs of query and class (as many as queries), corners in pixels of the frame, the classes of
+`KEPT_LABELS` from `min_score` on. On the warm-up call the script compares its boxes with
+`post_process_object_detection` of the installed package and stops when they differ
+(`check_against_tool`). Frames go to a tool in batches (`answer_frames(job, root, answer,
+batch)`; `one_at_a_time` for RF-DETR and PnLCalib): the time of a frame is the time of its batch
+divided by its frames, and a transformers run adds `stage_ms_per_frame` (median milliseconds per
+frame of the image processor, the model after a device synchronisation, and the conversion) to
+the facts of the run. A line per frame for a live feed would be written in the loop of
+`answer_frames`, where each frame entry is complete. It takes the
 variables `GEMINI_API_KEY` and `OPENROUTER_API_KEY` out of its environment before it loads a
 tool (`KEY_VARIABLES`), and it writes its own SHA-256 into the facts of the run. Before the tool is built it checks the place of the run
 file (`check_out_place`: no folder, write access, not the job file), so that the answers of a
@@ -1476,8 +1498,10 @@ python3 tools/guard.py (--staged | --push | --tracked | --paths FILE ...) [--rep
 PeopleEngine = Literal["model", "detector"]; PitchEngine = Literal["model", "calibration"]
 NumberEngine = Literal["model", "none"]
 class EngineSettings(Record): people: PeopleEngine = "model"; pitch_mapping: PitchEngine = "model"; number: NumberEngine = "model"
-# PipelineConfig gets: engines: EngineSettings; detector: RfdetrSettings = DEFAULT_DETECTOR (RFDETRMedium, 0.5,
+# PipelineConfig gets: engines: EngineSettings; detector: DetectorSettings = DEFAULT_DETECTOR (RFDETRMedium, 0.5,
 # no antialias); calibration: PnlcalibSettings = DEFAULT_CALIBRATION (the settings of the pitch probe of PnLCalib)
+# DEFAULT_DETECTORS: the settings that a family named in the section detector starts from (load_config):
+# rfdetr = DEFAULT_DETECTOR; dfine medium and rtdetrv2 r18vd, both 0.5, 640 pixels, batch 1, float32
 
 # pipeline.py
 @dataclass(frozen=True)
@@ -1571,7 +1595,8 @@ def load_clip_run(first: Path) -> ClipRun
   frame keeps a camera. The camera of each keyframe gets its paint-alignment score in
   `ClipResult.paint`, like a landmark fit, so both pitch engines are scored on the same frames.
 - `ClipResult.engines` names `kit_legend`, `people`, `team_role`, `landmarks`, `number`, `ball`,
-  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<tool>:<model class>`,
+  `motion`, `pitch_mapping`, `tracks` and `fill`: `model:<model>`, `detector:<family>:<size>`
+  (`detector:rfdetr:RFDETRMedium`, `detector:dfine:medium`),
   `tool:<tool>`, `code`, `code:kit-colour`, `code:ball-tracker`, or `none` for a step that does
   not run. `<model>` is `config.model_label` of the step: the bare name for Gemini,
   `openrouter:<slug>` for OpenRouter.
@@ -1597,8 +1622,9 @@ to `--out`, and a frame whose answer does not fit into one part.
 
 Command line:
 
-- `clip-job --tool rfdetr|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]` writes
-  the clip job with the tool section of the settings file. A video file is refused, and so is a
+- `clip-job --tool rfdetr|dfine|rtdetrv2|pnlcalib --clip DIR --root DATA --out FILE [--config SETTINGS]`
+  writes the clip job with the tool section of the settings file. A detector family other than
+  the one of the settings file is refused. A video file is refused, and so is a
   clip folder that is not below the data folder. A clip folder of `video-frames` holds the record
   of its video: the job gets `video_sha256`, and a record that names another frame count or size
   than the folder holds is refused.
@@ -1784,7 +1810,8 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
 - Test the sign conventions explicitly: a far-side point has negative y; model boxes are
   `[ymin, xmin, ymax, xmax]`.
 - No external tool is installed where the tests run. `tests/test_run_tool.py` replaces each
-  tool by a stand-in with the call signatures of the real one, and one test of the image reader
+  tool by a stand-in with the call signatures of the real one (`tests/test_detector_families.py`
+  does the same for `transformers` and `torch`), and one test of the image reader
   is skipped without Pillow. So these tests say what the script calls, and not that the real
   tools answer as the script expects.
 - No media files in the repository: build images in the test.

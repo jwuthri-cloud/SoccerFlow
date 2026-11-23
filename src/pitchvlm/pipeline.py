@@ -1276,8 +1276,9 @@ def _engines(config: PipelineConfig) -> dict[str, str]:
 
     ``model:<model>`` for a model step, with the model as the command line writes it
     (``model_label``: the bare name for Gemini, ``openrouter:<slug>`` for OpenRouter),
-    ``detector:<tool>:<model class>`` and ``tool:<tool>`` for the answers of an external
-    tool, ``code`` for plain code, and ``none`` for a step that does not run.
+    ``detector:<family>:<size>`` (for example ``detector:rfdetr:RFDETRMedium`` or
+    ``detector:dfine:medium``) and ``tool:<tool>`` for the answers of an external tool,
+    ``code`` for plain code, and ``none`` for a step that does not run.
     """
     engines = config.engines
     detector = engines.people == "detector"
