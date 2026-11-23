@@ -420,7 +420,9 @@ def test_dfine_job_loads_the_pinned_checkpoint_and_writes_boxes_in_pixels_of_the
     assert set(runner["stage_ms_per_frame"]) == {"preprocess", "model", "postprocess"}
     assert all(value >= 0 for value in runner["stage_ms_per_frame"].values())
     # The script checked its boxes against those of the tool on the warm-up call, with the size of the frame.
-    assert Processor.post_processed == [{"threshold": 0.5, "target_sizes": [(HEIGHT, WIDTH)]}]
+    assert Processor.post_processed == [
+        {"threshold": run_tool.SELF_CHECK_MIN_SCORE, "target_sizes": [(HEIGHT, WIDTH)]}
+    ]
     printed = capsys.readouterr().out
     assert "median time per frame of each part: preprocess" in printed
 
@@ -591,6 +593,26 @@ def test_clip_job_of_dfine_gives_a_clip_run_that_the_package_reads(
     assert run.runner["checkpoint"] == "ustc-community/dfine-medium-coco"
 
 
+def test_live_run_of_dfine_checks_its_boxes_and_keeps_the_facts_of_the_run(
+    tmp_path: Path, transformers: SimpleNamespace
+) -> None:
+    """A live run (--feed) checks the boxes on the warm-up call as a clip run does, and writes the facts of
+    the run, with the self-check, next to the copy of the feed (live feed of round 6)."""
+    frames = small_frames(tmp_path / "data", 4)
+    job = {"format": runs.CLIP_JOB_FORMAT, "clip": "CLIP-A", "tool": dict(DFINE), "images": [e["image"] for e in frames]}
+    (tmp_path / "job.json").write_text(json.dumps(job), encoding="utf-8")
+    copy, feed = tmp_path / "runs" / "feed.jsonl", tmp_path / "feed.jsonl"
+    arguments = ["dfine", "--job", str(tmp_path / "job.json"), "--root", str(tmp_path / "data"), "--out", str(copy)]
+    assert run_tool.main([*arguments, "--device", "cuda:0", "--feed", str(feed)]) == 0
+    lines = [json.loads(text) for text in feed.read_text(encoding="utf-8").splitlines()]
+    assert [line.get("frame") for line in lines] == [None, 0, 1, 2, 3]
+    assert lines[1]["payload"]["labels"] == ["person"]
+    facts = json.loads((tmp_path / "runs" / "feed-runner.json").read_text(encoding="utf-8"))
+    assert facts["runner"]["self_check_detections"] >= 1
+    assert facts["runner"]["checkpoint"] == "ustc-community/dfine-medium-coco"
+    assert (facts["answered_frames"], facts["skipped_frames"]) == (4, 0)
+
+
 # --- The package -----------------------------------------------------------------------
 
 
@@ -756,3 +778,157 @@ def test_tool_score_measures_a_dfine_run_like_a_rfdetr_run(
     assert measured["counts"]["tp"] == measured["counts"]["true_boxes"] > 0
     assert measured["settings"]["tool"]["name"] == "dfine"
     assert measured["provenance"]["runner"]["checkpoint"] == "ustc-community/dfine-medium-coco"
+
+
+# --- Second read (round 6): an independent reference, the self-check, the class places -------------
+
+
+def independent_post_process(
+    logits: np.ndarray, boxes: np.ndarray, height: int, width: int, threshold: float, labels: dict[int, str]
+) -> list[tuple[str, float, list[float]]]:
+    """``post_process_object_detection`` of transformers 5.23.0 for one frame, written apart from the script.
+
+    A reader who had not seen the script wrote it from the public source of the tag v5.23.0
+    (``models/rt_detr/image_processing_rt_detr.py``, ``image_transforms.py``) and the
+    configuration files of two checkpoints, on 2026-11-23: corners from the centre format,
+    scaled by (width, height, width, height) of a target size given as (height, width), no
+    clipping; the logistic function of the logits; ``topk`` with k = queries over the flattened
+    pairs of query and class; class = place modulo classes, query = place divided by classes;
+    scores above the threshold (strictly), in the order of ``topk``.
+    """
+    logits, boxes = np.asarray(logits, dtype=np.float64), np.asarray(boxes, dtype=np.float64)
+    queries, classes = logits.shape
+    centre_x, centre_y, box_width, box_height = boxes.T
+    corners = np.stack(
+        [centre_x - 0.5 * box_width, centre_y - 0.5 * box_height, centre_x + 0.5 * box_width, centre_y + 0.5 * box_height],
+        axis=-1,
+    ) * np.array([width, height, width, height], dtype=np.float64)
+    flat = 1.0 / (1.0 + np.exp(-logits.reshape(-1)))
+    order = np.argsort(-flat, kind="stable")[:queries]
+    return [
+        (labels[int(place % classes)], float(flat[place]), [float(value) for value in corners[place // classes]])
+        for place in order
+        if flat[place] > threshold
+    ]
+
+
+def test_conversion_agrees_with_an_independent_reference_on_random_outputs() -> None:
+    """1,000 random outputs (seed 300): frames that are not square, edge boxes, 1 to 300 queries, 80 classes.
+
+    Planted bugs that this test finds (each tried once): width and height swapped in the scale,
+    boxes read as corners, no cut to the best pairs, query and class places swapped, a limit
+    moved by 0.01 up or down.
+
+    The script keeps a score equal to its limit and the tool does not; no random score falls on a
+    limit, so the two sides must give the same detections.
+    """
+    labels = {index: f"class {index}" for index in range(80)} | {0: "person", 32: "sports ball"}
+    rng = np.random.default_rng(300)
+    sizes = [(1920, 1080), (1280, 720), (200, 100), (100, 200), (640, 640), (3840, 2160), (1, 1), (7, 3)]
+    n_detections = 0
+    for case in range(1000):
+        queries = int(rng.choice([1, 3, 10, 300]))
+        width, height = sizes[case % len(sizes)] if case % 3 else tuple(int(v) for v in rng.integers(1, 4000, 2))
+        # Most pairs score low; a person, a ball and one other class get scores spread over 0 to 1, so
+        # that both the limit and the cut to the best pairs (as many as queries) decide.
+        logits = rng.normal(-8.0, 2.0, (queries, 80))
+        for place in (0, 32, int(rng.integers(1, 80))):
+            logits[:, place] = np.log(1.0 / rng.uniform(0.001, 0.999, queries) - 1.0) * -1.0
+        logits = logits.astype(np.float32)
+        boxes = np.column_stack(
+            [rng.uniform(-0.1, 1.1, (queries, 2)), rng.uniform(0.0, 1.5, (queries, 2))]
+        ).astype(np.float32)
+        if case % 5 == 0:  # centres on the edges and corners of the frame: the boxes reach outside it
+            boxes[:, :2] = rng.choice([0.0, 1.0], (queries, 2))
+        limit = float(rng.choice([0.0, 0.05, 0.3, 0.5, 0.9]))
+        payload = run_tool.detections_of_queries(
+            logits, boxes, width=width, height=height, labels=labels, min_score=limit
+        )
+        mine = [(d["label"], d["score"], d["box_xyxy"]) for d in payload["detections"]]
+        assert all(score != limit for _, score, _ in mine)  # else the two sides may differ by design
+        theirs = [
+            item
+            for item in independent_post_process(logits, boxes, height, width, limit, labels)
+            if item[0] in run_tool.KEPT_LABELS
+        ]
+        assert [item[0] for item in mine] == [item[0] for item in theirs], case
+        for (_, my_score, my_box), (_, their_score, their_box) in zip(mine, theirs, strict=True):
+            assert my_score == pytest.approx(their_score, abs=1e-12)
+            assert my_box == pytest.approx(their_box, abs=1e-9)
+        n_detections += len(theirs)
+    assert n_detections > 10_000
+
+
+def test_class_places_that_are_not_0_to_classes_are_refused() -> None:
+    """Weights whose class places are 1 to 3 (the COCO ids start at 1) would give each box the name of another class."""
+    logits = np.full((2, 3), logit(0.01))
+    logits[0, 1] = logit(0.9)
+    boxes = np.tile([0.5, 0.5, 0.2, 0.2], (2, 1))
+    shifted = {1: "person", 2: "car", 3: "sports ball"}
+    with pytest.raises(run_tool.RunnerError, match="class places"):
+        run_tool.detections_of_queries(logits, boxes, width=WIDTH, height=HEIGHT, labels=shifted, min_score=0.5)
+
+
+def test_self_check_also_compares_a_first_frame_without_a_detection_above_the_limit(
+    tmp_path: Path, transformers: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A first frame with every score under ``min_score`` gave an empty check: a changed tool then passed."""
+
+    def low(red: int) -> tuple[np.ndarray, np.ndarray]:
+        logits = np.full((3, 3), logit(0.01))
+        logits[0, 0] = logit(0.3)
+        return logits, np.array([[0.5, 0.5, 0.1, 0.4], [0.2, 0.2, 0.1, 0.1], [0.8, 0.8, 0.1, 0.1]])
+
+    def shifted(results: list[dict[str, Tensor]]) -> None:
+        results[0]["boxes"] = Tensor(results[0]["boxes"].values + 0.5)
+
+    monkeypatch.setattr(Model, "answers", staticmethod(low))
+    monkeypatch.setattr(Processor, "change", staticmethod(shifted))
+    code, out = run_family(tmp_path, dict(DFINE))
+    assert code == 2
+    assert "differ from those of post_process_object_detection" in error_line(capsys)
+    assert not out.exists()
+
+
+def test_self_check_counts_the_detections_that_it_compared(
+    tmp_path: Path, transformers: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out = run_family(tmp_path, dict(DFINE))
+    assert code == 0, capsys.readouterr().err
+    runner = json.loads(out.read_text(encoding="utf-8"))["runner"]
+    # Of the 9 pairs of the frame the tool keeps the best 3 (as many as queries): the person, then two
+    # pairs of score 0.01. The cut decided, so only the pairs above the lowest kept score are compared.
+    assert runner["self_check_detections"] == 1
+
+
+def test_self_check_leaves_out_the_pairs_that_tie_at_the_cut_to_the_best_pairs(
+    tmp_path: Path, transformers: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``torch.topk`` gives no order for equal scores: the tool may keep other tied pairs than the script.
+
+    The stand-in frame has 8 pairs of score 0.01 for the last 2 of 3 places. The tool here breaks
+    the ties from the last place, the script from the first: a correct run must not stop.
+    """
+
+    frame = Model.answers(0)
+
+    def other_ties(results: list[dict[str, Tensor]]) -> None:
+        logits, boxes = frame
+        scores = 1.0 / (1.0 + np.exp(-logits.ravel()))
+        places = np.arange(scores.size)[::-1]
+        order = places[np.argsort(-scores[::-1], kind="stable")][: len(logits)]
+        corners = np.column_stack(
+            [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2, boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2]
+        ) * np.array([WIDTH, HEIGHT, WIDTH, HEIGHT])
+        classes = logits.shape[1]
+        results[0] = {
+            "scores": Tensor(scores[order]),
+            "labels": Tensor(order % classes),
+            "boxes": Tensor(corners[order // classes]),
+        }
+
+    monkeypatch.setattr(Model, "answers", staticmethod(lambda red: frame))
+    monkeypatch.setattr(Processor, "change", staticmethod(other_ties))
+    code, out = run_family(tmp_path, dict(DFINE))
+    assert code == 0, capsys.readouterr().err
+    assert json.loads(out.read_text(encoding="utf-8"))["runner"]["self_check_detections"] == 1

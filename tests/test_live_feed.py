@@ -109,7 +109,7 @@ def test_a_live_run_writes_each_line_before_it_answers_the_next_frame(
     # The warm-up call comes before the header; then the call of frame i sees the header and the i lines before it.
     assert stand_in_detector.lines_before == [0, *(1 + frame for frame in range(40))]
     # A live run writes no clip run.
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["copy.jsonl", "feed.jsonl"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["copy-runner.json", "copy.jsonl", "feed.jsonl"]
 
 
 class Clock:
@@ -405,9 +405,11 @@ def test_the_live_chain_gives_the_result_of_the_clip_runs(tmp_path: Path, live_c
 
 
 def test_the_chain_ends_when_the_stream_stops_before_it_reads(tmp_path: Path, live_clip: LiveClip) -> None:
+    """With a pace the tools are still at their first frame when the merger stops (without one, a fast tool can
+    put its whole feed into the pipe before that and end with 0)."""
     start = time.monotonic()
-    outcome = run_live(live_clip, tmp_path / "live", delay=5, pace=None, simulated_ms={"detector": 0, "calibration": 0},
-                       timeout_s=60, stream_arguments=["--history", "abc"])
+    outcome = run_live(live_clip, tmp_path / "live", delay=5, pace=25.0, simulated_ms={"detector": 0, "calibration": 0},
+                       timeout_s=60, stream_arguments=["--history", "abc"], start_margin_s=2.0)
     assert time.monotonic() - start < 60
     assert outcome.codes == {"stream": 2, "merge-feeds": 2, "rfdetr": 2, "pnlcalib": 2}
 
