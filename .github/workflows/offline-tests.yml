@@ -1,0 +1,100 @@
+# Offline tests, leak check and demos on Linux (docs/RUNBOOK.md, section 15).
+# No secret, no model call, no footage, no dataset. Every action is pinned by its full commit;
+# the version is in the comment (docs/DECISIONS.md, entry "The offline tests on Linux in CI" of
+# 2026-11-23). The packages come from locks/ci-linux.txt, with hashes.
+name: offline tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+
+jobs:
+  # The full run in several processes (tools/run_tests.py), the leak check and the three demos.
+  tests:
+    name: full run, Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the pinned packages
+        run: python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+
+      - name: Show the machine
+        run: |
+          python -VV
+          uname -a
+          nproc
+          python -c "import multiprocessing as m, sys, cv2, numpy; print('start method', m.get_start_method(), sys.platform); print('cv2', cv2.__version__, 'numpy', numpy.__version__)"
+          python -m pip list
+
+      - name: Leak check of the tracked files (no deny-list in CI)
+        run: python3 tools/guard.py --tracked
+
+      - name: Full offline run in several processes
+        if: ${{ !cancelled() }}
+        run: python tools/run_tests.py -m "slow or not slow"
+
+      - name: Demo, model engine
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONPATH: src
+        run: python -m pitchvlm.cli demo --out "$RUNNER_TEMP/demo-vlm"
+
+      - name: Demo, detector engine
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONPATH: src
+        run: python -m pitchvlm.cli demo --engine detector --out "$RUNNER_TEMP/demo-detector"
+
+      - name: Stream, synthetic clip
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONPATH: src
+        run: python -m pitchvlm.cli stream --synthetic --out "$RUNNER_TEMP/stream"
+
+  # The full run in one process: the tests share one interpreter, as with "python -m pytest".
+  one-process:
+    name: full run in one process, Python 3.13
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install the pinned packages
+        run: python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+
+      - name: Full offline run in one process
+        run: python -m pytest -m "slow or not slow"
