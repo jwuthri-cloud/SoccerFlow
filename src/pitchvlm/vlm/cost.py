@@ -13,6 +13,14 @@ its answer reports (``VLMResponse.reported_usd``); the price table of the
 OpenRouter models, ``configs/openrouter_prices.yaml`` (``load_price_table``),
 gives its estimate before a run. A model without a price in its table has no
 estimate, so its run does not start.
+
+Video input has a table of its own: the video rates (``VideoRate``). A rate
+says how many tokens a sampled video frame and a second of sound cost, at which
+rate the provider samples a video that names none, and at which price these
+tokens are billed. The Gemini rates are ``GEMINI_VIDEO_RATES``; the OpenRouter
+rates are the ``video`` entries of the price table file
+(``load_video_rates``). A model without a video rate takes no video: a request
+with a video part for it has no estimate and is not sent.
 """
 
 from __future__ import annotations
@@ -34,7 +42,17 @@ import yaml
 from pydantic import Field
 
 from pitchvlm.schemas import Record
-from pitchvlm.vlm.types import DEFAULT_PROVIDER, BilledTier, Usage, VLMRequest, VLMResponse
+from pitchvlm.vlm.types import (
+    DEFAULT_PROVIDER,
+    VIDEO_RESOLUTIONS,
+    BilledTier,
+    Provider,
+    Resolution,
+    Usage,
+    VideoPart,
+    VLMRequest,
+    VLMResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,33 +160,170 @@ class TokenEstimate(Record):
 
 
 #: Token estimates per step (``meta.step``), used until real token counts are measured.
+#:
+#: The estimate of a video step counts its text only: the tokens of its video parts are added
+#: from the video rate of the model (``video_input_tokens``). The output of ``people_video`` is
+#: the estimate of one frame and is counted once for each target frame of the request
+#: (``PER_FRAME_OUTPUT_STEPS``). The text counts of the two video steps are estimated, not
+#: measured: about one token per four characters of the prompt, with room for a longer kit legend
+#: (people_video: 1,843 characters with a kit legend of 136 characters and 5 target times, about
+#: 460 tokens; kit_legend_video: 1,156 characters, about 290 tokens). The output of a video
+#: frame is taken to be the output of an image frame; the probe measures it.
 DEFAULT_TOKEN_ESTIMATES: Mapping[str, TokenEstimate] = MappingProxyType(
     {
         "people": TokenEstimate(input_tokens=1500, output_tokens=1400),
         "landmarks": TokenEstimate(input_tokens=2200, output_tokens=800),
         "number": TokenEstimate(input_tokens=2500, output_tokens=400),
         "kit_legend": TokenEstimate(input_tokens=3600, output_tokens=600),
+        "people_video": TokenEstimate(input_tokens=600, output_tokens=1400),
+        "kit_legend_video": TokenEstimate(input_tokens=500, output_tokens=600),
     }
+)
+#: Steps whose output estimate is the output of one target frame: it is counted once for each
+#: entry of the context list ``frames`` of the request.
+PER_FRAME_OUTPUT_STEPS = frozenset({"people_video"})
+
+
+@dataclass(frozen=True)
+class VideoRate:
+    """What video input costs for one model from one day on.
+
+    A video part of a request costs ``sampled frames x tokens_per_frame[resolution]``
+    video tokens and ``seconds of its range x audio_tokens_per_second`` sound tokens.
+    The sound is counted for every part, because the estimate does not know whether a
+    file has a sound track. ``default_fps`` is the sampling rate of the provider for a
+    part that names none. The video tokens cost ``video_usd_per_million`` and the
+    sound tokens ``audio_usd_per_million``; None stands for the input price of the
+    model on the same day. ``takes_clips`` says whether the provider takes a range
+    and a sampling rate of a part; a provider without it gets the whole file.
+    """
+
+    model: str
+    valid_from: date
+    tokens_per_frame: Mapping[Resolution, int]
+    audio_tokens_per_second: float
+    default_fps: float
+    takes_clips: bool
+    video_usd_per_million: float | None = None
+    audio_usd_per_million: float | None = None
+
+
+#: Media resolution -> tokens per video frame of the Gemini 4 and Gemini 3 models, from the
+#: media-resolution page (read on 2026-11-23, published, not measured): 70 at low, medium and
+#: unspecified, 280 at high. The video page gives 66 and 258; the larger value of each pair is
+#: taken. The tokens page gives "263 tokens per second" for video in general: that value is not
+#: used, and the first doctor check of video input measures the count (docs/DECISIONS.md,
+#: entry of 2026-11-23).
+_GEMINI_FRAME_TOKENS: Mapping[Resolution, int] = MappingProxyType({"low": 70, "medium": 70, "high": 280})
+#: Sound tokens per second of Gemini: the media-resolution page gives 25, the tokens page 32;
+#: the larger value is taken (published, not measured).
+_GEMINI_AUDIO_TOKENS_PER_SECOND = 32.0
+#: Default sampling rate of Gemini: "extracting frames at 1 FPS" (video page, published).
+_GEMINI_DEFAULT_FPS = 1.0
+
+#: The Gemini models that take video, with their video rates. The pricing page (read on
+#: 2026-11-23) gives one input price for every input of these models, with no separate price for
+#: video or sound, so video and sound tokens cost the input price. The robotics model has no
+#: rate: its page names no media resolution table for video, so it takes no video here.
+GEMINI_VIDEO_RATES: tuple[VideoRate, ...] = tuple(
+    VideoRate(
+        model,
+        _TABLE_START,
+        _GEMINI_FRAME_TOKENS,
+        _GEMINI_AUDIO_TOKENS_PER_SECOND,
+        _GEMINI_DEFAULT_FPS,
+        takes_clips=True,
+    )
+    for model in ("gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash")
 )
 
 
+def video_rate_for(model: str, on: date, table: Sequence[VideoRate]) -> VideoRate:
+    """Return the video rate of a model on a day: the entry with the latest start that is not after the day.
+
+    Raises KeyError for a model without a video rate (it takes no video) and for a day
+    before its first rate.
+    """
+    entries = [rate for rate in table if rate.model == model]
+    if not entries:
+        raise KeyError(f"the model {model!r} has no video rate, so it takes no video input here")
+    started = [rate for rate in entries if rate.valid_from <= on]
+    if not started:
+        first_day = min(rate.valid_from for rate in entries)
+        raise KeyError(f"no video rate for the model {model!r} on {on.isoformat()}: its rates start on {first_day}")
+    return max(started, key=lambda rate: rate.valid_from)
+
+
+def video_rates_of(provider: Provider, openrouter_video_rates: Sequence[VideoRate]) -> Sequence[VideoRate]:
+    """Return the video rate table of a provider: ``GEMINI_VIDEO_RATES``, or the OpenRouter rates of the price file."""
+    return GEMINI_VIDEO_RATES if provider == DEFAULT_PROVIDER else openrouter_video_rates
+
+
+def video_input_tokens(part: VideoPart, rate: VideoRate) -> tuple[int, int]:
+    """Return the expected video tokens and sound tokens of one video part.
+
+    The video tokens are the sampled frames of the range (``VideoPart.sampled_frames``
+    at the rate of the part, or at ``rate.default_fps``) times the tokens per frame of
+    its resolution. The sound tokens are the seconds of the range times
+    ``rate.audio_tokens_per_second``, rounded up. A resolution without a token count
+    raises KeyError.
+    """
+    if part.resolution not in rate.tokens_per_frame:
+        raise KeyError(f"the video rate of {rate.model} has no token count for the resolution {part.resolution!r}")
+    start, end = part.range_s
+    frames = part.sampled_frames(rate.default_fps)
+    return frames * rate.tokens_per_frame[part.resolution], math.ceil((end - start) * rate.audio_tokens_per_second)
+
+
+def _video_usd(request: VLMRequest, input_price: float, on: date, video_rates: Sequence[VideoRate]) -> float:
+    """Return the expected cost of the video parts of a request, at standard prices. KeyError: no video rate."""
+    total = 0.0
+    for part in request.videos:
+        rate = video_rate_for(request.model, on, video_rates)
+        video_tokens, audio_tokens = video_input_tokens(part, rate)
+        video_price = input_price if rate.video_usd_per_million is None else rate.video_usd_per_million
+        audio_price = input_price if rate.audio_usd_per_million is None else rate.audio_usd_per_million
+        total += (video_tokens * video_price + audio_tokens * audio_price) / 1e6
+    return total
+
+
+def _output_count(request: VLMRequest) -> int:
+    """Return how many times the output estimate of the step of a request counts: the target frames, or 1."""
+    if request.meta.step not in PER_FRAME_OUTPUT_STEPS:
+        return 1
+    frames = request.context.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise KeyError(f"a {request.meta.step} request needs the context list 'frames' for its estimate")
+    return len(frames)
+
+
 def _estimated_usd(
-    request: VLMRequest, estimates: Mapping[str, TokenEstimate], on: date, openrouter_prices: Sequence[Price]
+    request: VLMRequest,
+    estimates: Mapping[str, TokenEstimate],
+    on: date,
+    openrouter_prices: Sequence[Price],
+    openrouter_video_rates: Sequence[VideoRate],
 ) -> float:
-    """Return the expected cost of one request from the token estimate of its step."""
+    """Return the expected cost of one request from the token estimate of its step and its video parts."""
     step = request.meta.step
     if step not in estimates:
         raise KeyError(f"no token estimate for the step {step!r}")
     estimate = estimates[step]
-    usage = Usage(input_tokens=estimate.input_tokens, output_tokens=estimate.output_tokens)
+    usage = Usage(input_tokens=estimate.input_tokens, output_tokens=estimate.output_tokens * _output_count(request))
     if request.provider == DEFAULT_PROVIDER:
-        return cost_usd(request.model, usage, request.service_tier, on)
+        text_usd = cost_usd(request.model, usage, request.service_tier, on)
+        if not request.videos:
+            return text_usd
+        price = price_for(request.model, on)
+        video_usd = _video_usd(request, price.input_usd_per_million, on, GEMINI_VIDEO_RATES)
+        return text_usd + video_usd * _TIER_FACTORS[request.service_tier]
     if request.service_tier != "standard":
         raise ValueError(f"an OpenRouter request has no service tier {request.service_tier!r}: use standard")
     price = price_for(request.model, on, openrouter_prices)
-    return (
+    text_usd = (
         usage.input_tokens * price.input_usd_per_million + usage.output_tokens * price.output_usd_per_million
     ) / 1e6
+    return text_usd + _video_usd(request, price.input_usd_per_million, on, openrouter_video_rates)
 
 
 def estimate_usd(
@@ -177,6 +332,7 @@ def estimate_usd(
     on: date,
     *,
     openrouter_prices: Sequence[Price] = (),
+    openrouter_video_rates: Sequence[VideoRate] = (),
 ) -> float:
     """Return the expected cost in USD of the requests, before they are sent.
 
@@ -187,8 +343,16 @@ def estimate_usd(
     model without a price raise KeyError. A request that asks for the flex tier of
     a model without one raises ValueError (``cost_usd``), and so does an OpenRouter
     request for any tier but the standard one.
+
+    The video parts of a request add their tokens at the video rate of the model
+    (``video_input_tokens``): ``GEMINI_VIDEO_RATES`` for Gemini, and
+    ``openrouter_video_rates`` (``load_video_rates``) for OpenRouter. A request with
+    a video part for a model without a video rate raises KeyError: the model takes no
+    video, so the request has no estimate.
     """
-    return math.fsum(_estimated_usd(request, estimates, on, openrouter_prices) for request in requests)
+    return math.fsum(
+        _estimated_usd(request, estimates, on, openrouter_prices, openrouter_video_rates) for request in requests
+    )
 
 
 class _PriceEntry(Record):
@@ -199,11 +363,27 @@ class _PriceEntry(Record):
     output_usd_per_million: float = Field(gt=0, allow_inf_nan=False)
 
 
+class _VideoRateEntry(Record):
+    """One dated video rate of one model in the price table file (``VideoRate``).
+
+    An OpenRouter model has one number of tokens per frame for every resolution: the
+    chat completions API sends no resolution with a video.
+    """
+
+    valid_from: date
+    tokens_per_frame: int = Field(gt=0)
+    audio_tokens_per_second: float = Field(ge=0, allow_inf_nan=False)
+    frames_per_second: float = Field(gt=0, allow_inf_nan=False)
+    video_usd_per_million: float = Field(gt=0, allow_inf_nan=False)
+    audio_usd_per_million: float = Field(gt=0, allow_inf_nan=False)
+
+
 class _PricedModel(Record):
-    """One model of the price table file with its dated prices."""
+    """One model of the price table file with its dated prices, and its video rates when it takes video."""
 
     model: str = Field(min_length=1)
     prices: tuple[_PriceEntry, ...] = Field(min_length=1)
+    video: tuple[_VideoRateEntry, ...] = ()
 
 
 class _PriceTableFile(Record):
@@ -243,6 +423,41 @@ def load_price_table(path: Path) -> tuple[Price, ...]:
             for price in entry.prices
         )
     return tuple(prices)
+
+
+def load_video_rates(path: Path) -> tuple[VideoRate, ...]:
+    """Read the video rates of the OpenRouter models from the price table file (YAML).
+
+    A model takes video when its entry has a ``video`` list. Each entry of the list has
+    ``valid_from``, ``tokens_per_frame``, ``audio_tokens_per_second``,
+    ``frames_per_second`` (the sampling of the provider: an OpenRouter request sends no
+    rate), ``video_usd_per_million`` and ``audio_usd_per_million``. An OpenRouter rate
+    never takes a range or a sampling rate (``VideoRate.takes_clips``): the video page
+    says that only Gemini reads them. Wrong content raises ValueError with the path; a
+    file that ``load_price_table`` refuses is refused here too.
+    """
+    load_price_table(path)
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    table = _PriceTableFile.model_validate({} if data is None else data)
+    rates: list[VideoRate] = []
+    for entry in table.models:
+        days = [rate.valid_from for rate in entry.video]
+        if len(set(days)) != len(days):
+            raise ValueError(f"{path}: the model {entry.model} has two video rates with the same start day")
+        rates.extend(
+            VideoRate(
+                entry.model,
+                rate.valid_from,
+                MappingProxyType(dict.fromkeys(VIDEO_RESOLUTIONS, rate.tokens_per_frame)),
+                rate.audio_tokens_per_second,
+                rate.frames_per_second,
+                takes_clips=False,
+                video_usd_per_million=rate.video_usd_per_million,
+                audio_usd_per_million=rate.audio_usd_per_million,
+            )
+            for rate in entry.video
+        )
+    return tuple(rates)
 
 
 def _utc_time(text: str) -> datetime:

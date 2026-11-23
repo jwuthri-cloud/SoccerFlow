@@ -210,6 +210,8 @@ def test_prompt_names() -> None:
         "people": "people/v1",
         "landmarks": "landmarks/v1",
         "number": "number/v1",
+        "kit_legend_video": "kit_legend_video/v1",
+        "people_video": "people_video/v1",
     }
 
 

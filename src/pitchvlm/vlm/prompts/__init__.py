@@ -1,4 +1,4 @@
-"""Versioned prompt texts of the four model steps.
+"""Versioned prompt texts of the four model steps, and of the two video steps.
 
 Each prompt is a plain text file in this folder. A placeholder is a name in
 curly braces, and ``str.format`` fills it. So a prompt file must not contain
@@ -30,6 +30,8 @@ PROMPT_NAMES: Mapping[str, str] = MappingProxyType(
         "people": "people/v1",
         "landmarks": "landmarks/v1",
         "number": "number/v1",
+        "kit_legend_video": "kit_legend_video/v1",
+        "people_video": "people_video/v1",
     }
 )
 
