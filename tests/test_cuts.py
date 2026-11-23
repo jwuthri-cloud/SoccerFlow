@@ -1,7 +1,9 @@
-"""Tests of the hard-cut test of motion.py and of the cuts of a motion field.
+"""Tests of the hard-cut test and the dissolve test of motion.py, and of the cuts of a motion field.
 
 The synthetic clips come from ``synth.RetimedScene``: a jump in its scene frames is a hard cut,
 a step of 10 scene frames per clip frame is a fast pan (83 pixels per frame at 1280 pixels).
+A dissolve blends two such clips (``BlendSource``). The window test also runs on plain test
+images (``CUT_TEST_WIDTH`` wide) with known motion.
 """
 
 from __future__ import annotations
@@ -9,20 +11,27 @@ from __future__ import annotations
 import json
 import warnings
 
+import cv2
 import numpy as np
 import pytest
 
 from pitchvlm.geometry import matrix_to_rows
 from pitchvlm.motion import (
+    DISSOLVE_WINDOW_FRAMES,
+    MAX_TRANSITION_CORRELATION,
     MIN_SHOT_CORRELATION,
     MotionField,
+    ShotTests,
     bridged_warp,
     compute_motion_field,
+    find_transitions,
     is_cut,
+    measure_shots,
     propagate_homographies,
     shot_correlation,
+    window_correlations,
 )
-from pitchvlm.schemas import HomographyRecord
+from pitchvlm.schemas import ClipInfo, HomographyRecord
 from pitchvlm.synth import RetimedScene, ScoreGraphicSource, SyntheticSource
 
 #: Image-to-pitch mapping of a simple top-down picture: 10 px per metre, centre mark at pixel (500, 250).
@@ -208,3 +217,163 @@ def test_no_pitch_mapping_is_propagated_across_a_cut() -> None:
     field = MotionField(steps, cuts=(5,))
     records = propagate_homographies({3: landmark_record(3, PITCH_H)}, field, 10, max_gap_frames=75)
     assert [record.valid for record in records] == [True] * 5 + [False] * 5
+
+
+# --- The dissolve test on test images with known motion ----------------------------------------
+
+#: Size (width, height) of the images of the cut tests.
+TEST_SIZE = (160, 90)
+
+
+def texture(seed: int) -> np.ndarray:
+    """Return a ``float32`` test image with smooth random structure, grey levels around 128."""
+    rng = np.random.default_rng(seed)
+    total = np.zeros((TEST_SIZE[1], TEST_SIZE[0]), dtype=np.float32)
+    for blur_px in (1.5, 4.0):
+        layer = cv2.GaussianBlur(rng.random(total.shape, dtype=np.float32), (0, 0), blur_px)
+        total += (layer - layer.mean()) / layer.std()
+    return 128.0 + 30.0 * total
+
+
+def two_shots(length: int, *, before: int = 40, after: int = 40) -> list[np.ndarray]:
+    """Return a still shot, ``length`` frames that blend it into a second still shot, and the second shot.
+
+    Frame ``before + i`` of the blend shows the second shot with the weight ``(i + 1) / (length + 1)``.
+    """
+    old, new = texture(1), texture(2)
+    blends = [old + (i + 1) / (length + 1) * (new - old) for i in range(length)]
+    return [old] * before + blends + [new] * after
+
+
+def still(n_frames: int) -> list[np.ndarray | None]:
+    """Return the steps of a camera that does not move."""
+    return [np.eye(3)] * (n_frames - 1)
+
+
+def test_a_still_shot_explains_every_window() -> None:
+    images = [texture(1)] * 50
+    values = window_correlations(images, still(50))
+    assert values[:DISSOLVE_WINDOW_FRAMES] == [None] * DISSOLVE_WINDOW_FRAMES
+    assert all(value is not None and value > 0.99 for value in values[DISSOLVE_WINDOW_FRAMES:])
+    assert find_transitions(images, still(50), values) == []
+
+
+def test_a_dissolve_is_found_with_its_blend_frames() -> None:
+    images = two_shots(5)
+    values = window_correlations(images, still(len(images)))
+    assert min(value for value in values if value is not None) < MAX_TRANSITION_CORRELATION
+    # The blend weights are 1/6 to 5/6: every blend frame shows less than MIN_SHOT_SHARE of either shot.
+    assert find_transitions(images, still(len(images)), values) == [(40, 45)]
+
+
+def test_frames_that_show_a_shot_almost_alone_stay_in_that_shot() -> None:
+    # Weights 1/26 to 25/26: the first and the last frame of the blend show 96% of one shot,
+    # more than MIN_SHOT_SHARE, so they stay in that shot; the next frames show 92%.
+    images = two_shots(25)
+    values = window_correlations(images, still(len(images)))
+    assert find_transitions(images, still(len(images)), values) == [(41, 64)]
+
+
+def test_a_change_without_a_blend_frame_is_a_cut() -> None:
+    images = two_shots(0)
+    values = window_correlations(images, still(len(images)))
+    assert find_transitions(images, still(len(images)), values) == [(40, 40)]
+
+
+def test_a_window_with_a_missing_step_is_not_judged() -> None:
+    images = two_shots(5)
+    steps = still(len(images))
+    steps[42] = None
+    values = window_correlations(images, steps)
+    assert values[43 : 43 + DISSOLVE_WINDOW_FRAMES] == [None] * DISSOLVE_WINDOW_FRAMES
+    assert find_transitions(images, steps, values) == []
+
+
+def test_the_window_test_checks_its_input() -> None:
+    images = [texture(1)] * 5
+    with pytest.raises(ValueError, match="need 4 steps"):
+        window_correlations(images, still(4))
+    with pytest.raises(ValueError, match="need 5 window values"):
+        find_transitions(images, still(5), [None] * 4)
+
+
+def test_a_chain_that_follows_a_pan_explains_its_window() -> None:
+    image = texture(3)
+    images = [np.roll(image, frame, axis=1) for frame in range(DISSOLVE_WINDOW_FRAMES + 1)]
+    steps: list[np.ndarray | None] = [translation(1.0, 0.0)] * DISSOLVE_WINDOW_FRAMES
+    value = window_correlations(images, steps)[DISSOLVE_WINDOW_FRAMES]
+    assert value is not None and value > 0.99
+    # The identity does not explain the window: only the chained motion is tried.
+    assert window_correlations(images, still(len(images)))[DISSOLVE_WINDOW_FRAMES] < MAX_TRANSITION_CORRELATION
+
+
+# --- The dissolve test on synthetic clips ------------------------------------------------------
+
+
+class BlendSource:
+    """Two synthetic clips that are blended over ``length`` frames from frame ``start`` on.
+
+    Frame ``start + i`` shows the second clip with the weight ``(i + 1) / (length + 1)``.
+    """
+
+    def __init__(self, old: RetimedScene, new: RetimedScene, start: int, length: int) -> None:
+        self._old, self._new = SyntheticSource(old), SyntheticSource(new)
+        self._start, self._length = start, length
+        width, height = old.info.width, old.info.height
+        self.info = ClipInfo(clip_id="blend", n_frames=old.info.n_frames, fps=25.0, width=width, height=height)
+
+    def read(self, frame: int) -> np.ndarray:
+        if frame < self._start:
+            return self._old.read(frame)
+        if frame >= self._start + self._length:
+            return self._new.read(frame)
+        weight = (frame - self._start + 1) / (self._length + 1)
+        blend = (1.0 - weight) * self._old.read(frame).astype(np.float32) + weight * self._new.read(frame)
+        return np.clip(blend, 0, 255).astype(np.uint8)
+
+
+def dissolve_clip(length: int) -> BlendSource:
+    """Return a small clip whose frames 40 to ``40 + length - 1`` blend two shots 100 scene frames apart."""
+    n_frames = 80 + length
+    return BlendSource(small_clip(list(range(n_frames))), small_clip(list(range(100, 100 + n_frames))), 40, length)
+
+
+@pytest.mark.parametrize("length", [5, 25])
+def test_a_dissolve_in_a_clip_is_found_and_every_frame_of_it_starts_a_shot(length: int) -> None:
+    tests = measure_shots(dissolve_clip(length))
+    assert tests.hard_cuts == ()  # the pair test alone does not see the dissolve
+    [(start, stop)] = tests.transitions
+    assert 40 <= start <= 40 + length // 4  # synthetic seed 0: at most 4 frames late at 25 frames
+    assert 40 + length - length // 4 <= stop <= 40 + length
+    field = compute_motion_field(dissolve_clip(length))
+    assert field.cuts == tuple(range(start, stop + 1))
+    assert field.transition_frames() == frozenset(range(start, stop))
+    assert field.between(start - 1, start) is None
+    assert field.between(stop - 1, stop) is None
+    assert field.between(0, start - 1) is not None
+    assert field.between(stop, field.n_frames - 1) is not None
+
+
+def test_shot_tests_name_the_hard_cuts_and_every_frame_of_a_transition() -> None:
+    tests = ShotTests(
+        steps=(None,) * 9,
+        test_images=(),
+        test_steps=(),
+        pair_correlations=(None,) * 9,
+        hard_cuts=(2, 8),
+        window_correlations=(None,) * 10,
+        transitions=((4, 6), (7, 7)),
+    )
+    assert tests.cuts() == (2, 4, 5, 6, 7, 8)
+
+
+def test_a_shot_of_one_frame_next_to_a_cut_is_a_transition_frame() -> None:
+    def field(n_frames: int, cuts: tuple[int, ...]) -> MotionField:
+        return MotionField([None if frame + 1 in cuts else np.eye(3) for frame in range(n_frames - 1)], cuts)
+
+    assert field(10, ()).transition_frames() == frozenset()
+    assert field(1, ()).transition_frames() == frozenset()
+    assert field(10, (4,)).transition_frames() == frozenset()
+    assert field(10, (3, 4, 5, 6)).transition_frames() == frozenset({3, 4, 5})
+    assert field(10, (1,)).transition_frames() == frozenset({0})
+    assert field(10, (9,)).transition_frames() == frozenset({9})
