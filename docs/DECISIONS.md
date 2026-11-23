@@ -790,8 +790,9 @@ Items 5 and 6 come from the checks of the change of item 4.
      `Retry-After` up to 300 s). The status 503 can mean that no provider meets the routing
      settings; its error line says so. A timeout is not tried again. Assumed, not documented: a
      call refused with an error status is not billed (as for Gemini).
-   - A 200 answer without usage, without a cost or with `is_byok: true` raises
-     `UnconfirmedCallError`: the ledger cannot price it. A 200 answer with an error, a finish
+   - A 200 answer without usage, without a cost above 0 or with `is_byok: true` raises
+     `UnconfirmedCallError`: the ledger cannot price it. So does a 200 answer whose body cannot
+     be read; it is not sent again. A redirect is not followed. A 200 answer with an error, a finish
      reason other than `stop` or no text raises `BilledAnswerError` with its reported cost.
    - The strict schema gets `additionalProperties: false` on every object (the strict mode of
      several providers needs it). Not known: whether every provider takes `minItems` and
@@ -810,8 +811,9 @@ Items 5 and 6 come from the checks of the change of item 4.
    (one provider), `google/gemini-2.5-flash` 0.54 / 4.50 (endpoints 0.15 / 1.25, 0.30 / 2.50,
    0.54 / 4.50). The pages showed no per-image price, no `:free` entry and no mark of zero data
    retention; so it is not known whether any provider of these models meets the routing settings.
-   Estimated, not measured: the first doctor of `qwen/qwen3-vl-235b-a22b-instruct` costs about
-   0.02 USD (6 calls at the token estimates of Gemini; image tokens of Qwen differ).
+   Estimated, not measured: the first doctor of `qwen/qwen3-vl-235b-a22b-instruct` costs
+   0.015 USD, the estimate that the doctor prints (6 calls at the token estimates of Gemini;
+   image tokens of Qwen differ).
 7. **Video input is not built.** The video page shows a `video_url` part with links (YouTube for
    Gemini on AI Studio; Vertex takes no video links) in its chat examples, and base64 video only in
    the examples of the Responses API. The footage cannot go to a public link, and no page shows a
@@ -829,7 +831,7 @@ Items 5 and 6 come from the checks of the change of item 4.
      drawing."
    - Rule 4: "Only `src/pitchvlm/vlm/client.py` talks to a model service: it imports the model SDK
      of Gemini and sends the OpenRouter requests with the standard library. Everything else must
-     run without the SDK and without a network. Only `tools/run_tool.py` imports an external tool
+     run without the SDK and must not call a model service. Only `tools/run_tool.py` imports an external tool
      (RF-DETR, PnLCalib). It runs in the environment of that tool, and the package never imports
      it."
    - Rule 5: "Model calls: paid models only (no OpenRouter model with the suffix `:free`), no
@@ -1226,6 +1228,79 @@ Items 5 and 6 come from the checks of the change of item 4.
    synthetic kits; the ball with a stand-in ball that the synthetic picture does not show. The
    values of the table above were read by one agent and not checked by a second reader.
 
+## 2026-11-22 — Second read of the model provider and money code
+
+The second read of the code that the OpenRouter entry above brought in (`vlm/client.py`,
+`vlm/cost.py`, `vlm/types.py`, `vlm/coords.py`, `vlm/steps.py`, the prompts, the doctor and its
+command line, the price table, the guard and the secret scan, and the OpenRouter parts of the
+docs). Four readers read separate parts (rules 4 and 5 with the secrets; the money; errors,
+coordinates and cache keys; the docs). Each claim then went to a second reader whose job was to
+refute it with a test or an exact trace. Every test ran offline, with fake HTTP layers.
+
+Counts: 24 distinct claims. 12 confirmed and fixed: 1 major, 5 minor, 6 small. 11 refuted. 1
+not sent to a second reader, because the docs already describe it (a `Retry-After` header with a
+date is ignored, and the normal wait is used). Each code fix has one test that fails on the code
+before the fix (run on a copy of the old code with the new tests: 9 of 9 fail for the reason
+that the fix removes).
+
+1. **Major. A success answer whose body breaks off was sent again.** `UrllibTransport` turned a
+   failed read after the status 200 into a lost connection, which is tried again: up to 4
+   billed calls for one request, none of them in the ledger. Now it raises
+   `HttpUnreadAnswerError`, and the backend ends the request with `UnconfirmedCallError` at
+   once, as for a timeout.
+2. **Minor. A redirect carried the key to another host.** `urlopen` follows 301, 302 and 303 on
+   a POST as a GET with every header, also `Authorization`. The transport now follows no
+   redirect: a 3xx answer is an error status that is not tried again.
+3. **Minor. A reported cost of 0 counted as a paid answer.** The ledger, the spend window and the
+   stops then counted 0 USD for the call. A cost of 0 now raises `UnconfirmedCallError` (after
+   the BYOK case, which keeps its own message), and the doctor line `reported cost` fails for it.
+4. **Minor. The guard and the secret scan missed an OpenRouter key after a letter, a digit or an
+   underscore** (`MY_KEY_sk-or-v1-...`), where they find a Google key. The `sk-or-v1-` prefix is
+   long enough to need no word start: both rules dropped it.
+5. **Minor. Doc: proposed rule 4** said that everything else runs "without a network", but
+   `datasets.py` downloads the dataset. It now says "must not call a model service".
+6. **Minor. Doc: RUNBOOK section 10** said that a 503 that ends the doctor means that no provider
+   meets the privacy settings. A 503 is retried like every 5xx, can be a busy service, and a
+   failed request fails one check while the doctor goes on. The text now says so.
+7. **Small. An error status whose body read failed** escaped as a raw `IncompleteRead`, not
+   retried and not logged. The body is now left out with a warning, and the status decides.
+8. **Small. Error text from a 200 body** went into the error unchanged: no key removal, no cut
+   to 500 characters. `_error_message` now cleans every body text.
+9. **Small. `"error": null`** in a 200 body rejected a usable, billed answer. Only an error that
+   is not null counts now.
+10. **Small. Docs:** the first Qwen3-VL doctor costs 0.015 USD as estimated by the code (6
+    calls, `DEFAULT_TOKEN_ESTIMATES` at 0.21 / 1.90 USD per million), not "about 0.02";
+    `--thinking-level` applies to every model of a doctor run, not only to the OpenRouter
+    models; the Gemini thinking levels are `minimal` to `xhigh`, by model.
+
+Refuted (behaviour reproduced, but not a defect of this change):
+- An answer with readable tokens but no usable cost gets no ledger line: the documented policy
+  for a call whose cost is unknown, as for Gemini; the run stops at the first one.
+- One spend window per provider: documented; the window protects the limit of each account,
+  and the ledger stops count both providers together.
+- The doctor goes on after a call whose cost is unknown: unchanged since f7d788e, and the line
+  `reported cost` fails.
+- `:FREE`, a trailing space or `:free:beta` pass the free-model check: a request is sent only
+  for a slug with an exact entry in the tracked price table, which is paid only.
+- An upper-case key followed by `,` or `)` escapes gitleaks: real keys are lower-case (auth
+  page), and the guard's general `sk-` rule finds them.
+- A model that answers in another coordinate convention is not detected in a run: by design,
+  gate G0 proves the convention before a settings file names it.
+- The routing settings and the image type are not in the cache key; the prompt names stay `v1`;
+  "data policy checks every sent body"; "the doctor compares the ledger with the account page";
+  reasoning tokens counted twice without `total_tokens` (logged, and the money uses the
+  reported cost): intended, harmless, or only loose wording.
+
+Open, not fixed (inferred, not measured):
+- Unknown-cost answers with readable tokens could be priced at the table price as an upper
+  bound, instead of having no ledger line. That needs a ledger field that says the cost is
+  not reported; owner decision.
+- `run` and `probe` do not check that a G0 pass exists for the model and the convention of a
+  step, and nothing counts coordinates outside the bounds of the convention.
+- Not checkable offline: whether OpenRouter ever redirects, reports a cost of 0, treats slugs
+  case-insensitively, or bills a 524; `urllib` applies the timeout to each read, so a server
+  that sends bytes slowly can hold a call longer than 300 s.
+
 ## 2026-11-22 — Second read of the tracking, cuts, paint alignment and detector engine
 
 A second read of the code that pull requests 5, 6 and 7 brought into `main` (`652c82b`; base
@@ -1518,7 +1593,7 @@ Decisions for the owner that are open, each with its recommendation:
   than 1.5 times, add estimates per model (a small change of `vlm/cost.py`) before its first probe.
 - **OpenRouter: which models to try.** Candidates with a published price: Qwen3-VL 235B (first
   guess `xy_1000`), Qwen2.5-VL 72B and Gemini 2.5 Flash through OpenRouter (`yx_1000`).
-  Recommendation: one doctor of Qwen3-VL first (about 0.02 USD, estimated), then the people
+  Recommendation: one doctor of Qwen3-VL first (0.015 USD, estimated), then the people
   probe of the model that passes, on the frames of the Gemini people probe.
 - **Paint alignment: the rule** (entry "Paint alignment of pitch mappings, and hard cuts" of
   2026-11-22, item 4). Recommendation: run the free measurement of the RUNBOOK (section 3) on

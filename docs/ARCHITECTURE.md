@@ -798,9 +798,11 @@ schema as `response_format` of the type `json_schema` (strict, every object with
 `OPENROUTER_ROUTING`: `zdr: true`, `data_collection: deny`, `require_parameters: true`,
 `allow_fallbacks: false`. The key comes from the environment at every request and goes into the
 `Authorization` header only. Retries as for Gemini: 408, 409, 429, 5xx and a lost connection,
-with the wait of a `Retry-After` header up to 300 s; a timeout is not tried again
-(`UnconfirmedCallError`). A success answer without a usage, without a cost or with `is_byok`
-raises `UnconfirmedCallError`; one with an error, a finish reason other than `stop` or no text
+with the wait of a `Retry-After` header up to 300 s; a timeout and a success status whose body
+cannot be read are not tried again (`UnconfirmedCallError`: the call may be billed). A redirect
+is not followed, so the key never goes to another address. A body text in an error message is
+cleaned of the key and cut. A success answer without a usage, without a cost above 0 or with
+`is_byok` raises `UnconfirmedCallError`; one with an error, a finish reason other than `stop` or no text
 raises `BilledAnswerError` with its reported cost. Reasoning tokens are a part of
 `completion_tokens`; `normalize_usage` moves them to `thought_tokens`. The response has
 `service_tier="standard"`, `sdk_version=None`, `reported_usd` and `served_by`. Video input is not
@@ -1096,8 +1098,8 @@ Providers in the integration layer: `cli.model_backend` (for `run` and `probe`) 
 `cli.recording_backend` (for `doctor`) build a `ProviderBackend` of a `GeminiBackend` and an
 `OpenRouterBackend`; the recording one records both into one `doctor.CallRecorder` (a
 `RecordingClient` around a `LazySdkClient`, and a `RecordingTransport` around `UrllibTransport`).
-`doctor --models` takes Gemini names and `openrouter:<slug>`, with `--coords` and
-`--thinking-level` for the OpenRouter models; the environment checks ask only for the keys and
+`doctor --models` takes Gemini names and `openrouter:<slug>`, with `--coords` for the
+OpenRouter models and `--thinking-level` for every model of the run; the environment checks ask only for the keys and
 the SDK of the providers of the run. For an OpenRouter model the contract checks replace `store
 flag` and `served tier` by `data policy`, `served by` and `reported cost`, and plan no flex
 request. The scorer gets neither key (`cli.KEY_VARIABLES`).

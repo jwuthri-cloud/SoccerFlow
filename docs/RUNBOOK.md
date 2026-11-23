@@ -1117,7 +1117,7 @@ ran against the real API before this machine: the first check of each model is i
 |---|---|---|
 | `provider` | `gemini` | `openrouter` |
 | `model` | a Gemini name, `gemini-4-argon` | the slug of the model page, `author/name`; a slug that ends with `:free` is refused (rule 5) |
-| `thinking_level` | `low`, `medium`, `high` (by model) | sent as the reasoning effort; `model_default` sends none, for a model without one |
+| `thinking_level` | `minimal` to `xhigh`, the levels of the model (`config.THINKING_LEVELS`) | sent as the reasoning effort; `model_default` sends none, for a model without one |
 | `resolution` | `low` to `ultra_high` | `low` or `high` (the `detail` of an image) |
 | `service_tier` | `standard` or `flex` | `standard` only |
 | `coords` | `yx_1000` only | `yx_1000`, `xy_1000`, `xy_unit` or `xy_pixel`: the convention that the model was trained on |
@@ -1162,7 +1162,7 @@ neither the Gemini key nor the SDK for an OpenRouter model.
 python -m pitchvlm.cli doctor --no-api
 
 # Contract checks of one OpenRouter model, in the convention that its model card names. Paid:
-# about 0.02 USD at the published prices of the price table (6 calls; an estimate from the Gemini
+# 0.015 USD at the published prices of the price table (6 calls; an estimate from the Gemini
 # token counts, not measured). The checks stop above the 2 USD of gate G0.
 python -m pitchvlm.cli doctor --models openrouter:qwen/qwen3-vl-235b-a22b-instruct \
     --coords xy_1000 --thinking-level model_default \
@@ -1181,10 +1181,12 @@ python -m pitchvlm.cli doctor --models openrouter:qwen/qwen3-vl-235b-a22b-instru
   that served each call), `reported cost` (fails when an answer reports no cost; its detail
   compares the reported cost with the price table: above 1 means that the table price is too
   low). The line `store flag` and `served tier` are for Gemini only.
-- When the status 503 ends the doctor, no provider of the model meets the privacy settings. When
-  the status 400 ends it, a provider refused a part of the request, for example a keyword of the
-  answer schema in its strict mode (`minItems`, `maxItems`). Tell the owner; do not change the
-  routing settings.
+- A request that fails makes its check fail, and the doctor goes on with the next check. The
+  status 503 after all 4 attempts can mean that no provider of the model meets the privacy
+  settings, or only that the service was busy: run the doctor again later before you take it for
+  the first. The status 400 means that a provider refused a part of the request, for example a
+  keyword of the answer schema in its strict mode (`minItems`, `maxItems`). Tell the owner; do
+  not change the routing settings.
 - Write into `docs/DECISIONS.md`: the convention that passed, the two accuracy values, the
   served providers, the reported cost against the estimate, and the mean tokens of the measured
   cost lines. Image tokens of other models differ from those of Gemini, so the token estimates

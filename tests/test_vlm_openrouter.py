@@ -3,7 +3,7 @@
 No test calls a model service. The OpenRouter answers are written by hand in the shapes of the
 API documentation (docs/DECISIONS.md, entry "Image models through OpenRouter" of 2026-11-22,
 item 4), and a fake HTTP layer returns them.
-The tests of ``UrllibTransport`` replace ``urlopen``: no test opens a network connection.
+The tests of ``UrllibTransport`` replace the opening of a URL: no test opens a network connection.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+import urllib.response
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -564,6 +565,10 @@ def test_lost_connections_end_with_a_call_whose_cost_is_unknown(key: str) -> Non
             ok(chat_answer(usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0, "is_byok": True})),
             "BYOK",
         ),
+        (
+            ok(chat_answer(usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.0})),
+            "a cost of 0 USD for a paid model",
+        ),
     ],
 )
 def test_an_answer_without_a_cost_is_a_call_whose_cost_is_unknown(key: str, answer: HttpAnswer, words: str) -> None:
@@ -748,7 +753,15 @@ def test_fake_backend_reports_a_cost_for_openrouter_requests_only() -> None:
 
 
 # --- The HTTP layer of the standard library ------------------------------------------------------
-# No test opens a network connection (docs/ARCHITECTURE.md, section 5): ``urlopen`` is replaced.
+# No test opens a network connection (docs/ARCHITECTURE.md, section 5): ``OpenerDirector.open``, or the
+# handler of https addresses, is replaced.
+
+
+def _replace_open(monkeypatch: pytest.MonkeyPatch, urlopen: Any) -> None:
+    """Let every opener of ``urllib`` answer with ``urlopen(request, timeout)``."""
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector, "open", lambda self, request, data=None, timeout=None: urlopen(request, timeout)
+    )
 
 
 class _Opened(io.BytesIO):
@@ -776,7 +789,7 @@ def test_urllib_transport_sends_the_body_and_returns_the_answer(monkeypatch: pyt
         seen.append((request, timeout))
         return _Opened(200, b'{"ok": true}', {})
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    _replace_open(monkeypatch, urlopen)
     answer = UrllibTransport().post(OPENROUTER_URL, {"Authorization": "Bearer test-value"}, b'{"a": 1}', 5.0)
 
     assert answer == HttpAnswer(200, b'{"ok": true}', None)
@@ -795,7 +808,7 @@ def test_urllib_transport_returns_an_error_status_with_its_wait(
     def urlopen(request: urllib.request.Request, timeout: float) -> _Opened:
         raise _http_error(429, b'{"error": {"code": 429}}', headers)
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    _replace_open(monkeypatch, urlopen)
     answer = UrllibTransport().post(OPENROUTER_URL, {}, b"{}", 5.0)
     assert answer == HttpAnswer(429, b'{"error": {"code": 429}}', retry_after_s)
 
@@ -816,6 +829,89 @@ def test_urllib_transport_tells_a_timeout_from_a_failed_connection(
     def urlopen(request: urllib.request.Request, timeout: float) -> _Opened:
         raise error
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    _replace_open(monkeypatch, urlopen)
     with pytest.raises(expected):
         UrllibTransport().post(OPENROUTER_URL, {}, b"{}", 5.0)
+
+
+class _CutBody(_Opened):
+    """An answer whose body breaks off while it is read."""
+
+    def read(self, *args: Any) -> bytes:
+        raise http.client.IncompleteRead(b'{"id": "gen-1"', 900)
+
+
+def test_a_success_whose_body_cannot_be_read_is_not_sent_again(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    """The provider has done the request, so a new attempt could be billed a second time."""
+    opened: list[str] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> _Opened:
+        opened.append(request.full_url)
+        return _CutBody(200, b"", {}) if len(opened) == 1 else _Opened(200, json.dumps(chat_answer()).encode(), {})
+
+    _replace_open(monkeypatch, urlopen)
+    backend = OpenRouterBackend(prices=PRICES, transport=UrllibTransport(), sleep=lambda seconds: None)
+    with pytest.raises(UnconfirmedCallError, match="the answer could not be read.*may still be billed"):
+        backend.generate(request_of())
+    assert opened == [OPENROUTER_URL]
+
+
+def test_an_error_status_whose_body_cannot_be_read_is_tried_again_by_its_status(
+    monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    opened: list[str] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> _Opened:
+        opened.append(request.full_url)
+        if len(opened) == 1:
+            raise urllib.error.HTTPError(OPENROUTER_URL, 503, "busy", email.message.Message(), _CutBody(503, b"", {}))
+        return _Opened(200, json.dumps(chat_answer()).encode(), {})
+
+    _replace_open(monkeypatch, urlopen)
+    backend = OpenRouterBackend(prices=PRICES, transport=UrllibTransport(), sleep=lambda seconds: None)
+    assert backend.generate(request_of()).attempts == 2
+
+
+class _RedirectingHttps(urllib.request.HTTPSHandler):
+    """The handler of https addresses: the endpoint answers with a redirect to another host."""
+
+    seen: list[tuple[str, str | None]] = []
+
+    def https_open(self, request: urllib.request.Request) -> urllib.response.addinfourl:
+        _RedirectingHttps.seen.append((request.full_url, request.get_header("Authorization")))
+        headers = email.message.Message()
+        status = 200
+        if request.full_url == OPENROUTER_URL:
+            headers["Location"] = "https://github.com/collect"
+            status = 302
+        answer = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, request.full_url, status)
+        answer.msg = "Found" if status == 302 else "OK"
+        return answer
+
+
+def test_urllib_transport_follows_no_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A redirect would carry the key in the Authorization header to another host."""
+    monkeypatch.setattr(urllib.request, "HTTPSHandler", _RedirectingHttps)
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    monkeypatch.setattr(_RedirectingHttps, "seen", [])
+    answer = UrllibTransport().post(OPENROUTER_URL, {"Authorization": "Bearer test-value"}, b"{}", 5.0)
+    assert answer.status == 302
+    assert _RedirectingHttps.seen == [(OPENROUTER_URL, "Bearer test-value")]
+
+
+def test_error_text_of_a_success_answer_holds_no_key_and_is_cut(key: str) -> None:
+    echo = {"code": 502, "message": f"Bearer {key} " + "x" * 2000}
+    billed = chat_answer(error=echo)
+    backend, _ = backend_with(FakeTransport(ok(billed), ok({"error": echo})))
+    with pytest.raises(BilledAnswerError) as raised:
+        backend.generate(request_of())
+    with pytest.raises(UnconfirmedCallError) as unconfirmed:
+        backend.generate(request_of())
+    for error in (raised.value, unconfirmed.value):
+        assert key not in str(error) and "[key removed]" in str(error)
+        assert len(str(error)) < 1000
+
+
+def test_a_null_error_in_a_success_answer_is_no_error(key: str) -> None:
+    backend, _ = backend_with(FakeTransport(ok(chat_answer(error=None))))
+    assert backend.generate(request_of()).text == '{"people": []}'
