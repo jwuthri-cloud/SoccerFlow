@@ -146,17 +146,18 @@ from pitchvlm.fallbacks.pnlcalib import homography_from_payload
 from pitchvlm.fallbacks.rfdetr import people_from_detections
 from pitchvlm.fallbacks.runs import (
     CLIP_JOB_FORMAT,
+    DETECTOR_FAMILIES,
     JOB_FORMAT,
     ClipJob,
     ClipRun,
     JobFrame,
     PnlcalibSettings,
-    RfdetrSettings,
     RunFrame,
     ToolJob,
     ToolRun,
     ToolSettings,
     clip_run_part_path,
+    is_detector,
     load_clip_run,
     load_tool_run,
 )
@@ -326,8 +327,8 @@ ProbeKind = Literal["people", "pitch", "number"]
 PROBE_KINDS: tuple[ProbeKind, ...] = ("people", "pitch", "number")
 #: Model calls of one kind in a plan: (step, settings, number of requests).
 PlannedCalls = tuple[str, StepSettings, int]
-#: The probe whose frames and values measure each external tool.
-TOOL_PROBES: dict[str, ProbeKind] = {"rfdetr": "people", "pnlcalib": "pitch"}
+#: The probe whose frames and values measure each external tool: every detector family, and the calibration.
+TOOL_PROBES: dict[str, ProbeKind] = {**dict.fromkeys(DETECTOR_FAMILIES, "people"), "pnlcalib": "pitch"}
 #: The record that the adapter of an external tool makes from the payload of one frame.
 _Adapted = TypeVar("_Adapted")
 
@@ -2712,6 +2713,12 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
     if args.config is not None:
         refuse_input_as_output(args.out, {"--config": args.config})
     config = PipelineConfig() if args.config is None else read_settings(args.config)
+    settings: ToolSettings = config.detector if args.tool in DETECTOR_FAMILIES else config.calibration
+    if settings.name != args.tool:
+        raise CliError(
+            f"the settings name the detector {settings.name}, not {args.tool}: give --tool {settings.name}, "
+            f"or a settings file whose section detector names {args.tool}"
+        )
     if not args.clip.is_dir():
         raise CliError(
             f"{args.clip} is not a folder of frame images: a clip job names image files, so write the frames "
@@ -2728,7 +2735,6 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
             f"the clip folder {folder} does not lie below the data folder {root}: the job names each image by its "
             "path below the data folder"
         ) from error
-    settings: ToolSettings = config.detector if args.tool == "rfdetr" else config.calibration
     job = ClipJob(
         format=CLIP_JOB_FORMAT, clip=source.info.clip_id, tool=settings, images=images, video_sha256=video_sha256
     )
@@ -2884,7 +2890,7 @@ def score_tool(
     """
     tool = experiment.tool
     settings = tool.model_dump(mode="json")
-    if isinstance(tool, RfdetrSettings):
+    if is_detector(tool):
         return probes.score_people_answers(
             clips,
             _adapted(partial(people_from_detections, min_score=tool.min_score), answers, path),

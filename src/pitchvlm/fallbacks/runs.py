@@ -23,8 +23,9 @@ Job file::
     }
 
 - ``name``: the name of the experiment.
-- ``tool``: the tool and its settings, as the experiment file gives them (``RfdetrSettings`` or
-  ``PnlcalibSettings``).
+- ``tool``: the tool and its settings, as the experiment file gives them (``RfdetrSettings``,
+  ``TransformersDetectorSettings`` or ``PnlcalibSettings``). The ``name`` of a detector is its
+  family: ``rfdetr``, ``dfine`` or ``rtdetrv2`` (``DETECTOR_FAMILIES``).
 - ``frames``: one entry per frame. ``frame`` is the index of the frame in its clip, from 0.
   ``image`` is the path of the image file below the data folder, with forward slashes.
 
@@ -46,7 +47,8 @@ Run file::
   of the tool. They go into the metrics file as they are.
 - ``frames``: one entry per frame of the job. ``seconds`` is the time that the tool needed for
   the frame, without the time to read the image file. ``payload`` is the answer of the tool in
-  the format of its adapter module (``fallbacks.rfdetr`` or ``fallbacks.pnlcalib``).
+  the format of its adapter module: ``fallbacks.rfdetr`` for a detector of every family,
+  ``fallbacks.pnlcalib`` for the calibration.
 
 Both files hold no pixel and no label data, and no absolute path.
 
@@ -144,6 +146,55 @@ class RfdetrSettings(Record):
     antialias: StrictBool
 
 
+#: Detector families that run through the object-detection interface of Hugging Face transformers,
+#: and the sizes of each one: the checkpoints with COCO-only weights whose model card was read
+#: (``docs/DECISIONS.md``, entry "A second detector family" of 2026-11-23). The script
+#: ``tools/run_tool.py`` maps each size to its checkpoint and the commit of that checkpoint.
+TRANSFORMERS_MODELS: dict[str, tuple[str, ...]] = {
+    "dfine": ("nano", "small", "medium", "large", "xlarge"),
+    "rtdetrv2": ("r18vd", "r34vd", "r50vd", "r101vd"),
+}
+#: Input sizes of a transformers detector, pixels: the side of the square that the frame is resized to.
+#: The backbones of both families halve the image five times, so the side is a multiple of 32.
+INPUT_SIZE_STEP = 32
+
+
+class TransformersDetectorSettings(Record):
+    """Settings of a detector of the families ``TRANSFORMERS_MODELS`` for one measurement.
+
+    The frame is resized to a square of ``input_size`` pixels without keeping its aspect ratio
+    (the image processor of both families does so), and the boxes come back in pixels of the
+    full frame. ``batch`` frames go through the model together; the time of a frame in the run
+    file is the time of its batch divided by the frames of the batch.
+    """
+
+    name: Literal["dfine", "rtdetrv2"]
+    #: Size of the family: a key of ``TRANSFORMERS_MODELS[name]``.
+    model: str
+    #: A detection counts when its score is at least this value. The tool gets the same value as its threshold.
+    min_score: float = Field(strict=True, ge=0.0, le=1.0)
+    #: Side of the square input of the model, pixels: a multiple of ``INPUT_SIZE_STEP``. The weights were
+    #: trained at 640.
+    input_size: StrictInt = Field(ge=320, le=1280, multiple_of=INPUT_SIZE_STEP)
+    #: Frames per call of the model.
+    batch: StrictInt = Field(ge=1, le=64)
+    #: True when the model runs in half precision (float16). The script refuses it on the device ``cpu``.
+    half: StrictBool
+
+    @model_validator(mode="after")
+    def _check_model(self) -> TransformersDetectorSettings:
+        sizes = TRANSFORMERS_MODELS[self.name]
+        if self.model not in sizes:
+            raise ValueError(f"the detector {self.name} has the sizes {', '.join(sizes)}, not {self.model!r}")
+        return self
+
+
+#: The settings of a detector. The key ``name`` says which family it is.
+DetectorSettings = Annotated[RfdetrSettings | TransformersDetectorSettings, Field(discriminator="name")]
+#: Names of the detector families: the tools whose payload is a list of boxes (``fallbacks.rfdetr``).
+DETECTOR_FAMILIES = ("rfdetr", *TRANSFORMERS_MODELS)
+
+
 class PnlcalibSettings(Record):
     """Settings of the PnLCalib calibration tool for one measurement."""
 
@@ -158,7 +209,14 @@ class PnlcalibSettings(Record):
 
 
 #: The settings of one tool. The key ``name`` says which tool it is.
-ToolSettings = Annotated[RfdetrSettings | PnlcalibSettings, Field(discriminator="name")]
+ToolSettings = Annotated[
+    RfdetrSettings | TransformersDetectorSettings | PnlcalibSettings, Field(discriminator="name")
+]
+
+
+def is_detector(settings: Any) -> bool:
+    """Return True for the settings of a detector of any family, False for the calibration."""
+    return isinstance(settings, (RfdetrSettings, TransformersDetectorSettings))
 
 
 class JobFrame(Record):

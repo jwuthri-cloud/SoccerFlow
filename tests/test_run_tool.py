@@ -1215,9 +1215,12 @@ def test_script_and_package_agree_on_formats_settings_and_models() -> None:
     assert (run_tool.JOB_FORMAT, run_tool.RUN_FORMAT) == (runs.JOB_FORMAT, runs.RUN_FORMAT)
     assert run_tool.TOOL_KEYS == {
         "rfdetr": frozenset(runs.RfdetrSettings.model_fields),
+        "dfine": frozenset(runs.TransformersDetectorSettings.model_fields),
+        "rtdetrv2": frozenset(runs.TransformersDetectorSettings.model_fields),
         "pnlcalib": frozenset(runs.PnlcalibSettings.model_fields),
     }
     assert set(run_tool.TOOL_KEYS) == set(cli.TOOL_PROBES)
+    assert run_tool.DETECTOR_TOOLS == runs.DETECTOR_FAMILIES
     assert run_tool.RFDETR_MODELS == get_args(runs.RfdetrModel)
     assert run_tool.PITCH_ORIGIN == pnlcalib_adapter.PITCH_ORIGIN
 

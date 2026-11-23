@@ -12,9 +12,12 @@ format of its adapter module: ``src/pitchvlm/fallbacks/rfdetr.py`` for the detec
 
 This script runs in the environment of the tool, not in the environment of the package. It
 imports the tool and what the tool needs (PyTorch, NumPy, Pillow and, for PnLCalib, PyYAML),
-and it does not import pitchvlm. It needs Python 3.10 or newer.
+and it does not import pitchvlm. It needs Python 3.10 or newer. The detector families D-FINE
+(``dfine``) and RT-DETRv2 (``rtdetrv2``) share one tool, Hugging Face transformers, and one
+environment.
 
     python tools/run_tool.py rfdetr --job JOB --root DATA --out RUN --device mps
+    python tools/run_tool.py dfine --job JOB --root DATA --out RUN --device cuda:0
     python tools/run_tool.py pnlcalib --job JOB --root DATA --out RUN --device cpu \\
         --repo PNLCALIB --weights-kp SV_kp --weights-lines SV_lines
 
@@ -42,6 +45,15 @@ What each tool gets, and what the script takes from it:
   without antialiasing). The tool scales its boxes to the pixels of the frame and gives the
   class name of each detection. Every detection goes into the payload: the adapter of the
   package keeps the people.
+- D-FINE and RT-DETRv2 (package ``transformers``, versions ``TRANSFORMERS_VERSIONS``): the
+  checkpoint of the size that the job names, at its commit (``TRANSFORMERS_CHECKPOINTS``),
+  through ``AutoImageProcessor`` and ``AutoModelForObjectDetection``. The image processor
+  resizes the frames of a batch to the square input size of the job; the model gives a class
+  score per query and class and a box per query (centre, width, height in parts of the
+  input); ``detections_of_queries`` turns them into boxes in pixels of the frame, like the
+  ``post_process_object_detection`` of the image processor, and keeps the classes ``person``
+  and ``sports ball`` (``KEPT_LABELS``). On the first call the script checks its boxes against
+  that function of the tool and stops when they differ.
 - PnLCalib (a clone of its repository at the commit ``PNLCALIB_COMMIT``): the script follows
   the steps of ``inference.py`` of the clone. It takes the projection matrix of the camera and
   writes the mapping of the grass (pitch metres to pixels of the frame). The world frame of
@@ -49,10 +61,14 @@ What each tool gets, and what the script takes from it:
   the right goal, y towards the main camera.
 
 The time of a frame is the time of the tool for that frame, without the reading of the image
-file. The first frame is given to the tool one more time before the measured calls, because
-the first call of a model also builds what it needs.
+file. A detector of transformers takes the frames in batches of ``batch`` frames; the time of a
+frame is then the time of its batch divided by the frames of the batch, and the run facts add
+the median time per frame of the three parts of a call (``stage_ms_per_frame``: the image
+processor, the model, the conversion of its output). The first frame (or the first batch) is
+given to the tool one more time before the measured calls, because the first call of a model
+also builds what it needs.
 
-This script was written from the source of the two tools. It was never run with them: the
+This script was written from the source of the tools. It was never run with them: the
 tests replace each tool by a stand-in with the same interface.
 """
 
@@ -73,7 +89,7 @@ import time
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 try:
@@ -98,11 +114,43 @@ HEX_DIGITS = "0123456789abcdef"
 #: Rounding of a compact detection row: the box to 0.1 pixel, the score to 0.0001.
 BOX_DECIMALS = 1
 SCORE_DECIMALS = 4
+#: Keys of the tool section of a job of a detector of transformers: those of every family of it.
+TRANSFORMERS_KEYS = frozenset({"name", "model", "min_score", "input_size", "batch", "half"})
+#: Checkpoints of each detector family of transformers, by size: the repository on the Hugging Face hub
+#: and the commit whose model card was read (COCO-only weights, Apache-2.0; docs/DECISIONS.md, 2026-11-23).
+TRANSFORMERS_CHECKPOINTS: dict[str, dict[str, tuple[str, str]]] = {
+    "dfine": {
+        "nano": ("ustc-community/dfine-nano-coco", "066438d3d8f0da137a37b38fdf3368fd4afceced"),
+        "small": ("ustc-community/dfine-small-coco", "f79e65b5fbb33ceb9d3ebba042955d7410c608f8"),
+        "medium": ("ustc-community/dfine-medium-coco", "4ab9f5e466432f4fcf9a9a023da6aa5ecc9c9829"),
+        "large": ("ustc-community/dfine-large-coco", "aa8f8211545e4cff5adf52ea512f9ac74a9824ec"),
+        "xlarge": ("ustc-community/dfine-xlarge-coco", "ea4f6be7350bbe3c199ec6febc74168346cb5a68"),
+    },
+    "rtdetrv2": {
+        "r18vd": ("PekingU/rtdetr_v2_r18vd", "5650961749fa93567c0d46fc7f43ea4f9e914107"),
+        "r34vd": ("PekingU/rtdetr_v2_r34vd", "5d60d8fb5eb2a3ee5575bf200ecbce4e2cfa420c"),
+        "r50vd": ("PekingU/rtdetr_v2_r50vd", "282494075698cab9faa1096ae26856890030c817"),
+        "r101vd": ("PekingU/rtdetr_v2_r101vd", "2c5dbbd2d4d8c8814827a3b42737ba1afce3cf2a"),
+    },
+}
+#: The model type that the configuration of a checkpoint of each family names.
+TRANSFORMERS_MODEL_TYPES = {"dfine": "d_fine", "rtdetrv2": "rt_detr_v2"}
+#: Versions of the package ``transformers`` whose source was read for this script.
+TRANSFORMERS_VERSIONS = ("5.23.0",)
+#: Class names of the COCO weights that a detector payload of transformers keeps: those that the package reads.
+KEPT_LABELS = ("person", "sports ball")
+#: Largest difference between the boxes of the script and those of the tool on the first call (pixels), and
+#: between their scores.
+SELF_CHECK_BOX_PX = 0.01
+SELF_CHECK_SCORE = 1e-5
 #: Keys of the tool section of a job, by tool.
 TOOL_KEYS = {
     "rfdetr": frozenset({"name", "model", "min_score", "antialias"}),
+    **dict.fromkeys(TRANSFORMERS_CHECKPOINTS, TRANSFORMERS_KEYS),
     "pnlcalib": frozenset({"name", "kp_threshold", "line_threshold", "pnl_refine"}),
 }
+#: The tools whose payload is a list of boxes: the detector families.
+DETECTOR_TOOLS = ("rfdetr", *TRANSFORMERS_CHECKPOINTS)
 #: Versions of the package ``rfdetr`` whose source was read for this script.
 RFDETR_VERSIONS = ("1.12.0", "1.12.1")
 #: Model classes of ``rfdetr`` that come with pretrained weights for the 80 everyday classes.
@@ -125,6 +173,8 @@ WRONG_ENVIRONMENT = "Run this script with the Python of the environment of the t
 
 #: Turns one frame, an RGB ``uint8`` array of shape (height, width, 3), into the payload of the frame.
 Answer = Callable[[np.ndarray], dict[str, Any]]
+#: Turns a batch of frames into the payload of each frame, in the order of the frames.
+BatchAnswer = Callable[[Sequence[np.ndarray]], list[dict[str, Any]]]
 
 
 class RunnerError(Exception):
@@ -222,48 +272,77 @@ def read_rgb(path: Path) -> np.ndarray:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
-def answer_frames(job: Mapping[str, Any], root: Path, answer: Answer) -> list[dict[str, Any]]:
+def answer_frames(
+    job: Mapping[str, Any], root: Path, answer: BatchAnswer, batch: int = 1
+) -> list[dict[str, Any]]:
     """Give every frame of a job to the tool and return the frame entries of the run file.
 
-    The first frame is given to the tool one more time before the measured calls, and that
-    answer is thrown away. ``seconds`` of an entry is the time of ``answer`` for the frame.
-    An error of the tool on a frame is not caught: a line on the error stream names the
-    frame, and the error goes on. So a frame is never counted as a frame without an answer
-    because of an error. An error of the operating system inside the tool also shows its
-    traceback here, because ``main`` prints only one line for such an error. An image file
-    that cannot be read stops the run with a line that names the frame.
+    The frames go to ``answer`` in batches of ``batch`` frames, in the order of the job; the
+    last batch can be smaller. A tool that takes one frame at a time is given with
+    ``one_at_a_time``. The first batch is given to the tool one more time before the measured
+    calls, and that answer is thrown away. ``seconds`` of an entry is the time of ``answer``
+    for its batch divided by the frames of the batch. An answer with another number of payloads
+    than frames raises ``RunnerError``.
+
+    An error of the tool on a batch is not caught: a line on the error stream names the frame
+    (or the first and the last frame of the batch), and the error goes on. So a frame is never
+    counted as a frame without an answer because of an error. An error of the operating system
+    inside the tool also shows its traceback here, because ``main`` prints only one line for
+    such an error. An image file that cannot be read stops the run with a line that names the
+    frame.
+
+    The loop below is the place where a line per frame (for a live feed) would be written: each
+    entry is complete when it is appended.
     """
 
-    def ask(entry: Mapping[str, Any], image: np.ndarray) -> dict[str, Any]:
+    def where(entries: Sequence[Mapping[str, Any]]) -> str:
+        first, last = entries[0], entries[-1]
+        if len(entries) == 1:
+            return f"clip {first['clip']}, frame {first['frame']} ({first['image']})"
+        return f"the batch of clip {first['clip']}, frame {first['frame']} ({first['image']}) to frame {last['frame']}"
+
+    def ask(entries: Sequence[Mapping[str, Any]], images: list[np.ndarray]) -> list[dict[str, Any]]:
         try:
-            return answer(image)
+            payloads = answer(images)
         except Exception as error:
-            where = f"clip {entry['clip']}, frame {entry['frame']} ({entry['image']})"
-            print(f"the tool stopped on {where}", file=sys.stderr)
+            print(f"the tool stopped on {where(entries)}", file=sys.stderr)
             if isinstance(error, OSError):
                 traceback.print_exc()  # main prints one line for an OSError: the traceback says where in the tool.
             raise
+        if len(payloads) != len(images):
+            raise RunnerError(f"the tool gave {len(payloads)} answers for the {len(images)} frames of {where(entries)}")
+        return payloads
 
     def read(entry: Mapping[str, Any]) -> np.ndarray:
         try:
             return read_rgb(root / entry["image"])
         except OSError:
-            where = f"clip {entry['clip']}, frame {entry['frame']} ({entry['image']})"
-            print(f"the image cannot be read: {where}", file=sys.stderr)
+            print(f"the image cannot be read: {where([entry])}", file=sys.stderr)
             raise
 
     frames = job["frames"]
-    ask(frames[0], read(frames[0]))
+    batches = [frames[start : start + batch] for start in range(0, len(frames), batch)]
+    ask(batches[0], [read(entry) for entry in batches[0]])
     entries = []
-    for entry in frames:
-        image = read(entry)
+    for group in batches:
+        images = [read(entry) for entry in group]
         start = time.perf_counter()
-        payload = ask(entry, image)
-        seconds = time.perf_counter() - start
-        entries.append(
-            {"clip": entry["clip"], "frame": entry["frame"], "seconds": round(seconds, 6), "payload": payload}
-        )
+        payloads = ask(group, images)
+        seconds = (time.perf_counter() - start) / len(group)
+        for entry, payload in zip(group, payloads, strict=True):
+            entries.append(
+                {"clip": entry["clip"], "frame": entry["frame"], "seconds": round(seconds, 6), "payload": payload}
+            )
     return entries
+
+
+def one_at_a_time(answer: Answer) -> BatchAnswer:
+    """Return the batch answer of a tool that takes one frame at a time (batches of one frame)."""
+
+    def batch_answer(images: Sequence[np.ndarray]) -> list[dict[str, Any]]:
+        return [answer(image) for image in images]
+
+    return batch_answer
 
 
 def write_run(
@@ -365,7 +444,7 @@ def write_clip_run(
         "video_sha256": job["video_sha256"],
         "runner": dict(runner),
     }
-    detector = job["tool"]["name"] == "rfdetr"
+    detector = job["tool"]["name"] in DETECTOR_TOOLS
     entries = [
         [entry["frame"], entry["seconds"], compact_detections(entry["payload"]) if detector else entry["payload"]]
         for entry in frames
@@ -489,6 +568,256 @@ def rfdetr_engine(settings: Mapping[str, Any], device: str) -> tuple[dict[str, A
         }
 
     return {"tool_version": version, "predictor": "predict() of the model, not compiled"}, answer
+
+
+# --- D-FINE and RT-DETRv2 through transformers -----------------------------------------
+
+
+def sigmoid(values: np.ndarray) -> np.ndarray:
+    """Return the logistic function of each value, without an overflow for large negative values."""
+    return np.exp(-np.logaddexp(0.0, -values))
+
+
+def detections_of_queries(
+    logits: np.ndarray,
+    boxes: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    labels: Mapping[int, str],
+    min_score: float,
+) -> dict[str, Any]:
+    """Turn the output of a DETR detector for one frame into the payload of the frame.
+
+    ``logits`` has the shape (queries, classes): the class scores before the logistic function
+    (the weights of both families are trained with the focal loss, so each class has its own
+    score). ``boxes`` has the shape (queries, 4): the centre x, the centre y, the width and the
+    height of each box in parts of the model input, from 0 to 1. The model input is the whole
+    frame resized to a square without padding, so a part of the input is the same part of the
+    frame of ``width`` x ``height`` pixels.
+
+    The steps are those of ``post_process_object_detection`` of the image processor of the tool
+    (transformers 5.23.0, ``RTDetrImageProcessor``): the logistic function of every class
+    score, the best ``queries`` pairs of query and class over all pairs, each with the box of
+    its query as corners in pixels of the frame. A pair is kept when its score is at least
+    ``min_score`` and its class name (``labels``) is one of ``KEPT_LABELS``; the tool keeps a
+    score above its threshold, so the two differ only for a score equal to it. The detections
+    are in the order of their scores, best first.
+
+    ``RunnerError`` is raised for an output with a value that is not a finite number and for
+    shapes that do not fit together or do not fit ``labels``.
+    """
+    if logits.ndim != 2 or boxes.shape != (logits.shape[0], 4):
+        raise RunnerError(
+            f"the detector gave scores of the shape {logits.shape} and boxes of the shape {boxes.shape}: "
+            "expected (queries, classes) and (queries, 4)"
+        )
+    queries, classes = logits.shape
+    if classes != len(labels):
+        raise RunnerError(
+            f"the detector gave {classes} class scores per query, and its weights name {len(labels)} classes"
+        )
+    if not (np.isfinite(logits).all() and np.isfinite(boxes).all()):
+        raise RunnerError("the detector gave a box or a score that is not a finite number")
+    scores = sigmoid(logits.astype(np.float64)).ravel()
+    best = np.argsort(-scores, kind="stable")[:queries]
+    scale = np.array([width, height, width, height], dtype=np.float64)
+    detections = []
+    for pair in best:
+        score = float(scores[pair])
+        if score < min_score:
+            break
+        query, label = divmod(int(pair), classes)
+        name = labels[label]
+        if name not in KEPT_LABELS:
+            continue
+        centre_x, centre_y, box_width, box_height = boxes[query].astype(np.float64)
+        corners = np.array(
+            [centre_x - box_width / 2, centre_y - box_height / 2, centre_x + box_width / 2, centre_y + box_height / 2]
+        )
+        detections.append({"box_xyxy": [float(value) for value in corners * scale], "score": score, "label": name})
+    return {"detections": detections}
+
+
+def tool_detections(
+    result: Mapping[str, Any], labels: Mapping[int, str], min_score: float
+) -> list[tuple[str, float, list[float]]]:
+    """Return the detections of one frame as ``post_process_object_detection`` of the tool gave them.
+
+    Only the classes of ``KEPT_LABELS`` are kept, and only scores above ``min_score`` (the tool
+    keeps those), as (class name, score, box).
+    """
+    return [
+        (labels[int(label)], float(score), [float(value) for value in box])
+        for score, label, box in zip(result["scores"].tolist(), result["labels"].tolist(), result["boxes"].tolist())
+        if labels[int(label)] in KEPT_LABELS and float(score) > min_score
+    ]
+
+
+def check_against_tool(
+    payload: Mapping[str, Any], tool: list[tuple[str, float, list[float]]], min_score: float
+) -> None:
+    """Raise ``RunnerError`` unless the payload of the script holds the detections of the tool for one frame.
+
+    The detections of the payload with a score equal to ``min_score`` are left out: the tool
+    keeps only scores above its threshold. Each detection of the tool must match its own
+    detection of the payload: the same class, boxes at most ``SELF_CHECK_BOX_PX`` pixels apart
+    and scores at most ``SELF_CHECK_SCORE`` apart. The detections are matched by these
+    tolerances, not by their order: two scores that are equal in float32 (the tool) can differ
+    in float64 (the script), so the two orders can differ.
+    """
+    own = [
+        (detection["label"], detection["score"], detection["box_xyxy"])
+        for detection in payload["detections"]
+        if detection["score"] > min_score
+    ]
+
+    def same(mine: tuple[str, float, list[float]], theirs: tuple[str, float, list[float]]) -> bool:
+        return (
+            mine[0] == theirs[0]
+            and abs(mine[1] - theirs[1]) <= SELF_CHECK_SCORE
+            and max(abs(a - b) for a, b in zip(mine[2], theirs[2], strict=True)) <= SELF_CHECK_BOX_PX
+        )
+
+    unmatched = list(own)
+    for theirs in tool:
+        match = next((position for position, mine in enumerate(unmatched) if same(mine, theirs)), None)
+        if match is None:
+            break
+        unmatched.pop(match)
+    else:
+        if not unmatched:
+            return
+    raise RunnerError(
+        f"the boxes of the script differ from those of post_process_object_detection of the tool on the first "
+        f"frame ({len(own)} against {len(tool)} detections of {', '.join(KEPT_LABELS)}): the output of the "
+        "installed version is not the one that the script was written for. Read what changed and change "
+        "detections_of_queries"
+    )
+
+
+def synchronize(torch: ModuleType, device: str) -> None:
+    """Wait until the device has done the work that was given to it, so that a clock reads its time."""
+    if device.startswith("cuda"):
+        torch.cuda.synchronize(device)
+    elif device.startswith("mps"):
+        torch.mps.synchronize()
+
+
+def transformers_engine(
+    family: str, settings: Mapping[str, Any], device: str
+) -> tuple[dict[str, Any], BatchAnswer, Callable[[], dict[str, Any]]]:
+    """Build a detector of transformers for a job. Return its facts, the batch answer and the facts of the run.
+
+    The facts of the run are known only after the run: the median time per frame of the image
+    processor, of the model and of the conversion of its output (``stage_ms_per_frame``). The
+    time of the model is read after the device has done its work (``synchronize``).
+
+    ``RunnerError`` is raised for a version of ``transformers`` whose source was not read for
+    this script, for a size that has no checkpoint in ``TRANSFORMERS_CHECKPOINTS``, for half
+    precision on the device ``cpu``, and for a checkpoint whose configuration is not one of the
+    family (model type, focal loss, the classes of ``KEPT_LABELS``). The weights are loaded
+    only from a safetensors file: a downloaded file must not run code.
+    """
+    version = installed_version("transformers")
+    if version not in TRANSFORMERS_VERSIONS:
+        raise RunnerError(
+            f"this script was written for transformers {' and '.join(TRANSFORMERS_VERSIONS)}, and transformers "
+            f"{version} is installed. Install one of these versions. Or read what changed in the image processor "
+            "and the output of the detector, change the script where needed and add the version to "
+            "TRANSFORMERS_VERSIONS"
+        )
+    checkpoints = TRANSFORMERS_CHECKPOINTS[family]
+    size = settings["model"]
+    if size not in checkpoints:
+        raise RunnerError(f"the size {size!r} of {family} is not one of {', '.join(checkpoints)}")
+    half = truth_value(settings, "half")
+    if half and device == "cpu":
+        raise RunnerError("half precision needs a GPU: set half to false for the device cpu")
+    input_size, batch, min_score = int(settings["input_size"]), int(settings["batch"]), float(settings["min_score"])
+    repository, revision = checkpoints[size]
+    torch = tool_module("torch")
+    transformers = tool_module("transformers")
+    dtype = torch.float16 if half else torch.float32
+    processor = transformers.AutoImageProcessor.from_pretrained(repository, revision=revision)
+    model = transformers.AutoModelForObjectDetection.from_pretrained(
+        repository, revision=revision, dtype=dtype, use_safetensors=True
+    )
+    model.to(device)
+    model.eval()
+    config = model.config
+    if config.model_type != TRANSFORMERS_MODEL_TYPES[family]:
+        raise RunnerError(f"the checkpoint {repository} is of the model type {config.model_type!r}, not of {family}")
+    if getattr(config, "use_focal_loss", None) is not True:
+        raise RunnerError(
+            f"the checkpoint {repository} is not trained with the focal loss: the script reads only such scores"
+        )
+    labels = {int(index): str(name) for index, name in config.id2label.items()}
+    missing = [name for name in KEPT_LABELS if name not in labels.values()]
+    if missing:
+        raise RunnerError(f"the weights of {repository} have no class {', '.join(missing)}")
+    times: list[tuple[float, float, float, int]] = []
+    checked = False
+
+    def answer(images: Sequence[np.ndarray]) -> list[dict[str, Any]]:
+        nonlocal checked
+        start = time.perf_counter()
+        inputs = processor(images=list(images), size={"height": input_size, "width": input_size}, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device=device, dtype=dtype)
+        synchronize(torch, device)
+        prepared = time.perf_counter()
+        with torch.inference_mode():
+            outputs = model(pixel_values=pixel_values)
+        synchronize(torch, device)
+        modelled = time.perf_counter()
+        logits = outputs.logits.float().cpu().numpy()
+        boxes = outputs.pred_boxes.float().cpu().numpy()
+        payloads = [
+            detections_of_queries(
+                logits[index],
+                boxes[index],
+                width=image.shape[1],
+                height=image.shape[0],
+                labels=labels,
+                min_score=min_score,
+            )
+            for index, image in enumerate(images)
+        ]
+        done = time.perf_counter()
+        if not checked:
+            # The first call is the warm-up call, which is not measured. Check the boxes of the script
+            # against those of the tool on it.
+            # The function of the tool reads only these two fields, and it gets them as float32 like the script.
+            output = SimpleNamespace(logits=outputs.logits.float(), pred_boxes=outputs.pred_boxes.float())
+            sizes = [(image.shape[0], image.shape[1]) for image in images]
+            results = processor.post_process_object_detection(output, threshold=min_score, target_sizes=sizes)
+            for payload, result in zip(payloads, results, strict=True):
+                check_against_tool(payload, tool_detections(result, labels, min_score), min_score)
+            checked = True
+        else:
+            times.append((prepared - start, modelled - prepared, done - modelled, len(images)))
+        return payloads
+
+    def run_facts() -> dict[str, Any]:
+        per_frame = {
+            name: [part[position] / part[3] for part in times for _ in range(part[3])]
+            for position, name in enumerate(("preprocess", "model", "postprocess"))
+        }
+        return {
+            "stage_ms_per_frame": {
+                name: round(1000 * statistics.median(values), 4) for name, values in per_frame.items()
+            }
+        }
+
+    facts = {
+        "tool_version": version,
+        "checkpoint": repository,
+        "checkpoint_revision": revision,
+        "model_type": config.model_type,
+        "dtype": "float16" if half else "float32",
+        "predictor": "the model of AutoModelForObjectDetection in eager mode, not compiled",
+    }
+    return facts, answer, run_facts
 
 
 # --- PnLCalib ------------------------------------------------------------------------
@@ -716,7 +1045,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Exit code 0 means that the run file was written, 2 means that the script could not run.",
     )
     tools = parser.add_subparsers(dest="tool", metavar="TOOL", required=True)
-    for name, text in (("rfdetr", "the RF-DETR detector"), ("pnlcalib", "the PnLCalib calibration")):
+    for name, text in (
+        ("rfdetr", "the RF-DETR detector"),
+        ("dfine", "the D-FINE detector through transformers"),
+        ("rtdetrv2", "the RT-DETRv2 detector through transformers"),
+        ("pnlcalib", "the PnLCalib calibration"),
+    ):
         tool = tools.add_parser(name, help=text)
         tool.add_argument(
             "--job", type=_path, required=True, metavar="FILE", help="job file of the tool-job or the clip-job command"
@@ -761,15 +1095,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             check_no_later_parts(args.out)
         job_sha256 = file_sha256(args.job)
         machine = machine_facts(args.device)
+        batch, run_facts = 1, dict
         if args.tool == "rfdetr":
-            facts, answer = rfdetr_engine(job["tool"], args.device)
+            facts, single = rfdetr_engine(job["tool"], args.device)
+            answer = one_at_a_time(single)
+        elif args.tool in TRANSFORMERS_CHECKPOINTS:
+            facts, answer, run_facts = transformers_engine(args.tool, job["tool"], args.device)
+            batch = int(job["tool"]["batch"])
         else:
-            facts, answer = pnlcalib_engine(job["tool"], args.device, args.repo, args.weights_kp, args.weights_lines)
-        frames = answer_frames(job, args.root, answer)
+            facts, single = pnlcalib_engine(job["tool"], args.device, args.repo, args.weights_kp, args.weights_lines)
+            answer = one_at_a_time(single)
+        frames = answer_frames(job, args.root, answer, batch)
+        runner = {**machine, **facts, **run_facts()}
         if clip_job:
-            written = write_clip_run(args.out, job, job_sha256, {**machine, **facts}, frames)
+            written = write_clip_run(args.out, job, job_sha256, runner, frames)
         else:
-            write_run(args.out, job, {**machine, **facts}, frames)
+            write_run(args.out, job, runner, frames)
             written = [args.out]
     except (RunnerError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -783,6 +1124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{args.tool}: {len(frames)} frames of the job {job['name']}, "
         f"median time per frame {median:.3f} s on {args.device}"
     )
+    if "stage_ms_per_frame" in runner:
+        stages = ", ".join(f"{name} {value} ms" for name, value in runner["stage_ms_per_frame"].items())
+        print(f"median time per frame of each part: {stages}")
     print(f"run file: {args.out}" + (f" and {len(written) - 1} more parts" if len(written) > 1 else ""))
     return EXIT_OK
 

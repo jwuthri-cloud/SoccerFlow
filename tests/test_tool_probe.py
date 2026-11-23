@@ -31,6 +31,7 @@ from pitchvlm.fallbacks.runs import (
     RfdetrSettings,
     ToolJob,
     ToolRun,
+    TransformersDetectorSettings,
     load_tool_run,
 )
 from pitchvlm.labels import gsr_frame_people
@@ -47,6 +48,14 @@ DETECTOR_FILES = {
     ("RFDETRMedium", False): EXPERIMENTS / "people_probe_rfdetr_medium.yaml",
     ("RFDETRLarge", False): EXPERIMENTS / "people_probe_rfdetr_large.yaml",
     ("RFDETRLarge", True): EXPERIMENTS / "people_probe_rfdetr_large_antialias.yaml",
+}
+#: The detector files of the families of transformers, by family and size (entry of 2026-11-23).
+FAMILY_FILES = {
+    ("dfine", "small"): EXPERIMENTS / "people_probe_dfine_small.yaml",
+    ("dfine", "medium"): EXPERIMENTS / "people_probe_dfine_medium.yaml",
+    ("dfine", "large"): EXPERIMENTS / "people_probe_dfine_large.yaml",
+    ("rtdetrv2", "r18vd"): EXPERIMENTS / "people_probe_rtdetrv2_r18vd.yaml",
+    ("rtdetrv2", "r50vd"): EXPERIMENTS / "people_probe_rtdetrv2_r50vd.yaml",
 }
 CALIBRATION_FILE = EXPERIMENTS / "pitch_probe_pnlcalib.yaml"
 CLIP_ID = "SNGS-999"
@@ -167,6 +176,7 @@ GOOD_TOOL = "tool: {name: rfdetr, model: RFDETRSmall, min_score: 0.5, antialias:
     ("path", "model_probe", "kind", "gate"),
     [
         *((path, "people_probe.yaml", "people", "gate G2") for path in DETECTOR_FILES.values()),
+        *((path, "people_probe.yaml", "people", "gate G2") for path in FAMILY_FILES.values()),
         (CALIBRATION_FILE, "pitch_probe.yaml", "pitch", "gate G3"),
     ],
 )
@@ -201,10 +211,17 @@ def test_tool_experiment_files_name_the_settings_of_each_tool() -> None:
         )
     # The thresholds of the script inference.py of the tool, with its line refinement.
     assert calibration == PnlcalibSettings(name="pnlcalib", kp_threshold=0.3434, line_threshold=0.7867, pnl_refine=True)
-    assert cli.TOOL_PROBES == {"rfdetr": "people", "pnlcalib": "pitch"}
-    # Every experiment file of a tool is one of these six.
+    # The files of the other families take the threshold of RF-DETR, the input size of their weights
+    # (640 pixels), one frame per call and float32, so that their time compares with that of RF-DETR.
+    for (family, size), path in FAMILY_FILES.items():
+        assert cli.load_tool_experiment(path).tool == TransformersDetectorSettings(
+            name=family, model=size, min_score=0.5, input_size=640, batch=1, half=False
+        )
+    assert cli.TOOL_PROBES == {"rfdetr": "people", "dfine": "people", "rtdetrv2": "people", "pnlcalib": "pitch"}
+    # Every experiment file of a tool is one of these eleven.
     tool_files = sorted(path.name for path in EXPERIMENTS.glob("*.yaml") if "tool:" in path.read_text(encoding="utf-8"))
-    assert tool_files == sorted(path.name for path in (*DETECTOR_FILES.values(), CALIBRATION_FILE))
+    expected = (*DETECTOR_FILES.values(), *FAMILY_FILES.values(), CALIBRATION_FILE)
+    assert tool_files == sorted(path.name for path in expected)
 
 
 @pytest.mark.parametrize(
