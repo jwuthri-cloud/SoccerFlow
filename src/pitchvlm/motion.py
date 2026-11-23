@@ -302,7 +302,7 @@ def window_correlations(images: Sequence[np.ndarray], steps: Sequence[np.ndarray
 
     ``images`` are the test images of the clip (``CUT_TEST_WIDTH`` pixels wide, ``float32``).
     ``steps[i]`` maps test pixels of frame ``i`` to frame ``i + 1``; it is None where no
-    motion explains the pair, also into a hard cut. The value of frame ``t`` is the median block
+    motion was measured for the pair, and into a hard cut. The value of frame ``t`` is the median block
     correlation (``_block_correlation``) of frame ``t - DISSOLVE_WINDOW_FRAMES``, moved with the
     chained steps of the window, with frame ``t``. Only the chained motion is tried, not the
     identity: a pan that the chain follows explains its window, a dissolve does not, whatever
@@ -669,7 +669,8 @@ class ShotTests:
     wide), and ``test_steps[i]`` is the motion from frame ``i`` to frame ``i + 1`` in these
     pixels: the measured motion when it passes the pair test alone, else the motion of the
     pair test that explains the pair best (the identity or the last measured motion); None
-    into a hard cut. They are the input of ``window_correlations`` and
+    into a hard cut and where no motion was measured, except for a lone such pair between two
+    pairs with a step, which takes the last measured motion when that explains it alone. They are the input of ``window_correlations`` and
     ``find_transitions``. ``pair_correlations[i]`` is the value of the test of frames ``i``
     and ``i + 1`` (``shot_correlation``), and ``hard_cuts`` holds the frames where it is below
     ``MIN_SHOT_CORRELATION`` or None. ``window_correlations[t]`` is the value of the window
@@ -708,13 +709,17 @@ def measure_shots(
     frames are grown by 10% and no corner is taken inside them. A pair whose
     motion cannot be measured gives a missing step.
 
-    Each pair is tested for a hard cut (``is_cut``) with the measured motion
-    and the last measured motion of the same shot. A hard cut gives a missing
-    step, also when a motion was measured: static broadcast graphics can give a
-    motion across a cut. Then the windows of the clip are tested for a
-    dissolve (``window_correlations``, ``find_transitions``). Their motion chain takes the
-    measured motion where it explains its pair alone; in a fast pan the optical flow can be
-    wrong by tens of pixels while the last motion explains the pair, and that motion is taken.
+    Each pair is tested for a hard cut with the identity, the measured motion and the last
+    measured motion of the same shot, as ``is_cut`` does (the test is repeated here, so that
+    the test images and the values are kept). A hard cut gives a missing step, also when a
+    motion was measured: static broadcast graphics can give a motion across a cut. Then the
+    windows of the clip are tested for a dissolve (``window_correlations``,
+    ``find_transitions``). Their motion chain takes the measured motion where it explains its
+    pair alone; in a fast pan the optical flow can be wrong by tens of pixels while the last
+    motion explains the pair, and that motion is taken. A pair without a measured motion has
+    no step in the chain, so the windows over it are not judged, unless it is a lone such pair
+    between two pairs with a step and the last measured motion explains it alone. A clip of
+    ``DISSOLVE_WINDOW_FRAMES`` frames or fewer has no window, and an info line says so.
     """
     if not 0.0 < downscale <= 1.0:
         raise ValueError("downscale must be above 0 and at most 1")
@@ -733,6 +738,8 @@ def measure_shots(
     pair_values: list[float | None] = []
     hard_cuts: list[int] = []
     last_step: np.ndarray | None = None
+    #: The last motion of each pair without a measured motion that the last motion explains alone.
+    bridges: dict[int, np.ndarray] = {}
     previous = _small_grey(source.read(0), full_size, small_size)
     images = [_test_image(previous, test_size)]
     for frame in range(1, info.n_frames):
@@ -751,13 +758,35 @@ def measure_shots(
             steps.append(None)
             test_steps.append(None)
             last_step = None
+        elif step is None:
+            # No motion was measured: the windows over this pair are not judged. The identity or the
+            # last motion explains the pair well enough for the pair test, but chained over a window
+            # in a pan it would make up a dissolve. A lone such pair may be bridged below.
+            steps.append(None)
+            test_steps.append(None)
+            if last_step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION:
+                bridges[len(test_steps) - 1] = matrices[1]
         else:
-            steps.append(None if step is None else to_full @ step @ to_small)
+            steps.append(to_full @ step @ to_small)
             # The measured motion, when it explains the pair alone, else the motion that explains it best.
-            measured_explains = step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
+            measured_explains = values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
             test_steps.append(matrices[1] if measured_explains else best[1])
-            last_step = step if step is not None else last_step
+            last_step = step
         previous = current
+    # A lone pair without a measured motion between two pairs with a step takes the last motion:
+    # one step that is a little wrong does not make up a dissolve, and one failed pair inside a
+    # dissolve does not hide it (second read of 2026-11-22). Two or more in a row stay missing.
+    missing = [test_step is None for test_step in test_steps]
+    for index, matrix in bridges.items():
+        if 0 < index < len(test_steps) - 1 and not missing[index - 1] and not missing[index + 1]:
+            test_steps[index] = matrix
+    if info.n_frames <= DISSOLVE_WINDOW_FRAMES:
+        logger.info(
+            "clip %s: %d frames, not more than the window of %d frames: no dissolve test",
+            info.clip_id,
+            info.n_frames,
+            DISSOLVE_WINDOW_FRAMES,
+        )
     window_values = window_correlations(images, test_steps)
     transitions = find_transitions(images, test_steps, window_values)
     for start, stop in transitions:

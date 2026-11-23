@@ -983,7 +983,12 @@ class ObjectInfo:
 
     def finish(self) -> None:
         """Close the input, wait for git to end, and raise a GuardError for an exit code that is not 0."""
-        self._input.close()
+        try:
+            self._input.close()
+        except BrokenPipeError:
+            # Git ended before it read a name that is still in the buffer (`ask` met the same
+            # broken pipe). Its exit code below, or `_ended` after this call, reports it.
+            pass
         self._output.read()
         code = self._process.wait()
         self._errors.seek(0)

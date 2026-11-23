@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import hashlib
 import io
 import json
@@ -1357,10 +1358,25 @@ def paint_summary(checks: Sequence[PaintCheck]) -> dict[str, Any]:
     return {"n_fits": len(checks), "n_cannot_judge": len(checks) - scores.size, "score": summarize(scores)}
 
 
-def print_shots_and_paint(result: ClipResult) -> None:
-    """Print the cuts of a clip and the paint-alignment scores of its keyframe mappings (diagnostics only)."""
-    cuts = ", ".join(str(frame) for frame in result.cuts) if result.cuts else "none"
-    print(f"hard cuts (frames that start a new shot): {cuts}")
+def print_shots_and_paint(result: ClipResult, config: PipelineConfig) -> None:
+    """Print the cuts of a clip and the paint-alignment scores of its keyframe mappings (diagnostics only).
+
+    The frames of a transition (a shot of one frame: a frame of a dissolve, or a lone frame
+    between two cuts) get their own line, with the keyframes among them: the pipeline drops
+    what any engine answered for them, also a paid model answer.
+    """
+    info = result.info
+    transitions = MotionField([None] * (info.n_frames - 1), result.cuts).transition_frames()
+    starts = [frame for frame in result.cuts if frame not in transitions]
+    print(f"cuts (frames that start a new shot): {', '.join(map(str, starts)) if starts else 'none'}")
+    if transitions:
+        keyframes = keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)
+        dropped = [frame for frame in keyframes if frame in transitions]
+        print(
+            f"transition frames (a dissolve, or a lone frame between two cuts), which carry nothing: "
+            f"{', '.join(map(str, sorted(transitions)))}; {len(dropped)} of {len(keyframes)} keyframes among them, "
+            f"their answers dropped{': ' + ', '.join(map(str, dropped)) if dropped else ''}"
+        )
     summary = paint_summary(result.paint)
     score = summary["score"]
     if score["n"]:
@@ -1448,7 +1464,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             f"ball: {summary['frames_with_ball']} of {info.n_frames} frames "
             "(a stand-in ball that the picture does not show)"
         )
-    print_shots_and_paint(result)
+    print_shots_and_paint(result, config)
     print_diagnostics(diagnostics.lines())
     print_timing(timing)
     print(f"prediction file: {predictions}")
@@ -1706,7 +1722,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     finally:
         if session is not None:
             cost = close_session(session)
-    print_shots_and_paint(result)
+    print_shots_and_paint(result, config)
     clip_dir = args.out / info.clip_id
     provenance = {
         "command": "run",
@@ -2891,6 +2907,8 @@ def _cmd_video_frames(args: argparse.Namespace) -> int:
         f"{info.width} x {info.height} pixels, SHA-256 {video_sha256}"
     )
     clip_folder = args.out / info.clip_id
+    for left in sorted(args.out.glob(f".{glob.escape(info.clip_id)}.partial-*")):
+        print(f"a stopped run of video-frames left the hidden folder {left}: remove it to free its space")
     try:
         record = write_video_frames(source, video_sha256, clip_folder)
     except FileExistsError as error:
@@ -2907,6 +2925,9 @@ class MappingSource:
 
     #: Name of the source: the experiment, or the clip of a run.
     name: str
+    #: Name of the image folder before its seed and count: the name, and for a run also the first
+    #: 8 digits of the SHA-256 of its result file, so that two runs of one clip get two folders.
+    folder: str
     #: The engine of the mappings, as a result file names engines.
     engine: str
     #: Number of frames that the source covers.
@@ -2973,19 +2994,26 @@ def probe_mappings(args: argparse.Namespace) -> MappingSource:
     sources = {clip.source.info.clip_id: clip.source for clip in clips}
     mapped = [
         item
-        for clip_id, records in fits.items()
-        for item in mapped_frames(sources[clip_id], records, lambda record: "landmark fit of this frame")
+        for clip_id, pairs in fits.items()
+        for item in mapped_frames(
+            sources[clip_id], [record for record, _ in pairs], lambda record: "landmark fit of this frame"
+        )
     ]
     unmapped = [
-        (clip_id, record.frame, "the landmarks of the stored answer give no mapping")
-        for clip_id, records in fits.items()
-        for record in records
+        (
+            clip_id,
+            record.frame,
+            "the landmarks of the stored answer give no mapping" if parsed else "the stored answer cannot be parsed",
+        )
+        for clip_id, pairs in fits.items()
+        for record, parsed in pairs
         if not record.valid
     ]
     return MappingSource(
         name=experiment.name,
+        folder=experiment.name,
         engine=f"model:{model_label(experiment.step.provider, experiment.step.model)} landmarks, fit by code",
-        n_frames=sum(len(records) for records in fits.values()),
+        n_frames=sum(len(pairs) for pairs in fits.values()),
         mapped=mapped,
         unmapped=unmapped,
         sources=sources,
@@ -3024,6 +3052,7 @@ def tool_mappings(args: argparse.Namespace) -> MappingSource:
     ]
     return MappingSource(
         name=experiment.name,
+        folder=experiment.name,
         engine=f"tool:{experiment.tool.name}",
         n_frames=len(answers),
         mapped=mapped,
@@ -3060,7 +3089,7 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
     between the cuts of the result, ``MotionField.transition_frames``: a frame of a dissolve)
     has no mapping in any run, and its reason says so. The keyframes come from the settings of
     the run (its provenance). The clip must be the clip of the result file: the same clip id,
-    frame count and image size.
+    frame count and image size, and the video of its clip runs (``check_result_video``).
     """
     try:
         document = json.loads(args.result.read_text(encoding="utf-8"))
@@ -3079,6 +3108,8 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
             f"{seen.height} pixels, but the result file {args.result} is of the clip {info.clip_id} with "
             f"{info.n_frames} frames of {info.width} x {info.height} pixels"
         )
+    clip_sha256 = file_sha256(args.clip) if args.clip.is_file() else video_of_folder(args.clip, seen)
+    check_result_video(document, args.result, args.clip, clip_sha256)
     pitch_engine = result.engines.get("pitch_mapping")
     if pitch_engine is None:
         raise CliError(f"the result file {args.result} names no engine of the pitch mapping")
@@ -3104,8 +3135,10 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
             return "carried from another frame with the camera motion"
         return "landmark fit of this frame" if pitch_engine == "code" else "camera of the tool for this frame"
 
+    result_sha256 = file_sha256(args.result)
     return MappingSource(
         name=info.clip_id,
+        folder=f"{info.clip_id}-result{result_sha256[:8]}",
         engine=engine,
         n_frames=len(keyframes),
         mapped=mapped_frames(source, records, origin),
@@ -3113,11 +3146,34 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
         sources={info.clip_id: source},
         facts={
             "result_file": args.result.name,
-            "result_file_sha256": file_sha256(args.result),
+            "result_file_sha256": result_sha256,
             "run_commit": document["provenance"].get("commit"),
             "clip": info.clip_id,
         },
     )
+
+
+def check_result_video(document: Mapping[str, Any], path: Path, clip: Path, seen: str | None) -> None:
+    """Raise ``CliError`` unless ``clip`` holds the frames of the video of every clip run that a result file used.
+
+    ``run`` used a clip run of the frames of a video only with that video (``check_clip_run_video``);
+    the result file records its SHA-256 (``clip_run_facts``), or None for clip runs of images of
+    no video. ``seen`` is the SHA-256 of the video of ``clip``: of the file, or of the record of
+    its frame folder (``video_of_folder``), or None for images of no video. A video of the same
+    name, frame count and size with other pixels would get the mappings of the run drawn on
+    other frames. A result without clip runs (the model engine), or made before clip runs named
+    their video, has nothing to compare.
+    """
+    tool_runs = document["provenance"].get("tool_runs") or {}
+    # A result file made before clip runs named their video has no key: nothing can be compared.
+    wanted = {facts["video_sha256"] for facts in tool_runs.values() if "video_sha256" in facts}
+    if not wanted or wanted == {seen}:
+        return
+    made_from = ", ".join(
+        sorted(f"the video with the SHA-256 {sha}" if sha else "images of no video" for sha in wanted)
+    )
+    given = f"the video with the SHA-256 {seen}" if seen else "a folder of images of no video"
+    raise CliError(f"the result file {path} used clip runs of {made_from}, but --clip {clip} is {given}: give that clip")
 
 
 #: The function that collects the mappings of each source of the command ``overlay``.
@@ -3151,7 +3207,13 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
             f"none of the {mappings.n_frames} frames of {mappings.name} has a pitch mapping: nothing to draw"
         )
     chosen = choose_frames(mappings.mapped, count=args.count, seed=args.seed)
-    folder = args.out / f"{mappings.name}-seed{args.seed}-count{args.count}"
+    folder_name = f"{mappings.folder}-seed{args.seed}-count{args.count}"
+    if Path(folder_name).name != folder_name:
+        raise CliError(
+            f"the name {mappings.name!r} holds a folder separator, so its images would not go below --out: give the "
+            "experiment a name without one"
+        )
+    folder = args.out / folder_name
     if folder.exists():
         raise CliError(f"{folder} is already there: remove it, or give another --out")
     print(
@@ -3165,20 +3227,6 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
             print(f"  {reason}: {frames}")
     if len(chosen) < args.count:
         print(f"only {len(chosen)} frames have a mapping, fewer than the count {args.count}: all of them are drawn")
-    partial = folder.with_name(f".{folder.name}.partial-{secrets.token_hex(4)}")
-    partial.mkdir(parents=True)
-    try:
-        for position, item in enumerate(chosen):
-            image = draw_mapping_check(
-                mappings.sources[item.clip].read(item.frame),
-                item.matrix,
-                caption(item, engine=mappings.engine, position=position, count=len(chosen)),
-            )
-            write_png(partial / image_name(position, item), image)
-        os.rename(partial, folder)
-    except BaseException:
-        shutil.rmtree(partial, ignore_errors=True)
-        raise
     provenance = {
         "command": f"overlay {args.source}",
         "commit": state.commit,
@@ -3198,7 +3246,28 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
         unmapped=mappings.unmapped,
         provenance=provenance,
     )
-    write_json(args.list, document)
+    # The list file is written before the image folder gets its name, so a failed write leaves
+    # neither of them, and the next run is not refused.
+    partial = folder.with_name(f".{folder.name}.partial-{secrets.token_hex(4)}")
+    partial.mkdir(parents=True)
+    list_started = False
+    try:
+        for position, item in enumerate(chosen):
+            image = draw_mapping_check(
+                mappings.sources[item.clip].read(item.frame),
+                item.matrix,
+                caption(item, engine=mappings.engine, position=position, count=len(chosen)),
+            )
+            write_png(partial / image_name(position, item), image)
+        # The list file was not there at the start, so a file there now, also a part of one, is ours.
+        list_started = True
+        write_json(args.list, document)
+        os.rename(partial, folder)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        if list_started:
+            args.list.unlink(missing_ok=True)
+        raise
     for position, item in enumerate(chosen):
         paint = f"paint score {item.score:.3f}" if item.score is not None else f"cannot judge ({item.reason})"
         print(f"  {image_name(position, item)}: clip {item.clip}, frame {item.frame}, {item.origin}, {paint}")

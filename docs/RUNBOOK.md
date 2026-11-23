@@ -563,13 +563,12 @@ python -m pitchvlm.cli overlay tool --experiment configs/experiments/pitch_probe
 # The mappings that a run used on its keyframes (landmark fits or calibration cameras, section 11).
 python -m pitchvlm.cli overlay run --result ~/pitchvlm-data/runs/dev-detector/<clip>/result.json \
     --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> --seed 20261113 --count 5 \
-    --list ../pitchvlm-results/results/overlays/<clip>_dev-detector.json \
-    --out ~/pitchvlm-data/overlays/dev-detector
+    --list ../pitchvlm-results/results/overlays/<clip>_dev-detector.json
 ```
 
-- The image folder of `overlay run` is named by the clip only (`<clip>-seed<seed>-count<count>`).
-  So give each run folder its own `--out` (above: `~/pitchvlm-data/overlays/dev-detector`):
-  without it the second engine on the same clip is refused, because the folder is already there.
+- The image folder of `overlay run` names the clip and the first 8 digits of the SHA-256 of the
+  result file (`<clip>-result<8 digits>-seed<seed>-count<count>`), so the runs of two engines on
+  one clip get two folders below the same `--out`. Each still needs its own `--list` file.
 
 - `overlay probe` reads the stored answers of the probe only (the cache folder of section 2): a
   frame without a stored answer stops the command with one line. Give the same `--max-clips` and
@@ -584,8 +583,8 @@ python -m pitchvlm.cli overlay run --result ~/pitchvlm-data/runs/dev-detector/<c
   dissolve has the reason "a frame of a transition": the run drops the mapping of every such frame
   (entry "A dissolve is a transition, not a shot" of `docs/DECISIONS.md`).
 - The command prints each chosen image with its clip, frame and paint score, and writes the images
-  into `~/pitchvlm-data/overlays/<name>-seed<seed>-count<count>/`. It refuses a list file or an
-  image folder that is already there.
+  into `~/pitchvlm-data/overlays/<name>-seed<seed>-count<count>/` (for `overlay run` the name is
+  `<clip>-result<8 digits>`). It refuses a list file or an image folder that is already there.
 - **The check by eye.** Open each image. A mapping is right when the magenta lines lie on the
   white paint wherever paint is visible (the far touchline, the halfway line, the penalty box, the
   centre circle), and wrong when a line lies beside its paint by more than its own width over a

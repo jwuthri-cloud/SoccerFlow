@@ -2197,6 +2197,222 @@ This entry records that walk on the build machine (base `main` fe4f316) and what
 10. **Checks of this work.** Full run of the offline tests: 3203 passed, 1 skipped (Pillow), 191 s,
     exit code 0 (8 of them new). `python3 tools/guard.py --tracked`: exit code 0.
 
+## 2026-11-22 — Second read of the dissolve test, the video frames, the overlays and the guard
+
+A second read of the code that pull requests 11, 12 and 13 brought into `main` (`fe4f316`; base
+`81bb2d9`), plus one code finding of the rehearsal of the runbook. Four readers read separate
+parts (the guard; video frames and the image folder check; overlays and the rules; dissolves).
+Each finding went to a second reader whose job was to refute it, with a test that fails on the
+old code or an exact trace; only confirmed findings are fixed. One more reader then tried to
+break the fixes. Every number below is synthetic or made on the build machine: synthetic clips,
+stand-ins of the model and the tools, videos written by OpenCV. None is a result on real footage.
+"Before" is `fe4f316` (the guard and the documents: `638863a`, which has the same guard);
+"after" is the commit of this entry.
+
+1. **Counts.** Major: 2 proposed, 1 confirmed and fixed (item 2), 1 confirmed and graded minor
+   by its second reader (the frame rate, item 3). Minor: 10 confirmed, 7 fixed, 3 kept as written
+   limits (item 7). Small: 15 confirmed, 9 fixed, 6 kept as written limits (item 7). Refuted: 2,
+   and 1 graded down to an owner item (item 8). No fail-open of the guard was found (item 5).
+   The read of the fixes found 1 major regression of this review (the dissolve hidden by one
+   failed pair, item 2), 1 minor and 4 small holes (item 4): all fixed with a test that fails
+   before.
+2. **Major, fixed: a failed optical flow inside a shot made up a dissolve.** When
+   `estimate_motion` gave no motion for a pair that passed the pair test, `measure_shots` put the
+   identity or the last motion into the window chain (`ShotTests.test_steps`), so a pan was
+   judged with a wrong chain, while the entry "A dissolve is a transition, not a shot" and
+   ARCHITECTURE said that a window with a missing step is not judged. Such a pair is now a
+   missing step: the windows over it are not judged; the pair test and the hard cuts are
+   unchanged. The reader of the fixes then found the other side: one such pair inside a
+   dissolve hid the whole dissolve, because every window that holds it holds the missing step.
+   So a lone such pair between two pairs with a step takes the last measured motion when that
+   motion explains the pair alone; two or more in a row stay missing. Tests: `test_a_pan_whose_flow_fails_for_some_pairs_has_no_transition` (seed 21,
+   flow forced off for the pairs into frames 1 to 10; before: frames 2 to 9 dropped as a
+   transition in a clip without a cut) and
+   `test_one_pair_of_a_dissolve_without_a_measured_motion_does_not_hide_it` (one and two lone
+   pairs; the dissolve was not found without the bridge). Measured on new seeds 20 to 29 (n = 10 per case, the clip
+   families of `tools/synthetic_diagnostics.py`; the old `motion.py` against the new one):
+   - Without forcing, the flow failed on 0 of 9,230 pairs outside cut pairs and the pans of
+     100 px per frame, on 10 of 790 hard-cut pairs and on 17 of 590 pairs of the 100 px pans.
+     Seed 29, pan at 100 px per frame: before, a natural false transition (frames 26 to 40
+     dropped); after, none. Every other case: the same hits and false cuts (dissolves 49 of 50,
+     hard cuts 10 of 10; control false blocks 3 before, 2 after, all in the 100 px pans; windows
+     judged in those pans 270 of 300 before, 240 after).
+   - Flow forced off (pan 25 px per frame, pairs 1 to 10 / 20 to 40): clips with a made-up
+     transition 4 of 10 (26 frames dropped) / 8 of 10 (114) before, 0 of 10 after; pan 50 px,
+     pairs 20 to 40: 3 of 10 (26) before, 0 after.
+   - Lone pairs forced off inside a dissolve (10 frames: pair 45, or pairs 43 and 47; 25 frames:
+     pair 52, or pairs 45, 50 and 55): found 10 of 10 / 10 of 10 / 9 of 10 / 9 of 10, as before;
+     without the bridge 0 of 10 each. Lone pairs forced off in pans (every 5th pair, or pair 30;
+     25 and 50 px per frame): no transition before or after.
+   - The cost: a dissolve whose flow fails for several pairs in a row inside the blend is no
+     longer found by the window test. Pairs 41 to 48 of a 10-frame dissolve: found 10 of 10
+     before, 5 of 10 after; pairs 50 to 55 of a 25-frame dissolve: 9 of 10 before, 3 of 10 after.
+     Without forcing the flow failed on 0 of 4,700 dissolve pairs. On real blends it may fail
+     more often (inferred): an open question below.
+   - Command: `PYTHONPATH=src python d1.py natural|forced` of the scratch folder of this read
+     (not in the repository; it loads the old `motion.py` next to the new one).
+   - `tools/synthetic_diagnostics.py dissolve-fit dissolve-held-out` run again with the fix,
+     only to see whether the numbers of the entry still hold (no threshold changed, nothing
+     tuned): every hit, miss and false cut on seeds 0 to 19 is unchanged. Changed: the lowest
+     window value of the pans at 100 px per frame, fit seeds 0.268 to 0.848 (247 of 300 windows
+     judged) -> 0.281 to 0.848 (218 of 300); held-out seeds 0.201 to 0.860 (300 of 300) -> 0.358
+     to 0.860 (275 of 300); the fade through black 0.572 -> 0.807 (295 -> 280 of 600 windows).
+     So the thin margin of item 5 of that entry (0.201 against 0.18) came from a made-up chain;
+     the cost is that 25 of 300 windows of those pans are no longer judged.
+3. **Minor, fixed.**
+   - **The frame rate of a video comes from its frame times** (`frames.check_frame_times`,
+     reader's grade major, second reader's minor: the refusal is loud and only the video path is
+     hit). OpenCV gives `CAP_PROP_FPS` as the frame count over the length of the stream, and
+     that length holds the length of the last frame. Measured: an mp4 of 750 frames, every frame
+     40 ms after the one before, whose last frame lasts 1/40 of a frame, reads 25.0326 frames per
+     second and was refused at frame 384 as "a variable frame rate"; with a last frame of 2
+     frames, 24.9667, refused at frame 376. Any last frame shorter than 0.5 or longer than 1.5
+     frames was refused, for any clip length. Now the rate is the time from the first to the last
+     frame over the count less one (`info.fps`, so `video.json` too); a frame is refused when its
+     step from the frame before is more than half the median step away from it (a frame dropped
+     or doubled anywhere: the mean step alone hides one lost frame in the middle of a long clip)
+     or when it is more than half the mean step away from its place (a slowly changing rate).
+     The header count check is unchanged. Tests: `test_video_with_a_short_last_frame_keeps_its_rate`,
+     `test_frame_times_give_the_rate_of_the_frames_whatever_the_header_rate` (25, 30000/1001,
+     60000/1001, 24000/1001 with times rounded to the millisecond; header rates exact, 0.13 %
+     off, and rounded to 2 decimals), `test_a_frame_missing_in_the_middle_of_a_long_clip_is_refused`.
+     The docstring said "in decoding order": OpenCV gives the frames in the order they are shown
+     (measured on an H.264 file with B-frames and an edit list: 120 of 120 frames, times rising).
+   - **`overlay run` checked only the clip id, the frame count and the size of `--clip`.** A
+     video of the same name with other pixels got the mappings of the run drawn on other frames.
+     `check_result_video` now compares the SHA-256 of every clip run of the result
+     (`provenance.tool_runs.*.video_sha256`) with the video of `--clip` (the file, or the record
+     of a frame folder). Test: `test_overlay_of_a_run_refuses_a_video_with_other_pixels` (the
+     frames of the run in reverse order). A run of the model engine records no clip hash, so it
+     is not checked (item 7).
+   - **The rule-4 test left `tools/run_tool.py` out**, so an SDK import there passed. It is
+     scanned now, with the SDK forbidden and the tools and computed names allowed there. Test:
+     `test_rule_4_check_lets_the_tool_runner_import_a_tool_but_not_the_sdk`.
+   - **A paid model answer of a keyframe on a blend frame was dropped without a word**, and the
+     run printed the frames of a dissolve as "hard cuts". `run` and `demo` now print the cuts
+     that start a shot apart from the transition frames, with the keyframes among them, whose
+     answers are dropped. Test: `test_the_cli_names_the_transition_frames_and_the_keyframes_whose_answers_are_dropped`
+     (the synthetic dissolve clip: keyframe 48 lies on a blend frame).
+   - **The guard: a broken pipe at the close of the input of `git cat-file --batch-check`** left
+     `main` as an error it does not catch: exit code 1 with a traceback (the code of
+     "violations", with no violation line), where the guard of `81bb2d9` exited 2 with the
+     exit code of git. It needs a git that ends before the guard writes its first name. Still a
+     refusal, not a leak. `ObjectInfo.finish` now takes that second broken pipe; the exit code of
+     git, or `_ended`, still raise. Test: `test_git_that_ends_before_the_first_name_is_written_is_a_git_error`.
+   - **The guard: no test held the `resolve()` of the start folder.** With `start.absolute()`
+     (a planted fault), `--repo` naming a link to a subfolder missed the deny-list and exited 0.
+     The code was right; test: `test_deny_list_is_found_through_a_link_to_a_subfolder`.
+   - **`overlay run` named its image folder by the clip only** (found by the rehearsal of the
+     runbook): two engines on one clip, the comparison of RUNBOOK section 11, refused the second.
+     The folder is now `<clip>-result<first 8 digits of the SHA-256 of the result file>-seed..-count..`;
+     the RUNBOOK lost its way around. Test: `test_overlays_of_two_runs_of_one_clip_go_to_two_folders`.
+4. **Small, fixed.** `overlay` refuses an experiment name with a folder separator (the image
+   folder is named after it, a text of the experiment file: `../` put the images outside `--out`,
+   into a work tree when it pointed there). The list file of `overlay` is written before the
+   image folder gets its name, so a failed write leaves neither and the next run is not refused.
+   `video-frames` names the hidden `.<clip>.partial-*` folders that a killed run left (SIGKILL
+   runs no clean-up; about 1 to 2 GB each). `overlay probe` gives an answer that cannot be parsed
+   its own reason (`probes.pitch_probe_fits` returns the flag). The rule-4 check now flags every
+   use of a dynamic import function (`import_module` under another name, handed on without a
+   call, `pkgutil.resolve_name`, `find_spec`, `run_module`, pydantic `ImportString`, a relative
+   name in `import_module`); the package uses none. A clip of 30 frames or fewer logs that it
+   has no dissolve test. Texts: the docstring of `measure_shots` (it repeats the pair test of
+   `is_cut`, it does not call it), the comment of `ClipResult.cuts` (blend frames are cuts too),
+   the module text of `overlays.py` (what the list file holds), ARCHITECTURE.
+   Found by the reader of the fixes, fixed: a list file written half way (a full disk) blocked
+   the next `overlay` (minor; the list was not there at the start, so any file there now is
+   removed on a failure); the pattern of the hidden folders of `video-frames` was not escaped (a
+   clip id with `[` named the folders of another clip); `check_result_video` let a video pass
+   for clip runs of images of no video; the step test let a step of exactly half the usual step
+   pass (a variable rate of 60 % 80 ms and 40 % 40 ms steps was taken as 15.6 frames per second;
+   the check before this read let it pass too); the rule-4 check read
+   `__import__('genai', {...}, None, [], 1)` (relative by its last argument) as `genai` and took a
+   variable named `run_path` for an import. Still not found by the rule-4 check, and only by
+   deliberate evasion: `getattr(importlib, "import_module")`, `exec` of a text,
+   `vars(builtins)[...]`, a `SourceFileLoader`.
+5. **The guard: differential and fault check.** The generator is new (written in this read,
+   kept in the scratch folder, not in the repository): plain repositories, subfolders, linked
+   work trees and their subfolders, submodules, a symbolic link as the start folder, folder names
+   with a line break, a trailing line break or spaces; HEAD unborn, detached, detached on a
+   damaged commit, a branch or a tag named `HEAD`; annotated, lightweight and blob tags; a
+   remote with tracking branches; missing blobs; file names with a line break; files above
+   2 MB; tracked ignored files; deny words in files, paths, messages and branch names; the
+   variables `GIT_DIR` (absolute and relative), `GIT_WORK_TREE`, `GIT_INDEX_FILE` (absolute and
+   relative), `GIT_COMMON_DIR` and those of the hook runner, one with a line break. Each state
+   ran in `--staged`, `--push`, `--tracked` and `--paths`; exit code, violation lines and the
+   class of the error were compared.
+   - `fe4f316` against `81bb2d9`, seeds 9100 to 9419: 312 states (8 not built: damaged objects
+     of the generator break `git worktree add`), 1,205 mode pairs, 2,410 runs, 0 differences.
+   - Final code against `81bb2d9`, seeds 9500 to 9759: 253 states (7 not built), 978 mode pairs,
+     1,956 runs, 0 differences.
+   - Real `git commit` and `git push` hooks in a plain repository, a linked work tree and a
+     submodule: both guards refuse. No hang and no process left behind in any run.
+   - A folder name that is not UTF-8 could not be made (the file system refuses it); by the code
+     it takes the old commands, which fail with exit code 2 as before (inferred).
+   - Faults planted in the new code paths, `tests/test_guard.py` run on each: on `fe4f316` 16 of
+     21 caught (one only as a hang of 900 s: `stop` without `kill`). On the final code, with one more fault (the catch of item 3 taken out) and without the
+     one that hangs: 17 of 21 caught; both faults that the new tests of item 3 aim at are caught.
+     Not caught and judged harmless: the check of the object name in an answer (git answers one
+     line per question), no `stop` after an error (git ends at the end of its input when the
+     guard ends), `HEAD` asked without `^{commit}` (differs only for a HEAD on a tag object), a
+     decode with "replace" (not testable here).
+   - Error texts: with a relative `GIT_DIR` and `GIT_WORK_TREE` from a subfolder, both guards exit
+     2, but the new one names `git ls-files` or `git remote` where the old one named
+     `git rev-parse --git-common-dir`. The entry of the faster guard promises the old texts only
+     on the path back; kept.
+6. **Measured again: the dissolve entry** (`tools/synthetic_diagnostics.py dissolve-fit
+   dissolve-held-out` on `fe4f316`): every number of items 5 and 6 of that entry matches, also
+   the shares, the out-of-scope rows and the midpoints 0.1775 and 0.9535. Timing differs:
+   pair test 1.17 ms, pair and window test 1.48 ms per frame (n 135; the entry: 1.12 and 1.42 ms);
+   1.31 and 1.65 ms with the fixes. Timing noise of this machine; not compared further.
+7. **Kept as written limits, not fixed** (each confirmed by a test or a trace; seeds 20 and up).
+   - Minor: two dissolves less than about 25 frames apart become one transition and the clean
+     shot between them is dropped (gaps of 10 and 15 frames: 5 of 5 merged; 20, 25 and 30: split;
+     seeds 20 to 22). `find_transitions` has no upper bound on the length of a transition.
+   - Minor: a hard cut in the middle of a dissolve: only the hard cut is found in 4 of 5 clips
+     (seeds 20 to 24); the blend frames next to it keep their states.
+   - Minor: the window is 30 frames at any frame rate. A dissolve of 1 s at 50 frames per second
+     leaves frames with up to 0.137 of the other shot in the shots, at 75 frames up to 0.28 (the
+     dissolve entry: "up to about 0.1", for 5 to 25 frames at 25 frames per second). A window
+     in seconds needs a new fit, which rule 7 forbids here.
+   - Small: the test images are kept as `float32`, 57.6 KB per frame: 43 MB for a clip of 30 s,
+     7.8 GB for a whole match (out of scope).
+   - Small: the kit legend is asked before the motion is measured, so its keyframe can be a blend
+     frame.
+   - Small: `refuse_pixels_in_repository` knows only the work trees that `git worktree list`
+     names: a work tree moved by hand without `git worktree repair`, and a separate clone of the
+     repository, pass (`.gitignore` still covers `*.png`). `run` and `demo` write their video
+     into `--out` without this check (older code).
+   - Small: `overlay run` compares no video for a result of the model engine (it records no
+     hash of its clip) and for a result file older than the key `video_sha256`.
+   - Small: the SHA-256 ties a clip run to the bytes of a video, not to its decoded pixels:
+     another OpenCV or FFmpeg build could decode other pixels (inferred).
+   - Small, for the owner: the check images of G3 are not blind: the caption shows the paint
+     score and the images are numbered in score order, which can anchor the eye. G3 and the
+     RUNBOOK define the caption so; a change is the owner's.
+8. **Refuted, and checked and found right.** Refuted: a NaN paint score (no source: the matrices
+   are finite, the score is a mean of booleans); an unmeasurable shot share counted as a blend
+   frame (no case on seeds 20 to 24: 0 frames); the eye check against the definition of G3 (G3
+   asks only for 5 images checked; kept as an owner item, item 7). Found right: the steering of the choice of overlay frames: the same choice under
+   `PYTHONHASHSEED` 0, 1 and 12345 and with numpy integers, 0 of 500 shuffles of the input
+   changed it. A text in the overlay list against rule 2 or 3: every field traced, none. A model
+   call by `overlay probe`: none (a missing answer stops it). Frame numbering: `000001.png` is frame 0
+   everywhere, no off-by-one. The refusal of an image folder in the repository held against a
+   symbolic link, a dangling link, `..`, another letter case, a linked work tree, a link to it,
+   the git folder and a relative path.
+9. **Estimated, not measured on real frames:** a PNG frame of 1080p at compression level 1 is
+   about 1.1 to 3.0 MB on synthetic frames with noise (the video entry: 1 to 2 MB), so 0.8 to
+   2.3 GB per clip of 30 s at 25 frames per second.
+10. **Only the run machine can settle:** a broadcast TS or MKV whose frame count OpenCV estimates
+    from the length (an off-by-one refusal); interlaced 1080i where FFmpeg may report 50 for 25
+    frames per second (the header count would then be refused); how often a real cut file has a
+    last frame of odd length; edit lists that drop leading frames of a `-c copy` cut; how often
+    the optical flow fails inside a real dissolve (item 2).
+11. **Tests.** Every fix has a test that fails on the code before it (checked by putting the old
+    file back). Full run (`-m "slow or not slow"`) on the commit of this entry: 3,232 passed,
+    1 skipped (Pillow is not installed), exit code 0. `python3 tools/guard.py --tracked`: exit
+    code 0. `demo --engine model` and `demo --engine detector`: exit code 0.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
@@ -2216,6 +2432,10 @@ This entry records that walk on the build machine (base `main` fe4f316) and what
 - How many hard cuts does the cut test find in the demo clip, and how many does it miss?
 - Does the window test find the dissolves of real broadcast clips, and does it raise false
   transitions in fast real pans (entry "A dissolve is a transition, not a shot")?
+- How often does the optical flow fail for several pairs in a row inside a real dissolve (the
+  window test then misses it), and how often does OpenCV give a cut broadcast file a last frame
+  of odd length, an estimated frame count or a field rate (entry "Second read of the dissolve
+  test, the video frames, the overlays and the guard", items 2 and 10)?
 - Right value of the two-people margin (6 m) and of the limit for a repeated box (0.6) on real
   answers (RUNBOOK section 8, facts 13 and 15)?
 - Do two crops that are less than one second apart agree on a wrong number, and does the model

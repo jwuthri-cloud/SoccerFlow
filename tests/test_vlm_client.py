@@ -544,54 +544,110 @@ def _tool_names() -> frozenset[str]:
     raise AssertionError("tools/run_tool.py has no PNLCALIB_PACKAGES")
 
 
-def _is_import_call(function: ast.expr) -> bool:
-    name = function.attr if isinstance(function, ast.Attribute) else getattr(function, "id", "")
-    return name in ("import_module", "__import__")
+#: Functions and types that import a module by a name: an import through any of them is found,
+#: also when the function is given another name or handed on without a call.
+DYNAMIC_IMPORTS = frozenset(
+    {
+        "import_module",
+        "__import__",
+        "resolve_name",
+        "find_spec",
+        "spec_from_file_location",
+        "run_module",
+        "run_path",
+        "ImportString",
+    }
+)
+
+
+#: The two functions whose call with one text is read as an import of that text. A name that is
+#: a plain variable is flagged only for these; the others only as an attribute (``runpy.run_path``)
+#: or an import of the name, so a variable such as ``run_path`` is no import.
+READ_IMPORTS = ("import_module", "__import__")
+
+
+def _dynamic_name(node: ast.AST) -> str | None:
+    """Return the name of a dynamic import function that a node names, or None."""
+    if isinstance(node, ast.Attribute):
+        name = node.attr
+    elif isinstance(node, ast.Name) and node.id in READ_IMPORTS:
+        name = node.id
+    else:
+        return None
+    return name if name in DYNAMIC_IMPORTS else None
+
+
+def _read_name(call: ast.Call) -> str | None:
+    """Return the module name of a call of a function of ``READ_IMPORTS`` with one text argument, else None.
+
+    A second argument (a package, globals) or a keyword can make the name relative, so such a
+    call is not read.
+    """
+    if _dynamic_name(call.func) not in READ_IMPORTS or len(call.args) != 1 or call.keywords:
+        return None
+    first = call.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str) and not first.value.startswith("."):
+        return first.value
+    return None
 
 
 def imported_modules(source: str) -> list[tuple[int, str]]:
     """Return the line and the module name of every import of a source, at any depth.
 
-    A call of ``importlib.import_module`` or ``__import__`` counts as an import; its name is
-    ``COMPUTED_NAME`` when it is not a text in the source. A relative import names a module
-    of the same package and is left out.
+    A call of ``importlib.import_module`` or ``__import__`` with one text argument that is not
+    relative counts as an import of that name (``_read_name``). Every other use of a function of
+    ``DYNAMIC_IMPORTS`` (another name for it, a computed or relative name, a reference without a
+    call, a ``from importlib import import_module``) counts as an import of ``COMPUTED_NAME``. A
+    relative import names a module of the same package and is left out.
     """
+    nodes = list(ast.walk(ast.parse(source)))
     found = []
-    for node in ast.walk(ast.parse(source)):
+    read = set()  # the functions of calls whose module name is read from the source
+    for node in nodes:
+        if isinstance(node, ast.Call) and (name := _read_name(node)) is not None:
+            found.append((node.lineno, name))
+            read.add(id(node.func))
+    for node in nodes:
         if isinstance(node, ast.Import):
             found += [(node.lineno, alias.name) for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            found.append((node.lineno, node.module or ""))
-        elif isinstance(node, ast.Call) and _is_import_call(node.func):
-            first = node.args[0] if node.args else None
-            text = isinstance(first, ast.Constant) and isinstance(first.value, str)
-            found.append((node.lineno, first.value if text else COMPUTED_NAME))  # type: ignore[union-attr]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                found.append((node.lineno, node.module or ""))
+            found += [(node.lineno, COMPUTED_NAME) for alias in node.names if alias.name in DYNAMIC_IMPORTS]
+        elif _dynamic_name(node) is not None and id(node) not in read:
+            found.append((node.lineno, COMPUTED_NAME))  # type: ignore[attr-defined]
     return found
 
 
-def rule_4_breaks(label: str, source: str, *, may_import_sdk: bool) -> list[str]:
-    """Return one line for each import of the source that hard rule 4 forbids."""
+def rule_4_breaks(label: str, source: str, *, may_import_sdk: bool, may_import_tools: bool = False) -> list[str]:
+    """Return one line for each import of the source that hard rule 4 forbids.
+
+    The tool runner (``may_import_tools``) imports the modules of a tool by computed names:
+    for it, only an import of the model SDK breaks the rule.
+    """
     tools = _tool_names()
     breaks = []
     for line, name in imported_modules(source):
         top = name.split(".")[0]
-        if name == COMPUTED_NAME:
+        if name == COMPUTED_NAME and not may_import_tools:
             breaks.append(f"{label}:{line}: imports a module whose name is computed, so no check can read it")
         elif top in SDK_NAMES and not may_import_sdk:
             breaks.append(f"{label}:{line}: imports the model SDK ({name})")
-        elif top in tools:
+        elif top in tools and not may_import_tools:
             breaks.append(f"{label}:{line}: imports an external tool ({name})")
     return breaks
 
 
 def test_only_the_client_imports_the_sdk_and_only_the_tool_runner_imports_a_tool() -> None:
-    """Hard rule 4, read from the source of every module of the package and of every other script of tools/."""
-    sources = sorted(PACKAGE_DIR.rglob("*.py")) + sorted(set(TOOLS_DIR.glob("*.py")) - {TOOL_RUNNER})
-    assert len(sources) > 20 and SDK_MODULE in sources
+    """Hard rule 4, read from the source of every module of the package and of every script of tools/."""
+    sources = sorted(PACKAGE_DIR.rglob("*.py")) + sorted(TOOLS_DIR.glob("*.py"))
+    assert len(sources) > 20 and SDK_MODULE in sources and TOOL_RUNNER in sources
     breaks = []
     for path in sources:
         source = path.read_text(encoding="utf-8")
-        breaks += rule_4_breaks(path.name, source, may_import_sdk=path == SDK_MODULE)
+        breaks += rule_4_breaks(
+            path.name, source, may_import_sdk=path == SDK_MODULE, may_import_tools=path == TOOL_RUNNER
+        )
     assert breaks == []
     assert any(name.split(".")[0] in SDK_NAMES for _, name in imported_modules(SDK_MODULE.read_text(encoding="utf-8")))
 
@@ -608,11 +664,31 @@ def test_only_the_client_imports_the_sdk_and_only_the_tool_runner_imports_a_tool
         ("class Detector:\n    def run(self):\n        import rfdetr\n", "imports an external tool (rfdetr)"),
         ("from model.cls_hrnet import get_cls_net\n", "imports an external tool (model.cls_hrnet)"),
         ("def load(name):\n    return __import__(name)\n", "imports a module whose name is computed"),
+        # Found in the second read of 2026-11-22: other spellings of a dynamic import.
+        ("from importlib import import_module as load\n", "imports a module whose name is computed"),
+        ("import importlib as il\n\ndef sdk():\n    return il.import_module\n", "imports a module whose name is computed"),
+        ("import pkgutil\n\ndef sdk():\n    return pkgutil.resolve_name('google.genai:Client')\n", "imports a module whose name is computed"),
+        ("import importlib\n\ndef sdk():\n    return importlib.import_module('.genai', 'google')\n", "imports a module whose name is computed"),
+        ("def sdk():\n    return __import__('genai', {'__package__': 'google'}, None, [], 1)\n", "imports a module whose name is computed"),
+        ("import runpy\n\ndef sdk():\n    return runpy.run_module('google.genai')\n", "imports a module whose name is computed"),
     ],
 )
 def test_rule_4_check_finds_an_import_at_the_top_and_inside_a_function(source: str, expected: str) -> None:
     breaks = rule_4_breaks("pipeline.py", source, may_import_sdk=False)
     assert len(breaks) == 1 and expected in breaks[0], breaks
+
+
+def test_rule_4_check_takes_a_variable_with_the_name_of_an_import_function_for_no_import() -> None:
+    source = "def save(run_path, spec):\n    find_spec = spec.find\n    return run_path.read_text(), find_spec\n"
+    assert rule_4_breaks("cli.py", source, may_import_sdk=False) == []
+
+
+def test_rule_4_check_lets_the_tool_runner_import_a_tool_but_not_the_sdk() -> None:
+    runner = "import importlib\n\ndef load(name):\n    return importlib.import_module(name)\n\nimport rfdetr\n"
+    assert rule_4_breaks("run_tool.py", runner, may_import_sdk=False, may_import_tools=True) == []
+    assert rule_4_breaks("run_tool.py", "import google.genai\n", may_import_sdk=False, may_import_tools=True) == [
+        "run_tool.py:1: imports the model SDK (google.genai)"
+    ]
 
 
 def test_rule_4_check_lets_the_client_import_the_sdk_but_no_tool() -> None:
