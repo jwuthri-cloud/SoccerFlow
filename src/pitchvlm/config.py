@@ -10,7 +10,12 @@ from typing import Any, Literal
 import yaml
 from pydantic import Field, model_validator
 
-from pitchvlm.fallbacks.runs import PnlcalibSettings, RfdetrSettings
+from pitchvlm.fallbacks.runs import (
+    DetectorSettings,
+    PnlcalibSettings,
+    RfdetrSettings,
+    TransformersDetectorSettings,
+)
 from pitchvlm.schemas import Record
 from pitchvlm.vlm.coords import GEMINI_CONVENTION, CoordConvention
 from pitchvlm.vlm.cost import FREE_MODEL_SUFFIX
@@ -176,6 +181,20 @@ class EngineSettings(Record):
 
 #: The detector of the people engine ``detector`` by default: RF-DETR Medium with its own threshold.
 DEFAULT_DETECTOR = RfdetrSettings(name="rfdetr", model="RFDETRMedium", min_score=0.5, antialias=False)
+#: The settings that a family named in the section ``detector`` of a settings file starts from. The
+#: score limit is that of RF-DETR, and the input size, the batch and the precision are those of the
+#: weights as published (640 pixels, one frame, float32), so that the families compare as published.
+DEFAULT_DETECTORS: Mapping[str, RfdetrSettings | TransformersDetectorSettings] = MappingProxyType(
+    {
+        "rfdetr": DEFAULT_DETECTOR,
+        "dfine": TransformersDetectorSettings(
+            name="dfine", model="medium", min_score=0.5, input_size=640, batch=1, half=False
+        ),
+        "rtdetrv2": TransformersDetectorSettings(
+            name="rtdetrv2", model="r18vd", min_score=0.5, input_size=640, batch=1, half=False
+        ),
+    }
+)
 #: The calibration of the pitch engine ``calibration`` by default: the settings of the pitch probe of PnLCalib.
 DEFAULT_CALIBRATION = PnlcalibSettings(name="pnlcalib", kp_threshold=0.3434, line_threshold=0.7867, pnl_refine=True)
 
@@ -204,8 +223,8 @@ class PipelineConfig(Record):
     repeat: int = Field(default=0, ge=0)
     #: Engine of the people step, of the pitch mapping and of the shirt numbers.
     engines: EngineSettings = EngineSettings()
-    #: Settings of the detector; the clip run file of the people engine ``detector`` must have them.
-    detector: RfdetrSettings = DEFAULT_DETECTOR
+    #: Settings of the detector, of any family; the clip run file of the people engine ``detector`` must have them.
+    detector: DetectorSettings = DEFAULT_DETECTOR
     #: Settings of the calibration; the clip run file of the pitch engine ``calibration`` must have them.
     calibration: PnlcalibSettings = DEFAULT_CALIBRATION
 
@@ -233,8 +252,10 @@ def load_config(path: Path | None = None) -> PipelineConfig:
 
     The file is laid over the defaults. A setting that the file does not name
     keeps its default, also inside a section: ``number: {model: ...}`` keeps
-    the low resolution of the number step. An empty file gives the defaults.
-    Any other content that is not a mapping raises ``ValueError``.
+    the low resolution of the number step. A section ``detector`` that names a
+    family (``detector: {name: dfine}``) is laid over the defaults of that family
+    (``DEFAULT_DETECTORS``), because the families have other keys. An empty file
+    gives the defaults. Any other content that is not a mapping raises ``ValueError``.
     """
     if path is None:
         return PipelineConfig()
@@ -243,4 +264,9 @@ def load_config(path: Path | None = None) -> PipelineConfig:
         data = {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: the top level must be a mapping")
-    return PipelineConfig.model_validate(_laid_over(PipelineConfig().model_dump(), data))
+    defaults = PipelineConfig().model_dump()
+    section = data.get("detector")
+    family = section.get("name") if isinstance(section, dict) else None
+    if isinstance(family, str) and family in DEFAULT_DETECTORS:
+        defaults["detector"] = DEFAULT_DETECTORS[family].model_dump()
+    return PipelineConfig.model_validate(_laid_over(defaults, data))
