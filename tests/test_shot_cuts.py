@@ -18,9 +18,10 @@ from collections.abc import Sequence
 import numpy as np
 import pytest
 
-from pitchvlm import pipeline
+from pitchvlm import cli, motion, pipeline
 from pitchvlm.config import EngineSettings, PipelineConfig, TrackingConfig
 from pitchvlm.fallbacks.fake import fake_calibration_answers, fake_detector_answers
+from pitchvlm.frames import keyframe_indices
 from pitchvlm.geometry import apply_homography, matrix_from_record
 from pitchvlm.pipeline import ToolAnswers, run_clip
 from pitchvlm.schemas import Box, ClipInfo, ClipResult, Track
@@ -290,3 +291,50 @@ def test_the_shots_around_a_dissolve_keep_their_own_mappings(
     errors = _mapping_errors_m(dissolve_truth, result, [*before, *after])
     assert len(errors) == len(before) + len(after)
     assert max(errors) < 1.0
+
+
+def test_the_cli_names_the_transition_frames_and_the_keyframes_whose_answers_are_dropped(
+    dissolve_results: dict[str, ClipResult], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A paid model answer of a keyframe on a blend frame is dropped: the run says which (second read of 2026-11-22)."""
+    result = dissolve_results["model"]
+    config = PipelineConfig()
+    blends = _blend_frames(result)
+    keyframes = keyframe_indices(result.info.n_frames, result.info.fps, config.keyframe_interval_s)
+    dropped = [frame for frame in keyframes if frame in blends]
+    assert dropped, "a keyframe lies on a blend frame"
+    cli.print_shots_and_paint(result, config)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"cuts (frames that start a new shot): {blends[-1] + 1}"
+    named = "transition frames (a dissolve, or a lone frame between two cuts), which carry nothing"
+    assert lines[1].startswith(f"{named}: {', '.join(map(str, blends))};")
+    assert lines[1].endswith(
+        f"{len(dropped)} of {len(keyframes)} keyframes among them, their answers dropped: {', '.join(map(str, dropped))}"
+    )
+
+
+@pytest.mark.parametrize("failed", [[DISSOLVE_START + 4], [DISSOLVE_START + 2, DISSOLVE_START + 6]])
+def test_one_pair_of_a_dissolve_without_a_measured_motion_does_not_hide_it(
+    failed: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lone pair without a measured motion takes the last motion, so the windows over it are judged.
+
+    Without it every window that holds the dissolve held a missing step, and the dissolve was not
+    found (the reader of the fixes of the second read of 2026-11-22). The flow fails for the
+    pairs into the frames ``failed`` only.
+    """
+    real = motion.estimate_motion
+    pairs = {"done": 0}
+
+    def flow(prev: np.ndarray, nxt: np.ndarray, **kwargs: object) -> np.ndarray | None:
+        pairs["done"] += 1
+        return None if pairs["done"] in failed else real(prev, nxt, **kwargs)
+
+    monkeypatch.setattr(motion, "estimate_motion", flow)
+    tests = motion.measure_shots(BlendSource())
+    assert tests.hard_cuts == ()
+    assert all(tests.test_steps[frame - 1] is not None for frame in failed)
+    assert len(tests.transitions) == 1
+    start, stop = tests.transitions[0]
+    assert DISSOLVE_START <= start <= DISSOLVE_START + 2
+    assert DISSOLVE_START + DISSOLVE_FRAMES - 2 <= stop <= DISSOLVE_START + DISSOLVE_FRAMES

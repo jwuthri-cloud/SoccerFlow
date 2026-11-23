@@ -8,8 +8,10 @@ chooses the frames to draw and writes their list.
 
 The choice can be repeated and cannot be steered (``choose_frames``): it depends only on the
 mappings, the seed and the count. The list file is text without pixels and without label data:
-clip ids, frame numbers, the engine, the paint alignment score of each mapping and the name of
-its image. So it can go on the results branch (rule 2 of ``CLAUDE.md``). The person who checks
+clip ids, frame numbers, the engine, how each mapping was made, its paint alignment score or the
+reason that none is given, the name of its image, the frames without a mapping with their
+reasons, the rule of the choice and the provenance (commit, file names and their SHA-256, no
+path). So it can go on the results branch (rule 2 of ``CLAUDE.md``). The person who checks
 the images writes the verdict of each frame into its ``by_eye`` field.
 """
 

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import pytest
 
+from pitchvlm import motion
 from pitchvlm.geometry import matrix_to_rows
 from pitchvlm.motion import (
     DISSOLVE_WINDOW_FRAMES,
@@ -377,3 +378,38 @@ def test_a_shot_of_one_frame_next_to_a_cut_is_a_transition_frame() -> None:
     assert field(10, (3, 4, 5, 6)).transition_frames() == frozenset({3, 4, 5})
     assert field(10, (1,)).transition_frames() == frozenset({0})
     assert field(10, (9,)).transition_frames() == frozenset({9})
+
+
+# --- Second read of 2026-11-22 ---------------------------------------------------------
+
+
+def test_a_pan_whose_flow_fails_for_some_pairs_has_no_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pair without a measured motion is a missing step of the window chain, not the identity.
+
+    A pan of about 25 pixels per frame without a cut (synthetic seed 21, a new seed); the flow
+    gives no motion for the pairs into frames 1 to 10, as on a frame with little texture. The
+    identity was taken for those pairs, and the chain made up a dissolve at frames 2 to 9.
+    """
+    seed = 21
+    start = int(np.random.default_rng([seed, 5]).integers(0, 400))
+    source = SyntheticSource(RetimedScene([start + 3 * k for k in range(60)], seed=seed))
+    real = motion.estimate_motion
+    pairs = {"done": 0}
+
+    def flow(prev: np.ndarray, nxt: np.ndarray, **kwargs: object) -> np.ndarray | None:
+        pairs["done"] += 1
+        return None if pairs["done"] <= 10 else real(prev, nxt, **kwargs)
+
+    monkeypatch.setattr(motion, "estimate_motion", flow)
+    tests = motion.measure_shots(source)
+    assert tests.hard_cuts == ()
+    assert tests.test_steps[:10] == (None,) * 10
+    assert tests.transitions == ()
+
+
+def test_a_clip_too_short_for_a_window_says_that_it_has_no_dissolve_test(caplog: pytest.LogCaptureFixture) -> None:
+    source = SyntheticSource(RetimedScene(list(range(DISSOLVE_WINDOW_FRAMES)), seed=20))
+    with caplog.at_level("INFO", logger=motion.logger.name):
+        tests = motion.measure_shots(source)
+    assert tests.window_correlations == (None,) * DISSOLVE_WINDOW_FRAMES
+    assert f"not more than the window of {DISSOLVE_WINDOW_FRAMES} frames: no dissolve test" in caplog.text

@@ -449,7 +449,8 @@ def test_overlay_of_a_run_draws_the_chosen_keyframes_and_lists_them(
     assert (document["source"], document["name"], document["engine"]) == ("run", VIDEO_CLIP, "tool:pnlcalib")
     assert (document["n_frames"], document["n_frames_with_mapping"], document["n_chosen"]) == (keyframes, keyframes, 4)
     assert document["provenance"]["result_file_sha256"] == video_sha256(video_run["result"])
-    folder = tmp_path / "images" / f"{VIDEO_CLIP}-seed3-count4"
+    result_tag = video_sha256(video_run["result"])[:8]
+    folder = tmp_path / "images" / f"{VIDEO_CLIP}-result{result_tag}-seed3-count4"
     names = [entry["image"] for entry in document["frames"]]
     assert sorted(path.name for path in folder.iterdir()) == sorted(names)
     for entry in document["frames"]:
@@ -692,3 +693,136 @@ def test_a_video_with_a_dissolve_keeps_its_frames_and_overlay_names_the_transiti
     assert not drawn & set(on_transition)
     assert document["n_frames_with_mapping"] == len(keyframes) - len(document["frames_without_mapping"])
     assert document["n_chosen"] == document["n_frames_with_mapping"]
+
+
+# --- Second read of 2026-11-22 ---------------------------------------------------------
+
+
+def test_video_frames_names_the_hidden_folder_that_a_stopped_run_left(
+    scene: SyntheticScene, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run stopped by SIGKILL cannot remove its hidden folder; the next run names it."""
+    video = write_video(tmp_path / "footage" / f"{VIDEO_CLIP}.mp4", [scene.image(frame) for frame in range(5)], 25.0)
+    out = tmp_path / "videos"
+    left = out / f".{VIDEO_CLIP}.partial-0a1b2c3d" / "img1"
+    left.mkdir(parents=True)
+    assert cli.main(["video-frames", "--video", str(video), "--out", str(out)]) == 0
+    assert f"left the hidden folder {left.parent}" in capsys.readouterr().out
+    assert left.is_dir()
+    # A clip id with a character of a file pattern names its own folders, not those of another clip.
+    odd = write_video(tmp_path / "footage" / "match[1].mp4", [scene.image(frame) for frame in range(5)], 25.0)
+    (out / ".match[1].partial-0a1b2c3d").mkdir()
+    (out / ".match1.partial-0a1b2c3d").mkdir()
+    assert cli.main(["video-frames", "--video", str(odd), "--out", str(out)]) == 0
+    printed = capsys.readouterr().out
+    assert ".match[1].partial-0a1b2c3d" in printed and ".match1.partial" not in printed
+
+
+def test_overlay_refuses_a_name_that_would_put_the_images_outside_out(
+    dataset: tuple[Path, Path], scene: SyntheticScene, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The folder of the images is named after the experiment, a text of the experiment file."""
+    root, split_list = dataset
+    settings = (EXPERIMENTS / "pitch_probe_pnlcalib.yaml").read_text(encoding="utf-8")
+    experiment = tmp_path / "experiment.yaml"
+    experiment.write_text(settings.replace("\nname: ", "\nname: ../elsewhere/", 1), encoding="utf-8")
+    group = ["--root", str(root), "--manifest", str(split_list)]
+    assert cli.main(["tool-job", "--experiment", str(experiment), *group, "--out", str(tmp_path / "job.json")]) == 0
+    job = json.loads((tmp_path / "job.json").read_text(encoding="utf-8"))
+    assert job["name"].startswith("../elsewhere/")
+    run = {
+        "format": "pitchvlm-tool-run-1",
+        "name": job["name"],
+        "tool": job["tool"],
+        "runner": {"device": "stand-in"},
+        "frames": [
+            {"clip": entry["clip"], "frame": entry["frame"], "seconds": 0.1, "payload": camera_payload(scene, entry["frame"])}
+            for entry in job["frames"]
+        ],
+    }
+    run_file = tmp_path / "run.json"
+    run_file.write_text(json.dumps(run), encoding="utf-8")
+    capsys.readouterr()
+    arguments = ["--experiment", str(experiment), *group, "--run", str(run_file), "--seed", "1", "--count", "5"]
+    assert cli.main(overlay("tool", tmp_path, "list", *arguments)) == 2
+    assert "holds a folder separator" in error_lines(capsys)[0]
+    assert list(tmp_path.rglob("*.png")) == [] and not (tmp_path / "list.json").exists()
+
+
+def test_overlay_of_a_run_refuses_a_video_with_other_pixels(
+    video_run: dict[str, Path], scene: SyntheticScene, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The frames of the run in reverse order: the same clip id, frame count and size, but other pixels."""
+    other = write_video(
+        tmp_path / "other" / f"{VIDEO_CLIP}.mp4", [scene.image(frame) for frame in reversed(range(N_FRAMES))], 25.0
+    )
+    arguments = ["--result", str(video_run["result"]), "--clip", str(other), "--seed", "1", "--count", "2"]
+    assert cli.main(overlay("run", tmp_path, "list", *arguments)) == 2
+    lines = error_lines(capsys)
+    assert len(lines) == 1 and "used clip runs of the video with the SHA-256" in lines[0]
+    images = tmp_path / "images-of-no-video" / VIDEO_CLIP
+    shutil.copytree(video_run["clip_folder"] / "img1", images / "img1")
+    folder = ["--result", str(video_run["result"]), "--clip", str(images / "img1"), "--seed", "1", "--count", "2"]
+    assert cli.main(overlay("run", tmp_path, "list", *folder)) == 2
+    assert "is a folder of images of no video: give that clip" in error_lines(capsys)[0]
+    # Clip runs of images of no video: a video file is not their clip either (found by the reader of the fixes).
+    document = json.loads(video_run["result"].read_text(encoding="utf-8"))
+    for facts in document["provenance"]["tool_runs"].values():
+        facts["video_sha256"] = None
+    of_images = tmp_path / "of-images" / VIDEO_CLIP / "result.json"
+    of_images.parent.mkdir(parents=True)
+    of_images.write_text(json.dumps(document), encoding="utf-8")
+    video = ["--result", str(of_images), "--clip", str(video_run["video"]), "--seed", "1", "--count", "2"]
+    assert cli.main(overlay("run", tmp_path, "list", *video)) == 2
+    assert "used clip runs of images of no video, but --clip" in error_lines(capsys)[0]
+
+
+def test_a_failed_list_write_leaves_no_image_folder_that_blocks_the_next_run(
+    video_run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = tmp_path / "results"
+    blocker.write_text("a file where a folder is meant\n", encoding="utf-8")
+    base = ["overlay", "run", "--result", str(video_run["result"]), "--clip", str(video_run["video"])]
+    base += ["--seed", "1", "--count", "2", "--out", str(tmp_path / "images")]
+    assert cli.main([*base, "--list", str(blocker / "list.json")]) == 2
+    assert list((tmp_path / "images").iterdir()) == []
+    capsys.readouterr()
+    assert cli.main([*base, "--list", str(tmp_path / "list.json")]) == 0, capsys.readouterr().err
+
+
+def test_overlays_of_two_runs_of_one_clip_go_to_two_folders(
+    video_run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two engines on one clip (RUNBOOK section 11): the folder names the result file, not only the clip."""
+    other = tmp_path / "other-run" / VIDEO_CLIP / "result.json"
+    other.parent.mkdir(parents=True)
+    other.write_text(video_run["result"].read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    folders = []
+    for name, result in (("first", video_run["result"]), ("second", other)):
+        arguments = ["--result", str(result), "--clip", str(video_run["video"]), "--seed", "1", "--count", "2"]
+        assert cli.main(overlay("run", tmp_path, name, *arguments)) == 0, capsys.readouterr().err
+        folders.append(tmp_path / "images" / f"{VIDEO_CLIP}-result{video_sha256(result)[:8]}-seed1-count2")
+    assert sorted((tmp_path / "images").iterdir()) == sorted(folders)
+
+
+def test_a_list_write_that_fails_half_way_leaves_no_list_file(
+    video_run: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk fills while the list file is written: a part of it must not block the next run."""
+    listed = tmp_path / "list.json"
+    real = Path.write_text
+
+    def full_disk(self: Path, text: str, *args: Any, **kwargs: Any) -> int:
+        if self == listed:
+            real(self, text[: len(text) // 2], *args, **kwargs)
+            raise OSError(28, "No space left on device")
+        return real(self, text, *args, **kwargs)
+
+    base = ["overlay", "run", "--result", str(video_run["result"]), "--clip", str(video_run["video"])]
+    base += ["--seed", "1", "--count", "2", "--out", str(tmp_path / "images"), "--list", str(listed)]
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", full_disk)
+        assert cli.main(base) == 2
+    assert not listed.exists() and list((tmp_path / "images").iterdir()) == []
+    capsys.readouterr()
+    assert cli.main(base) == 0, capsys.readouterr().err

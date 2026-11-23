@@ -333,7 +333,8 @@ class ClipResult(Record):
     #: Which engine did each step, e.g. {"people": "model:gemini-4-argon", "tracks": "code"}.
     #: A dict can be changed in place although the record is frozen: read it, do not edit it.
     engines: dict[str, str] = Field(default_factory=dict)
-    #: The frames that start a new shot (hard cuts), in increasing order.
+    #: The frames that start a new shot, in increasing order: the hard cuts, every frame of a dissolve and
+    #: the frame after it (``MotionField.cuts``).
     cuts: tuple[int, ...] = ()
     #: The paint-alignment score of every keyframe mapping, in keyframe order. A diagnostic only.
     paint: tuple[PaintCheck, ...] = ()
