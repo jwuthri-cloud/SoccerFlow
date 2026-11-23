@@ -44,10 +44,12 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import NoReturn, Protocol
+from types import TracebackType
+from typing import IO, NoReturn, Protocol
 
 EXIT_CLEAN = 0
 EXIT_VIOLATIONS = 1
@@ -409,9 +411,41 @@ def git_paths(repo: Path, args: Sequence[str]) -> list[str]:
     return [path for path in git_text(repo, args).split("\0") if path]
 
 
-def repository_root(start: Path) -> Path:
-    """Return the top level of the git working tree that contains `start`."""
-    return Path(git_text(start, ["rev-parse", "--show-toplevel"]).rstrip("\n")).resolve()
+def repository_folders(start: Path) -> tuple[Path, Path]:
+    """Return the top level of the git working tree that contains `start`, and the git folder.
+
+    The git folder is the one that all work trees of the repository share. One git process
+    usually answers both (`paired_folders`). When it cannot, git is asked for each path on its
+    own, from the top level, so that an error names the one command that failed.
+    """
+    paired = paired_folders(start)
+    if paired is not None:
+        return paired
+    repo = Path(git_text(start, ["rev-parse", "--show-toplevel"]).rstrip("\n")).resolve()
+    return repo, repo / git_text(repo, ["rev-parse", "--git-common-dir"]).rstrip("\n")
+
+
+def paired_folders(start: Path) -> tuple[Path, Path] | None:
+    """Ask one git process for the top level and the shared git folder, or return None.
+
+    Git prints the two paths, one on each line, and the git folder relative to `start` or as
+    an absolute path. The answer is None when git cannot run, fails, or prints text that is
+    not two lines of UTF-8: a path that holds a line break cannot be told apart from the other.
+    """
+    command = ["git", "rev-parse", "--show-toplevel", "--git-common-dir"]
+    try:
+        result = subprocess.run(command, cwd=str(start), capture_output=True, check=False)
+        lines = result.stdout.decode("utf-8").split("\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if result.returncode != 0 or len(lines) != 3 or lines[2]:
+        return None
+    repo = Path(lines[0]).resolve()
+    here = start.resolve()
+    if here == repo or Path(lines[1]).is_absolute():
+        return repo, here / lines[1]
+    # `here` and its parents are real folders, so `..` is the parent folder.
+    return repo, Path(os.path.normpath(here / lines[1]))
 
 
 def list_entries(path: Path) -> list[tuple[int, str]]:
@@ -438,13 +472,12 @@ def load_deny_list(path: Path) -> tuple[DenyEntry, ...]:
     )
 
 
-def load_settings(repo: Path) -> Settings:
+def load_settings(git_folder: Path) -> Settings:
     """Read the host allow-list next to this script and the local deny-list in the git folder.
 
     All work trees of one repository share one git folder, so they share one deny-list.
     """
     hosts = [text.lower() for _, text in list_entries(ALLOW_LIST)]
-    git_folder = repo / git_text(repo, ["rev-parse", "--git-common-dir"]).rstrip("\n")
     deny_list = git_folder / DENY_LIST_NAME
     has_deny_list = deny_list.is_file()
     return Settings(
@@ -906,33 +939,134 @@ def ignored_paths(repo: Path, entries: Sequence[Entry]) -> dict[str, str]:
     return refused
 
 
-class GitObjects:
-    """Reads files from the git database. The key of a file is its object name.
+class ObjectInfo:
+    """One `git cat-file --batch-check` process, which tells the type and the size of an object.
 
-    Each call starts one git process for all its keys, or one for each 64 MB of content.
+    It answers one name at a time: git prints one line for each line that it reads, or ends.
+    It never prints the content of an object, so a damaged object cannot leave the guard
+    waiting for bytes that do not come. The error output of git goes to a temporary file, so
+    that git never waits for the guard to read it.
+    """
+
+    COMMAND = "git cat-file --batch-check"
+
+    def __init__(self, repo: Path) -> None:
+        self._errors = tempfile.TemporaryFile()
+        try:
+            self._process = subprocess.Popen(
+                ["git", "cat-file", "--batch-check"],
+                cwd=str(repo),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._errors,
+            )
+        except OSError as error:
+            self._errors.close()
+            raise GuardError(f"cannot run {self.COMMAND} in {repo}: {error}") from error
+        self._input: IO[bytes] = self._process.stdin  # type: ignore[assignment]
+        self._output: IO[bytes] = self._process.stdout  # type: ignore[assignment]
+
+    def ask(self, name: str) -> str:
+        """Send one name and return the line of the answer without its line break.
+
+        The line is `<object name> <type> <size>`, or the name and a word such as `missing`.
+        """
+        try:
+            self._input.write(name.encode("ascii") + b"\n")
+            self._input.flush()
+        except BrokenPipeError:
+            self._ended()
+        line = self._output.readline()
+        if not line.endswith(b"\n"):
+            self._ended()
+        return line[:-1].decode("ascii", "replace")
+
+    def finish(self) -> None:
+        """Close the input, wait for git to end, and raise a GuardError for an exit code that is not 0."""
+        self._input.close()
+        self._output.read()
+        code = self._process.wait()
+        self._errors.seek(0)
+        detail = self._errors.read().decode("utf-8", "replace").strip()
+        self.stop()
+        if code != 0:
+            raise GuardError(f"{self.COMMAND} failed with exit code {code}: {detail}")
+
+    def stop(self) -> None:
+        """End git if it still runs, and close the pipes and the file of the error output."""
+        if self._process.poll() is None:
+            self._process.kill()
+            self._process.wait()
+        for stream in (self._input, self._output, self._errors):
+            stream.close()
+
+    def _ended(self) -> NoReturn:
+        """Report that git ended before it answered: its exit code, or a missing answer."""
+        self.finish()
+        raise GuardError(f"{self.COMMAND} did not answer for every object")
+
+
+class GitObjects:
+    """Reads files and other objects from the git database. The key of a file is its object name.
+
+    For the length of one guard run it keeps one git process that tells the type and the size
+    of an object (`ObjectInfo`). It starts when it is first needed. Each call of `contents`
+    starts one git process for all its keys, or one for each 64 MB of content. Use the reader
+    in a `with` block: its end stops the process and checks its exit code. Nothing is kept
+    from one guard run to the next.
     """
 
     def __init__(self, repo: Path) -> None:
         self._repo = repo
         self._sizes: dict[str, int] = {}
+        self._info: ObjectInfo | None = None
 
-    def _batch(self, mode: str, keys: Sequence[str]) -> bytes:
-        """Run `git cat-file` in a batch mode with the keys as its input, and return its output."""
-        names = "".join(key + "\n" for key in keys).encode("ascii")
-        return run_git(self._repo, ["cat-file", mode], stdin=names).stdout
+    def __enter__(self) -> GitObjects:
+        return self
+
+    def __exit__(
+        self,
+        kind: type[BaseException] | None,
+        error: BaseException | None,
+        trace: TracebackType | None,
+    ) -> None:
+        info, self._info = self._info, None
+        if info is None:
+            return
+        try:
+            if kind is None:
+                info.finish()
+        finally:
+            info.stop()
+
+    def _ask(self, name: str) -> str:
+        """Return the answer of the `git cat-file --batch-check` process for one name."""
+        if self._info is None:
+            self._info = ObjectInfo(self._repo)
+        return self._info.ask(name)
+
+    def names_commit(self, revision: str) -> bool:
+        """Tell whether a fixed revision such as `HEAD` names a commit, as `git rev-parse --verify` does.
+
+        When the `git cat-file --batch-check` process cannot answer, for example because the
+        commit is damaged, `git rev-parse --verify` is asked, as the guard did before it had
+        this process: an error then names that command. A later question starts a new process.
+        """
+        try:
+            fields = self._ask(revision + "^{commit}").split(" ")
+        except GuardError:
+            self._info = None
+            return revision_exists(self._repo, revision)
+        return len(fields) == 3 and fields[1] == "commit"
 
     def sizes(self, keys: Sequence[str]) -> dict[str, int | None]:
         """Return the size in bytes of each object."""
-        unknown = [key for key in keys if key not in self._sizes]
-        if unknown:
-            lines = self._batch("--batch-check", unknown).decode("ascii", "replace").splitlines()
-            for key, line in zip(unknown, lines):
-                fields = line.split(" ")  # <object name> <type> <size>, or <object name> missing
+        for key in keys:
+            if key not in self._sizes:
+                fields = self._ask(key).split(" ")  # <object name> <type> <size>, or <object name> missing
                 if len(fields) != 3 or fields[0] != key:
                     raise GuardError(f"git cannot find the object {key}")
                 self._sizes[key] = int(fields[2])
-            if len(lines) != len(unknown):
-                raise GuardError("git cat-file --batch-check did not answer for every object")
         return {key: self._sizes[key] for key in keys}
 
     def contents(self, keys: Sequence[str]) -> Iterator[tuple[str, bytes]]:
@@ -954,7 +1088,8 @@ class GitObjects:
 
         For each object git prints a header line, the bytes and a line break.
         """
-        output = self._batch("--batch", keys)
+        names = "".join(key + "\n" for key in keys).encode("ascii")
+        output = run_git(self._repo, ["cat-file", "--batch"], stdin=names).stdout
         position = 0
         for key in keys:
             start = output.find(b"\n", position) + 1
@@ -1157,7 +1292,7 @@ def check_identities(
 
 
 def revision_exists(repo: Path, revision: str) -> bool:
-    """Tell whether a revision such as `HEAD` names a commit."""
+    """Tell whether a revision such as the name of a commit from the environment names a commit."""
     # With --verify --quiet, git exits with code 1 and prints nothing when it does not.
     command = ["rev-parse", "--verify", "--quiet", revision + "^{commit}"]
     return run_git(repo, command, accept=(0, 1)).returncode == 0
@@ -1178,7 +1313,7 @@ def known_remotes(repo: Path) -> list[str]:
     return [pushed_to] if pushed_to in remotes else []
 
 
-def unpushed_commits(repo: Path, remotes: Sequence[str]) -> list[str]:
+def unpushed_commits(repo: Path, objects: GitObjects, remotes: Sequence[str]) -> list[str]:
     """Return the commits that a push can send and that the remotes do not have, oldest first.
 
     A push can send every local branch, every tag and HEAD, so the commits of all of them
@@ -1187,9 +1322,13 @@ def unpushed_commits(repo: Path, remotes: Sequence[str]) -> list[str]:
     remote has are the commits of its remote-tracking branches.
     """
     starts = ["--branches", "--tags"]
-    for revision in ("HEAD", os.environ.get(PUSHED_COMMIT_VARIABLE, "")):
-        if revision and revision_exists(repo, revision):
-            starts.append(revision)
+    if objects.names_commit("HEAD"):
+        starts.append("HEAD")
+    # The pushed commit comes from the environment and can hold any text, also a line break,
+    # which the object reader cannot take. So git rev-parse tests it.
+    pushed = os.environ.get(PUSHED_COMMIT_VARIABLE, "")
+    if pushed and revision_exists(repo, pushed):
+        starts.append(pushed)
     known = ["--not", *(f"--remotes={remote}" for remote in remotes)] if remotes else []
     return git_text(repo, ["rev-list", "--reverse", *starts, *known, "--"]).split()
 
@@ -1284,19 +1423,18 @@ def check_tag_target(name: str, target: str) -> list[Violation]:
     return [Violation(NO_PATH, None, "tag", message)]
 
 
-def check_push(repo: Path, settings: Settings) -> list[Violation]:
+def check_push(repo: Path, objects: GitObjects, settings: Settings) -> list[Violation]:
     """Check what a push can send.
 
     The commits and the annotated tags are checked for their files, their messages and their
     identities, every tag for what it points at, and the new names of branches and tags as
     text.
     """
-    objects = GitObjects(repo)
     remotes = known_remotes(repo)
     refs = list_refs(repo)
     tags = [ref for ref in refs if ref.kind == "tag"]
     annotated = [tag for tag in tags if tag.object_type == "tag"]
-    commits = unpushed_commits(repo, remotes)
+    commits = unpushed_commits(repo, objects, remotes)
     entries = pushed_entries(repo, commits)
     history = unpushed_history(objects, commits, annotated)
     violations = check_files(entries, objects, settings, ignored_paths(repo, entries))
@@ -1371,11 +1509,13 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 def find_violations(options: argparse.Namespace, repo: Path, settings: Settings) -> list[Violation]:
     """Return every violation for the mode that the command line selects."""
     if options.push:
-        violations = check_push(repo, settings)
+        with GitObjects(repo) as objects:
+            violations = check_push(repo, objects, settings)
     elif options.staged:
         entries = staged_entries(repo)
         ignored = ignored_paths(repo, entries)
-        violations = check_files(entries, GitObjects(repo), settings, ignored)
+        with GitObjects(repo) as objects:
+            violations = check_files(entries, objects, settings, ignored)
         violations += check_identities(repo, lambda: next_commit_identities(repo), settings.deny)
     else:
         paths = options.paths or []
@@ -1393,8 +1533,8 @@ def main(argv: Sequence[str]) -> int:
     """Run the guard, print one line for each violation and return the exit code."""
     try:
         options = parse_arguments(argv)
-        repo = repository_root(options.repo or Path.cwd())
-        settings = load_settings(repo)
+        repo, git_folder = repository_folders(options.repo or Path.cwd())
+        settings = load_settings(git_folder)
         violations = find_violations(options, repo, settings)
     except GuardError as error:
         print(f"guard: error: {error}", file=sys.stderr)

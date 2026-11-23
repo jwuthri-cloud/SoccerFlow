@@ -1034,6 +1034,14 @@ it for these hooks: it is a bypass, like `--no-verify`. Another hook folder
 | `--tracked` | by hand | every tracked file of the working tree |
 | `--paths <file> ...` | the command `sync` | the given files |
 
+One run of the guard starts a few git processes, however many files it reads: `--paths` 2,
+`--tracked` 3, `--staged` at most 8 (5 when no file is staged), `--push` at most 10 (6 when
+nothing is new), and one more for the commit that the hook runner names. One process gives
+the top folder and the git folder, and one process gives the type and the size of every object
+that the run needs. Nothing is kept from one run to the next. When git fails, or a path of the
+repository holds a line break, the guard asks for the two folders one at a time, so that an
+error message names the git command that failed.
+
 A report line is `<path>:<line>: <rule>: <message>`. A line for a commit ends with its name, for
 example `[commit 1a2b3c4d5e]`. The rules:
 

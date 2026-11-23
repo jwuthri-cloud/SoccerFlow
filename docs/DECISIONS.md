@@ -1672,6 +1672,213 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
     cached functions, planted again one at a time: the default run catches 7 of 8, as before
     (F01 again caught by no run).
 
+## 2026-11-22 — Fewer git processes in the guard, and three test gaps closed
+
+1. **Goal and result.** The guard starts most of the git processes of `tests/test_guard.py`
+   (item 6 of the entry before). Goal: the same behaviour with fewer processes, and tests for
+   the gaps F01, F31 and F33 of that entry. **Result:** the guard starts 16 % fewer git
+   processes in that file (1,625 to 1,362), and the file runs 8 % faster with the same tests
+   (45.2 s to 41.5 s). The new guard tests cost about 3.6 s, so the whole file is not
+   faster (item 5). The default run is about 2 s faster with 17 more tests. No output, message
+   or exit code changed in 480 generated repository states (item 6). Every time here is
+   measured on the build machine while other sessions ran; the load average goes with each.
+   The raw output of every measurement is kept outside the repository.
+
+2. **Where the processes came from (before).** A stand-in `git` first on `PATH` counted the
+   processes of one run of `tests/test_guard.py` on `main` 81bb2d9: 2,300, of them 1,625 started
+   by the guard and 675 by the tests (add, commit, push, init, the hook runner). The guard's by
+   command: `var` 200, `rev-parse --show-toplevel` 187, `rev-parse --git-common-dir` 185,
+   `cat-file --batch-check` 176, `cat-file --batch` 176, `config --local` 160, `check-ignore`
+   150, `diff --cached` 103, `rev-parse --verify` 64, `remote`, `for-each-ref` and `rev-list`
+   57 each, `diff-tree` 41, `ls-files` 12. A trivial git process takes about 12 ms here, a real
+   one 25 to 35 ms. How Python starts it (fork or `posix_spawn`) makes no difference (measured,
+   12 to 13 ms either way, also from a process with NumPy and OpenCV loaded).
+
+3. **Changes in `tools/guard.py`.**
+   - One `git rev-parse --show-toplevel --git-common-dir` gives the top folder and the git
+     folder (was two processes). When that process fails, or a path holds a line break (git
+     prints one path per line, so the two cannot be told apart), the guard runs the two old
+     commands one at a time, so every error message is the old one, word for word.
+   - One `git cat-file --batch-check` process stays open for the whole run and answers every
+     question of the type and size of an object (was one process per question): the sizes of
+     the commits and tags of a push, the sizes of the files, and whether `HEAD` names a commit
+     (was `git rev-parse --verify --quiet HEAD^{commit}`; both give the same answer for 30 forms
+     of a revision, tried one by one: unborn, detached, branch, tag, tag at a blob, tree, blob,
+     missing object, short and full object names, a leading dash, spaces, `@`, `HEAD~1`,
+     `HEAD@{1}`, `:/text` and more). When that process cannot answer the `HEAD` question (git
+     dies on a damaged commit), the guard asks `git rev-parse --verify` as before, so the error
+     names that command. Its exit code is checked at the end of the run. A result lives for one
+     run only: the reader is made in `find_violations` and closed at its end.
+   - The commit that the hook runner names (`PRE_COMMIT_TO_REF`) is still tested with
+     `git rev-parse --verify`: it comes from the environment and can hold a line break, which
+     the line protocol of `cat-file` cannot carry.
+   - Tried and dropped: an open `git cat-file --batch` process for the contents. It **hangs**
+     on a damaged object whose header gives more bytes than the object has: git prints the
+     short content and waits for the next name. The contents are still read by one
+     `cat-file --batch` per call, with its input closed. `--batch-check` prints one line for
+     each name or ends: 10 kinds of damage tried (short and long content, bad header, no zlib,
+     cut zlib, empty file, size overflow, bad type, unreadable file, a folder in place of the
+     file); none hangs.
+   - Not changed, and why: the two `git var` calls (author and committer of the next commit):
+     `git var -l` gives both in one process but does not refuse an empty name, so an error of
+     today (exit 2) would become a report (exit 1). `git remote` and `git config --local` read
+     other sources than one call could replace exactly.
+
+4. **Git processes of one guard run, before and after** (counted by the stand-in `git`).
+
+   | Mode | Repository | Before | After |
+   |---|---|---|---|
+   | `--paths` (2 or 3 files) | this one, a small one | 3 | 2 |
+   | `--tracked` | this one, a small one | 4 | 3 |
+   | `--staged`, nothing staged | this one | 6 | 5 |
+   | `--staged`, 3 files staged | a small one | 9 | 8 |
+   | `--push`, nothing new | this one | 7 | 6 |
+   | `--push`, a new commit with 3 files and an annotated tag | a small one | 13 | 10 |
+   | `--push`, the same, from the hook runner (`PRE_COMMIT_TO_REF` set) | a small one | 14 | 11 |
+
+   `test_each_mode_starts_a_known_number_of_git_processes` fixes the "After" column.
+
+5. **Times.** Back to back, old against new, both orders; the load average (1 min) before each.
+   The old tree is a clone of 81bb2d9; the new tree is the same with the change of this entry.
+
+   | What | Old, s | New, s | Load |
+   |---|---|---|---|
+   | `tests/test_guard.py` of 81bb2d9 (143 tests), only `tools/guard.py` swapped, 3 runs per arm | 45.1, 45.4, 45.2 | 41.5, 41.7, 41.3 | 3.5 to 4.1 |
+   | `tests/test_guard.py` of each tree (old 143 tests, new 148), 2 runs per arm | 43.3, 46.3 | 45.0, 45.2 | 4.8 to 5.5 |
+   | Default run of each tree (old 3,107 tests, new 3,124), 2 runs per arm | 111.1, 111.3 | 109.3, 108.7 | 4.6 to 5.6 |
+
+   The new tree of the second and third rows had 5 of the 7 new guard tests; the other two
+   (a damaged commit of a detached `HEAD`, a `cat-file` that ends before it answers) came
+   after these runs and take less than 1 s together. The
+   machine was faster than in the entry before (70 s for `test_guard.py` then), so the seconds
+   of the two entries cannot be compared; only the back-to-back runs here count. The guard runs
+   in the test process in most tests, so a test pays for its git processes and not for Python.
+
+   One guard run as a process, median of 7 runs, two series per arm (old, new, new, old; load
+   3.6 to 3.9):
+
+   | Mode | Repository | Old, ms | New, ms |
+   |---|---|---|---|
+   | `--staged`, nothing staged | this one | 137, 137 | 129, 128 |
+   | `--push`, nothing new | this one | 156, 157 | 144, 140 |
+   | `--tracked` | this one | 490, 487 | 476, 477 |
+   | `--paths` (3 files) | this one | 129, 136 | 117, 121 |
+   | `--staged` | a small one | 173, 181 | 161, 169 |
+   | `--push` | a small one | 225, 231 | 191, 193 |
+   | `--tracked` | a small one | 105, 105 | 95, 96 |
+   | `--paths` (2 files) | a small one | 96, 90 | 82, 80 |
+
+   The hooks, through the hook runner, in a clone of this repository with one staged file and
+   one new commit, median of 8 runs per arm in alternating order (load 4.0 to 4.4); the output
+   of both arms is the same: commit hook 451 ms to 435 ms, push hook 503 ms to 463 ms.
+
+6. **Differential check: no difference.** A script builds seeded repository states, runs the
+   guard of 81bb2d9 and the new guard on each, in every mode, and compares the output, the
+   error output and the exit code byte for byte. Final run on the final guard: seeds 2000 to
+   2479, **480 states, 1,964 runs, 0 differences**. Exit codes of the runs: 0 in 366, 1 in
+   1,161, 2 in 437 (errors of git or of use). The states mix, at random: planted media and
+   dataset files (by name and by content), keys of six services, home paths, private and
+   unknown hosts, base64 runs, deny-list words in files, messages, branch and tag names, binary
+   and non-UTF-8 content, path names that are not UTF-8 (in the index), spaces, tabs, line
+   breaks, a leading dash and non-ASCII letters in file names, links, submodule entries,
+   renames, deletions, empty commits, annotated, plain and blob tags, new branches on old
+   commits, a bare remote with some commits pushed, the variables of the hook runner (also a
+   pushed commit with a line break or a leading dash), a missing or partial local identity,
+   other authors; and per state: 100 merge commits, 126 detached heads, 67 with
+   `core.hooksPath`, 29 shallow clones, 22 work trees, 10 runs from a subfolder, 50 damaged or
+   deleted objects (32 of them the commit of `HEAD`), and runs in a folder that is no
+   repository and in a bare repository (240 runs end with the same `rev-parse` error). An
+   earlier run on the first version of the change (seeds 2000 to 2239 of an older generator,
+   240 states, 987 runs) also had 0 differences. A difference found by hand after it: a
+   detached `HEAD` on a damaged commit that no branch names gave the same exit code and the
+   same text of git, but named `cat-file --batch-check` instead of `rev-parse --verify`. The
+   change now asks `rev-parse` in that case (item 3), and a test fixes the old message.
+
+7. **Fault check: the default run catches 28 of 30.** Thirty faults planted in the new guard
+   one at a time, each undone after its run: 16 in the new code and 14 in the old rules.
+
+   | Fault | Change | Caught |
+   |---|---|---|
+   | G01 | two folders: more than two lines taken | yes |
+   | G02 | two folders: git folder of a subfolder joined to the top folder | yes |
+   | G03 | two folders, slow way: `.git` under the top folder, not what git says | yes |
+   | G04 | two folders: the slow way never taken | yes |
+   | G05 | `HEAD`: any answer of three fields is a commit | yes |
+   | G06 | `HEAD`: never a commit | yes |
+   | G07 | sizes: the object name of the answer not compared | **no** |
+   | G08 | sizes: one byte too small | yes |
+   | G09 | reader: exit code of git not checked | yes |
+   | G10 | reader: exit code not checked at the end of the run | yes |
+   | G11 | reader: an answer without a line break taken | **no** |
+   | G12 | contents: one git process per object | yes |
+   | G13 | push: the commit of the hook runner not read | yes |
+   | G14 | push: `HEAD` never a start | yes |
+   | G15 | `HEAD`: a failed question is no commit, `rev-parse` not asked | yes |
+   | G16 | `HEAD`: the stopped process kept after a failed question | yes |
+   | R01 to R14 | lock files pass; size limit off by one; deny text not masked; e-mail of an identity not compared; remote branch name not read; a deleted file read as a change; the ignore file of the user read; a tag at a tag passes; base64 limit 201; every remote counts; no byte order mark removed; tagger not read; secret not redacted; merge commit against its first parent only | yes, 14 of 14 |
+
+   G03, G10 and G16 were missed by the first round of this check and are caught by three of the
+   new tests (a work tree in a folder with a line break; a `cat-file --batch-check` that ends
+   with an error after its answers, and one that ends before). G07 and G11 need a git that
+   breaks its own line protocol; `tests/test_guard.py` and the whole default run (run with each
+   of the two planted) pass. A control run without a fault passes.
+
+8. **The three gaps of the entry before, closed with tests.** Each new test is in the default
+   run. No gap showed a defect of the code: nothing under `src/` changed.
+   - **F33, rule 4 over the whole package.**
+     `tests/test_vlm_client.py::test_only_the_client_imports_the_sdk_and_only_the_tool_runner_imports_a_tool`
+     reads the source of every module of `src/pitchvlm/` and of every other script of `tools/`
+     (it imports none of them and needs no SDK and no tool). It fails for an import of the
+     model SDK (`google`) outside `vlm/client.py`, and for an import of an external tool
+     (`rfdetr`, and the packages of PnLCalib, read from `tools/run_tool.py`) anywhere: at the
+     top, inside a function or a class, inside `try`, and through `importlib.import_module` or
+     `__import__` with a text name. An import whose name is computed fails too, because no
+     check can read it; the package has none. A second test runs the check on 8 small sources
+     (each form above, and a clean one). Shown on the real tree: the guarded import of F33
+     (`try: import google.genai`) at the top of `pipeline.py`, no SDK installed: the old test of
+     rule 4 passes, the new one fails. An unguarded `from google import genai` there, with a
+     stand-in `google.genai` on the path as on the run machine: the old test passes, the new
+     one fails (without the stand-in, the import already stops the test run). `import rfdetr`
+     inside `_draw_person` of `synth.py`: the new test fails.
+   - **F01, draw order of `synth.py`.**
+     `tests/test_synth.py::test_near_person_covers_a_far_person_where_their_boxes_overlap` takes
+     pairs of whole boxes of different kit colours that overlap and that no third box reaches,
+     in the clips of seeds 1 and 14 (seed 7, the clip of the other tests, has no overlap). Inside
+     the overlap, one pixel in from its edges, no pixel may have the kit colour of the far person
+     (the one whose feet are higher in the image), and some must have the near person's. The
+     expectation comes from the boxes and the kit colours, not from the drawing code. 86 pairs
+     are checked: in 22 the near person comes first in the fixed order of the people, in 64
+     later (seed 1 alone has none of the first kind, so a drawing in the fixed order would pass
+     there). Faults planted one at a time: far over near (two forms), the fixed order of the
+     people, the order of x: the new test fails for each; the 52 other tests of `test_synth.py`
+     pass for each. It takes 0.3 s.
+   - **F31, the stand-in ball.**
+     `tests/test_detector_engine.py::test_stand_in_ball_rolls_from_its_start_at_its_speed` maps
+     the bottom centre of each ball box of `fake_detector_answers` to the pitch with the true
+     mapping of the scene and compares it with the numbers of the design written in the test
+     (start (-10, 5) m, speed (6, -2) m/s, 25 frames per second), to 1e-6 m; it also checks the
+     frames without a ball. It does not call `fake_ball_position`. Faults: the time halved, the
+     speed constant halved, the start moved by 1 m: the new test fails for each, the old
+     `test_ball_follows_the_stand_in_ball` passes for each. It takes 0.01 s.
+
+9. **Open.**
+   - What the guard still starts is what it needs: per staged commit `diff --cached`,
+     `check-ignore`, one `cat-file --batch`, `config --local` and two `git var` (item 3 says
+     why they stay); per push `remote`, `for-each-ref`, `rev-list`, `diff-tree` and up to two
+     `cat-file --batch`. The tests start the other 700 processes of `test_guard.py`.
+   - `test_guard.py` still takes about 41 to 45 s of the default run here. The decision of the
+     entry before (a marker for the process tests, or `pytest-xdist`) stays with the owner.
+   - Faults G07 and G11 (item 7) are found by no test: both need a git that breaks its own
+     line protocol.
+   - Differences that the generated states cannot show, by reading the code: when two things
+     fail in one run, the first error can be another one than before (for example, git answers
+     "missing" for one object and then dies on a later one in the same question: before, the
+     exit code was reported; now the missing object). The error text of a failed
+     `cat-file --batch-check` can hold warnings of earlier questions of the same run.
+   - Not verified: any git other than 2.56 on macOS, the run machine, and Linux. The features
+     used (`rev-parse` with two options, `cat-file --batch-check` reading one name at a time)
+     are old, but the equality of the `HEAD` answers was tried on this git only.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
