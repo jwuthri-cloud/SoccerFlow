@@ -3288,17 +3288,36 @@ def refuse_video_folder(folder: Path, cache_dir: Path) -> None:
     """Raise ``CliError`` when the folder of the videos of a video step lies in the repository or in the cache folder.
 
     The cache folder goes to the results branch, which is text only (rule 2 of
-    ``CLAUDE.md``), so no video may lie below it.
+    ``CLAUDE.md``), so no video may lie below it. The two folders are compared as places
+    on the disk (``_lies_in``), so another letter case or a link does not pass.
     """
     refuse_pixels_in_repository(folder, "--video-dir")
     target = folder.resolve()
     cache = cache_dir.resolve()
-    if target == cache or cache in target.parents or target in cache.parents:
+    if _lies_in(target, cache) or _lies_in(cache, target):
         raise CliError(
             f"--video-dir {folder} and the cache folder {cache_dir} overlap: the cache goes to the results branch, "
             f"which is text only (rule 2 of CLAUDE.md). Write the videos below the data folder, for example "
             f"{VIDEO_INPUT_DIR}"
         )
+
+
+def _lies_in(inner: Path, outer: Path) -> bool:
+    """Say whether the folder ``inner`` is the folder ``outer`` or lies below it, both given as resolved paths.
+
+    A folder and a folder above it are the same place as ``outer`` when the disk says so
+    (``os.path.samefile``), so another letter case on a disk that does not tell cases
+    apart is found. A path that does not exist yet is compared as text without letter
+    case: on a disk that tells cases apart this refuses more than it must, never less.
+    """
+    outer_exists = outer.exists()
+    for folder in (inner, *inner.parents):
+        if outer_exists and folder.exists():
+            if os.path.samefile(folder, outer):
+                return True
+        elif str(folder).casefold() == str(outer).casefold():
+            return True
+    return False
 
 
 def _cmd_video_frames(args: argparse.Namespace) -> int:

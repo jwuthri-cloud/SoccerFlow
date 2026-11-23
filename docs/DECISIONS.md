@@ -3452,6 +3452,150 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
      M39 is fixed to a November day, so it does not fail then; the runbook sentence should say
      both prices.
 
+## 2026-11-23 — Second read of the video input and the detector families (session A of round 6)
+
+1. **What and how.** An independent second read of two pieces of round 5: the video input of the
+   model steps (entry "Video input for the model steps") and the second detector family (entry
+   "A second detector family: D-FINE and RT-DETRv2 through transformers"). The reader did not
+   write them. Method: list findings, reproduce each one with a failing test or a script,
+   confirm it with a second reader, fix it with a test, and undo each fix once to see its test
+   fail. Build machine only: no model call, no key, no footage, no install, no weights. Public
+   pages were read with `curl` on 2026-11-23 (published, not measured).
+2. **Findings.** No major defect was found in either piece. Ranks: major (wrong numbers, money
+   or privacy at risk on a normal run), minor (wrong on a plausible edge), small (wrong only on
+   input that no pinned file has).
+
+   | Id | Rank | Finding | Reproduction (build machine) | Status | Test |
+   |---|---|---|---|---|---|
+   | V1 | minor | The 20,000,000-byte limit of a request with a video counted only the base64 inline data. The video page of Gemini names the "total request size". A request with its inline data just under the limit and a prompt, schema and settings on top was sent. | inline data 100 bytes under a lowered limit, 1,000 characters of text: no refusal | fixed: `client.request_size_bytes` (the whole request as JSON text) for both providers; a request of exactly the limit is sent, one byte more is refused | `test_size_limit_counts_the_whole_request_and_not_only_its_inline_data` |
+   | V2 | minor | `refuse_video_folder` compared the video folder and the cache folder as text. On a disk that does not tell letter cases apart (the default disk of macOS, the build machine and a likely run machine), `--video-dir <data>/CACHE/videos` with the cache `<data>/cache` passed, so the MP4 files would go into the cache folder, which goes to the text-only results branch (rule 2). | `refuse_video_folder(tmp/"CACHE", tmp/"cache")`: no refusal | fixed: `cli._lies_in` compares folders that exist as places on the disk (`os.path.samefile`), and paths that do not exist yet as text without letter case (this refuses more than it must on a disk that tells cases apart, never less) | `test_probe_refuses_a_video_folder_in_the_cache_typed_in_another_letter_case` |
+   | V3 | minor | A video written again from the same frames can get other bytes: same file name (the name holds the pixel hash), other SHA-256, so another cache key. A paid session then pays the request again without an error, where an image request stops with `OtherImagesError`. The docstring of `VLMRequest.cache_key` said the opposite ("its hash does not change with a library version"); `docs/RUNBOOK.md` already says not to delete the video folder between a paid run and its replay. | 3 frames of the contract scene written with `avc1`, removed, written with `mp4v`: same name, other hash (1 trial; written again with `avc1`: same hash) | written as a limit; the docstring now says it. `--replay` refuses a miss, so a replay costs nothing. Owner decision below | none (no code change) |
+   | D1 | small | `detections_of_queries` checked only that the classes and the names are as many. With names at the places 1 to 80 (the COCO ids start at 1), column 0 among the best pairs above the limit stopped the script with a bare `KeyError: 0` (the second reader reproduced it at the limit 0.001); the other columns took the name that the tool also gives them. All 9 pinned configurations have the places 0 to 79 (read again, item 4), so no pinned file is hit. | names `{1: person, 2: car, 3: sports ball}`: no `RunnerError` | fixed: the places must be 0 to classes minus 1, else `RunnerError` with a line that says why | `test_class_places_that_are_not_0_to_classes_are_refused` |
+   | D2 | minor | The warm-up self-check compared the script with `post_process_object_detection` of the tool only above `min_score`. A first frame with no detection above it (a replay graphic, a black frame) gave an empty comparison, and a changed tool passed it. | stand-in tool that shifts its boxes by 0.5 pixel, first frame with a best score of 0.3: exit 0, run file written | fixed: the check compares from `SELF_CHECK_MIN_SCORE` = 0.001 whatever `min_score`, and the run facts count the compared detections (`self_check_detections`; the runbook says that 0 means that it compared nothing) | `test_self_check_also_compares_a_first_frame_without_a_detection_above_the_limit`, `test_self_check_counts_the_detections_that_it_compared` |
+   | N1 | minor | Found by the second reader in the fix of D2. From 0.001 the cut to the best 300 pairs often decides. `torch.topk` gives no order for equal scores, the script sorts stably, so at the cut the two sides can keep other tied pairs and a correct run stops. Half precision gives many ties: the second reader simulated 2,000 frames of 300 x 80 logits (normal(-9, 2), person column + normal(3, 2)): ties at the cut in 893 frames in float16, 266 of them (about 13 %) with a person or a ball; 0 in float32. Not measured on a real model; the five files of G2 run in float32. | stand-in tool that breaks ties from the last place: the run stopped | fixed: when the tool kept as many pairs as queries, the check compares only the pairs more than `SELF_CHECK_SCORE` above the lowest kept score (`self_check_floor`) | `test_self_check_leaves_out_the_pairs_that_tie_at_the_cut_to_the_best_pairs` |
+
+   Each fix was undone once: each of its tests then failed (V1, V2, D1: "DID NOT RAISE"; D2:
+   exit 0 against 2, and another count; N1: exit 2 against 0).
+3. **Checked and found right** (read, and run where a check could run here):
+   - Rule 2 on the files that a fake run really writes: `probe people` with
+     `people_probe_video_batch.yaml`, the fake model, one synthetic clip. Written: `ledger.jsonl`,
+     2 cassettes, 1 metrics file. No file holds the temporary path, the word `.mp4`, a base64 run
+     of 200 characters or more, or a box of the labels; the cassettes hold the SHA-256 of each
+     video (the identity, by design). Error texts of the video paths name the type of an
+     `OSError` and a 12-digit hash prefix, never a path. The standard output names the video
+     folder, as it names the cache folder and the ledger.
+   - Cache key: the identity of a video part holds the hash, the range, the rate, the
+     resolution and the length; a people request also names the hash in its item; the replay of
+     the CLI test hits all 6 answers.
+   - Money: a model without a video rate is refused before any call from the probe (the estimate
+     raises, `CliError`), the doctor (no request, a failed line) and both backends
+     (`VideoInputError` before the price check and the call); every date is the date in UTC; a
+     video rate holds from its first day (inclusive); the doctor estimate includes the video
+     request, and the meter of the doctor stops the run above 2 USD, counting the checks before
+     the video check (a call that starts under the limit can end above it, as for every call of
+     the doctor).
+   - Time: frame `k` of a written file is at `k / fps`; the prompt writes times with 2 decimals,
+     at most 0.005 s from the true time, against a tolerance of half a frame interval (0.0208 s at
+     the largest rate, 24); the mapping goes by place in the file, so a clip rate that is not 25
+     (step `round(clip fps / video fps)`) and a range after zero (no step sends one) do not move
+     it.
+   - Rule 5: `store=False` and no sampling parameter for Gemini, the private routing for
+     OpenRouter (the privacy check leaves the video parts out); no upload anywhere; both video
+     prompts ask for kit colours and shirt numbers and say not to use faces or names.
+   - Detector: the box conversion (item 5), class mapping by name from the configuration, the
+     last short batch, the score limit (the script keeps a score equal to `min_score`, the tool
+     drops it; the package keeps it), half precision (scores and boxes go to float32 before the
+     conversion), the pinned revisions of both the processor and the model, safetensors only,
+     no remote code; a settings file that names a family and one value takes the defaults of
+     that family; an unknown family or a size of another family is a settings error; the engine
+     name is written in one place and parsed nowhere.
+4. **Licences, read again on 2026-11-23** (this reader, `curl`, the pinned commits of the script).
+   Every row of the table of the round-5 entry matches:
+   - `LICENSE` of transformers at tag v5.23.0: Apache License 2.0. `LICENSE` of D-FINE at
+     `956d1709` and of RT-DETR at `df2a96c8`: Apache License 2.0. The D-FINE README: checkpoints
+     trained or pretrained on Objects365 "should not be assumed to be commercially cleared"
+     (`*_obj365`, `*_obj2coco`); the RT-DETRv2 README lists COCO+Objects365 weights apart.
+   - The 9 checkpoints at the 9 commits of `TRANSFORMERS_CHECKPOINTS` (hub API and README at the
+     commit; the commit of the API answer equals the pinned one for all 9): licence `apache-2.0`,
+     dataset `coco`, `train2017` named, no word of Objects365, one weight file
+     `model.safetensors`, 80 classes at the places 0 to 79 with `person` at 0 and `sports ball`
+     at 32, 300 queries, focal loss, `eval_size` and `anchor_image_size` null.
+   - COCO terms (`dataset/termsofuse.htm`): annotations under CC BY 4.0; the consortium does not
+     own the copyright of the images; use "must abide by the Flickr Terms of Use"; users accept
+     full responsibility.
+   - New, not in the round-5 table: the D-FINE configuration `configs/dfine/include/dfine_hgnetv2.yml`
+     at `956d1709` sets `pretrained: True` for its backbone HGNetv2, and
+     `src/nn/backbone/hgnetv2.py` downloads `PPHGNetV2_B*_stage1.pth` from a release of the
+     author; neither file names the data of that pretraining. That the hub checkpoints were
+     trained from this configuration is inferred, not stated on their cards.
+5. **Differential check of the box conversion.** A NumPy reference of
+   `post_process_object_detection` (transformers v5.23.0, `RTDetrImageProcessor`) was written by a
+   reader who had not seen the script, from the public source of the tag and the configuration
+   files of two checkpoints. It is `independent_post_process` in
+   `tests/test_detector_families.py`. Its facts: the corners from the centre format, scaled by
+   (width, height, width, height) of a target size given as (height, width), no clipping; the
+   logistic function; `topk` with k = queries over the flattened pairs; class = place modulo
+   classes; scores above the threshold, strictly; both checkpoints resize to 640 x 640 without
+   keeping the aspect ratio and without padding (`do_pad: false`), so the plain scale is right.
+   Measured (seed 300, which no earlier entry used; 1,000 random outputs: frame sizes from 1 x 1
+   to 3840 x 2160, square and not, 1 to 300 queries, 80 classes, limits 0 to 0.9, centres on the
+   edges and corners in 1 of 5 outputs):
+
+   | Measure | Value |
+   |---|---|
+   | Detections compared | 41,361 |
+   | Detections with a box that reaches outside the frame | 38,911 |
+   | Detections within 0.01 above their limit | 362 |
+   | Outputs in which the cut to the best pairs removes a pair above the limit | 732 |
+   | Outputs whose detections differ (classes, order, count) | 0 |
+   | Largest box difference | 0.0 pixels |
+   | Largest score difference | 1.1e-16 |
+
+   A first version of the test drew scores whose best pairs all lay far above the limit: a
+   limit moved by 0.01 then passed it. The scores of the person, the ball and one other class
+   are now spread over 0 to 1. Six planted bugs were tried once each against the final test,
+   and each made it fail: width and height swapped in the scale, boxes read as corners, no cut
+   to the best pairs, query and class places swapped, and the limit moved up or down by 0.01.
+   The test runs in about 2 s.
+6. **Limits written, not fixed.**
+   - V3 (above).
+   - The fake model takes every video request: it does not refuse a model without a video rate,
+     a range for OpenRouter or a request above the size limit, it never opens the file, and its
+     usage is the same for every video length (1,200 input tokens for `people_video`). The real
+     backends refuse before any call, so no money is at risk, but a fake run cannot show that a
+     setting would be refused, and the 1.3 times stop is never tested here against video tokens
+     that grow with the frames.
+   - The five detector files of G2 use `min_score` 0.5 for every family. The score of each
+     family has its own calibration, so the recall of two families at one limit compares
+     limits as well as detectors. Rule 7 fixes the limit before the run, which is right; the
+     report of G2 should name the limit next to each recall.
+7. **Not verified (only the run machine can):** the size of a real request on the wire against
+   its JSON text (the SDK adds its own fields); the output of a real checkpoint and of the real
+   `post_process_object_detection`; how often a score of the tool (float32) and the same score of
+   the script (float64) fall on two sides of 0.001 and stop a correct run (the same question as
+   for `min_score` in the round-5 entry, item 9; not measured, expected to be rare because both
+   come from the same float32 logits); the letter-case behaviour of the disk of the run machine.
+8. **Owner decisions (proposed).**
+   - V3: keep the written videos with the data and run every replay with `--replay` (no code
+     change), or put the pixel hash of the frames in the key in the place of the file hash and
+     stop a hit whose file has other bytes, as for images (a change of the key of video
+     requests; no video answer is stored yet, so no answer would be lost). Recommendation: the
+     second, before the first paid video probe.
+   - No text of `CLAUDE.md` is proposed.
+9. **Second read** (a subagent given the diff and the list of findings, run on a copy of the
+   commit before the fixes): V1, V2, V3, D2 confirmed with the tests failing before the fixes and
+   passing after them; D1 confirmed, with the description corrected above (a bare `KeyError`,
+   not a wrong name); it probed the fixed `refuse_video_folder` with a link to the cache, a cache
+   reached through a link, `..`, a relative path in capitals and a cache that does not exist yet
+   (all refused) and a sibling, `cache2` and a sibling that does not exist yet (all taken). New:
+   N1 (above, fixed); two sentences of the docs that still said "inline data" (fixed); blank
+   lines (fixed). It found that the first version of the differential test did not see a limit
+   moved to `<=` (a test of round 5 does); the final version sees a limit moved by 0.01 either
+   way (item 5).
+10. **Test runs** (build machine, `tools/run_tests.py`, 14 workers, after every fix):
+    default run 3,417 passed, 1 skipped, 9 deselected, exit 0, 58.3 s (load 7.6 at the start);
+    full run (`-m "slow or not slow"`) 3,426 passed, 1 skipped, exit 0, 52.3 s (load 32.0).
+
 ## 2026-11-23 — Rehearsal of the commands of 23 Nov, the budget at both prices and the owner decisions
 
 Session C of round 6. Base `main` 0c2ac24. The owner's first session on the run machine follows
@@ -3615,6 +3759,16 @@ decisions, and what changed in the documents.
     word "default" without its value. Confirmed right: every other number (recomputed), the help
     edits change no behaviour, the print claims of steps 20 to 23 (each traced to its `print`),
     no owner decision is missing, and none is decided.
+12. **Merge of `main` 7e89517** (the review fixes of round 5, entry "Second read of the video
+    input and the detector families"). The documents now hold: owner decision 42 (V3: a video
+    written again with other bytes is paid again; the review recommends a key on the pixel hash
+    of the frames before the first paid video probe) in HANDOVER 11.1 and in step 21; the limit of
+    20,000,000 bytes that counts the whole request (decision 33, step 20); the count of the
+    self-check of the second family (`self_check_detections` above 0, step 22). 42 open owner
+    decisions. Test runs after the merge (14 workers): default run 3,435 passed, 1 skipped, 9
+    deselected, exit 0, 39.5 s (load 4.3); full run 3,444 passed, 1 skipped, exit 0, 43.3 s (load
+    17.8); `tests/test_guard.py` 152 passed.
+
 
 ## Open questions (to settle with measurements)
 

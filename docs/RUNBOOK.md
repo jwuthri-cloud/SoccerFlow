@@ -1569,7 +1569,9 @@ python -m pitchvlm.cli tool-score --experiment configs/experiments/people_probe_
 - On its first call (not measured) the script compares its boxes with
   `post_process_object_detection` of the installed transformers and stops with a line when they
   differ. A stop there means that the output of the model is not the one that the script was
-  written for: tell the owner, do not loosen the check.
+  written for: tell the owner, do not loosen the check. The check compares the detections from
+  the score 0.001, also below `min_score`; `self_check_detections` in the `runner` facts of the
+  run file is their count, and 0 means that it compared nothing: tell the owner.
 - `seconds_per_frame` is the whole call (image processor, model, conversion), like the plain
   `predict` of RF-DETR. The script also prints and stores the median of each part
   (`runner.stage_ms_per_frame`: `preprocess`, `model`, `postprocess`); the model time is read
@@ -1662,7 +1664,8 @@ How it works, in short:
   Do not delete this folder between a paid run and its replay.
 - Gemini: the bytes go inline with the media resolution of the step and `fps`. There is no upload
   (the Files API keeps a file for 48 hours, against the intent of `store=False`): a request whose
-  inline data is above 20,000,000 bytes is refused before any call. A 2.5 s file of 1080p frames
+  size as JSON text (inline data, text, schema, settings) is above 20,000,000 bytes is refused
+  before any call. A 2.5 s file of 1080p frames
   is far below it; the error says to send a shorter range.
 - OpenRouter: a `video_url` part with a base64 data URL, no range and no rate. A model takes video
   only with a `video` entry in `configs/openrouter_prices.yaml`; no model has one yet (owner

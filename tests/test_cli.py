@@ -6157,6 +6157,20 @@ def test_probe_refuses_a_video_folder_in_the_cache_or_in_the_repository(tmp_path
     cli.refuse_video_folder(tmp_path / "videos", cache)
 
 
+def test_probe_refuses_a_video_folder_in_the_cache_typed_in_another_letter_case(tmp_path: Path) -> None:
+    """On a disk that does not tell letter cases apart (the default disk of macOS), CACHE is the folder cache."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    if not (tmp_path / "CACHE").exists():
+        pytest.skip("this disk tells letter cases apart, so CACHE is another folder")
+    for folder in (tmp_path / "CACHE", tmp_path / "Cache" / "videos"):
+        with pytest.raises(cli.CliError, match="text only"):
+            cli.refuse_video_folder(folder, cache)
+    # A cache folder typed in another case than the folder on the disk is found too.
+    with pytest.raises(cli.CliError, match="text only"):
+        cli.refuse_video_folder(cache / "videos", tmp_path / "CACHE")
+
+
 def test_estimate_of_a_video_request_that_cannot_be_priced_is_a_command_error(tmp_path: Path) -> None:
     """A flex video request of a model without a flex tier is refused with one error line, not a traceback."""
     video = tmp_path / "clip.mp4"

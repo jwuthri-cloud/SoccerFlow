@@ -29,7 +29,7 @@ Words:
 | Code | Branch `main` of the remote (public since 14 Nov 2026). Package `pitchvlm` under `src/`, tests under `tests/` |
 | Added on 22 Nov | A second model provider (OpenRouter, RUNBOOK section 10), the paint alignment of pitch mappings and the cut test (section 3), two track repairs as arms of G4 (`configs/arms`, section 4), a detector engine with `clip-job`, `run --detections --calibration` and `video-frames` (section 11), the check images of G3 (`overlay`, section 3), two test tiers (section 1), a faster guard |
 | Added on 23 Nov | Video input for the model steps: `doctor --video` and three experiment files `people_probe_video*.yaml` (RUNBOOK section 13); a second detector family, D-FINE and RT-DETRv2 through transformers, with five experiment files and an install proposal (section 11); the streaming path `stream` (section 14); new tests of the money guards |
-| Offline tests | `3419 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run of `main` 0c2ac24 on 23 Nov; this commit adds the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have |
+| Offline tests | `3444 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run on 23 Nov of `main` 7e89517 (the review fixes of round 5) with the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have |
 | Demo | `demo` gives a video, a radar and a valid prediction file from a synthetic clip and a fake model; `demo --engine detector` does the same with stand-ins of the two tools |
 | Reviews | Two reviews tested the first build, a third one the measurement of the two specialist tools, a fourth one the fixes of the third, and a fifth one the fixes of the fourth; two more read the code of 22 Nov. Each finding was repaired, kept with its reason, or recorded as not built or as an open owner decision (`docs/DECISIONS.md`) |
 | Rehearsal | On 22 Nov this file and the RUNBOOK were walked from the first line to the last on the build machine, with a synthetic dataset, the fake model, a stand-in scorer and stand-ins of the tools (`docs/DECISIONS.md`, entry "Rehearsal of the handover and the runbook"). On 23 Nov the commands of 23 Nov were walked the same way, and the estimates of every paid step were printed at both prices (entry "Rehearsal of the commands of 23 Nov, the budget at both prices and the owner decisions") |
@@ -213,7 +213,7 @@ git --version
 python -m pytest tests/test_guard.py -rs
 ```
 
-- Passes: the last line starts with `152 passed` (the count of `main` 0c2ac24 on 23 Nov), with no
+- Passes: the last line starts with `152 passed` (the count of 23 Nov), with no
   failure. A skipped test names its reason.
 - When not: a failed test names a git behaviour that this machine has and the build machine did
   not. Commit nothing until it is repaired: the guard is the hook of every commit. Repair
@@ -232,8 +232,8 @@ python tools/run_tests.py -m "slow or not slow"
   on it is the test run after each change: `python tools/run_tests.py` (default run) and
   `python tools/run_tests.py -m "slow or not slow"` (full run, before a commit).
 - Passes: no failure, and the second command prints the same counts of passed and skipped tests
-  as the first, with exit code 0. On 23 Nov the build machine printed `3419 passed, 1 skipped` for
-  `main` 0c2ac24 (later commits add tests). Here one more group of tests
+  as the first, with exit code 0. On 23 Nov the build machine printed `3444 passed, 1 skipped` for
+  `main` 7e89517 with the tests of the documents (later commits add tests). Here one more group of tests
   can run or be skipped: some tests need a disk that tells upper and lower case apart, some one
   that does not.
 - When not: a skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of
@@ -509,6 +509,9 @@ python -m pitchvlm.cli doctor --video \
   gemini-4-argon,gemini-3.8-flash`: 0.198 USD for 16 calls until 30 Nov, 0.343 USD from 1 Dec) in
   the place of steps 5 and 20. It saves the second payment of the image checks, but a failed video
   check then fails the exit code of the run that decides gate G0. Keep the two steps apart.
+- The doctor writes its video into a temporary folder and stores no answer, so decision 42 does
+  not touch this step. Since the review of round 5 the limit of 20,000,000 bytes counts the whole
+  request (RUNBOOK, section 13); the video of the check is far below it.
 
 **Step 21. The cost pilot of the video input.** Paid. Needs step 9 (the image pilot of the same
 2 clips is the baseline) and step 20 passed. RUNBOOK, section 13:
@@ -526,6 +529,11 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
   decide nothing; the three arms of RUNBOOK, section 13, on 24 clips do.
 - When not: a stop with the words "1.3 times its estimate": the video token rate is too low
   (RUNBOOK, section 13, line `video tokens`); tell the owner before a second try.
+- Before it: decision 42 of section 11.1. Until the key of a video request is the pixel hash of
+  its frames, a video that is written again with other bytes (another codec, another OpenCV build)
+  misses its stored answer, and a paid run pays it again without an error. So keep
+  `~/pitchvlm-data/video-input` between a paid run and its replay, and run every replay with
+  `--replay`: it refuses a miss and pays nothing.
 
 **Step 22. The first check of the second detector family.** Free; it downloads packages and a
 checkpoint (79 MB for D-FINE Medium, estimated). It needs the owner's yes to the install and the
@@ -536,8 +544,10 @@ RT-DETRv2 (2026-11-23)": the install block, then the three commands of
 - Passes: `tool-job` prints `tool job people_probe_dfine_medium: 10 frames of 2 clips of the group
   probe (valid) for the tool dfine` (printed on the build machine); the script ends with
   `dfine: 10 frames of the job ...`, a line `median time per frame of each part: preprocess ...,
-  model ..., postprocess ...` and `run file: ...`; `tool-score` ends with exit code 0. Write the
-  versions of `uv pip freeze` into `docs/DECISIONS.md`.
+  model ..., postprocess ...` and `run file: ...`; `self_check_detections` in the `runner` facts
+  of the run file is above 0 (0 means that the self-check compared nothing: tell the owner);
+  `tool-score` ends with exit code 0. Write the versions of `uv pip freeze` into
+  `docs/DECISIONS.md`.
 - When not: a stop of the self-check of the first call means that the output of the model is
   not the one that the script was written for: tell the owner; do not loosen the check.
 
@@ -770,7 +780,8 @@ Before the clip runs (M4, M5):
 | 30 | A limit for `purity` of the track repairs [same entry, item 11 (c)] | a limit before the dev runs of the arms; none | Fix it before those runs (rule 7) | no limit: a repair can pass G4 and mix people | the dev runs of the arms |
 | 31 | Cost of the split arm [same entry, item 11 (d)] | team slots first, then the split arm after its estimate; both together | Team slots first | as the owner starts them | nothing |
 | 32 | Video input in the pipeline (`run`) [entry "Video input for the model steps" of 23 Nov, item 7] | build it after the probes; never | Decide after the probes, with both metrics files | `run` sends images | nothing |
-| 33 | Uploads of a video above 20,000,000 bytes (the Files API keeps a file for 48 hours) [same entry, item 7] | keep the refusal; an upload followed by a delete | This session: keep the refusal while only the probes send video (a 2.5 s file of 1080p frames is far below the limit) | refused before any call | nothing now |
+| 33 | Uploads of a video request above 20,000,000 bytes (the Files API keeps a file for 48 hours); since the review of round 5 the limit counts the whole request as JSON text (inline data, text, schema, settings), not only its inline data [same entry, item 7; entry "Second read of the video input and the detector families", V1] | keep the refusal; an upload followed by a delete | This session: keep the refusal while only the probes send video (a 2.5 s file of 1080p frames is far below the limit) | refused before any call | nothing now |
+| 42 | A video written again from the same frames with other bytes (another codec or OpenCV build) gets another cache key: a paid run pays its request again without an error, where an image request stops [entry "Second read of the video input and the detector families", V3 and item 8] | keep the written videos with the data and run every replay with `--replay` (no code change); key a video request on the pixel hash of its frames and stop a hit whose file has other bytes, as for images (a change of the key; no video answer is stored yet) | The review session: the pixel key, before the first paid video probe | the file hash stays in the key; `--replay` refuses a miss, a paid run pays again | section 6, step 21, and every later video probe |
 | 34 | A video rate for an OpenRouter model [same entry, item 7] | add a `video` entry to `configs/openrouter_prices.yaml` from the model card of one model, then `doctor --video`; none | None published yet: add one only from a model card | every OpenRouter video request is refused before any call | video input through OpenRouter |
 | 35 | OpenRouter: the price table on the estimate side, the token estimates per model, which models to try [last list, three items] | price table: the highest price of any provider, or that of the provider that the routing chose; token estimates: one table for all models, or per model; models: which to try first | Keep the highest price; estimates per model when the first doctor of a model differs by more than 1.5 times; Qwen3-VL first | the highest price, one table for all models, no model tried | the OpenRouter probes |
 
