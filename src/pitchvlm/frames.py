@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import math
 import operator
+import os
+import secrets
+import shutil
 import threading
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import cv2
 import numpy as np
+from pydantic import Field, FiniteFloat
 
-from pitchvlm.schemas import ClipInfo
+from pitchvlm.schemas import ClipInfo, Record
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
+#: Largest distance of the time of a video frame from its place at a constant frame rate, in frames.
+FRAME_TIME_TOLERANCE = 0.5
+#: Folder of the frame images inside a clip folder, as in the dataset.
+FRAME_FOLDER = "img1"
+#: The record of a video next to the folder of its frame images (``write_video_frames``), and its format.
+VIDEO_RECORD_NAME = "video.json"
+VIDEO_RECORD_FORMAT = "pitchvlm-video-frames-1"
+#: PNG compression of the written frames: 1 is fast; every level keeps every pixel.
+PNG_COMPRESSION = 1
 #: Decoded frames that a video source keeps for a repeated read. One 1080p frame needs about 6 MB.
 _RECENT_FRAMES = 8
 
@@ -111,10 +125,52 @@ class ImageFolderSource:
         return self._load(self.path(frame))
 
 
+def check_frame_times(path: Path, times_ms: list[float], *, fps: float, header_frames: float) -> None:
+    """Raise ``OSError`` unless the decoded frames of a video are all its frames, at a constant frame rate.
+
+    ``times_ms`` holds the time of every decoded frame in milliseconds, in decoding order;
+    ``fps`` and ``header_frames`` are the frame rate and the frame count of the header of the
+    video. Three faults raise, each with one line that says what to do:
+
+    - The header names no frame count (0 or less): nothing shows a frame that could not be decoded.
+    - A frame is more than ``FRAME_TIME_TOLERANCE`` frames away from the time that the frame
+      rate gives it, counted from the first frame: the frame rate is variable, or the decoder
+      dropped or repeated a frame.
+    - The header names another number of frames than were decoded: a frame cannot be read, or
+      the header is wrong.
+
+    The times are checked before the count, so a video with a variable frame rate gets the
+    line about the rate also when the decoder dropped frames of it.
+    """
+    if header_frames <= 0:
+        raise OSError(
+            f"video {path} names no frame count in its header, so a frame that cannot be decoded would not be seen. "
+            "Convert it to a video file with a frame count (for example MP4) first"
+        )
+    step_ms = 1000.0 / fps
+    for index, time_ms in enumerate(times_ms):
+        shown_ms = time_ms - times_ms[0]
+        if abs(shown_ms - index * step_ms) > FRAME_TIME_TOLERANCE * step_ms:
+            raise OSError(
+                f"video {path}: frame {index} is shown at {shown_ms:.1f} ms, but the constant rate of {fps:g} frames "
+                f"per second shows it at {index * step_ms:.1f} ms. The video has a variable frame rate, or a frame is "
+                "missing or doubled: convert it to a constant frame rate first"
+            )
+    if round(header_frames) != len(times_ms):
+        raise OSError(
+            f"video {path}: its header names {round(header_frames)} frames, but {len(times_ms)} frames can be decoded. "
+            "A frame cannot be read, or the header is wrong: convert the video again from its source"
+        )
+
+
 class VideoFileSource:
     """A video file. Frames are decoded when they are read, so the memory use does not grow with the clip.
 
-    The file is decoded one time when the source is made, to count its frames.
+    The file is decoded one time when the source is made, to count its frames and to
+    check them (``check_frame_times``): a frame that cannot be decoded, a frame count of
+    the header that differs from the decoded frames, and a variable frame rate raise
+    ``OSError``. The decoder of OpenCV drops or repeats frames of such a video without
+    an error, so the frames would not be sure.
     After that the decoder runs forward only. Reading frames in increasing
     order is fast. A read of an earlier frame starts the decoder again at the
     first frame, unless the frame is one of the last frames that were read:
@@ -126,17 +182,23 @@ class VideoFileSource:
         self._path = Path(path)
         capture = self._open()
         fps = float(capture.get(cv2.CAP_PROP_FPS))
-        ok, first = capture.read()
-        n_frames = 0
-        while ok:
-            n_frames += 1
-            ok, _ = capture.read()
+        header_frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        first: np.ndarray | None = None
+        times_ms: list[float] = []
+        while capture.grab():
+            if first is None:
+                ok, first = capture.retrieve()
+                if not ok:
+                    capture.release()
+                    raise OSError(f"cannot decode frame 0 of video {self._path}")
+            times_ms.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)))
         capture.release()
-        if n_frames == 0 or not 0 < fps < math.inf:
+        if first is None or not 0 < fps < math.inf:
             raise OSError(f"video {self._path} has no readable frames or no frame rate")
+        check_frame_times(self._path, times_ms, fps=fps, header_frames=header_frames)
         height, width = first.shape[:2]
         self.info = ClipInfo(
-            clip_id=clip_id or self._path.stem, n_frames=n_frames, fps=fps, width=width, height=height
+            clip_id=clip_id or self._path.stem, n_frames=len(times_ms), fps=fps, width=width, height=height
         )
         self._lock = threading.Lock()
         #: The last frames that were read, by frame index, oldest first.
@@ -144,6 +206,11 @@ class VideoFileSource:
         self._capture = self._open()
         #: Index of the frame that the decoder gives next.
         self._position = 0
+
+    @property
+    def path(self) -> Path:
+        """Return the video file."""
+        return self._path
 
     def _open(self) -> cv2.VideoCapture:
         """Open the video file. The decoder then stands at the first frame."""
@@ -177,3 +244,80 @@ class VideoFileSource:
         if len(self._recent) > _RECENT_FRAMES:
             del self._recent[next(iter(self._recent))]
         return image
+
+
+class VideoRecord(Record):
+    """What the clip folder of the frame images of a video says about the video (``write_video_frames``).
+
+    The record holds no path: ``video`` is the name of the video file without its folder.
+    """
+
+    format: Literal["pitchvlm-video-frames-1"]
+    video: str = Field(min_length=1)
+    #: SHA-256 of the bytes of the video file, as 64 small hexadecimal digits.
+    video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    n_frames: int = Field(gt=0)
+    fps: FiniteFloat = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+def frame_image_name(frame: int) -> str:
+    """Return the name of the image file of a frame: frame 0 is ``000001.png``, as in the dataset."""
+    return f"{operator.index(frame) + 1:06d}.png"
+
+
+def write_video_frames(source: VideoFileSource, video_sha256: str, clip_folder: Path) -> VideoRecord:
+    """Write every frame of a video as a PNG image, and the record of the video, into a new clip folder.
+
+    The images go to ``clip_folder/img1`` (``frame_image_name``) and the record to
+    ``clip_folder/video.json``. PNG keeps every pixel, so ``ImageFolderSource`` reads the
+    frames of ``source``: the same count, the same order and the same pixels. The folder
+    is first written under a hidden name next to ``clip_folder`` and gets its name only
+    when every file is written, so a stopped command leaves no clip folder with a part of
+    the frames. ``FileExistsError`` is raised when ``clip_folder`` is already there:
+    nothing is replaced. An image that cannot be written raises ``OSError``, and the
+    hidden folder is removed.
+    """
+    clip_folder = Path(clip_folder)
+    if clip_folder.exists():
+        raise FileExistsError(f"{clip_folder} is already there: remove it, or write the frames to another place")
+    info = source.info
+    record = VideoRecord(
+        format=VIDEO_RECORD_FORMAT,
+        video=source.path.name,
+        video_sha256=video_sha256,
+        n_frames=info.n_frames,
+        fps=info.fps,
+        width=info.width,
+        height=info.height,
+    )
+    clip_folder.parent.mkdir(parents=True, exist_ok=True)
+    partial = clip_folder.with_name(f".{clip_folder.name}.partial-{secrets.token_hex(4)}")
+    images = partial / FRAME_FOLDER
+    images.mkdir(parents=True)
+    try:
+        for frame in range(info.n_frames):
+            path = images / frame_image_name(frame)
+            if not cv2.imwrite(str(path), source.read(frame), [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION]):
+                raise OSError(f"cannot write the image {path}")
+        (partial / VIDEO_RECORD_NAME).write_text(record.model_dump_json() + "\n", encoding="utf-8")
+        os.rename(partial, clip_folder)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    return record
+
+
+def read_video_record(clip_folder: Path) -> VideoRecord | None:
+    """Return the record of the video whose frames a clip folder holds, or None when it holds no record.
+
+    ``ValueError`` is raised for a record that does not follow the format of ``VideoRecord``.
+    """
+    path = Path(clip_folder) / VIDEO_RECORD_NAME
+    if not path.is_file():
+        return None
+    try:
+        return VideoRecord.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error

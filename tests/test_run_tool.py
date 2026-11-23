@@ -1762,6 +1762,9 @@ def test_later_part_of_an_older_run_is_refused_before_the_tool_is_built(
         (lambda job: job.update(images="000001.png"), "names no frame"),
         (lambda job: job["images"].append("/etc/hosts"), "'image' must be a path below the data folder"),
         (lambda job: job["tool"].pop("antialias"), "it has ['min_score', 'model', 'name']"),
+        (lambda job: job.update(video_sha256="A" * 64), "'video_sha256' must be null or 64 small hexadecimal"),
+        (lambda job: job.update(video_sha256="a" * 63), "'video_sha256' must be null or 64 small hexadecimal"),
+        (lambda job: job.update(video_sha256=7), "'video_sha256' must be null or 64 small hexadecimal"),
     ],
 )
 def test_clip_job_with_wrong_content_is_refused_before_the_tool_is_built(
@@ -1773,6 +1776,30 @@ def test_clip_job_with_wrong_content_is_refused_before_the_tool_is_built(
     assert code == 2
     assert words in error_line(capsys)
     assert Detector.made == [] and not out.exists()
+
+
+@pytest.mark.parametrize("video", [None, "0123456789abcdef" * 4])
+def test_clip_run_names_the_video_of_its_clip_job(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch, video: str | None
+) -> None:
+    monkeypatch.setattr(detector, "find", staticmethod(lambda image: []))
+    job = clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data", count=2))
+    job["video_sha256"] = video
+
+    code, out = run_clip_job(tmp_path, job)
+
+    assert code == 0
+    assert read_json(out)["video_sha256"] == video
+    assert runs.load_clip_run(out).video_sha256 == video
+
+
+def test_clip_job_without_the_video_key_gives_a_clip_run_of_images(
+    tmp_path: Path, detector: type[Detector], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(detector, "find", staticmethod(lambda image: []))
+    code, out = run_clip_job(tmp_path, clip_job_of(DETECTOR_SETTINGS, small_frames(tmp_path / "data", count=2)))
+    assert code == 0
+    assert read_json(out)["video_sha256"] is None
 
 
 def test_compact_rows_keep_a_score_at_its_threshold_and_round_the_box() -> None:

@@ -831,10 +831,40 @@ def _error_by_clip(summaries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]
     }
 
 
-def _probe_pitch_frame(
-    clip: LabelledClip, frame: int, backend: Backend, settings: StepSettings, ransac_px: float, repeat: int
-) -> _PitchFrame:
-    """Ask the landmarks of one frame, fit the pitch mapping and measure it at the labelled foot points."""
+def pitch_probe_fits(
+    clips: Sequence[LabelledClip],
+    backend: Backend,
+    settings: StepSettings,
+    *,
+    frames_per_clip: int,
+    seed: int,
+    ransac_px: float,
+    repeat: int = 0,
+) -> dict[str, list[HomographyRecord]]:
+    """Return the landmark fit of every frame of the pitch probe, by clip id, in frame order.
+
+    The frames, the requests and the fit are those of ``probe_pitch`` with the same
+    arguments, so a backend that replays the stored answers of a pitch probe gives the
+    mappings that the probe measured. An answer that cannot be parsed gives a record
+    without a matrix, as in the probe.
+    """
+    _check_clips(clips)
+    _check_at_least("frames_per_clip", frames_per_clip, 1)
+    _check_at_least("repeat", repeat, 0)
+    _check_above_zero("ransac_px", ransac_px)
+    return {
+        clip.source.info.clip_id: [
+            fit_from_landmarks(_landmarks(clip, frame, backend, settings, repeat)[0], ransac_px=ransac_px)
+            for frame in sample_frames(clip.labels, frames_per_clip, seed)
+        ]
+        for clip in clips
+    }
+
+
+def _landmarks(
+    clip: LabelledClip, frame: int, backend: Backend, settings: StepSettings, repeat: int
+) -> tuple[FrameLandmarks, bool]:
+    """Ask the landmarks of one frame. Return them, and False when the answer could not be parsed (no landmark then)."""
     info = clip.source.info
     request = steps.build_landmarks_request(
         _read_frame(clip, frame), clip_id=info.clip_id, frame=frame, settings=settings, repeat=repeat
@@ -843,7 +873,14 @@ def _probe_pitch_frame(
         steps.parse_landmarks, frame=frame, width=info.width, height=info.height, coords=settings.coords
     )
     answer = _parsed(request, backend, parse)
-    landmarks = FrameLandmarks(frame=frame) if answer is None else answer
+    return (FrameLandmarks(frame=frame), False) if answer is None else (answer, True)
+
+
+def _probe_pitch_frame(
+    clip: LabelledClip, frame: int, backend: Backend, settings: StepSettings, ransac_px: float, repeat: int
+) -> _PitchFrame:
+    """Ask the landmarks of one frame, fit the pitch mapping and measure it at the labelled foot points."""
+    landmarks, parsed = _landmarks(clip, frame, backend, settings, repeat)
     record = fit_from_landmarks(landmarks, ransac_px=ransac_px)
     without_share_rule = fit_from_landmarks(landmarks, ransac_px=ransac_px, min_near_share=0.0)
     return _PitchFrame(
@@ -851,7 +888,7 @@ def _probe_pitch_frame(
         valid_without_share_rule=without_share_rule.valid,
         n_landmarks=len(landmarks.landmarks),
         n_inliers=record.n_inliers,
-        parsed=answer is not None,
+        parsed=parsed,
     )
 
 

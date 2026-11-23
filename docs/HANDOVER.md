@@ -265,8 +265,9 @@ with goalkeeper evidence, and the requests in flight at a budget stop. Four came
 measurement of the two specialist tools: its settings, the place of its run files, the work
 that lets the pipeline use a tool that passed its gate (not built, not budgeted), and the
 frames of gate G3. Two came with the public repository: where the branch `results` goes, and
-the licence of the repository. One is about the kill switch of gate G3: no command writes the
-overlay images that it names.
+the licence of the repository. One was about the kill switch of gate G3: the command
+`overlay` (2026-11-22) now writes the overlay images that it names, and the owner checks them
+(RUNBOOK, section 3).
 
 ## 12 Schedule after the handover
 

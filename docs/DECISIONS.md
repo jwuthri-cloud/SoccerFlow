@@ -1804,6 +1804,93 @@ detector engine", item 5. Every number here is synthetic: build machine, synthet
     thresholds; the margin at 100 px per frame (item 5) is thin. The 30-frame window was
     measured at 25 frames per second only. The faint ends of a dissolve keep their states.
 
+## 2026-11-22 — A video file into the detector engine, and the check images of gate G3
+
+Two tools for the first real clip runs, from the last list below ("Video files for the detector
+engine", "Overlay images of the kill switch of G3"). Everything here was measured on the build
+machine with synthetic clips and stand-ins of the tools (OpenCV 5.0.0, Python 3.13); nothing ran
+on real footage.
+
+1. **Design of the video path: one command writes the frames as images.** `video-frames` writes
+   every frame of a video file as PNG into `~/pitchvlm-data/videos/<clip id>/img1` with the record
+   `video.json` (SHA-256 of the video, frame count, rate, size). `clip-job` reads that folder as it
+   reads a clip of the dataset, and puts the SHA-256 into the job (`video_sha256`); the script
+   copies it into the head of the clip run; `run` reads a clip run only with the video of that
+   check sum (null: only with a folder of images). The other way, a clip job with a video as its
+   source, was not taken: the script would decode the video in each tool environment with the
+   OpenCV and FFmpeg build of that environment, and two builds need not give the same pixels; the
+   script reads images with Pillow, which reads no video; the two tools would decode the video two
+   times. With images the clip job, the script and both tools stay as they were; the cost is disk.
+2. **Same frames, proved on synthetic videos.** A video of 20 random frames (more than the 8
+   frames that the video source keeps) and the synthetic clip of 50 frames (1280 x 720): every
+   image read back by `ImageFolderSource` is equal, pixel for pixel, to the frame that
+   `VideoFileSource` decodes, in the same order and count (`tests/test_frames.py`,
+   `tests/test_video_overlay.py`). The script reads the images with Pillow, which is not installed
+   here: that read of PNG was not compared (open item a).
+3. **A video whose frames are not sure is refused, with one line** (`frames.check_frame_times`,
+   in `VideoFileSource`, so `run` refuses it too). Measured: an mp4 of 10 frames whose second half
+   was given double frame times (variable rate) decodes in OpenCV as 8 frames at 16.7 frames per
+   second, without any error: two frames were dropped in silence. The source now refuses a header
+   without a frame count, a frame more than half a frame away from its time at the constant rate
+   (checked first, so this video gets the line about the rate), and a header count that differs
+   from the decoded frames (a Motion JPEG file cut by 15 % decodes 8 or 9 of its 10 frames).
+   Not found: the same file cut by 400 bytes decodes all 10 frames without an error (FFmpeg
+   prints "overread" on the error stream); the last frame is then damaged (open item b).
+4. **Rule 2.** `video-frames` and `overlay` refuse an image folder inside the repository or any
+   work tree of it (`git worktree list`, so the results work tree too), compared as places on the
+   disk. The defaults are `~/pitchvlm-data/videos` and `~/pitchvlm-data/overlays`. The list file
+   of `overlay` is text: clip ids, frame numbers, the engine, how each mapping was made and its
+   paint score or reason; the guard passes on it (measured with `--paths`).
+5. **Check images: one command, three sources.** `overlay probe` replays the stored landmark
+   answers of the pitch probe (no model call; a missing answer stops it) and fits them as the
+   probe does (`probes.pitch_probe_fits`, the same code path): its count of frames with a mapping
+   equals `n_frames_valid` of the probe (test). `overlay tool` reads the PnLCalib run file of
+   `tool-score` on the frames of its probe. `overlay run` draws the mapping that a run used on
+   each keyframe (`result.json`): the landmark fit or tool camera of that frame, or a mapping
+   carried with the camera motion; the caption says which. The image is the frame under a caption
+   band (clip, frame, engine, mapping, paint score or the reason why the frame cannot judge) with
+   the pixels of `geometry.projected_line_pixels` in 70 % magenta, 1 pixel per 1280 of width, so
+   the white paint stays visible beside a line. A first version with opaque lines of 3 pixels
+   covered the paint of a right mapping completely, and the eye could not judge it.
+6. **The choice cannot be steered.** The frames with a mapping are ordered by paint score
+   (frames that cannot judge first), cut into `count` equal parts, and from each part the frame of
+   the clip with the fewest picks so far is taken; ties by a SHA-256 of the seed, the clip and the
+   frame. The RUNBOOK fixes the seed (20261113, the seed of the probe experiment files) and the
+   counts (5 for the kill switch, 10 for M3). The owner writes `right` or `wrong` into `by_eye` of
+   each entry of the list file and the counts into this file with the decision on G3 (RUNBOOK,
+   section 3, "Check images of the pitch mappings").
+7. **Measured on the synthetic demo clip** (100 frames, 1280 x 720, mp4v): `video-frames` 2.7 s
+   and 63.5 MB (0.64 MB per frame); clip jobs of both tools named the SHA-256; the stand-in clip
+   runs carried it; `run --clip <video>` read them (exit 0). `overlay run` on that result: 10
+   keyframes, all with a mapping, 5 drawn in 1.2 s (3.3 MB of images); the true camera scores
+   1.000 on every keyframe. The size per frame of real 1920 x 1080 footage is not measured
+   (estimate 1 to 2 MB, about 1 GB per clip of 30 s).
+8. **Formats.** `video_sha256` is a new key of the clip job and of the head of a clip run, null for
+   images; a file without the key reads as null, so the format names stay `-1` (no file of the old
+   form exists outside tests). The script refuses a value that is not null or 64 small hexadecimal
+   digits.
+9. **Open.**
+   (a) The script reads the PNG frames with Pillow: compare one image of a real clip read by
+   Pillow (converted to BGR) with `run`'s frame on the run machine before the first tool run.
+   (b) A damaged last frame that still decodes is not found; look at the end of each video.
+   (c) `overlay run` draws used mappings only: a refused landmark fit that no frame uses is not
+   drawn (its score is in `result.json`). For a check of the raw fits of a run, a replay of the
+   landmark answers of the run would be needed; not built.
+   (d) The colour and width of the lines were judged on synthetic frames only.
+   (e) No real video, real tool or real footage ran through any of this.
+10. **After the merge of the dissolve test** (`main` 9b63a02, entry "A dissolve is a
+    transition, not a shot"). A run drops the mapping of every transition frame. `overlay` now
+    lists every frame without a mapping with its reason (printed, and `frames_without_mapping` in
+    the list file) and draws no image of it; a keyframe of a run on a transition frame gets the
+    reason "a frame of a transition", found from the cuts of the result with
+    `MotionField.transition_frames`, the rule of the pipeline. Measured on a synthetic mp4 of 90
+    frames with a dissolve of 10 frames (`tests/test_video_overlay.py`): `video-frames` gives the
+    frames that `run` decodes, pixel for pixel; the run with stand-in clip runs of that video put
+    at least one keyframe on a transition frame (asserted), and the overlay of every keyframe
+    named it and drew it not. The cut test runs on the decoded (lossy) frames, as `run` reads
+    them; the tools never see the cuts.
+
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?
@@ -1922,13 +2009,12 @@ Decisions for the owner that are open, each with its recommendation:
 - **Licence of this repository.** It has no licence file, and one script imports GPL code of
   another project when it runs. Recommendation: decide both before the two tools are installed
   on the run machine (M2), and add a licence file.
-- **Overlay images of the kill switch of G3.** The gate file wants five overlay images that
-  are checked by eye before the kill switch counts (`overlays_checked_by_eye: 5`), and M3 asks
-  the owner to check 10. No command writes an overlay of a pitch mapping on its frame, for the
-  model step or for PnLCalib. Recommendation: build a small command that draws the pitch lines
-  of a mapping on its frame into `~/pitchvlm-data` (images stay on the run machine), before
-  the pitch probe of M3. The other way, to take the line out of the kill switch, is a change
-  of the gate and needs its own entry here (rule 7).
+- **Overlay images of the kill switch of G3.** Built on 2026-11-22 (entry "A video file into
+  the detector engine, and the check images of gate G3"): `overlay probe|tool|run` (RUNBOOK,
+  section 3, "Check images of the pitch mappings"). The gate file is unchanged. Owner to do: after
+  the first 4 clips of the pitch probe, run the overlay with `--count 5`, check the images, write
+  `right` or `wrong` into each `by_eye` of the list file and the counts into this file before the
+  kill switch is judged; for M3 the same with `--count 10` for the model step and PnLCalib.
 - **OpenRouter: rule text** (entry "Image models through OpenRouter" of 2026-11-22, item 9).
   Accept, change or refuse the proposed text of the first paragraph and of rules 4 and 5 of
   `CLAUDE.md`. Recommendation: accept; the code already keeps it, and the doctor line `data policy`
@@ -1984,8 +2070,13 @@ Decisions for the owner that are open, each with its recommendation:
 - **Soccer-trained detector** (RUNBOOK, section 12). Recommendation: read the terms of the
   SoccerNet-GSR train data first; build the converter and train only with a budget line for the
   GPU time and a decision that research-only weights may drive the demo.
-- **Video files for the detector engine.** A clip job reads frame images; no command writes the
-  frames of a video file as images. Recommendation: build it before the demo clip (a video) runs
-  through the detector engine.
+- **Video files for the detector engine.** Built on 2026-11-22 (entry "A video file into the
+  detector engine, and the check images of gate G3"): `video-frames`
+  writes the frames of a video as PNG below the data folder, the clip job names the video by
+  its SHA-256, and `run --clip <video>` reads the clip run only with that video (RUNBOOK,
+  section 11, "A video file as the clip"). Owner to do: put the demo clip below
+  `~/pitchvlm-data`, run `video-frames` on it, compare one frame read by Pillow in a tool
+  environment with the frame of `run` (item 9 (a) of that entry), and keep about 1 GB of disk per
+  clip of 30 s (estimated).
 - **Clip runs on the results branch.** They are tool runs (item "Run files of the tools on the
   results branch" above). Recommendation: decide both together; each part passes the guard.
