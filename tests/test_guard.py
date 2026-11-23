@@ -2078,6 +2078,33 @@ class ModeTest(GuardTestCase):
             self.assertEqual((result.returncode, result.stdout), (2, ""), mode)
             self.assertIn("guard: error: git cat-file --batch-check failed with exit code 3", result.stderr, mode)
 
+    def test_git_that_ends_before_the_first_name_is_written_is_a_git_error(self) -> None:
+        """Git ends before the guard writes: the write and the close of its input meet a broken pipe.
+
+        Before the second read of 2026-11-22 the second broken pipe, at the close, left `main` as
+        an error that it does not catch (exit code 1, a traceback). The test waits for git to end,
+        so the order does not depend on the speed of the machine.
+        """
+        guard = guard_module()
+        with mock.patch.dict(os.environ, self.failing_cat_file(before=True)):
+            info = guard.ObjectInfo(self.repo)
+            info._process.wait()
+            with self.assertRaisesRegex(guard.GuardError, "git cat-file --batch-check failed with exit code 3"):
+                info.ask("HEAD^{commit}")
+        self.assertIsNotNone(info._process.returncode)
+
+    def test_deny_list_is_found_through_a_link_to_a_subfolder(self) -> None:
+        """`--repo` names a symbolic link to a subfolder: the git folder is found from the real folder."""
+        self.set_deny_list()
+        self.stage("sub/notes.md", f"made by {DENIED}\n")
+        self.commit("add notes")
+        link = self.base / "link to sub"
+        link.symlink_to(self.repo / "sub")
+        result = self.guard("--tracked", repo=link)
+        expected = ["sub/notes.md:1: deny: content matches the entry on line 3 of the local deny-list"]
+        self.assertEqual(self.assert_refused(result, "deny"), expected)
+        self.assertNotIn(NO_DENY_LIST, result.stderr)
+
     def test_tracked_mode_reads_the_working_tree(self) -> None:
         self.stage("leak.txt", "clean\n")
         self.stage("clean.txt", "clean\n")

@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 import math
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -419,11 +420,11 @@ def _mp4_box_path(data: bytes, start: int, end: int, wanted: bytes, path: list[i
     return None
 
 
-def make_variable_rate(video: Path, out: Path) -> None:
-    """Copy an mp4v video of OpenCV and give its second half frames that last twice as long.
+def _rewrite_frame_times(video: Path, out: Path, runs: Callable[[int, int], list[tuple[int, int]]]) -> None:
+    """Copy an mp4v video of OpenCV with other frame lengths: ``runs(n_samples, delta)`` gives the new entries.
 
-    The time-to-sample box ``stts`` of the copy has two entries in the place of one, so its
-    frames are not at a constant rate. The boxes that hold it grow by 8 bytes. OpenCV writes
+    The time-to-sample box ``stts`` of the copy has two entries in the place of one, each a
+    count of frames and their length. The boxes that hold it grow by 8 bytes. OpenCV writes
     the box ``moov`` after the media data, so no offset of a sample moves.
     """
     data = bytearray(video.read_bytes())
@@ -433,12 +434,22 @@ def make_variable_rate(video: Path, out: Path) -> None:
     size = struct.unpack(">I", data[stts : stts + 4])[0]
     entries, n_samples, delta = struct.unpack(">III", data[stts + 12 : stts + 24])
     assert (size, entries) == (24, 1), "the test expects one entry, as OpenCV writes it"
-    half = n_samples // 2
-    data[stts : stts + size] = struct.pack(">I4sIIIIII", 32, b"stts", 0, 2, half, delta, n_samples - half, 2 * delta)
+    (count_1, delta_1), (count_2, delta_2) = runs(n_samples, delta)
+    data[stts : stts + size] = struct.pack(">I4sIIIIII", 32, b"stts", 0, 2, count_1, delta_1, count_2, delta_2)
     for parent in path[:-1]:
         grown = struct.unpack(">I", data[parent : parent + 4])[0] + 32 - size
         data[parent : parent + 4] = struct.pack(">I", grown)
     out.write_bytes(bytes(data))
+
+
+def make_variable_rate(video: Path, out: Path) -> None:
+    """Copy an mp4v video of OpenCV and give its second half frames that last twice as long."""
+    _rewrite_frame_times(video, out, lambda n, delta: [(n // 2, delta), (n - n // 2, 2 * delta)])
+
+
+def make_short_last_frame(video: Path, out: Path) -> None:
+    """Copy an mp4v video of OpenCV whose last frame lasts 1/40 of a frame. No frame time moves."""
+    _rewrite_frame_times(video, out, lambda n, delta: [(n - 1, delta), (1, delta // 40)])
 
 
 def textured_frames(count: int) -> list[np.ndarray]:
@@ -480,6 +491,48 @@ def test_video_with_a_variable_frame_rate_is_refused(tmp_path: Path) -> None:
     make_variable_rate(constant, variable)
     with pytest.raises(OSError, match="variable frame rate"):
         VideoFileSource(variable)
+
+
+def test_video_with_a_short_last_frame_keeps_its_rate(tmp_path: Path) -> None:
+    """A good video: every frame 40 ms after the one before, only the last frame lasts 1 ms.
+
+    OpenCV gives the rate of the header as the frame count over the length of the stream, here
+    25.03 frames per second, which put frame 384 more than half a frame away from its time
+    (second read of 2026-11-22). The rate of the frames comes from their times.
+    """
+    whole = tmp_path / "whole.mp4"
+    write_video(whole, textured_frames(750), fps=25.0)
+    cut = tmp_path / "cut.mp4"
+    make_short_last_frame(whole, cut)
+    capture = cv2.VideoCapture(str(cut))
+    assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(25.03, abs=0.01)
+    capture.release()
+    info = VideoFileSource(cut).info
+    assert (info.n_frames, info.fps) == (750, 25.0)
+
+
+@pytest.mark.parametrize("rate", [Fraction(25), Fraction(30000, 1001), Fraction(60000, 1001), Fraction(24000, 1001)])
+def test_frame_times_give_the_rate_of_the_frames_whatever_the_header_rate(rate: Fraction) -> None:
+    """Times rounded to the millisecond, as a container with a millisecond time base holds them."""
+    times = [float(round(index * 1000 / rate)) for index in range(750)]
+    for header_fps in (float(rate), float(rate) * 1.0013, round(float(rate), 2)):
+        measured = check_frame_times(Path("v.mkv"), times, fps=header_fps, header_frames=750.0)
+        assert measured == pytest.approx(float(rate), rel=1e-4)
+
+
+def test_a_frame_missing_in_the_middle_of_a_long_clip_is_refused() -> None:
+    """The mean step then grows by one frame over the clip only, but the step into the gap is two frames."""
+    times = [40.0 * index for index in range(751) if index != 375]
+    with pytest.raises(OSError, match="frame 375 is shown at 15040.0 ms, 80.0 ms after the frame before it"):
+        check_frame_times(Path("v.mp4"), times, fps=25.0, header_frames=750.0)
+
+
+def test_a_step_half_the_usual_step_away_is_refused() -> None:
+    """60 % of the steps 80 ms, 40 % 40 ms: a variable rate whose short steps are exactly half a step away."""
+    steps = [80.0, 80.0, 40.0, 80.0, 40.0] * 20
+    times = [sum(steps[:index]) for index in range(len(steps) + 1)]
+    with pytest.raises(OSError, match="frame 3 is shown at 200.0 ms, 40.0 ms after the frame before it"):
+        check_frame_times(Path("v.mp4"), times, fps=15.625, header_frames=float(len(times)))
 
 
 def test_video_with_a_frame_that_cannot_be_read_is_refused(tmp_path: Path) -> None:

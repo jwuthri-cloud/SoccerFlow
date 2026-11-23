@@ -2020,3 +2020,16 @@ def test_a_tool_mapping_that_is_10_m_off_scores_low_with_the_paint(
     assert paint["n_scored"] == 12
     assert paint["score"]["median"] < 0.3
     assert paint["separation"]["n_bad"] == 12
+
+
+def test_pitch_probe_fits_tell_an_answer_that_cannot_be_parsed() -> None:
+    """The overlay of the probe gives such a frame its own reason (second read of 2026-11-22)."""
+    backend = StubBackend({"landmarks": pitch_answers})
+    fits = probes.pitch_probe_fits([pitch_clip()], backend, SETTINGS, frames_per_clip=10, seed=0, ransac_px=8.0)
+    assert [(record.frame, record.valid, parsed) for record, parsed in fits["HAND-1"]] == [
+        (0, True, True),
+        (1, True, True),
+        (2, True, True),
+        (3, False, True),
+        (4, False, False),
+    ]

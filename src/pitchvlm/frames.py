@@ -125,17 +125,24 @@ class ImageFolderSource:
         return self._load(self.path(frame))
 
 
-def check_frame_times(path: Path, times_ms: list[float], *, fps: float, header_frames: float) -> None:
-    """Raise ``OSError`` unless the decoded frames of a video are all its frames, at a constant frame rate.
+def check_frame_times(path: Path, times_ms: list[float], *, fps: float, header_frames: float) -> float:
+    """Return the frame rate of the decoded frames of a video, and raise ``OSError`` unless they are all its frames.
 
-    ``times_ms`` holds the time of every decoded frame in milliseconds, in decoding order;
-    ``fps`` and ``header_frames`` are the frame rate and the frame count of the header of the
-    video. Three faults raise, each with one line that says what to do:
+    ``times_ms`` holds the time of every decoded frame in milliseconds, in the order that the
+    decoder gives them (the order in which they are shown); ``fps`` and ``header_frames`` are
+    the frame rate and the frame count of the header of the video. The rate of the frames is
+    measured from their times: the time from the first to the last frame over the frame count
+    less one. The rate of the header is not used for it, because OpenCV gives the frame count
+    over the duration of the stream, and the duration holds the length of the last frame, which
+    a cut file can change: a good video of 750 frames 40 ms apart has a header rate of 25.03
+    when its last frame lasts 1 ms. The rate of the header is the answer only for a video of one
+    frame. Three faults raise, each with one line that says what to do:
 
     - The header names no frame count (0 or less): nothing shows a frame that could not be decoded.
-    - A frame is more than ``FRAME_TIME_TOLERANCE`` frames away from the time that the frame
-      rate gives it, counted from the first frame: the frame rate is variable, or the decoder
-      dropped or repeated a frame.
+    - A frame is ``FRAME_TIME_TOLERANCE`` steps or more away from the frame before it, at the
+      usual length of a frame (the median of the steps), or more than that from its place counted
+      from the first frame, at the measured rate. The first test finds a frame that the decoder dropped or
+      repeated anywhere in the clip, the second a frame rate that changes slowly.
     - The header names another number of frames than were decoded: a frame cannot be read, or
       the header is wrong.
 
@@ -147,20 +154,33 @@ def check_frame_times(path: Path, times_ms: list[float], *, fps: float, header_f
             f"video {path} names no frame count in its header, so a frame that cannot be decoded would not be seen. "
             "Convert it to a video file with a frame count (for example MP4) first"
         )
-    step_ms = 1000.0 / fps
-    for index, time_ms in enumerate(times_ms):
-        shown_ms = time_ms - times_ms[0]
-        if abs(shown_ms - index * step_ms) > FRAME_TIME_TOLERANCE * step_ms:
-            raise OSError(
-                f"video {path}: frame {index} is shown at {shown_ms:.1f} ms, but the constant rate of {fps:g} frames "
-                f"per second shows it at {index * step_ms:.1f} ms. The video has a variable frame rate, or a frame is "
-                "missing or doubled: convert it to a constant frame rate first"
-            )
+    if len(times_ms) > 1:
+        usual_ms = float(np.median(np.diff(times_ms)))
+        step_ms = (times_ms[-1] - times_ms[0]) / (len(times_ms) - 1)
+        for index in range(1, len(times_ms)):
+            shown_ms = times_ms[index] - times_ms[0]
+            after_ms = times_ms[index] - times_ms[index - 1]
+            if not (
+                usual_ms > 0
+                and abs(after_ms - usual_ms) < FRAME_TIME_TOLERANCE * usual_ms
+                and abs(shown_ms - index * step_ms) <= FRAME_TIME_TOLERANCE * step_ms
+            ):
+                raise OSError(
+                    f"video {path}: frame {index} is shown at {shown_ms:.1f} ms, {after_ms:.1f} ms after the frame "
+                    f"before it, but the frames are {usual_ms:.1f} ms apart as a rule and {step_ms:.1f} ms apart on "
+                    "average. The video has a variable frame rate, or a frame is missing or doubled: convert it to a "
+                    "constant frame rate first"
+                )
+        # Every step is more than half the usual step, so the steps and their mean are above 0.
+        rate = 1000.0 / step_ms
+    else:
+        rate = fps
     if round(header_frames) != len(times_ms):
         raise OSError(
             f"video {path}: its header names {round(header_frames)} frames, but {len(times_ms)} frames can be decoded. "
             "A frame cannot be read, or the header is wrong: convert the video again from its source"
         )
+    return rate
 
 
 class VideoFileSource:
@@ -195,10 +215,10 @@ class VideoFileSource:
         capture.release()
         if first is None or not 0 < fps < math.inf:
             raise OSError(f"video {self._path} has no readable frames or no frame rate")
-        check_frame_times(self._path, times_ms, fps=fps, header_frames=header_frames)
+        rate = check_frame_times(self._path, times_ms, fps=fps, header_frames=header_frames)
         height, width = first.shape[:2]
         self.info = ClipInfo(
-            clip_id=clip_id or self._path.stem, n_frames=len(times_ms), fps=fps, width=width, height=height
+            clip_id=clip_id or self._path.stem, n_frames=len(times_ms), fps=rate, width=width, height=height
         )
         self._lock = threading.Lock()
         #: The last frames that were read, by frame index, oldest first.

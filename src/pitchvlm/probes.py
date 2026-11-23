@@ -840,13 +840,13 @@ def pitch_probe_fits(
     seed: int,
     ransac_px: float,
     repeat: int = 0,
-) -> dict[str, list[HomographyRecord]]:
+) -> dict[str, list[tuple[HomographyRecord, bool]]]:
     """Return the landmark fit of every frame of the pitch probe, by clip id, in frame order.
 
     The frames, the requests and the fit are those of ``probe_pitch`` with the same
     arguments, so a backend that replays the stored answers of a pitch probe gives the
-    mappings that the probe measured. An answer that cannot be parsed gives a record
-    without a matrix, as in the probe.
+    mappings that the probe measured. Each fit comes with True when the answer could be
+    parsed. An answer that cannot be parsed gives a record without a matrix, as in the probe.
     """
     _check_clips(clips)
     _check_at_least("frames_per_clip", frames_per_clip, 1)
@@ -854,8 +854,11 @@ def pitch_probe_fits(
     _check_above_zero("ransac_px", ransac_px)
     return {
         clip.source.info.clip_id: [
-            fit_from_landmarks(_landmarks(clip, frame, backend, settings, repeat)[0], ransac_px=ransac_px)
-            for frame in sample_frames(clip.labels, frames_per_clip, seed)
+            (fit_from_landmarks(landmarks, ransac_px=ransac_px), parsed)
+            for landmarks, parsed in (
+                _landmarks(clip, frame, backend, settings, repeat)
+                for frame in sample_frames(clip.labels, frames_per_clip, seed)
+            )
         ]
         for clip in clips
     }

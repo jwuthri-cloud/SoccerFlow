@@ -193,7 +193,7 @@ pitch-mapping error.
 | M1 | 13-16 Nov | build | Repo: schemas, pitch table, geometry, tracking, camera motion, exporter + checker, Gemini client (real, replay, fake) with cache and ledger, fallback adapters, renderer, roster lookup, CLI, guard, handoff docs | All tests pass offline with no SDK. Synthetic clip gives video + radar + a valid prediction file | To-dos 1-4 by 16 Nov (about 1 h) |
 | M2 | 17-18 Nov | run | Setup, `doctor`, data, split list, free label stage, cost pilot, fallback install | G0 and G1 pass. Real token counts replace the estimates. Spend <= 2 USD | Start the session; approve first paid calls |
 | M3 | 19-24 Nov | run | People probe, pitch probe, number probe on ground-truth crops. RF-DETR and PnLCalib measured on the frames of the people probe and the pitch probe | G2 and G3 decided with numbers by 24 Nov | Check 10 overlay images; confirm the gate decisions |
-| M4 | 24-26 Nov | run | If G2 or G3 failed and the tool passed: the fallback wired into the pipeline (not built, not budgeted; open owner decision). First end-to-end dev clip. Your demo clip: free dry run (decode, frame rate, keyframes), then a first paid pass | A watchable video + radar on 26 Nov | Demo clip + roster by 22 Nov; watch the video |
+| M4 | 24-26 Nov | run | If G2 or G3 failed and the tool passed: the tool engine switched on in the settings (the detector engine and the calibration engine are built since 22 Nov, RUNBOOK section 11; the switch itself stays an owner decision under rule 8). First end-to-end dev clip. Your demo clip: free dry run (decode, frame rate, keyframes), then a first paid pass | A watchable video + radar on 26 Nov | Demo clip + roster by 22 Nov; watch the video |
 | M5 | 27-30 Nov | run | Identity probe; 6 dev clips scored through the half-price tier | G4, G5b decided. First GS-HOTA. Standard-price runs end 30 Nov | Read the numbers |
 | M6 | 1-5 Dec | run | Fixes from G4-G6, smoothing, look of the video, 3 fresh clips once, freeze tag | G6 passes or is reported as is | Approve the freeze |
 | M7 | 6-10 Dec | run | 10 test clips once; final demo clip with names; report | Report rebuilds from cached answers with one command | Watch the demo; read the report |
@@ -202,6 +202,10 @@ pitch-mapping error.
   4 in parallel, throttled below the 10 USD per 10 minutes limit of the first billing tier).
 - If a date slips by more than 2 days, cut in this order: extra models, Gemini-carried IDs, test set
   from 10 to 6 clips, names. The video + radar and one measured score are protected.
+- State on 22 Nov 2026: no step of M2 has run, so every date from M2 on has slipped by at least
+  5 days. The dates in the table are those of the plan. New dates are an owner decision
+  (`docs/DECISIONS.md`, entry "Rehearsal of the handover and the runbook" of 2026-11-22); the
+  price change of 1 Dec stays fixed.
 
 ## Budget (your money)
 

@@ -144,9 +144,13 @@ a calibration tool on every frame. A tool runs in its own environment through
     use does not grow with the clip. The decoder runs forward: a read of an earlier frame starts
     it again at the first frame. Read frames in increasing order where you can. The source decodes
     the whole file once when it is made and refuses (`OSError`, one line) a video whose frames are
-    not sure (`check_frame_times`): a header without a frame count, a frame more than half a frame
-    away from its time at the constant rate (a variable rate, or a frame that the decoder dropped
-    or repeated), and a header count that differs from the decoded frames. `path` is the file.
+    not sure (`check_frame_times`): a header without a frame count, a frame half a step or more
+    away from the frame before it (at the median step), or more than half a step from its place
+    counted from the first frame (at the mean step): a variable rate, or a frame that the decoder
+    dropped or repeated; and a header
+    count that differs from the decoded frames. The frame rate of `info` is the rate of the frame
+    times (first to last frame), not the rate of the header, which OpenCV takes from the length
+    of the stream and so from the length of the last frame. `path` is the file.
   - `write_video_frames(source, video_sha256, clip_folder) -> VideoRecord` writes every frame of a
     video as PNG (`clip_folder/img1/000001.png` = frame 0) and the record `clip_folder/video.json`
     (`VideoRecord`: format `pitchvlm-video-frames-1`, the file name of the video, its SHA-256, frame
@@ -341,8 +345,12 @@ Dissolves (2026-11-22, `docs/DECISIONS.md` entry "A dissolve is a transition, no
   the first frame is moved with the chained steps of the window (no identity) and the median
   block correlation is taken, on the 160-pixel test images. The chain takes the measured motion
   of a pair when it passes the pair test alone, else the motion of the pair test that explains
-  the pair best (`ShotTests.test_steps`). A window is not judged (None) when a step is missing
-  (also a hard cut inside it) or when the moved frame covers too little (a fast pan).
+  the pair best (`ShotTests.test_steps`). A pair whose motion the optical flow did not measure
+  has no step in the chain (second read of 2026-11-22: the identity there made up dissolves in
+  pans), except a lone such pair between two pairs with a step, which takes the last measured
+  motion when that explains it alone (so one failed pair inside a dissolve does not hide it). A window is not judged (None) when a step is missing (a pair without a measured motion,
+  or a hard cut inside it) or when the moved frame covers too little (a fast pan). A clip of 30
+  frames or fewer has no window; an info line says so.
 - `find_transitions`: each run of windows below 0.18 (`MAX_TRANSITION_CORRELATION`) holds one
   transition. Its first window's first frame shows the old shot alone, its last window's last
   frame the new shot alone (for a dissolve shorter than the window). The transition starts at
@@ -358,6 +366,8 @@ Dissolves (2026-11-22, `docs/DECISIONS.md` entry "A dissolve is a transition, no
   dissolve and a lone frame between two hard cuts (also the first or last frame of a clip cut off
   by a cut). A clip without a cut has none. `pipeline.run_clip` drops the people, the ball
   candidates and the pitch mapping of these frames, so they get no state, no track and no ball.
+  `run` and `demo` print these frames apart from the cuts, with the keyframes among them, whose
+  answers are dropped (a paid model answer too).
 - Not found: a fade through black is found as hard cuts at the dark frames (no contrast); a
   wipe, a picture-in-picture replay, a dissolve during a pan the chain cannot follow for a whole
   window, and a dissolve between two moments of one camera that a chained motion happens to
@@ -1626,7 +1636,8 @@ def list_document(chosen, *, source, name, engine, seed, count, n_frames, unmapp
 
 # probes.py
 def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_px, repeat=0)
-    -> dict[str, list[HomographyRecord]]   # the frames, requests and fits of probe_pitch
+    -> dict[str, list[tuple[HomographyRecord, bool]]]   # the frames, requests and fits of probe_pitch;
+                                                         # False: the answer cannot be parsed
 ```
 
 - `choose_frames`: the frames are ordered by paint score (cannot judge first, then rising; a
@@ -1636,21 +1647,27 @@ def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_
 - `overlay probe|tool|run ... --seed S --count N --list FILE [--out DIR]` (`cli._cmd_overlay`):
   - `probe --experiment E --root DATA [--manifest] [--max-clips] [--cache] [--allow-other-images]`:
     the landmark fits of the pitch probe from the stored answers only (`CachedBackend` without an
-    inner backend: a missing answer stops with one line, no model call).
+    inner backend: a missing answer stops with one line, no model call). A stored answer that
+    cannot be parsed and one whose landmarks give no mapping get their own reasons.
   - `tool --experiment E --root DATA --run RUN [--manifest] [--max-clips]`: the cameras of a
     calibration run file on the frames of its probe, read as `tool-score` reads them.
   - `run --result result.json --clip PATH`: the mapping that the run used on each keyframe
     (`ClipResult.homographies`; the keyframes from the settings in its provenance); `--clip` must
-    be the clip of the result (clip id, frame count, size). A keyframe on a transition frame (a
+    be the clip of the result (clip id, frame count, size), and the video of every clip run of
+    the result (`check_result_video`: the SHA-256 of the file, or of the record of the frame
+    folder, against `provenance.tool_runs.*.video_sha256`; None there asks for images of no
+    video; a result without clip runs, or older than the key, is not compared). A keyframe on a transition frame (a
     shot of one frame between the cuts of the result: `MotionField.transition_frames`, a frame of
     a dissolve) has no mapping in the run; it gets no image and its own reason.
   - Every frame without a mapping is printed (grouped by reason) and listed in
     `frames_without_mapping` of the list file; it gets no image.
   - Every frame with a mapping gets its paint alignment; `choose_frames` picks; each pick is drawn
-    with `draw_mapping_check` into `<out>/<name>-seed<S>-count<N>/` (written under a hidden name,
-    renamed when complete; a folder that is there is refused) and listed in `--list`
-    (`list_document`: no path, no pixel, no label data; `by_eye` null in each entry). A list file
-    that is there is refused, and so is a source without any mapping.
+    with `draw_mapping_check` into `<out>/<name>-seed<S>-count<N>/` (for `run` the name is
+    `<clip>-result<first 8 digits of the SHA-256 of the result file>`; written under a hidden name,
+    renamed when complete, after the list file is written; a folder that is there is refused, and
+    so is a name with a folder separator) and listed in `--list` (`list_document`: no path, no
+    pixel, no label data; `by_eye` null in each entry). A list file that is there is refused, and
+    so is a source without any mapping.
 - `refuse_pixels_in_repository(path, option)`: the path and each existing folder above it are
   compared (`os.path.samefile`) with the top folder of the repository and of every work tree that
   `git worktree list` names (the results work tree is one); a match raises `CliError`. Git that
@@ -1675,3 +1692,11 @@ def pitch_probe_fits(clips, backend, settings, *, frames_per_clip, seed, ransac_
   is skipped without Pillow. So these tests say what the script calls, and not that the real
   tools answer as the script expects.
 - No media files in the repository: build images in the test.
+- `tests/test_documented_commands.py` reads the fenced blocks of `CLAUDE.md`,
+  `docs/HANDOVER.md` and `docs/RUNBOOK.md`. Every shell command that calls the package, the tool
+  script or the guard must parse with the argument parser of that program, every file below
+  `configs/` that a call of the package names must exist (an experiment file or a settings file
+  must also load, and a probe must name the experiment file of its kind), and a Python block
+  may import from the package only names that it has. Each sub-command of the package must have
+  at least one documented command line. A new option or a renamed file therefore needs the same
+  change in the documents.
