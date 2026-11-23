@@ -4154,16 +4154,38 @@ def _add_stream(commands: Any) -> None:
         "--synthetic", action="store_true", help="the synthetic clip with the stand-ins of the tools (no --clip)"
     )
     parser.add_argument(
-        "--frames", type=_positive_int, default=DEMO_FRAMES, metavar="N", help="frames of the synthetic clip"
+        "--frames",
+        type=_positive_int,
+        default=DEMO_FRAMES,
+        metavar="N",
+        help=f"frames of the synthetic clip (default: {DEMO_FRAMES})",
     )
     parser.add_argument("--seed", type=_seed, default=0, metavar="S", help="seed of the synthetic clip (default: 0)")
     parser.add_argument(
-        "--config", type=_path, metavar="FILE", help="settings file (YAML); default: the detector engine settings"
+        "--config",
+        type=_path,
+        metavar="FILE",
+        help="settings file (YAML); default: the engines of configs/engines/detector_calibration.yaml",
     )
     parser.add_argument("--labels", type=_path, metavar="FILE", help="label file of the clip, as for run")
-    parser.add_argument("--fps", type=_frame_rate, metavar="FPS", help="frame rate of a folder of frame images")
-    parser.add_argument("--split", default=DEFAULT_SPLIT, metavar="NAME", help="split name in the prediction path")
-    parser.add_argument("--tracker", default=DEFAULT_TRACKER, metavar="NAME", help="tracker name in the prediction path")
+    parser.add_argument(
+        "--fps",
+        type=_frame_rate,
+        metavar="FPS",
+        help="frame rate of a folder of frame images, when no label file is given",
+    )
+    parser.add_argument(
+        "--split",
+        default=DEFAULT_SPLIT,
+        metavar="NAME",
+        help=f"split name in the prediction path (default: {DEFAULT_SPLIT})",
+    )
+    parser.add_argument(
+        "--tracker",
+        default=DEFAULT_TRACKER,
+        metavar="NAME",
+        help=f"tracker name in the prediction path (default: {DEFAULT_TRACKER})",
+    )
     parser.add_argument("--detections", type=_path, metavar="FILE", help="first part of the clip run of the detector")
     parser.add_argument("--calibration", type=_path, metavar="FILE", help="first part of the clip run of the calibration")
     parser.add_argument(
@@ -4181,7 +4203,10 @@ def _add_stream(commands: Any) -> None:
         type=_history,
         default="default",
         metavar="N",
-        help="frames of the window before the decided frame, clip, or default (stream.default_history_frames)",
+        help=(
+            "frames of the window before the decided frame, or clip; default: the longest join plus the votes of a "
+            "team-key change (123 frames at 25 frames per second with the default settings)"
+        ),
     )
     parser.add_argument(
         "--kit-warmup",
@@ -4319,13 +4344,21 @@ def _add_clip_job(commands: Any) -> None:
     parser = commands.add_parser(
         "clip-job", help="write every frame of one clip and the settings that an external tool must run on"
     )
-    parser.add_argument("--tool", choices=tuple(TOOL_PROBES), required=True, help="the tool of the job")
+    parser.add_argument(
+        "--tool",
+        choices=tuple(TOOL_PROBES),
+        required=True,
+        help="the tool of the job: a detector family, which must be the family of the settings file, or pnlcalib",
+    )
     parser.add_argument(
         "--clip",
         type=_path,
         required=True,
         metavar="DIR",
-        help="a folder of frame images, or a clip folder of the dataset",
+        help=(
+            "a clip folder of the dataset, or a folder of frame images below --root; "
+            "for a video file, run video-frames first"
+        ),
     )
     parser.add_argument(
         "--config", type=_path, metavar="FILE", help="settings file of the run (YAML); default: the built-in settings"

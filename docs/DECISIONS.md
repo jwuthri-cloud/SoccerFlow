@@ -3452,6 +3452,170 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
      M39 is fixed to a November day, so it does not fail then; the runbook sentence should say
      both prices.
 
+## 2026-11-23 — Rehearsal of the commands of 23 Nov, the budget at both prices and the owner decisions
+
+Session C of round 6. Base `main` 0c2ac24. The owner's first session on the run machine follows
+`docs/HANDOVER.md`, section 6, and `docs/RUNBOOK.md`. Both were rehearsed on 22 Nov (entry
+"Rehearsal of the handover and the runbook"), before the code of 23 Nov added video input,
+a second detector family, the streaming path and new tests of the money guards. This entry
+records the walk of the new commands, the budget at the two prices, the list of open owner
+decisions, and what changed in the documents.
+
+1. **Method** (the one of 22 Nov). A scratch clone of 0c2ac24 outside the repository, with a home
+   folder of its own (so `~/pitchvlm-data` was a scratch folder), its hooks installed, a
+   deny-list of comments only, and the work tree `../pitchvlm-results` on the branch `results`.
+   The environment of the main checkout (Python 3.13, no SDK, no Pillow, no torch). Data: 34
+   synthetic clips (`synth.SyntheticScene`, seeds 300 to 333, not used before), JPEG, first with
+   50 frames, then with 750 frames (30 s at 25 frames per second); the real `data` command
+   extracted them from a local archive and wrote the split list (probe 24, dev 6, fresh 3,
+   reserve 1), with no request. Paid commands ran through a wrapper that sets the day that the
+   code sees (30 Nov or 1 Dec 2026, by replacing `datetime` in `cli` and `doctor`) and replaces
+   the model backend by one that raises at its first call; for the doctor it also takes the
+   checks of the SDK and of the key as passed. So no request could leave the machine. The tools:
+   clip runs written from the truth of the scene with the part writer of `tools/run_tool.py`.
+   The wrapper, the data script and the tables script are in the notes of this group of
+   sessions, not in the repository.
+2. **Walk of the commands** (verdicts: A agrees, D document wrong and fixed, N cannot be checked
+   on the build machine).
+
+   | Command | What happened | Verdict |
+   |---|---|---|
+   | `data --split valid --manifest --seed` (local archive) | as HANDOVER step 6 says | A |
+   | first commit in the clone | a hook of a git template of the build machine ran first and failed; `pre-commit install -f`, the row of HANDOVER 13, repaired it | A |
+   | `doctor --no-api` | `[ok  ] guard hooks`, `[ok  ] deny-list`, `[info]` for SDK and keys, exit 0 | A |
+   | `demo`, `demo --engine detector` | valid prediction files, exit 0 | A |
+   | `stream --synthetic --frames 250 --delay 25` (with and without `--allow-dirty`), `--delay clip` | exit 0, times per frame printed | A |
+   | `clip-job` x 2, clip runs, `run --detections --calibration` on a dev clip of 750 frames | "this run makes no model call and costs nothing", exit 0 | A |
+   | `stream` on those clip runs, then `--delay clip` | exit 0; the control line "a delay of whole clip" | A |
+   | `stream --lines` with a missing file; `stream` with the number settings | one error line each, exit 2 | A |
+   | `tool-job` of the 5 files of the second family; `--max-clips 2` | "120 frames of 24 clips", "10 frames of 2 clips" | A |
+   | `tools/run_tool.py dfine`, `rtdetrv2` without torch | "the package torch is not installed here", exit 2 | A |
+   | `tool-score` without a run file; `probe --video-dir` inside the clone; `doctor --video --no-api` | one error line each, exit 2 | A |
+   | `sync` | lists the clip runs as tool runs; HANDOVER step 14 did not say that its `add` takes `results/tools` | D |
+   | `guard.py --tracked`, `--push` | exit 0 | A |
+   | `pytest tests/test_guard.py -rs` | 152 passed; HANDOVER step 1 said 150 | D |
+   | `tools/run_tests.py`, then `-m "slow or not slow"` | 3,410 passed, 1 skipped, 9 deselected, exit 0 (82.3 s, load 11.8); 3,419 passed, 1 skipped, exit 0 (62.3 s, load 14.8); HANDOVER said 3203 | D |
+   | `doctor --models gemini-4-argon,gemini-3.8-flash` without key | `[fail] API key`, "The contract checks did not run", exit 1 | A |
+   | `probe people --max-clips 2` with the real backend, no SDK, no key | estimate and budget line, then `error: The environment variable GEMINI_API_KEY is not set or is empty. ...`, exit 2 | A |
+   | estimates of doctor, pilot, kill switch, OpenRouter doctor | equal to HANDOVER 6 on 30 Nov; no December value was written | D |
+   | `doctor --video` | 0.144 USD for 8 calls; RUNBOOK 13 gave only the video part | D |
+   | `doctor --video --models openrouter:...` | no video request planned, `[fail] video boxes` without a call | A |
+   | the three video probes | 2.382 / 4.764, 2.105 / 4.211, 2.267 / 4.534 USD; RUNBOOK 13 says 2.390 / 4.780, 2.108 / 4.215, 2.275 / 4.549 (another set of synthetic clips); 1 to 4 % lower on clips of 50 frames | D (note) |
+   | `run --replay` and the paid run of a dev clip | 2.345 USD for 179 calls, stops above 3.048; 4.690 USD from 1 Dec; RUNBOOK 4 named November only | D |
+   | install of the transformers environment, every real call, the download, the scorer, real clips and real videos | not run | N |
+
+   Counts: 23 rows; agrees 15, document wrong 7, cannot be checked 1. No defect of the code was
+   found (item 6 names one behaviour).
+3. **Fixes of the documents** (one line each):
+   - HANDOVER 1: the state of 23 Nov (what was added, the counts of the tests, this rehearsal).
+   - HANDOVER 5: the reading order names RUNBOOK 13 and 14, and the list of decisions.
+   - HANDOVER 6: a table of the 23 steps (paid or free, estimate at both prices, needed or
+     optional); the smallest path to a first result (steps 1 to 11, 14, 15: 0.785 USD until 30
+     Nov, 1.536 USD from 1 Dec); the December estimate in steps 5, 9, 12 and 13; 152 and 3,419 in
+     steps 1 and 2; the folder `results/tools` in step 14; new optional steps 20 (`doctor
+     --video`), 21 (video pilot), 22 (second detector family), 23 (`stream` on a dev clip).
+   - HANDOVER 8: how the price is chosen (start day of the command for the estimate, day of the
+     answer for the cost, both UTC), the run across midnight of 30 Nov, the price change of the
+     flash and robotics models on 1 Jan 2027, and the budget tables (item 4).
+   - HANDOVER 11: "each doctor run stops above 2 USD" (the code); the list of 41 open owner
+     decisions in place of the sentence "28 decisions of the owner are open" (item 5).
+   - HANDOVER 12: the state of each date and a proposed order without dates (item 7).
+   - RUNBOOK 2 and 4: both prices for the doctor, the pilot, a clip and a number request; the
+     rule "tell the owner when the doctor runs cost more than about 1.3 USD" now reads "when the
+     measured doctor runs and the estimate of the pilot pass 2 USD together", because the pilot
+     costs 1.3 USD from 1 Dec. The phrases that `test_vlm_cost.py` reads ("About 2.3 USD for a
+     clip of 30 seconds", "about 0.009 USD each with the default token estimates") stay.
+   - RUNBOOK 13: the printed total of `doctor --video`, the estimate of the video pilot, and the
+     note that the estimate of a video probe depends on the sampled frames.
+   - PLAN: the state of the milestones and of the to-dos on 23 Nov; the printed estimates of a
+     clip and of the budget table at both prices; PnLCalib can be used by the pipeline since 22
+     Nov (the risk text said it could not).
+   - `cli.py`, help strings only: `stream --frames`, `--split`, `--tracker` now name their
+     defaults; `stream --history` names its default in words, not by a function name; `stream
+     --config` names the file whose engines it takes; `stream --fps` says "when no label file is
+     given", as `run` does; `clip-job --tool` says that the family must be that of the settings
+     file; `clip-job --clip` says that it must lie below `--root` and that a video needs
+     `video-frames` first.
+4. **Budget at both prices** (printed by the code, estimates, not measured; the tables are in
+   HANDOVER 8 and were generated from the printed lines, not typed). The code takes the price of
+   the start day of a command (`cli.py`, `datetime.now(UTC).date()`) for the estimate and of the
+   day of each answer for its cost (`vlm/cost.py`, `response.created_at`).
+   - First session: needed steps 0.785 USD until 30 Nov, 1.536 USD from 1 Dec; with every
+     optional paid step of section 6, 1.367 and 2.686 USD. Every run stays below its own limit
+     by construction (1.3 times its estimate; 2 USD for a doctor); the hard stop is 132 USD or
+     more away.
+   - One clip of 30 s, model engine: 2.345 USD until 30 Nov, 4.690 USD from 1 Dec, 1.172 and
+     2.345 USD through flex. The doctor, the pilot and the full probes (one setting, number two):
+     12.61 USD until 30 Nov at the standard price, 25.18 USD after it.
+   - The whole plan of `docs/PLAN.md`, one pass of each item: 75.92 USD at the standard price
+     until 30 Nov, 38.34 USD through flex until 30 Nov, 151.81 USD at the standard price from 1
+     Dec (above the hard stop), 76.67 USD through flex from 1 Dec. Probes before 1 Dec and the 27
+     clip passes after it through flex: 75.92 USD. Flex failing after 1 Dec: 139.24 USD, or
+     92.34 USD with the cut of the plan (17 clip passes). The three video arms are not in the
+     plan: 6.75 USD until 30 Nov, 13.51 USD at the standard price from 1 Dec. A first version of
+     these totals held the video arms (found by the second reader, item 11); they are out now.
+   - Not verified: every number above uses the token estimates of 22 Nov; the cost pilot
+     replaces them. The number requests of a clip are a guess (50).
+5. **Owner decisions.** HANDOVER 11.1 lists 41 open decisions from every entry of this file and
+   from pull request 2, grouped by the first step that waits for each, with options, the
+   recommendation of the session that raised it, the default and what it blocks. Raised by this
+   session (each a recommendation, not a decision): which paid steps run before 1 Dec (the first
+   sessions and the full probes; decision 11); the tier of the process tests (as now; 9); the
+   ledger line of an answer without a cost (after the first OpenRouter doctor; 13); the
+   captions of the check images (keep for the kill switch; 21); uploads above 20 MB (keep the
+   refusal; 33); pull request 2 (decide before the key prompt of section 4.1; 1).
+6. **Behaviour to know, not changed** (inferred from the code, not run): a standard-price run
+   that starts on 30 Nov and runs past 00:00 UTC pays its later answers at the new price
+   against an estimate at the old one, so the 1.3 times stop can end it. HANDOVER 8 says so. A
+   guard that refuses a start when the estimate day and the next day differ in price would be a
+   change of the money code (sessions of the money code, not this one).
+7. **The test** (`tests/test_documented_commands.py`, default run, 18 new tests, 27 in all). It now also
+   reads the text around the blocks: every file of the repository that inline code names
+   (paths, modules below `src/pitchvlm`, experiment files by their bare name, which must load);
+   every command in inline code (`doctor --video`, `clip-job --tool dfine`, `tools/run_tool.py
+   dfine`), with its options and values; every inline option of RUNBOOK 11 to 14 and HANDOVER 6
+   (`--video-dir`, `--delay clip`); every reference "RUNBOOK, section N" or "HANDOVER, section
+   N.M", with a quoted title that must be a heading of that section; the numbering of the RUNBOOK
+   without a gap; that sections 11, 13 and 14 hold commands that the reader sees; and that the
+   help of every option with a default names it. Four drifts planted in the real documents (the
+   experiment file `people_probe_video_lo.yaml` in the table of RUNBOOK 13, the option
+   `--videos-dir` in its text, `stream --delays N` in RUNBOOK 14, the heading "A video as the
+   clip" in a reference of HANDOVER 6) made it fail with one line each; the test before this
+   change found none of the four. The help test fails on the `cli.py` of 0c2ac24 (three
+   options). The same kinds are kept as unit tests of the reader.
+8. **Proposed text for `CLAUDE.md`** (section "Commands"; the owner applies it; it replaces the
+   proposals of the entries "A faster default run of the offline tests", item 8, "Rehearsal of
+   the handover and the runbook", item 8, and "The offline tests in several processes", item
+   11): the commands block of item 11 of the last of these, and as the last paragraph: "The
+   run-machine commands (`doctor`, `data`, `oracle`, `probe`, `tool-job`, `tool-score`,
+   `clip-job`, `video-frames`, `overlay`, `run`, `stream`, `eval`, `sync`) are in
+   `docs/RUNBOOK.md`. The order of the first session on the run machine is in
+   `docs/HANDOVER.md`, section 6, and the open decisions of the owner are in its section 11.1."
+9. **What the parallel sessions of round 6 may change** (written for `main` 0c2ac24): session A
+   (review of round 5: video input, the transformers adapter, `fallbacks/`, `config.py`) may
+   change the lines of `doctor --video`, the estimates of the video probes and the commands of
+   the second family (HANDOVER 6, steps 20 to 22, and the rows 20 and 21 of the budget table);
+   session B (live feed) may change `stream`, its help, RUNBOOK 14 and the live mode of the tool
+   script (HANDOVER 6, step 23, and decision 39). The test of item 7 fails when a command,
+   option or file that these documents name goes away.
+10. **Not verified.** Every real call, real cost, real clip, real video and the install of every
+    tool environment; the token rate of video; the frame counts of real clips (750 assumed). The
+    test counts are those of the build machine.
+11. **Second read** (one subagent, given the diff and not these conclusions). Medium, confirmed
+    and fixed: the totals of the whole plan held the three video arms, which the same text called
+    "not in the plan" (82.68 / 41.72 / 165.32 / 83.43 USD; now 75.92 / 38.34 / 151.81 / 76.67 USD,
+    the arms in a row of their own); the conclusions hold (151.81 and 139.24 USD are above the hard
+    stop). Low, confirmed and fixed: the reader of the text skipped commands written as `python -m
+    pitchvlm.cli ...` or `python tools/run_tool.py ...` and spans whose second word is not an
+    option; references "section N of the RUNBOOK", "RUNBOOK.md, section N" and the second number
+    of "sections N to M"; files below `locks/`; and it read a heading "## 5.1" as section 5. Each
+    now has a case in the planted text of the test. Low, fixed: decision 39 put a state in the
+    column of the recommendation, decision 35 its recommendations in the column of the options,
+    and decision 1 named an application. Kept: the help test accepts a help text that has the
+    word "default" without its value. Confirmed right: every other number (recomputed), the help
+    edits change no behaviour, the print claims of steps 20 to 23 (each traced to its `print`),
+    no owner decision is missing, and none is decided.
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same
@@ -3511,6 +3675,9 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
   same frames and with steps of the same length?
 
 Decisions for the owner that are open, each with its recommendation:
+
+The complete list of 23 Nov 2026, with the decisions of the later entries, the options, the
+default when nothing is decided and what each one blocks, is in `docs/HANDOVER.md`, section 11.1.
 
 - **Label penalty.** Keep the growth with missed keyframes for the role and the team key, or
   let it grow for the team key only. Recommendation: keep it now. Take the growth for the team

@@ -156,8 +156,9 @@ Run one paid command at a time (section 4, money).
 # 1. The machine. No model call.
 python -m pitchvlm.cli doctor --no-api
 
-# 2. The contract of the model API, gate G0. Paid: about 0.13 USD for these two models (an
-#    estimate that is not measured yet). The checks stop above the 2 USD of gate G0.
+# 2. The contract of the model API, gate G0. Paid: about 0.13 USD for these two models until
+#    2026-11-30, 0.23 USD from 2026-12-01 (estimates, not measured; docs/HANDOVER.md, section 8).
+#    The checks stop above the 2 USD of gate G0.
 python -m pitchvlm.cli doctor --models gemini-4-argon,gemini-3.8-flash \
     --out ../pitchvlm-results/results/metrics/doctor.json
 
@@ -183,7 +184,8 @@ python -m pitchvlm.cli oracle --root ~/pitchvlm-data --split valid \
 mkdir -p ../pitchvlm-results/results/metrics
 cp ~/pitchvlm-data/oracle/valid/oracle.json ../pitchvlm-results/results/metrics/oracle_valid.json
 
-# 5. Cost pilot: the first 2 clips of the probe group. Paid: about 0.7 USD for the three probes.
+# 5. Cost pilot: the first 2 clips of the probe group. Paid: about 0.7 USD for the three probes
+#    until 2026-11-30, 1.3 USD from 2026-12-01 (estimates, not measured).
 python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe.yaml \
     --root ~/pitchvlm-data --max-clips 2 --out ../pitchvlm-results/results/metrics/pilot_people.json
 python -m pitchvlm.cli probe pitch --experiment configs/experiments/pitch_probe.yaml \
@@ -256,8 +258,9 @@ python -m pitchvlm.cli probe number --experiment configs/experiments/number_prob
   command line make their estimates from them.
 - The answers of the pilot stay in the cache. The full probes use them again and do not pay twice.
 - Planned budget for doctor and cost pilot together: 2 USD. One doctor run can use this amount
-  alone, because it stops only above 2 USD. When the doctor runs cost more than about 1.3 USD
-  together, tell the owner before the cost pilot (about 0.7 USD).
+  alone, because it stops only above 2 USD. When the measured cost of the doctor runs and the
+  estimate of the cost pilot (about 0.7 USD until 2026-11-30, 1.3 USD from 2026-12-01) are above
+  2 USD together, tell the owner before the cost pilot.
 
 ## 3 Probes
 
@@ -629,7 +632,8 @@ python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
     --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
     --out ~/pitchvlm-data/runs/dev --replay
 
-# Paid run: the same command without --replay. About 2.3 USD for a clip of 30 seconds.
+# Paid run: the same command without --replay. About 2.3 USD for a clip of 30 seconds until
+# 2026-11-30; from 2026-12-01 about 4.7 USD at the standard price, 2.3 USD through the flex tier.
 python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
     --labels ~/pitchvlm-data/SoccerNetGS-valid/<clip>/Labels-GameState.json \
     --out ~/pitchvlm-data/runs/dev
@@ -654,7 +658,8 @@ python -m pitchvlm.cli run --clip ~/pitchvlm-data/demo/<clip>.mp4 \
 - The cost estimate of a clip assumes 50 number requests. This is a guess from the synthetic
   clip (48 to 50 requests in 30 seconds); the real number is in `result.json` under
   `provenance.cost.requests`. With the default token estimates a clip of 30 seconds is estimated
-  at about 2.3 USD.
+  at about 2.3 USD until 2026-11-30 and 4.7 USD from 2026-12-01 at the standard price (half of it
+  through the flex tier; `docs/HANDOVER.md`, section 8).
 - A run that stops because of the network, or that is interrupted (Ctrl-C, a plain kill, a
   closed terminal), keeps the answers that it received in the cache. Start it again: it goes
   on. The model calls in flight finish first, so a command can take up to the client timeout
@@ -770,9 +775,10 @@ python -m pitchvlm.cli run --clip ~/pitchvlm-data/SoccerNetGS-valid/<clip> \
     --config configs/arms/g4_both_repairs.yaml --out ~/pitchvlm-data/runs/g4-both --replay
 ```
 
-- Money: the estimate line of the paid run counts every request of the clip (about 2.3 USD), but
-  the stored answers cost nothing. Only the number requests of the tracks that the split changed
-  are new: about 0.009 USD each with the default token estimates (an estimate, not measured).
+- Money: the estimate line of the paid run counts every request of the clip (about 2.3 USD; 4.7
+  USD from 2026-12-01), but the stored answers cost nothing. Only the number requests of the tracks
+  that the split changed are new: about 0.009 USD each with the default token estimates (twice
+  that from 2026-12-01, by the price table; an estimate, not measured).
   The run limit of 1.3 times the estimate does not stop such a run. Run one clip at a time.
 - Each run prints the tracking values without labels (births inside the image, steps faster than
   9 m/s, team-key changes, tracks per team) and writes them into `result.json` under
@@ -1671,7 +1677,8 @@ First check, gate G0, inside its 2 USD. Ask the owner first: it is paid.
 ```bash
 # Contract checks of Gemini with the video check: 7 image calls and 1 video call. The video check
 # alone is estimated at 0.048 USD for gemini-4-argon until 2026-11-30, 0.095 USD from 2026-12-01
-# (the price change of the table), 0.018 USD for gemini-3.8-flash: estimated, not measured.
+# (the price change of the table), 0.018 USD for gemini-3.8-flash: estimated, not measured. The
+# command prints 0.144 USD for 8 calls until 2026-11-30 and 0.289 USD from 2026-12-01.
 python -m pitchvlm.cli doctor --video \
     --out ../pitchvlm-results/results/metrics/doctor_video.json
 ```
@@ -1703,10 +1710,14 @@ model first, so that both metrics files exist.
 
 These are estimates, not measurements: the output of a video frame is taken to be the 1,400 tokens
 of an image frame, and the output tokens are most of the cost. The printed estimate of a run is
-the number that counts.
+the number that counts. It depends on where the sampled frames lie in each clip: a second set of
+24 synthetic clips of 750 frames printed 2.382 / 4.764, 2.105 / 4.211 and 2.267 / 4.534 USD for the
+three video files (inferred: a target near the start or the end of a clip has fewer context
+frames; on clips of 50 frames the estimates were 1 to 4 % lower).
 
 ```bash
-# Cost pilot first: 2 clips. The videos are written before the estimate is printed.
+# Cost pilot first: 2 clips. The videos are written before the estimate is printed: about 0.18 USD
+# until 2026-11-30, 0.35 USD from 2026-12-01 (estimated).
 python -m pitchvlm.cli probe people --experiment configs/experiments/people_probe_video_low.yaml \
     --root ~/pitchvlm-data --max-clips 2 --out ../pitchvlm-results/results/metrics/pilot_people_video_low.json
 # Then the whole probe group. The answers of the pilot are used again.
