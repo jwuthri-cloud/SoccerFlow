@@ -3452,6 +3452,314 @@ stand-ins of the model and the tools, videos written by OpenCV. None is a result
      M39 is fixed to a November day, so it does not fail then; the runbook sentence should say
      both prices.
 
+## 2026-11-23 — The live feed of the detector engine (session B of round 6)
+
+1. **Goal and result.** Round 5 built a stream that decides frame `t` once frame `t + L` is in,
+   but it read finished clip runs: no tool wrote a line per frame, nothing joined the feeds of the
+   two tools, and two results stood against real time (dissolves known about 30 frames late; the
+   95th percentile of the frame time above 40 ms on a loaded machine). Built: a live mode of
+   `tools/run_tool.py`, a merger of the two tool feeds (`feed.py`, command `merge-feeds`), a queue
+   with back-pressure in `stream --lines -`, the paint score on its own thread, an early dissolve
+   test, a latency log, a bench of the whole chain as real processes (`evalx/livebench.py`), and
+   the fixes of an independent second read of `stream.py`. Everything is measured on the build
+   machine with synthetic clips and stand-ins of the tools; nothing ran with a real tool.
+   **Results:** (a) dissolve hypothesis **holds** on the held-out seeds: with the early test the
+   stream at L = 25 equals the offline engine on 10- and 20-frame dissolves (exact boxes: every
+   paired difference 0; noisy boxes: every interval holds 0), where without it +4.3 switches;
+   (b) paint hypothesis **fails**: off the frame path the 95th percentile drops by about 5 to 10 ms
+   at a load average of 12 to 17, but under a load of 12 spinning processes it stays above 40 ms
+   in 2 of 3 runs (`main` in 3 of 3); (c) the chain of four processes gives, frame for frame, the
+   result of the clip-run path; (d) latency: table in item 8.
+2. **Live mode of the tool script** (`tools/run_tool.py`, new class `LiveFeed`, function
+   `run_live`, a hook in the per-frame loop `answer_frames`; the transformers adapter functions
+   are untouched). `--feed FILE|-` (a clip job only) writes the tool feed: a header
+   `{"format": "pitchvlm-tool-feed-1", "clip", "n_frames", "video_sha256", "job_sha256", "tool"}`,
+   then one line per frame, written and flushed as soon as its batch is answered,
+   `{"frame", "seconds", "arrived_at", "payload"}` (the compact detector payload of a clip run).
+   `--out` gets a copy of the feed instead of a clip run. `--pace FPS` reads frame `i` not before
+   the start plus `i / FPS` (a recorded clip played as a camera sends it); `--start-at` gives two
+   tools one start (seconds since the epoch). `--skip-behind` (pace, batches of 1) takes the
+   newest frame that has come and writes `{"frame", "arrived_at", "skipped": true}` for each frame
+   it leaves out. The script still imports neither the package nor a tool at module level and
+   takes the API keys out of its environment first (rule 4). A test checks that the line of frame
+   `i` is in the feed before the tool gets frame `i + 1`.
+3. **The merger** (`feed.FeedMerger`, `feed.merge_feeds`, `merge-feeds --detector --calibration
+   [--wait 1] [--queue 250]`). Policy, as written in the module docstring and tested case by case
+   (`tests/test_feed.py`, 25 tests):
+   - The stream header goes out when both headers are in; another clip, number of frames, video
+     or tool stops the merger before any line (exit 2).
+   - Frames go out in order, each once, as soon as both parts are in. The wait is bounded: the
+     clock of frame `n` starts when a line of frame `n` or later first comes from either tool (not
+     before both headers); after `--wait` seconds a part that is not in goes out as
+     `{"missing": "late"}`. Each frame has its own clock, so a stalled tool delays the stream by
+     one wait, not one wait per frame (test: a stall of 2 frames costs 1.0 and 1.0 s from 12.0 and
+     12.1 s, not 2 s).
+   - A slower tool: its parts are taken while they come within the wait. A tool that dies (its
+     pipe closes): its parts go out as `ended` with no wait; when both feeds have ended the stream
+     stops early and `stream` says so. A skipped frame goes out as `skipped` with no wait.
+   - Lines out of order wait for their frame. A line of a frame that went out (`late lines`), a
+     second line of a frame (`repeated`), a line that is not a frame line or names a frame outside
+     the clip (`broken`: its frame waits as if it had not come), and a last line without its line
+     end (`cut-off`) are dropped and counted. Report on the error stream; exit 1 when anything was
+     missing or dropped.
+   - Frames are decided one at a time, and the lines that came while the merger wrote a line are
+     applied before the next frame is decided, so a slow reader makes no part late. After the last
+     frame a feed that is still open is read to its end, so the pipe of a slow tool does not break.
+   - `stream` reads a missing detector part as a frame without people and a missing calibration
+     part as a frame without a camera (the camera then comes from the nearest earlier one, moved
+     with the motion, as in round 5). The format of the stream lines is now `pitchvlm-stream-2`:
+     the header names `n_frames` and `video_sha256`, a part may be `{"missing": reason}`, and a
+     part may carry `arrived_at`.
+4. **Back-pressure policy: delay, never drop.** Every frame carries a step of the camera motion,
+   of the cut tests and of the matching, so a frame cannot be left out of the stream without
+   breaking them. `stream --lines` reads on a thread into a queue of `--queue` lines (default 50,
+   2 s at 25 fps; `stream.QueuedLines`), and the merger reads each feed into a queue of 250 lines.
+   A full queue stops the reading of its pipe; the pipe fills and its writer waits. So a slow
+   stream slows the merger and then the tools; nothing is dropped; the delay shows in the latency
+   log (the reader thread notes when each line was read, so the time in the queue counts). Where
+   dropping is wanted, it is at the source: `--skip-behind` of a tool that cannot keep the pace
+   (the published time of PnLCalib is 439 ms per frame, item 8); the stream then gets frames
+   without a camera. Tests: a reader of 3 lines stops a producer of 20 after 4 lines and gives all
+   20 in order; a merged writer of 20 ms per line with queues of 2 lines gives 30 of 30 frames
+   whole with a wait of 50 ms (no part declared late while its tool was held back). Not built:
+   deciding several waiting frames on one window to catch up (it would make the result depend
+   on the timing).
+5. **The paint score off the frame path** (`stream._PaintWorker`): one thread; a frame waits only
+   when 4 scores are open (`PAINT_MAX_PENDING`; test with a held score: the push of keyframe 48
+   waits while 0, 12, 24 and 36 are open). Equal results: the control (`--delay clip`) still
+   equals the clip path in its paint scores (existing test), and a test compares each score with
+   `paint_alignment` on the same frame. Measurement (fixed before the run): hypothesis "the 95th
+   percentile of the frame time stays under 40 ms at a load where `main` is above"; baseline
+   `main` 0c2ac24 (a `git archive` of that commit); the same bench call in both trees
+   (`streambench.time_lines(250, 600, (25,), 1)`: plain clip, seed 600, exact boxes, L = 25, the
+   default window); order main, branch, branch, main, main, branch per block; block 1 as the
+   machine was, block 2 with 12 extra processes that spin (14 cores). Milliseconds per frame,
+   median / 95th percentile / largest, n = 250 frames per run:
+
+   | block | arm | run | load before | total | paint stage | decide | motion |
+   |---|---|---|---|---|---|---|---|
+   | as is | main | 1 | 17.3 | 18.5 / 29.6 / 34.3 | 0.00 / 12.4 / 14.0 | 9.5 / 13.5 / 24.9 | 7.6 / 8.4 / 8.9 |
+   | as is | branch | 1 | 16.1 | 18.1 / 23.1 / 37.2 | 0.00 / 0.02 / 0.18 | 9.6 / 13.7 / 29.3 | 7.5 / 8.8 / 11.3 |
+   | as is | branch | 2 | 14.7 | 18.3 / 25.5 / 37.6 | 0.00 / 0.02 / 0.11 | 9.6 / 15.8 / 29.2 | 7.6 / 9.1 / 13.4 |
+   | as is | main | 2 | 15.1 | 17.7 / 29.3 / 35.1 | 0.00 / 12.3 / 13.7 | 9.0 / 13.1 / 25.0 | 7.5 / 8.4 / 9.7 |
+   | as is | main | 3 | 14.3 | 18.5 / 30.5 / 44.4 | 0.00 / 12.6 / 16.9 | 9.3 / 16.1 / 36.3 | 7.7 / 9.7 / 12.9 |
+   | as is | branch | 3 | 13.5 | 16.9 / 19.2 / 34.1 | 0.00 / 0.02 / 0.11 | 8.4 / 10.3 / 26.0 | 7.3 / 8.7 / 11.0 |
+   | loaded | main | 1 | 13.2 | 23.9 / 44.3 / 57.7 | 0.00 / 20.3 / 27.6 | 9.1 / 15.9 / 40.1 | 12.8 / 17.6 / 38.5 |
+   | loaded | branch | 1 | 15.3 | 23.7 / 41.2 / 79.4 | 0.00 / 0.04 / 1.72 | 9.2 / 21.3 / 57.3 | 12.9 / 22.0 / 31.7 |
+   | loaded | branch | 2 | 16.1 | 27.0 / 45.3 / 136.5 | 0.00 / 0.04 / 5.73 | 9.4 / 23.0 / 109.3 | 14.5 / 24.8 / 46.2 |
+   | loaded | main | 2 | 21.2 | 24.3 / 44.8 / 134.0 | 0.00 / 21.6 / 37.7 | 9.1 / 16.7 / 27.2 | 12.6 / 18.9 / 87.4 |
+   | loaded | main | 3 | 24.7 | 24.3 / 47.4 / 73.3 | 0.00 / 21.2 / 27.9 | 9.2 / 19.7 / 45.4 | 12.5 / 17.6 / 43.5 |
+   | loaded | branch | 3 | 24.6 | 24.7 / 39.6 / 63.2 | 0.00 / 0.04 / 0.21 | 9.4 / 20.2 / 50.2 | 13.0 / 20.5 / 27.7 |
+
+   Reading (n = 3 runs per arm and block, so weak): as is, the 95th percentile is 29.3 to 30.5 ms
+   on `main` and 19.2 to 25.5 ms here, all under 40; loaded, `main` is above 40 in 3 of 3 runs
+   (44.3 to 47.4) and this branch in 2 of 3 (39.6 to 45.3, mean 42.0 against 45.5). **The
+   hypothesis fails.** The paint stage of the frame falls from about 12 (as is) and 21 ms (loaded)
+   at its 95th percentile to 0.04 ms, but under load the score still takes a core, and the motion
+   and the decision grow (their 95th percentiles 17.6 to 24.8 and 15.9 to 23.0 ms). The largest
+   frame is not lower (63 to 136 ms against 57 to 134 ms). The load average of the second block
+   rose from 13 to 25 during the block (other sessions ran too), so the two arms did not see the
+   same load: the order turned, but the load is not controlled. What would help under load: the
+   decision runs the window of 123 + L frames again for every frame (item 7 of the entry of round
+   5); this was not changed here.
+6. **Dissolves: an early test.** `motion.ShotMeter.open_transition(K)`: while a run of low window
+   values is open, `transition_span` is taken with the newest judged frame of the run as the
+   anchor of the new shot; while that anchor is still a blend, the end of the span moves with it.
+   The span is taken once it came out the same for `K` judged windows in a row and its new shot
+   starts at or before the anchor; it is kept until the run ends, and then the final span of the
+   window test replaces it. `measure_shots` never calls it: the offline result is unchanged (the
+   demo predictions of both engines are byte-equal to `main`; the existing dissolve tests pass).
+   `StreamSettings.early_dissolve_windows` = 4 (`None` = the round-5 behaviour).
+   - Fit of `K` (seeds 300 to 309, clips of `tools/synthetic_diagnostics.py dissolve-early-fit`:
+     dissolves of 5 to 25 frames between two shots of 40 frames, the 8 controls of the entry "A
+     dissolve is a transition, not a shot" with pans up to 100 px per frame, zoom, shake, goal
+     kick, 100 frames without a cut; 10 clips per case). Rule fixed before the held-out run: the
+     smallest `K` whose early span has the start of the final span and a stop within 1 frame of
+     it, known at most 25 frames after the start, for dissolves of up to 15 frames, with no early
+     transition on a control. `K` = 1, 2, 3 fail the stop (by up to 6, 3 and 2 frames on 15-frame
+     dissolves); `K` = 4: stops 0 to -1, known 9 to 22 frames after the start (the final span: 31
+     to 38). Controls: 0 early transitions in 80 clips at every `K` (no control has a low window).
+   - Held-out seeds 400 to 409 (`dissolve-early-held-out`, run once after the fit; `K` = 4):
+
+     | case | clips | taken early | equal to the final span | early minus final (start; stop) | known after the start, frames | final known after the start |
+     |---|---|---|---|---|---|---|
+     | dissolve, 5 frames | 10 | 10 | 8 | 0; -2 to 0 | 9 to 14 | 31 to 33 |
+     | dissolve, 10 frames | 10 | 10 | 6 | 0; -2 to 0 | 13 to 17 | 32 to 36 |
+     | dissolve, 15 frames | 10 | 10 | 6 | 0; -4 to 0 | 13 to 21 | 32 to 38 |
+     | dissolve, 20 frames | 10 | 9 | 2 | 0; -1 to 0 | 24 to 25 | 37 to 41 |
+     | dissolve, 25 frames | 10 | 10 | 4 | 0; -2 to 0 | 28 to 33 | 37 to 44 |
+     | 8 controls | 80 | 0 | - | - | - | - |
+
+     The stop rule of the fit (within 1 frame) does not hold on the held-out seeds: the early span
+     ends up to 4 frames before the final one, on blend frames with a weight below about 0.15 (the
+     offline test itself leaves such faint ends out, entry of 2026-11-22). Inferred: these frames
+     get states of the new shot under the early span and none under the final span. Statement:
+     a dissolve of up to 15 frames is known within 21 frames of its start (n = 30 held-out clips),
+     one of 20 frames within 25 (9 of 10 taken early), one of 25 frames within 33; so the stream
+     needs a delay of at least the length of the dissolve plus about 8 to 10 frames, and at least
+     35 frames for dissolves of 25 frames.
+   - The stream against the offline engine (`streambench`, held-out seeds 400 to 409, 250 frames,
+     kinds plain, cut, dissolve (10 frames) and dissolve-20 (20 frames, new), detectors exact and
+     noisy, n = 10 per cell; arms offline, L5, L25 (early test), L25-late (without it), L50;
+     command `PYTHONPATH=src python -m pitchvlm.evalx.streambench --seeds 400-409 --workers 6
+     --kinds plain,cut,dissolve,dissolve-20 --arms offline,L5,L25,L25-late,L50`, load average 13
+     to 30). Criterion fixed before the run: on dissolve clips the paired differences of L25 to
+     offline in switches, coverage and track ratio are 0 in every case with exact boxes, and their
+     95 % intervals hold 0 with noisy boxes. Paired difference to offline, mean [95 % t interval]:
+
+     | kind | detector | arm | switches | coverage | track ratio | side acc. |
+     |---|---|---|---|---|---|---|
+     | dissolve | exact | L25 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.001 [-0.002, +0.000] |
+     | dissolve | exact | L25-late | +4.300 [+3.621, +4.979] | +0.028 [+0.027, +0.029] | +0.187 [+0.157, +0.216] | -0.001 [-0.002, +0.000] |
+     | dissolve | noisy | L25 | -4.200 [-9.941, +1.541] | -0.000 [-0.000, +0.000] | +0.000 (all cases) | +0.000 [-0.002, +0.003] |
+     | dissolve | noisy | L25-late | +2.400 [-3.920, +8.720] | +0.037 [+0.014, +0.060] | +0.200 [+0.091, +0.309] | +0.000 [-0.002, +0.003] |
+     | dissolve-20 | exact | L25 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | -0.001 [-0.002, +0.000] |
+     | dissolve-20 | exact | L25-late | +3.900 [+3.113, +4.687] | +0.049 [+0.047, +0.050] | +0.170 [+0.135, +0.204] | -0.001 [-0.002, +0.000] |
+     | dissolve-20 | noisy | L25 | +2.900 [-3.449, +9.249] | -0.001 [-0.002, +0.000] | +0.009 [-0.004, +0.022] | -0.001 [-0.002, +0.000] |
+     | dissolve-20 | noisy | L25-late | +11.000 [+4.837, +17.163] | +0.044 [+0.042, +0.046] | +0.261 [+0.215, +0.307] | -0.001 [-0.002, +0.000] |
+     | dissolve | exact | L5 | +5.200 [+1.073, +9.327] | +0.040 [+0.023, +0.057] | +0.226 [+0.047, +0.406] | -0.020 [-0.034, -0.005] |
+     | dissolve | exact | L50 | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) | +0.000 (all cases) |
+     | plain | noisy | L25 | -6.400 [-11.347, -1.453] | +0.000 [-0.001, +0.001] | +0.000 (all cases) | -0.000 [-0.002, +0.001] |
+     | cut | noisy | L25 | -5.600 [-11.847, +0.647] | +0.000 [-0.000, +0.001] | +0.000 (all cases) | +0.000 [-0.002, +0.003] |
+
+     **The hypothesis holds** on these seeds for dissolves of 10 and 20 frames. On plain and cut
+     clips L25 and L25-late are equal in every value (the early test changes nothing without a
+     dissolve: no false cut). L25 on noisy plain clips has fewer switches than offline (-6.4, as
+     in round 5: a late join does not take back a given id). The full tables (all arms, means and
+     spreads) are in the output of the command; the clip-level cut count on the controls is item 6
+     above (0 of 80).
+7. **Second read of `stream.py` as a whole** (one independent subagent on a copy of 0c2ac24, every
+   finding with a reproduction it ran; repro scripts not kept in the repository):
+   - Minor, fixed: the whole-clip control differed from the clip path when the first frame of a
+     shot had no camera: at arrival that frame was matched without pitch positions, while the
+     clip path takes the camera of a later frame (cut clip, 60 frames, only frame 30 without a
+     camera, miss 0.3 and 4 px noise: 29 or 30 of 60 frames differed on 4 of 4 seeds). Fix: with a
+     history of the whole clip, `finish` matches the whole clip again with the cameras of the
+     whole clip (people of blend frames and people off the pitch dropped as `run_clip` does).
+     After the fix: 0 of 60 frames differ in all 12 cases of the reproduction; test
+     `test_the_control_matches_the_first_frame_of_a_shot_without_a_camera_with_a_later_camera`.
+   - Small, fixed: an infinite tool time passed the reader and broke `result.json` at the end
+     (now refused with its line number, also NaN and infinity anywhere in a line); a deeply
+     nested line raised `RecursionError` past the command (now "no JSON" with its line number); a
+     ball candidate of another frame was accepted by `push` and failed 5 frames later naming the
+     wrong frame, leaving the stream broken (now refused at its push, before any change). Each has
+     a test.
+   - Refuted by the reader (by running): the forgetting of `_forget` (96 combinations against a
+     stream that keeps everything: identical), the control on cuts at the clip edges and on plain
+     clips with half the cameras dropped, `_StreamIds` (no duplicate id), `_PitchMemo`, `finish`
+     with a delay longer than the clip, and 12 more kinds of wrong lines.
+   - Second read of this session's own work: item 10.
+8. **End-to-end latency** (`PYTHONPATH=src python -m pitchvlm.evalx.livebench --runs 3 --delays
+   5,25`): four processes as on the run machine (two `tools/stand_in_tool.py` in live mode with
+   `--pace 25` and one `--start-at`, `merge-feeds` between two named pipes, `stream --lines -`
+   through a pipe), a synthetic clip of 250 frames (seed 500) written as PNG files. The tools are
+   stand-ins that answer from a file after an added delay per frame. **The delays are a
+   simulation, taken from published values, not measured:** `fast` 4.4 ms per frame for both
+   tools (RF-DETR Medium, T4, TensorRT FP16, entry of 2026-11-22); `rfdetr-small-m4` 20.0 ms for
+   both (RF-DETR Small, plain `predict`, M4 Max, entry of 2026-11-14); `pnlcalib-paper` 20.0 ms
+   for the detector and 439 ms for the calibration (the PnLCalib paper, other hardware and
+   settings, entry of 2026-11-14), with `--skip-behind` for the calibration because 439 ms is
+   above the 40 ms of a frame. Milliseconds, median / 95th percentile / largest over the frames
+   decided while the stream ran (n = 250 - L each):
+
+   | profile (simulated ms: detector, calibration) | L | run | load | exit codes | missing parts | arrival to decision | arrival of f + L to decision | line of f + L to decision | stream frame total | largest queue |
+   |---|---|---|---|---|---|---|---|---|---|---|
+   | fast (4.4, 4.4) | 5 | 1 | 3.3 | all 0 | none | 241 / 244 / 247 | 41 / 44 / 47 | 20 / 22 / 26 | 20 / 22 / 25 | 0 |
+   | fast (4.4, 4.4) | 5 | 2 | 3.0 | all 0 | none | 241 / 244 / 246 | 41 / 44 / 46 | 20 / 22 / 24 | 20 / 21 / 23 | 0 |
+   | fast (4.4, 4.4) | 5 | 3 | 3.2 | all 0 | none | 241 / 244 / 246 | 41 / 44 / 46 | 20 / 22 / 23 | 20 / 22 / 23 | 0 |
+   | fast (4.4, 4.4) | 25 | 1 | 3.5 | all 0 | none | 1042 / 1045 / 1047 | 42 / 45 / 47 | 21 / 23 / 24 | 20 / 22 / 24 | 0 |
+   | fast (4.4, 4.4) | 25 | 2 | 3.0 | all 0 | none | 1042 / 1045 / 1047 | 42 / 45 / 47 | 21 / 23 / 25 | 20 / 22 / 24 | 0 |
+   | fast (4.4, 4.4) | 25 | 3 | 2.9 | all 0 | none | 1042 / 1046 / 1048 | 42 / 46 / 48 | 21 / 23 / 24 | 21 / 23 / 24 | 0 |
+   | rfdetr-small-m4 (20, 20) | 5 | 1 | 3.1 | all 0 | none | 258 / 261 / 264 | 58 / 61 / 64 | 21 / 22 / 24 | 20 / 22 / 24 | 0 |
+   | rfdetr-small-m4 (20, 20) | 5 | 2 | 2.9 | all 0 | none | 258 / 262 / 278 | 58 / 62 / 78 | 21 / 23 / 32 | 20 / 22 / 31 | 0 |
+   | rfdetr-small-m4 (20, 20) | 5 | 3 | 3.0 | all 0 | none | 258 / 262 / 265 | 58 / 62 / 65 | 21 / 23 / 25 | 21 / 22 / 25 | 0 |
+   | rfdetr-small-m4 (20, 20) | 25 | 1 | 3.6 | all 0 | none | 1059 / 1063 / 1065 | 59 / 63 / 65 | 22 / 24 / 25 | 21 / 23 / 25 | 0 |
+   | rfdetr-small-m4 (20, 20) | 25 | 2 | 2.8 | all 0 | none | 1059 / 1064 / 1068 | 59 / 64 / 68 | 22 / 23 / 24 | 21 / 23 / 24 | 0 |
+   | rfdetr-small-m4 (20, 20) | 25 | 3 | 3.1 | all 0 | none | 1059 / 1063 / 1066 | 59 / 63 / 66 | 22 / 24 / 25 | 21 / 23 / 25 | 0 |
+   | pnlcalib-paper (20, 439) | 5 | 1 | 3.4 | merge-feeds 1, others 0 | calibration 227 skipped | 646 / 708 / 725 | 446 / 508 / 525 | 157 / 335 / 381 | 30 / 33 / 48 | 10 |
+   | pnlcalib-paper (20, 439) | 5 | 2 | 2.9 | merge-feeds 1, others 0 | calibration 227 skipped | 648 / 710 / 733 | 448 / 510 / 533 | 157 / 332 / 394 | 29 / 33 / 44 | 10 |
+   | pnlcalib-paper (20, 439) | 5 | 3 | 2.9 | merge-feeds 1, others 0 | calibration 227 skipped | 648 / 710 / 726 | 448 / 510 / 526 | 157 / 337 / 393 | 29 / 33 / 45 | 10 |
+   | pnlcalib-paper (20, 439) | 25 | 1 | 2.6 | merge-feeds 1, others 0 | calibration 227 skipped | 1461 / 1514 / 1559 | 461 / 514 / 559 | 168 / 364 / 406 | 31 / 34 / 47 | 10 |
+   | pnlcalib-paper (20, 439) | 25 | 2 | 3.3 | merge-feeds 1, others 0 | calibration 227 skipped | 1461 / 1511 / 1550 | 461 / 511 / 550 | 168 / 363 / 411 | 31 / 35 / 48 | 10 |
+   | pnlcalib-paper (20, 439) | 25 | 3 | 2.5 | merge-feeds 1, others 0 | calibration 227 skipped | 1467 / 1514 / 1531 | 467 / 514 / 531 | 173 / 374 / 443 | 32 / 36 / 59 | 10 |
+
+   Reading (3 runs per cell, load average 2.5 to 3.6, the machine otherwise quiet; the order of
+   the 6 arms turned each run): every run ended with exit code 0 for the stream and the tools,
+   and no part was late. With tools of 4.4 and 20 ms the time from the arrival of frame
+   `f + L` to the decision of `f` is 41 to 59 ms at the median and at most 78 ms; the stream
+   alone (from the reading of the line) 20 to 22 ms at the median and at most 32 ms, and the queue
+   held no line: the stream kept the pace. So a decision comes `L` / 25 s plus about 45 to 60 ms
+   after its frame came (241 to 262 ms at L = 5, 1042 to 1064 ms at L = 25). The gap of about 20
+   ms between the arrival of a frame and its line at the stream is the reading of the PNG file by
+   the tool, its time, the merger and the pipes (not split further). With a calibration of 439 ms
+   per frame and `--skip-behind`, the calibration answers 23 of 250 frames (227 skipped) and every
+   other frame gets the camera moved with the motion; the merger holds each frame until the
+   calibration line of a frame at or after it came, so the decision comes 446 to 467 ms (median)
+   and up to 559 ms after frame `f + L` came, the lines come in bursts (largest queue 10 lines),
+   and `merge-feeds` ends with exit code 1 (skipped parts). An earlier run of the same bench, on
+   the merger before the fix of item 10 and at a load of 6 to 29, had the same values except in 2
+   of 6 runs of this profile, where the 95th percentile grew to 3.4 and 4.4 s and the queue to 49
+   lines: under load the bursts piled up. Not repeated after the fix under that load.
+
+9. **What this does and does not show about real time.** It shows that the chain of four
+   processes runs at a 25 fps pace on the build machine with these simulated tool times, what
+   the queues and the merger add, and how the delay `L` and a slow calibration show in the time
+   from a frame to its decision. It does not show real time: the tools are stand-ins that sleep
+   (a real detector takes a GPU and CPU time beside the stream), the frames are PNG files of a
+   synthetic clip read at a pace (no camera, no decoder), the delays are published values from
+   other hardware, and the build machine ran other sessions (load given per run). The latency of
+   a frame includes the delay of `L` frames by design (`L` / 25 s).
+10. **Second read of this work** (one subagent, before the commit, every finding reproduced by it):
+    - Major, fixed: `merge-feeds` returned once the last frame went out while a slower tool still
+      wrote; the next write of that tool broke its pipe (exit 2) and its copy at `--out` stopped
+      (calibration 300 ms per frame, 20 frames: the copy held 1 of 21 lines). The documented
+      commands also left out `--start-at`, so the tool that was ready later had most of its parts
+      late (120 of 150). Fix: the merger reads every feed to its end; the copy gets each line before
+      the feed; `START` and `--start-at` are in RUNBOOK section 14. After the fix: 21 of 21 lines,
+      no broken pipe; tests `test_the_merger_reads_a_slow_tool_to_its_end_so_that_its_pipe_does_not_break`
+      and `test_the_copy_gets_each_line_before_the_feed`.
+    - Minor, fixed: the merger decided every frame whose wait had run out in one go, so a part
+      that came while a slow reader held a write went out late (detector every 30 ms, reader 200
+      ms per line: 6 to 10 of 12 parts late). Fix: one frame at a time, the waiting lines applied
+      before each; after the fix 0 of 12 late (test
+      `test_a_slow_reader_does_not_make_a_part_late_that_came_while_a_line_was_written`).
+    - Small, fixed: `stream --synthetic --tracker X` was refused although the synthetic clip uses
+      the tracker name; `--skip-behind` with batches above 1 was refused only after the header was
+      in the feed (now before the tool is built). Each has a test.
+    - Refuted by the reader (by running): merger deadlines and header races, both feeds ending,
+      the whole-clip control against `run_clip` (seeds 0 to 3, 30 % missed people, about 15 % of
+      cameras dropped: 0 frames differ), the kit keys before the pitch filter, the paint worker,
+      `open_transition` across runs, the latency pairing of `f` with `f + L`, the pace of
+      `LiveFeed`, and the RUNBOOK commands against `check_stream_options`.
+11. **Other changes.** `--lines` checks the video: the header names `video_sha256` (null for a
+    folder of images) and the number of frames, and `stream` refuses lines of other pixels than
+    `--clip` or of another number of frames (round-5 open point). Options that do not apply are
+    refused, not ignored: `--frames` and `--seed` without `--synthetic`; `--clip`, `--lines`,
+    `--detections`, `--calibration`, `--labels`, `--fps`, `--split`, `--tracker`, `--queue` with
+    it; `--detections`/`--calibration` with `--lines`; `--queue` without `--lines`; `--split` and
+    `--tracker` without `--labels`; `--fps` with a video file (round-5 open point). `result.json`
+    of `stream` adds `paint_timing`, `latency`, `missing_parts` and `transitions_known_at`. The
+    offline `demo` predictions of both engines are byte-equal to `main` 0c2ac24 (SHA-256
+    `bb50efd43536dd71...` for the model engine, `1f97af18358d652b...` for the detector engine);
+    the summaries differ in timing values and the time of writing only.
+12. **Not verified.** A real detector or calibration in live mode, the run machine, a camera or
+    a decoder as the source of frames (the frames here are files), named pipes on Linux (built
+    and run on macOS only), a real dissolve, the early dissolve test on footage (the fit and the
+    held-out clips are synthetic two-shot clips), the latency with real tool times, the paint
+    thread on the run machine, a broadcast clip whose stream is longer than 10 s.
+13. **Proposed owner decisions.**
+    - Keep the early dissolve test on by default (`early_dissolve_windows` 4) with the delay of 25
+      frames: on the synthetic clips it removes the dissolve gap for dissolves up to 20 frames at
+      no cost on clips without a dissolve; a delay of at least 35 frames for longer dissolves.
+    - The calibration in a live run: `--skip-behind` when its time is above 40 ms per frame on the
+      run machine (its published time is 439 ms); else the stream waits for it.
+    - The wait of the merger (default 1 s): it bounds what a stalled tool costs; it must be above
+      the time of the slower tool per frame, or most of its parts go out late.
+    - The paint score in a live run: on its own thread now; under load it still competes for a
+      core. Leave it out of live runs if the run machine shows the 95th percentile above 40 ms.
+    - No text of `CLAUDE.md` is proposed: the package still imports no tool; the stand-in
+      launcher `tools/stand_in_tool.py` imports `run_tool.py` by its name and no tool.
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same

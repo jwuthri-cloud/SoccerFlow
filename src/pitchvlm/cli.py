@@ -90,6 +90,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import tempfile
 import threading
 import traceback
@@ -180,9 +181,12 @@ from pitchvlm.render import draw_mapping_check, render_clip, write_png
 from pitchvlm.roster import Roster, load_roster
 from pitchvlm.schemas import ClipInfo, ClipResult, FrameState, HomographyRecord, PaintCheck, Record
 from pitchvlm.synth import SyntheticScene, SyntheticSource
+from pitchvlm.feed import DEFAULT_QUEUE_LINES, DEFAULT_WAIT_S, FeedError, fd_lines, merge_feeds
 from pitchvlm.stream import (
     KIT_WARMUP_FRAMES,
+    STREAM_FORMAT,
     DetectorStream,
+    QueuedLines,
     StreamInput,
     StreamSettings,
     frames_text,
@@ -192,7 +196,7 @@ from pitchvlm.stream import (
     read_stream_lines,
     stand_in_inputs,
 )
-from pitchvlm.timing import StageClock, percentiles_ms
+from pitchvlm.timing import LatencyLog, StageClock, percentiles_ms
 from pitchvlm.tracking import SWAP_MIN_VOTES
 from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
@@ -1854,6 +1858,10 @@ STREAM_TIME_NOTE = (
 )
 
 
+#: Lines of a stream that ``stream --lines`` reads ahead on its thread before the reading waits: 2 s at 25 fps.
+STREAM_QUEUE_LINES = 50
+
+
 def _frames_or_clip(text: str) -> int | None:
     """Read a number of frames (0 or more), or ``clip`` for the whole clip (None)."""
     if text == "clip":
@@ -1890,22 +1898,26 @@ def stream_settings(args: argparse.Namespace, config: PipelineConfig, fps: float
 
 def stream_inputs(
     args: argparse.Namespace, config: PipelineConfig, info: ClipInfo, video_sha256: str | None
-) -> tuple[Iterator[StreamInput], dict[str, Any]]:
-    """Return the inputs of a ``stream`` command and the facts of where they come from.
+) -> tuple[Iterator[StreamInput], dict[str, Any], QueuedLines | None]:
+    """Return the inputs of a ``stream`` command, the facts of where they come from, and the queue of a pipe.
 
     From two clip runs (``--detections``, ``--calibration``) the lines of the stream are
     written in memory (``stream.clip_run_lines``) and read back, the path that a pipe takes.
-    From ``--lines`` (a file, or ``-`` for the standard input) the lines are read one by one.
-    The header must name the clip and the tool settings of the settings file.
+    From ``--lines`` (a file, or ``-`` for the standard input) the lines are read one by one,
+    on a thread into a queue of ``--queue`` lines (``stream.QueuedLines``). The header must name
+    the clip, its number of frames, its video (the SHA-256 of ``--clip``, or none for a folder of
+    images) and the tool settings of the settings file.
     """
     facts: dict[str, Any] = {}
+    queued: QueuedLines | None = None
     if args.lines is not None:
         if str(args.lines) == "-":
-            lines: Iterable[str] = sys.stdin
+            queued = QueuedLines(fd_lines(sys.stdin.fileno()), args.queue or STREAM_QUEUE_LINES)
             facts["lines"] = "standard input"
         else:
-            lines = _lines_of(args.lines)
+            queued = QueuedLines(_lines_of(args.lines), args.queue or STREAM_QUEUE_LINES)
             facts["lines"] = args.lines.name
+        lines: Iterable[str] = queued
     else:
         if args.detections is None or args.calibration is None:
             raise CliError("stream --clip needs --detections and --calibration, or --lines")
@@ -1920,9 +1932,16 @@ def stream_inputs(
         raise CliError(f"the stream cannot be read: {error}") from error
     if header.clip != info.clip_id:
         raise CliError(f"the stream is a stream of the clip {header.clip}, not of the clip {info.clip_id}")
+    if header.n_frames != info.n_frames:
+        raise CliError(f"the stream names {header.n_frames} frames, the clip has {info.n_frames} frames")
+    if header.video_sha256 != video_sha256:
+        raise CliError(
+            "the stream was made from other pixels than --clip: it names the video "
+            f"{header.video_sha256 or 'none (images)'}, and --clip is {video_sha256 or 'a folder of images'}"
+        )
     if (header.detector, header.calibration) != (config.detector, config.calibration):
         raise CliError("the stream was made with other tool settings than the settings file")
-    return _checked_inputs(inputs), facts
+    return _checked_inputs(inputs), facts, queued
 
 
 def _lines_of(path: Path) -> Iterator[str]:
@@ -1957,6 +1976,56 @@ def print_frame_timing(report: Mapping[str, Mapping[str, float]], tools: Mapping
     print(f"  note: {STREAM_TIME_NOTE}")
 
 
+def check_stream_options(args: argparse.Namespace) -> None:
+    """Refuse the options of ``stream`` that do not apply to its input, so that none is ignored without a word."""
+    if args.synthetic:
+        given = [
+            name
+            for name, value in (
+                ("--clip", args.clip),
+                ("--lines", args.lines),
+                ("--detections", args.detections),
+                ("--calibration", args.calibration),
+                ("--labels", args.labels),
+                ("--fps", args.fps),
+                ("--split", args.split),
+                ("--queue", args.queue),
+            )
+            if value
+        ]
+        if given:
+            raise CliError(f"stream --synthetic takes no {', '.join(given)}")
+        return
+    given = [name for name, value in (("--frames", args.frames), ("--seed", args.seed)) if value is not None]
+    if given:
+        raise CliError(f"{' and '.join(given)} apply only to stream --synthetic")
+    if args.lines is not None and (args.detections is not None or args.calibration is not None):
+        raise CliError("stream --lines takes no --detections or --calibration: the lines hold the answers of both tools")
+    if args.lines is None and args.queue is not None:
+        raise CliError("--queue applies only to stream --lines")
+    if args.labels is None and (args.split is not None or args.tracker is not None):
+        raise CliError("--split and --tracker name the prediction file, which stream writes only with --labels")
+    if args.clip is not None and args.clip.is_file() and args.fps is not None:
+        raise CliError("--fps applies only to a folder of frame images: a video file has its own frame rate")
+
+
+def print_latency(report: Mapping[str, Any]) -> None:
+    """Print the latency of a live stream (``timing.LatencyLog``): median / 95th percentile / largest, milliseconds."""
+    print(f"measured latency of the {int(report['decided_live'])} frames decided while the stream ran (median / 95th "
+          "percentile / largest, milliseconds):")
+    for name, text in (
+        ("source_to_decision", "from the arrival of a frame at the tools to its decision"),
+        ("after_last_needed_frame", "from the arrival of frame f + delay to the decision of f"),
+        ("line_to_decision", "from the reading of the line of frame f + delay to the decision of f"),
+    ):
+        values = report.get(name)
+        if values:
+            print(f"  {text}: {values['p50_ms']:.1f} / {values['p95_ms']:.1f} / {values['max_ms']:.1f}")
+    backlog = report.get("backlog_lines")
+    if backlog:
+        print(f"  lines waiting in the queue: median {backlog['p50']:g}, largest {backlog['max']:g}")
+
+
 def _cmd_stream(args: argparse.Namespace) -> int:
     """Run the streaming path of the detector engine on a clip run, a stream of lines or the synthetic clip.
 
@@ -1970,18 +2039,20 @@ def _cmd_stream(args: argparse.Namespace) -> int:
         check_stream_engines(config)
     except ValueError as error:
         raise CliError(str(error)) from error
+    check_stream_options(args)
     state = require_clean_tree(args.allow_dirty)
     scene: SyntheticScene | None = None
     labels: GsrLabels | None
+    queued: QueuedLines | None = None
     if args.synthetic:
-        if args.clip is not None or args.lines is not None or args.detections is not None or args.calibration:
-            raise CliError("stream --synthetic takes no --clip, --lines, --detections or --calibration")
-        scene = SyntheticScene(n_frames=args.frames, seed=args.seed)
+        frames = DEMO_FRAMES if args.frames is None else args.frames
+        seed = 0 if args.seed is None else args.seed
+        scene = SyntheticScene(n_frames=frames, seed=seed)
         source: FrameSource = SyntheticSource(scene)
         labels = scene_labels(scene)
-        people, balls = fake_detector_answers(scene, seed=args.seed)
+        people, balls = fake_detector_answers(scene, seed=seed)
         inputs: Iterator[StreamInput] = stand_in_inputs(people, balls, fake_calibration_answers(scene))
-        facts: dict[str, Any] = {"synthetic": {"seed": args.seed, "frames": args.frames}}
+        facts: dict[str, Any] = {"synthetic": {"seed": seed, "frames": frames}}
     else:
         if args.clip is None:
             raise CliError("stream needs --clip (with --detections and --calibration, or --lines), or --synthetic")
@@ -1990,7 +2061,7 @@ def _cmd_stream(args: argparse.Namespace) -> int:
         if labels is not None:
             check_labels_match(source, labels)
         video_sha256 = file_sha256(args.clip) if args.clip.is_file() else None
-        inputs, facts = stream_inputs(args, config, source.info, video_sha256)
+        inputs, facts, queued = stream_inputs(args, config, source.info, video_sha256)
     info = source.info
     settings = stream_settings(args, config, info.fps)
     print(
@@ -2003,14 +2074,32 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     stream = DetectorStream(
         config, settings, clip_id=info.clip_id, fps=info.fps, size=(info.width, info.height), clock=clock
     )
+    latency = LatencyLog(settings.delay_frames)
+    missing: dict[str, dict[str, int]] = {}
     for item in inputs:
         if item.frame >= info.n_frames:
             raise CliError(f"the stream holds frame {item.frame}, the clip has {info.n_frames} frames")
-        stream.push(item, partial(source.read, item.frame))
+        latency.arrived(
+            item.frame,
+            source_at=item.arrived_at,
+            line_at=None if queued is None else queued.last_read_at,
+            backlog=0 if queued is None else queued.last_backlog,
+        )
+        for tool, reason in item.missing:
+            missing.setdefault(tool, {}).setdefault(reason, 0)
+            missing[tool][reason] += 1
+        for given in stream.push(item, partial(source.read, item.frame)):
+            latency.given(given.frame, wall=time.time(), mono=time.monotonic())
     if stream.n_frames != info.n_frames:
         raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
     stream.finish()
     result = stream.result()
+    if missing:
+        parts = "; ".join(
+            f"{tool}: " + ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
+            for tool, reasons in sorted(missing.items())
+        )
+        print(f"frames with a missing part of a tool: {parts}")
     print_shots_and_paint(result, config)
     clip_dir = args.out / info.clip_id
     provenance = {
@@ -2031,8 +2120,8 @@ def _cmd_stream(args: argparse.Namespace) -> int:
             result.frames,
             labels,
             args.out / PREDICTIONS_FOLDER,
-            split=DEMO_SPLIT if scene is not None else args.split,
-            tracker=args.tracker,
+            split=DEMO_SPLIT if scene is not None else (args.split or DEFAULT_SPLIT),
+            tracker=args.tracker or DEFAULT_TRACKER,
             clip_id=info.clip_id,
         )
         problems = prediction_problems(predictions, labels)
@@ -2070,6 +2159,15 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     frame_timing = clock.frame_report()
     print_timing(timing)
     print_frame_timing(frame_timing, stream.tool_seconds)
+    paint_timing = percentiles_ms(stream.paint_seconds) if stream.paint_seconds else None
+    if paint_timing is not None:
+        print(
+            f"  paint score (on its own thread, not in the total): {paint_timing['p50_ms']:.2f} / "
+            f"{paint_timing['p95_ms']:.2f} / {paint_timing['max_ms']:.2f}"
+        )
+    live = latency.report() if queued is not None else None
+    if live is not None:
+        print_latency(live)
     tool_timing = {name: percentiles_ms(seconds) for name, seconds in stream.tool_seconds.items() if seconds}
     document = {
         "provenance": provenance,
@@ -2077,6 +2175,13 @@ def _cmd_stream(args: argparse.Namespace) -> int:
         "timing": timing,
         "frame_timing": frame_timing,
         "tool_timing": tool_timing,
+        "paint_timing": paint_timing,
+        "latency": live,
+        "missing_parts": missing,
+        "transitions_known_at": [
+            {"kind": kind, "start": span[0], "stop": span[1], "newest_frame": frame}
+            for kind, span, frame in stream.transition_log
+        ],
         "timing_note": STREAM_TIME_NOTE,
         "identity": identity,
         "diagnostics": diagnostics.as_dict(),
@@ -2087,6 +2192,84 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     video = render_clip(source, result, clip_dir / f"{info.clip_id}.mp4")
     print(f"video: {video}")
     return EXIT_FAILED if problems or empty is not None else EXIT_OK
+
+
+# --- merge-feeds --------------------------------------------------------------------
+
+
+def _cmd_merge_feeds(args: argparse.Namespace) -> int:
+    """Merge the live feeds of the detector and of the calibration by frame into the lines of a stream.
+
+    The two feeds are files or named pipes that ``tools/run_tool.py --feed`` writes; the merged
+    lines go to the standard output (for ``stream --lines -``), one flushed line at a time. The
+    policy is that of ``feed.FeedMerger``. A report goes to the error stream. Exit code 0 when
+    every frame went out with both parts, 1 when a part was missing, a line was dropped or the
+    stream ended early, 2 when the feeds cannot be merged.
+    """
+    out = sys.stdout
+
+    def write(text: str) -> None:
+        out.write(text + "\n")
+        out.flush()
+
+    # A named pipe opens when its writer opens it. The descriptors are not closed here: a reading
+    # thread may still wait in one when the reader of the merged lines stops early, and the end of
+    # the process closes them (``feed.fd_lines``).
+    feeds = {"detector": os.open(args.detector, os.O_RDONLY), "calibration": os.open(args.calibration, os.O_RDONLY)}
+    try:
+        merger = merge_feeds(
+            {tool: fd_lines(fd) for tool, fd in feeds.items()}, write, wait_s=args.wait, queue_lines=args.queue
+        )
+    except FeedError as error:
+        raise CliError(f"the feeds cannot be merged: {error}") from error
+    except BrokenPipeError as error:
+        # Nothing more can go to the standard output: point it at nothing, so that its flush at the end is quiet.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise CliError("the reader of the merged lines stopped before the end") from error
+    sent = merger.next_frame
+    print(f"merge-feeds: {sent} of {merger.n_frames} frames went out", file=sys.stderr)
+    for name, values in merger.counts.as_dict().items():
+        if any(values.values()):
+            text = ", ".join(f"{tool} {count}" for tool, count in values.items())
+            print(f"  {name.replace('_', ' ')}: {text}", file=sys.stderr)
+    return EXIT_OK if sent == merger.n_frames and merger.counts.problems() == 0 else EXIT_FAILED
+
+
+def _wait_seconds(text: str) -> float:
+    """Read a wait in seconds: a finite number of 0 or more."""
+    value = float(text)
+    if not 0.0 <= value < float("inf"):
+        raise argparse.ArgumentTypeError(f"{text} is not a number of 0 or more seconds")
+    return value
+
+
+def _add_merge_feeds(commands: Any) -> None:
+    """Add the command ``merge-feeds`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "merge-feeds",
+        help="merge the live feeds of the two tools by frame into the lines that stream --lines - reads",
+    )
+    parser.add_argument(
+        "--detector", type=_path, required=True, metavar="FILE", help="feed of the detector (a file or a named pipe)"
+    )
+    parser.add_argument(
+        "--calibration", type=_path, required=True, metavar="FILE", help="feed of the calibration (a file or a named pipe)"
+    )
+    parser.add_argument(
+        "--wait",
+        type=_wait_seconds,
+        default=DEFAULT_WAIT_S,
+        metavar="SECONDS",
+        help=f"longest wait of a frame for the part of the other tool (default: {DEFAULT_WAIT_S:g})",
+    )
+    parser.add_argument(
+        "--queue",
+        type=_positive_int,
+        default=DEFAULT_QUEUE_LINES,
+        metavar="N",
+        help=f"lines read ahead from each feed before its reading waits (default: {DEFAULT_QUEUE_LINES})",
+    )
+    parser.set_defaults(handler=_cmd_merge_feeds)
 
 
 # --- doctor --------------------------------------------------------------------------
@@ -4154,20 +4337,33 @@ def _add_stream(commands: Any) -> None:
         "--synthetic", action="store_true", help="the synthetic clip with the stand-ins of the tools (no --clip)"
     )
     parser.add_argument(
-        "--frames", type=_positive_int, default=DEMO_FRAMES, metavar="N", help="frames of the synthetic clip"
+        "--frames", type=_positive_int, metavar="N", help=f"frames of the synthetic clip (default: {DEMO_FRAMES})"
     )
-    parser.add_argument("--seed", type=_seed, default=0, metavar="S", help="seed of the synthetic clip (default: 0)")
+    parser.add_argument("--seed", type=_seed, metavar="S", help="seed of the synthetic clip (default: 0)")
     parser.add_argument(
         "--config", type=_path, metavar="FILE", help="settings file (YAML); default: the detector engine settings"
     )
     parser.add_argument("--labels", type=_path, metavar="FILE", help="label file of the clip, as for run")
     parser.add_argument("--fps", type=_frame_rate, metavar="FPS", help="frame rate of a folder of frame images")
-    parser.add_argument("--split", default=DEFAULT_SPLIT, metavar="NAME", help="split name in the prediction path")
-    parser.add_argument("--tracker", default=DEFAULT_TRACKER, metavar="NAME", help="tracker name in the prediction path")
+    parser.add_argument(
+        "--split", metavar="NAME", help=f"split name in the prediction path, with --labels (default: {DEFAULT_SPLIT})"
+    )
+    parser.add_argument(
+        "--tracker", metavar="NAME", help=f"tracker name in the prediction path, with --labels (default: {DEFAULT_TRACKER})"
+    )
     parser.add_argument("--detections", type=_path, metavar="FILE", help="first part of the clip run of the detector")
     parser.add_argument("--calibration", type=_path, metavar="FILE", help="first part of the clip run of the calibration")
     parser.add_argument(
-        "--lines", type=_path, metavar="FILE", help="the lines of a stream (format pitchvlm-stream-1); - for a pipe"
+        "--lines",
+        type=_path,
+        metavar="FILE",
+        help=f"the lines of a stream (format {STREAM_FORMAT}, the output of merge-feeds); - for a pipe",
+    )
+    parser.add_argument(
+        "--queue",
+        type=_positive_int,
+        metavar="N",
+        help=f"with --lines: lines read ahead before the reading waits (default: {STREAM_QUEUE_LINES})",
     )
     parser.add_argument(
         "--delay",
@@ -4466,6 +4662,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_demo,
         _add_run,
         _add_stream,
+        _add_merge_feeds,
         _add_doctor,
         _add_data,
         _add_oracle,
