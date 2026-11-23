@@ -374,6 +374,27 @@ def test_openrouter_backend_refuses_a_model_without_a_video_rate_before_any_call
 # --- Money -------------------------------------------------------------------------------
 
 
+def test_a_new_video_rate_holds_from_its_first_day() -> None:
+    """As a price, a video rate holds from its own start day on: an estimate on that day must not use the old rate."""
+    new_day = date(2026, 12, 1)
+    newer = VideoRate(
+        OPENROUTER_MODEL,
+        new_day,
+        {"low": 200, "medium": 200, "high": 200},
+        10.0,
+        2.0,
+        takes_clips=False,
+        video_usd_per_million=1.0,
+        audio_usd_per_million=3.0,
+    )
+    table = (*OPENROUTER_RATES, newer)
+
+    assert video_rate_for(OPENROUTER_MODEL, date(2026, 11, 30), table) is OPENROUTER_RATES[0]
+    assert video_rate_for(OPENROUTER_MODEL, new_day, table) is newer
+    with pytest.raises(KeyError, match="its rates start on 2026-11-01"):
+        video_rate_for(OPENROUTER_MODEL, date(2026, 10, 31), table)
+
+
 def test_video_tokens_follow_the_published_gemini_rate(tmp_path: Path) -> None:
     rate = video_rate_for("gemini-4-argon", NOVEMBER, GEMINI_VIDEO_RATES)
     # 5 frames at 2 frames per second: 5 x 280 video tokens at high, and 2.5 s x 32 sound tokens.
@@ -739,6 +760,20 @@ def test_doctor_video_check_passes_with_the_fake_model(contract_scene: Synthetic
     # 600 text tokens, 7 frames x 280 tokens at high, 7 s x 32 sound tokens.
     assert checks[doctor.VIDEO_TOKENS].limit == 600 + 7 * 280 + 7 * 32
     assert [answer["step"] for answer in result.answers][-1] == "people_video"
+
+
+def test_doctor_plans_a_video_request_for_an_openrouter_model_from_the_rates_of_the_price_file(
+    contract_scene: SyntheticScene, tmp_path: Path
+) -> None:
+    """An OpenRouter model takes its video rate from the price file, not from the Gemini table: with a rate it
+    gets the video check (a whole file, no sampling rate), and its estimate counts that request."""
+    settings = StepSettings(provider="openrouter", model=OPENROUTER_MODEL, coords="xy_1000")
+
+    request = doctor.video_contract_request(settings, contract_scene, tmp_path, OPENROUTER_RATES)
+
+    assert request is not None and request.provider == "openrouter"
+    assert [part.fps for part in request.videos] == [None]
+    assert doctor.video_contract_request(settings, contract_scene, tmp_path / "none", ()) is None
 
 
 def test_doctor_video_check_fails_when_the_model_names_other_times(

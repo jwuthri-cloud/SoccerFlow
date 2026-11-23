@@ -561,6 +561,8 @@ def test_lost_connections_end_with_a_call_whose_cost_is_unknown(key: str) -> Non
         (ok(error_body(502, "provider failed during the generation")), "provider failed during the generation"),
         (ok(chat_answer(usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})), "no cost"),
         (ok(chat_answer(usage={"completion_tokens": 5, "cost": 0.1})), "no prompt_tokens"),
+        # A negative cost would lower the spend window and the ledger total that the hard stop reads.
+        (ok(chat_answer(usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": -0.01})), "reports no cost: -0.01"),
         (
             ok(chat_answer(usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0, "is_byok": True})),
             "BYOK",

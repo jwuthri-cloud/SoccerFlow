@@ -311,15 +311,18 @@ def test_a_silent_worker_is_killed_and_named_with_its_file(tmp_path: Path, run_i
     hang = "import time\n\ndef test_first():\n    pass\n\ndef test_sleeps_for_ever():\n    time.sleep(LONG_S)\n"
     root = make_project(tmp_path / "project", {"test_pass.py": PASSING, "test_hang.py": hang})
 
+    # A limit far above the start of pytest: with 1 s, a loaded machine (load average 30 to 60) took
+    # more than 1 s to start the worker of test_pass.py, which was killed too (2 of 20 runs in one
+    # process, 11 of 20 with the runner). The healthy worker must survive the kill of the silent one.
     started = time.monotonic()
-    code, output = run_in_process(root, ["-j", "2", "--silence-limit", "1"])
+    code, output = run_in_process(root, ["-j", "2", "--silence-limit", "10"])
 
     assert time.monotonic() - started < 120
     assert code == runner.EXIT_UNTRUSTED
     errors = [line for line in output.splitlines() if line.startswith("error:")]
-    assert len(errors) == 1
+    assert len(errors) == 1, output
     assert errors[0].endswith(
-        "gave no output for 1 s and was killed, in test_hang.py (last test started: test_hang.py::test_sleeps_for_ever)"
+        "gave no output for 10 s and was killed, in test_hang.py (last test started: test_hang.py::test_sleeps_for_ever)"
     )
 
 
@@ -416,3 +419,88 @@ def test_ctrl_c_stops_every_worker_and_their_children(tmp_path: Path) -> None:
     assert "interrupted: every worker was stopped" in output
     assert not process_exists(worker_pid)
     assert not process_exists(child_pid)
+
+
+def test_a_test_that_fails_and_then_errors_in_teardown_counts_once(
+    tmp_path: Path, run_in_process: Callable[[Path, list[str]], tuple[int, str]]
+) -> None:
+    """pytest writes two JUnit entries for such a test: they are one result, as in one process the exit code is 1."""
+    teardown = """\
+        import pytest
+
+        @pytest.fixture
+        def breaks_at_teardown():
+            yield
+            raise RuntimeError("the teardown broke")
+
+        def test_fails_then_breaks(breaks_at_teardown):
+            assert 2 + 2 == 5
+
+        def test_passes_then_breaks(breaks_at_teardown):
+            pass
+
+        def test_plain():
+            pass
+        """
+    root = make_project(tmp_path / "project", {"test_teardown.py": teardown})
+
+    code, output = run_in_process(root, ["-j", "1"])
+
+    assert code == runner.EXIT_FAILED, output
+    assert "error:" not in output
+    assert "1 passed, 0 failed, 2 errors, 0 skipped, 0 deselected in " in summary_line(output)
+    # Both faults of the first test are shown under its one id.
+    shown = output.split(" ERROR test_teardown.py::test_fails_then_breaks ")[1]
+    assert "assert (2 + 2) == 5" in shown and "the teardown broke" in shown.split(" ERROR ")[0]
+
+
+def test_a_file_skipped_at_collection_is_counted(
+    tmp_path: Path, run_in_process: Callable[[Path, list[str]], tuple[int, str]]
+) -> None:
+    """A module-level skip (a missing package) leaves no test id; the summary still names it, as one process does."""
+    skipped = 'import pytest\n\npytest.importorskip("a_package_that_is_not_installed")\n\ndef test_a():\n    pass\n'
+    root = make_project(tmp_path / "project", {"test_pass.py": PASSING, "test_needs_package.py": skipped})
+
+    code, output = run_in_process(root, ["-j", "2"])
+
+    assert code == runner.EXIT_PASSED, output
+    assert "1 file skipped at collection" in summary_line(output)
+    assert "skipped at collection: test_needs_package.py" in output
+
+
+def test_ctrl_c_while_the_workers_start_stops_the_worker_that_just_started(tmp_path: Path) -> None:
+    """A Ctrl-C that comes while a worker process is being made must not leave that process running."""
+    pid_file = tmp_path / "pids.txt"
+    wait = f"import time\n\ndef test_waits():\n    time.sleep({LONG_S})\n"
+    root = make_project(tmp_path / "project", {"test_a.py": wait, "test_b.py": wait})
+    # The first worker process is made, then Ctrl-C arrives before the runner holds it.
+    script = textwrap.dedent(
+        f"""\
+        import os, signal, subprocess, sys
+        from pathlib import Path
+        sys.path.insert(0, {str(RUNNER.parent)!r})
+        import run_tests
+        made = subprocess.Popen
+        def popen(*args, **kwargs):
+            process = made(*args, **kwargs)
+            if "--junitxml" in " ".join(args[0]):
+                with open({str(pid_file)!r}, "a") as pids:
+                    pids.write(f"{{process.pid}}\\n")
+                if len(Path({str(pid_file)!r}).read_text().split()) == 1:
+                    os.kill(os.getpid(), signal.SIGINT)
+            return process
+        subprocess.Popen = popen
+        sys.exit(run_tests.run(run_tests.parse_options(["-j", "2"]), root=Path({str(root)!r})))
+        """
+    )
+    process = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, encoding="utf-8", timeout=120, check=False
+    )
+    pids = [int(value) for value in pid_file.read_text().split()]
+    left = [pid for pid in pids if process_exists(pid)]
+    for pid in left:
+        os.kill(pid, signal.SIGKILL)
+
+    assert process.returncode == runner.EXIT_INTERRUPTED, process.stdout + process.stderr
+    assert "interrupted: every worker was stopped" in process.stdout
+    assert pids and not left
