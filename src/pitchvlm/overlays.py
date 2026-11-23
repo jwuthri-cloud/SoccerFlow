@@ -126,14 +126,15 @@ def list_document(
     seed: int,
     count: int,
     n_frames: int,
-    n_mapped: int,
+    unmapped: Sequence[tuple[str, int, str]],
     provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the list file of the chosen frames as plain JSON types.
 
-    ``n_frames`` is the number of frames that the source covers, ``n_mapped`` the number of
-    them with a mapping, from which ``choose_frames`` chose. Every frame entry has
-    ``by_eye`` null: the person who checks the image writes one of ``VERDICTS`` there.
+    ``n_frames`` is the number of frames that the source covers; ``unmapped`` names those of
+    them without a mapping, as (clip id, frame, reason), and ``choose_frames`` chose from the
+    others. Every frame entry has ``by_eye`` null: the person who checks the image writes one
+    of ``VERDICTS`` there.
     """
     return {
         "format": LIST_FORMAT,
@@ -144,8 +145,11 @@ def list_document(
         "count": count,
         "rule": CHOICE_RULE,
         "n_frames": n_frames,
-        "n_frames_with_mapping": n_mapped,
+        "n_frames_with_mapping": n_frames - len(unmapped),
         "n_chosen": len(chosen),
+        "frames_without_mapping": [
+            {"clip": clip, "frame": frame, "reason": reason} for clip, frame, reason in unmapped
+        ],
         "verdicts": list(VERDICTS),
         "provenance": provenance,
         "frames": [

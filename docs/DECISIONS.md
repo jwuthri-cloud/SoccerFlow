@@ -1389,6 +1389,8 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
    a test over a window of frames needs its own measurement, and a fast pan must not become a
    cut. ARCHITECTURE names the limit. Owner decision: build a window test before the demo
    clip, or accept the limit (the clips of SoccerNet GSR have no cut).
+   Update: a window test was built, see the entry "A dissolve is a transition, not a shot" of
+   2026-11-22.
 6. **Refuted or taken back.** (a) Flat or tiny frames are always a cut: by design and written.
    (b) The change point of `team_key_runs` after merges (for example A10 B3 A3 B10): the contact
    is tested from the last vote of the merged run to the first vote of the next, the right
@@ -1672,6 +1674,136 @@ footage. "Before" is `652c82b`; "after" is the commit of this entry.
     cached functions, planted again one at a time: the default run catches 7 of 8, as before
     (F01 again caught by no run).
 
+## 2026-11-22 — A dissolve is a transition, not a shot
+
+Closes the open major of the entry "Second read of the tracking, cuts, paint alignment and
+detector engine", item 5. Every number here is synthetic: build machine, synthetic clips of
+`synth.py`, no model, no footage. None is a result on broadcast frames. Base `main` 81bb2d9.
+
+1. **Design.** The pair test of neighbouring frames (`motion.is_cut`) stays as it was; its cuts
+   and motion steps are identical to `main` on 40 synthetic clips (controls, dissolves and hard
+   cuts of seeds 0, 1, 2 and 9, checked against the `motion.py` of 81bb2d9). A second test runs
+   over windows (`motion.window_correlations`): frame `t - 30` is moved onto frame `t` with the
+   chained motion of the 30 steps between them (no identity), and the median block correlation
+   of the 160-pixel test images is taken. A pan that the chain follows explains its window; a
+   dissolve does not, because no frame in it shows the change of view from one shot to the
+   other. The chain takes the measured motion of a pair when it passes the pair test alone,
+   else the motion of the pair test that explains the pair best (identity or last motion): in
+   fast pans the optical flow was wrong by 9 to 250 px on some pairs that the last motion
+   explained. A window with a missing step, a hard cut, or too little cover is not judged.
+2. **Where the transition lies.** Each run of windows below 0.18 holds one transition
+   (`motion.find_transitions`). The first frame of the first window shows the old shot alone,
+   the last frame of the last window the new shot alone, for a dissolve shorter than the
+   window. The motion inside a dissolve follows the shot that dominates the blend: the old one
+   in the first half, the new one in the second. So the transition starts at the first frame
+   that the old anchor, moved with the chain, no longer explains with a regression slope of
+   0.95 (a blend frame with weight `w` has a slope near `1 - w`), and ends after the last frame
+   that the new anchor does not explain. A change without a blend frame gives a cut at one
+   frame.
+3. **Representation: every frame of a transition is a cut, and so is the frame after it.**
+   Each blend frame is then a shot of one frame. This is the smallest form that every consumer
+   of `MotionField.cuts` already handles: `bridged_warp`, `associate`, `stitch_fragments` and
+   `split_team_swaps` (per shot in `pipeline`), `link_team_slots` and `finalize_tracks`, the
+   dense fill, the ball tracker, the propagation of landmark fits and calibration cameras, the
+   tracking values and the radar trails all stop at a cut, so nothing crosses the transition
+   and none of them changed. `MotionField`, its JSON and `ClipResult` keep their form. One
+   change was needed: a blend frame must get no state at all, and a cut alone does not stop a
+   frame's own answers. `MotionField.transition_frames` names the shots of one frame next to a
+   cut, and `pipeline.run_clip` drops the people (before the kit colours and the tracks), the
+   pitch mapping (landmark fit or camera) and the ball candidates of these frames, for both
+   engines. A lone frame between two hard cuts is treated the same way: one frame cannot be
+   tracked. A model keyframe that falls on a blend frame is still paid for (the motion is
+   measured after the people requests), and its answer is dropped. A separate list of spans
+   was the other option: it needed a change in every consumer and in the JSON of the field.
+4. **Measurement.** Hypothesis: the window test finds dissolves of 5 to 25 frames and raises no
+   cut on clips without one. Baseline: the pair test of `main`. Command:
+   `PYTHONPATH=src python tools/synthetic_diagnostics.py dissolve-fit dissolve-held-out`.
+   Clips: two shots of the synthetic match of one seed (shot B 75 to 249 scene frames after
+   shot A, each panning up to 25 px per frame), 40 frames each, blended over the dissolve
+   (frame `40 + i` has the weight `(i + 1) / (length + 1)` of shot B); controls of 60 frames:
+   pans at about 25, 50, 75 and 100 px per frame at 1280 px, a zoom by 1.5 within 8 to 20
+   frames, a shake (sd 0.15 degrees in pan and tilt, 0.1 in roll), a goal kick (fast pan,
+   tilt up 5 degrees and back over 25 frames, zoom out by 12 %), and 100 frames without a cut.
+   The zoom, the shake and the goal kick come from a virtual camera that turns inside a
+   synthetic picture drawn at 2560 x 1440. The thresholds were fixed on seeds 0 to 9; seeds 10
+   to 19 were run once after that, and no threshold changed afterwards.
+5. **Held-out seeds 10 to 19** (one clip per seed and case, n = 10 each). "False cuts" counts
+   blocks of cut frames that do not touch the true change. "Lowest window value" is the lowest
+   judged window of each clip, as a range over the 10 clips; the found transitions need a value
+   below 0.18. Span error: found minus true first and last blend frame, in frames.
+
+   | Case | Fastest motion, px per frame | Hits | Misses | False cuts | Pair test alone: hits, false cuts | Lowest window value | Span error start / end |
+   |---|---|---|---|---|---|---|---|
+   | Dissolve, 5 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.042 to 0.018 | -1 to 0 / 0 to +1 |
+   | Dissolve, 10 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.037 to 0.017 | 0 to +1 / -1 to 0 |
+   | Dissolve, 15 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.037 to 0.012 | 0 to +2 / -2 to -1 |
+   | Dissolve, 20 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.041 to 0.034 | +1 to +2 / -4 to -1 |
+   | Dissolve, 25 frames | 8 to 25 | 10 | 0 | 0 | 0, 0 | -0.062 to 0.075 | +2 to +3 / -3 to -2 |
+   | Hard cut | 8 to 25 | 8 | 2 | 0 | 8, 0 | 0.807 to 0.869 | 0 / 0 |
+   | Pan, scene step 3 | 24 to 25 | - | - | 0 | -, 0 | 0.811 to 0.858 | - |
+   | Pan, scene step 6 | 47 to 50 | - | - | 0 | -, 0 | 0.828 to 0.876 | - |
+   | Pan, scene step 9 | 71 to 75 | - | - | 0 | -, 0 | 0.747 to 0.855 | - |
+   | Pan, scene step 12 | 96 to 100 | - | - | 0 | -, 0 | 0.201 to 0.860 | - |
+   | Zoom x1.5 | 9 to 25 | - | - | 0 | -, 0 | 0.750 to 0.889 | - |
+   | Shake | 27 to 49 | - | - | 0 | -, 0 | 0.801 to 0.870 | - |
+   | Goal kick | 31 to 67 | - | - | 0 | -, 0 | 0.776 to 0.828 | - |
+   | No cut, 100 frames | 6 to 8 | - | - | 0 | -, 0 | 0.839 to 0.871 | - |
+
+   Dissolves: 50 of 50 found (the pair test alone: 0 of 50). Controls: 0 false cuts in 80
+   clips, as the pair test alone. The 2 missed hard cuts are missed by the pair test of `main`
+   too (lowest pair value of these clips up to 0.913): shot B is the same synthetic camera some
+   seconds later in a pose the optical flow reaches, the known limit "a jump in time that one
+   camera motion explains". Not one window was judged across a hard cut, so the window test
+   cannot change a hard cut. The span errors leave the faint ends of a dissolve (weight up to
+   about 0.1) in their shots. The closest control is a pan at 100 px per frame with a lowest
+   window value of 0.201, 0.021 above the threshold: the margin at the top of the pan range is
+   thin.
+6. **Fit seeds 0 to 9**, last run with the final code (same layout, n = 10 per case):
+   dissolves 49 of 50 found (5, 10, 15 and 20 frames: 10 of 10; 25 frames: 9 of 10), highest
+   lowest window value of a found dissolve 0.087; the miss (seed 6, 25 frames) has 0.611: its
+   shot B is the same camera in a pose the chain of shot A happens to align. Hard cuts 10 of
+   10. Controls 0 false cuts from the window test; the pans at 96 to 99 px per frame have 3
+   false cuts of the pair test (as `main`, lowest pair value 0.141), and the lowest window value
+   of a control is 0.268 (pan at 99 px per frame). Span error start 0 to +4, end -3 to +4.
+   Shot shares (slopes) between the anchors: frames of the anchor's own shot 1.009 to 1.147
+   (n 1954, 5 not measurable), frames with a blend weight in (0.2, 0.3] 0.747 to 0.898, in
+   (0.1, 0.2] 0.835 to 1.001.
+7. **How the thresholds were fixed (seeds 0 to 9 only).** The window length, 30 frames, is
+   the design: a dissolve of up to 29 frames lies inside one window. 0.18 is halfway between
+   0.087 and 0.268 (item 6); 0.95 is halfway between 0.898 and 1.009. The first design had
+   other values and was changed on the fit seeds, never after the held-out run: (a) with the
+   measured motion as the chain and the pair threshold 0.5 as window threshold, the window
+   test added false cuts in fast pans (1 of 10 at 75 px per frame, 6 of 10 at 100 px against 3
+   of the pair test), from wrong flow steps; (b) a refinement of the chained motion by image
+   alignment (`cv2.findTransformECC`) removed those, but it also aligned shot A with shot B of
+   same-camera dissolves (2 of 50 missed); the corrections it made overlap (2 to 14 test pixels
+   in pans, 3 to 18 in dissolves), so no bound separates them, and it was dropped; (c) the
+   chain rule of item 1 and the threshold 0.18 then separated the fit seeds; (d) 0.9 was the
+   first share threshold, 0.95 the midpoint. The goal-kick control first panned at up to 132 px
+   per frame, beyond the 100 px of the hypothesis (the pair test alone had 8 false cuts in 10);
+   its pan was reduced to the stated range before the held-out run.
+8. **Cost.** Time of the cut test per frame on the build machine (seeds 0 clips, n = 135 frames,
+   `time.perf_counter`): the pair test of `main` median 1.12 ms; the new pair test plus the
+   window test median 1.42 ms, so about 0.3 ms more per frame. The localisation runs only on a
+   window run below 0.18 and was not timed. The motion measurement itself (optical flow) is
+   unchanged. Memory: the 160 x 90 test image of every frame is kept until the field is built
+   (57.6 KB per frame).
+9. **Out of scope, measured once on seeds 10 to 19 (n = 10 each).** A fade through black over
+   10 frames: the darkest frames have too little contrast, so the pair test makes them hard
+   cuts (10 of 10; a block of 1 or 2 cut frames in the middle of the fade, frames 45 to 46 of
+   40 to 49); the dimmed frames stay in their shots. A wipe over 10 frames (shot B covers the picture from left to right): found by the
+   window test as a transition in 10 of 10 (span error start 0 to +4, end -3 to 0), though not
+   designed for it. A picture-in-picture box of shot B (a ninth of the picture) for 25 frames
+   over shot A: the box is not found in 10 of 10 (the clip then cuts to shot B, found in 9 of 10
+   as a hard cut, the miss as in item 5). A dissolve during a pan that the chain cannot follow
+   for a whole window is not judged (the windows of the 50 px pans were judged 171 of 300
+   times), and not measured as a case. A dissolve between two moments of one camera can be
+   explained by the chain (item 6, 1 of 100 dissolves over both seed sets).
+10. **Open.** Nothing ran on broadcast frames: real dissolves (often into and out of a replay,
+    with a logo wipe), real chain drift and real people motion over 1.2 s may move both
+    thresholds; the margin at 100 px per frame (item 5) is thin. The 30-frame window was
+    measured at 25 frames per second only. The faint ends of a dissolve keep their states.
+
 ## 2026-11-22 — A video file into the detector engine, and the check images of gate G3
 
 Two tools for the first real clip runs, from the last list below ("Video files for the detector
@@ -1746,6 +1878,18 @@ on real footage.
    landmark answers of the run would be needed; not built.
    (d) The colour and width of the lines were judged on synthetic frames only.
    (e) No real video, real tool or real footage ran through any of this.
+10. **After the merge of the dissolve test** (`main` 9b63a02, entry "A dissolve is a
+    transition, not a shot"). A run drops the mapping of every transition frame. `overlay` now
+    lists every frame without a mapping with its reason (printed, and `frames_without_mapping` in
+    the list file) and draws no image of it; a keyframe of a run on a transition frame gets the
+    reason "a frame of a transition", found from the cuts of the result with
+    `MotionField.transition_frames`, the rule of the pipeline. Measured on a synthetic mp4 of 90
+    frames with a dissolve of 10 frames (`tests/test_video_overlay.py`): `video-frames` gives the
+    frames that `run` decodes, pixel for pixel; the run with stand-in clip runs of that video put
+    at least one keyframe on a transition frame (asserted), and the overlay of every keyframe
+    named it and drew it not. The cut test runs on the decoded (lossy) frames, as `run` reads
+    them; the tools never see the cuts.
+
 
 ## Open questions (to settle with measurements)
 
@@ -1764,6 +1908,8 @@ on real footage.
 - Does the paint-alignment score separate good from bad pitch mappings on real frames (AUROC,
   per engine), and how many real frames cannot judge a mapping?
 - How many hard cuts does the cut test find in the demo clip, and how many does it miss?
+- Does the window test find the dissolves of real broadcast clips, and does it raise false
+  transitions in fast real pans (entry "A dissolve is a transition, not a shot")?
 - Right value of the two-people margin (6 m) and of the limit for a repeated box (0.6) on real
   answers (RUNBOOK section 8, facts 13 and 15)?
 - Do two crops that are less than one second apart agree on a wrong number, and does the model
@@ -1924,7 +2070,8 @@ Decisions for the owner that are open, each with its recommendation:
 - **Soccer-trained detector** (RUNBOOK, section 12). Recommendation: read the terms of the
   SoccerNet-GSR train data first; build the converter and train only with a budget line for the
   GPU time and a decision that research-only weights may drive the demo.
-- **Video files for the detector engine.** Built on 2026-11-22 (same entry): `video-frames`
+- **Video files for the detector engine.** Built on 2026-11-22 (entry "A video file into the
+  detector engine, and the check images of gate G3"): `video-frames`
   writes the frames of a video as PNG below the data folder, the clip job names the video by
   its SHA-256, and `run --clip <video>` reads the clip run only with that video (RUNBOOK,
   section 11, "A video file as the clip"). Owner to do: put the demo clip below

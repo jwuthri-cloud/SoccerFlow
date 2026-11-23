@@ -170,6 +170,7 @@ from pitchvlm.frames import (
 )
 from pitchvlm.geometry import matrix_from_record, paint_alignment
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
+from pitchvlm.motion import MotionField
 from pitchvlm.overlays import MappedFrame, caption, choose_frames, image_name, list_document
 from pitchvlm.pipeline import ToolAnswers, keyframe_frames, run_clip
 from pitchvlm.probes import LabelledClip, write_metrics
@@ -2912,6 +2913,8 @@ class MappingSource:
     n_frames: int
     #: The frames with a mapping, with their paint alignment.
     mapped: list[MappedFrame]
+    #: The frames without a mapping, each as (clip id, frame, why it has none). They get no image.
+    unmapped: list[tuple[str, int, str]]
     #: The frames of each clip.
     sources: dict[str, FrameSource]
     #: What the list file records about the source: file names, check sums, group.
@@ -2973,11 +2976,18 @@ def probe_mappings(args: argparse.Namespace) -> MappingSource:
         for clip_id, records in fits.items()
         for item in mapped_frames(sources[clip_id], records, lambda record: "landmark fit of this frame")
     ]
+    unmapped = [
+        (clip_id, record.frame, "the landmarks of the stored answer give no mapping")
+        for clip_id, records in fits.items()
+        for record in records
+        if not record.valid
+    ]
     return MappingSource(
         name=experiment.name,
         engine=f"model:{model_label(experiment.step.provider, experiment.step.model)} landmarks, fit by code",
         n_frames=sum(len(records) for records in fits.values()),
         mapped=mapped,
+        unmapped=unmapped,
         sources=sources,
         facts={**group_facts(args, group, experiment.group), "experiment_file": args.experiment.name},
     )
@@ -2997,20 +3007,27 @@ def tool_mappings(args: argparse.Namespace) -> MappingSource:
     answers = probe_answers(run, experiment, frames_of_probe(clips, experiment), args.run)
     camera_of = _adapted(homography_from_payload, answers, args.run)
     sources = {clip.source.info.clip_id: clip.source for clip in clips}
+    cameras = {
+        clip_id: [camera_of(key_clip, frame) for key_clip, frame in answers if key_clip == clip_id]
+        for clip_id in sources
+    }
     mapped = [
         item
-        for clip_id, source in sources.items()
-        for item in mapped_frames(
-            source,
-            [camera_of(key_clip, frame) for key_clip, frame in answers if key_clip == clip_id],
-            lambda record: "camera of the tool for this frame",
-        )
+        for clip_id, records in cameras.items()
+        for item in mapped_frames(sources[clip_id], records, lambda record: "camera of the tool for this frame")
+    ]
+    unmapped = [
+        (clip_id, record.frame, "the tool gave no camera")
+        for clip_id, records in cameras.items()
+        for record in records
+        if not record.valid
     ]
     return MappingSource(
         name=experiment.name,
         engine=f"tool:{experiment.tool.name}",
         n_frames=len(answers),
         mapped=mapped,
+        unmapped=unmapped,
         sources=sources,
         facts={
             **group_facts(args, group, experiment.group),
@@ -3039,8 +3056,11 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
     The mapping of a keyframe is the one of the result file (``ClipResult.homographies``):
     the landmark fit or the camera of the tool of that frame when the run kept it, else the
     mapping of another frame carried with the camera motion. A keyframe without a mapping is
-    not drawn. The keyframes come from the settings of the run (its provenance). The clip
-    must be the clip of the result file: the same clip id, frame count and image size.
+    not drawn; it is listed with the reason. A frame of a transition (a shot of one frame
+    between the cuts of the result, ``MotionField.transition_frames``: a frame of a dissolve)
+    has no mapping in any run, and its reason says so. The keyframes come from the settings of
+    the run (its provenance). The clip must be the clip of the result file: the same clip id,
+    frame count and image size.
     """
     try:
         document = json.loads(args.result.read_text(encoding="utf-8"))
@@ -3065,7 +3085,19 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
     engine = f"{result.engines.get('landmarks')} landmarks, fit by code" if pitch_engine == "code" else pitch_engine
     by_frame = {record.frame: record for record in result.homographies}
     keyframes = keyframe_indices(info.n_frames, info.fps, config.keyframe_interval_s)
-    records = [by_frame[frame] for frame in keyframes if frame in by_frame]
+    records = [by_frame.get(frame, HomographyRecord(frame=frame)) for frame in keyframes]
+    transitions = MotionField([None] * (info.n_frames - 1), result.cuts).transition_frames()
+    unmapped = [
+        (
+            info.clip_id,
+            record.frame,
+            "a frame of a transition (a dissolve, or a lone frame between two cuts): the run gives it no mapping"
+            if record.frame in transitions
+            else "the run has no mapping for this frame",
+        )
+        for record in records
+        if not record.valid
+    ]
 
     def origin(record: HomographyRecord) -> str:
         if record.source == "propagated":
@@ -3077,6 +3109,7 @@ def run_mappings(args: argparse.Namespace) -> MappingSource:
         engine=engine,
         n_frames=len(keyframes),
         mapped=mapped_frames(source, records, origin),
+        unmapped=unmapped,
         sources={info.clip_id: source},
         facts={
             "result_file": args.result.name,
@@ -3125,6 +3158,11 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
         f"overlay of {mappings.name} ({mappings.engine}): {len(mappings.mapped)} of {mappings.n_frames} frames have a "
         f"mapping; {len(chosen)} chosen with the seed {args.seed}"
     )
+    if mappings.unmapped:
+        print(f"{len(mappings.unmapped)} of {mappings.n_frames} frames have no mapping and get no image:")
+        for reason in dict.fromkeys(reason for _, _, reason in mappings.unmapped):
+            frames = ", ".join(f"{clip} {frame}" for clip, frame, why in mappings.unmapped if why == reason)
+            print(f"  {reason}: {frames}")
     if len(chosen) < args.count:
         print(f"only {len(chosen)} frames have a mapping, fewer than the count {args.count}: all of them are drawn")
     partial = folder.with_name(f".{folder.name}.partial-{secrets.token_hex(4)}")
@@ -3157,7 +3195,7 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
         seed=args.seed,
         count=args.count,
         n_frames=mappings.n_frames,
-        n_mapped=len(mappings.mapped),
+        unmapped=mappings.unmapped,
         provenance=provenance,
     )
     write_json(args.list, document)

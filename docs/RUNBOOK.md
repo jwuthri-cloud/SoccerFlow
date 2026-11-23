@@ -562,6 +562,10 @@ python -m pitchvlm.cli overlay run --result ~/pitchvlm-data/runs/dev-detector/<c
   camera of that frame when the run kept it, else the mapping of another frame carried with the
   camera motion (the caption says which). A refused fit that no frame uses is not drawn; its paint
   score is in `paint` of `result.json`. `--clip` is the clip of the run (its video or its folder).
+- A frame without a mapping gets no image. The command prints these frames grouped by the reason,
+  and the list file holds them in `frames_without_mapping`. A keyframe of a run on a frame of a
+  dissolve has the reason "a frame of a transition": the run drops the mapping of every such frame
+  (entry "A dissolve is a transition, not a shot" of `docs/DECISIONS.md`).
 - The command prints each chosen image with its clip, frame and paint score, and writes the images
   into `~/pitchvlm-data/overlays/<name>-seed<seed>-count<count>/`. It refuses a list file or an
   image folder that is already there.

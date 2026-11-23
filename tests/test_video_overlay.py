@@ -33,7 +33,7 @@ from pitchvlm.frames import ImageFolderSource, VideoFileSource
 from pitchvlm.geometry import projected_line_pixels
 from pitchvlm.overlays import CHOICE_RULE, LIST_FORMAT, MappedFrame, caption, choose_frames, image_name
 from pitchvlm.render import draw_mapping_check
-from pitchvlm.synth import SyntheticScene
+from pitchvlm.synth import RetimedScene, SyntheticScene
 from pitchvlm.vlm.fake import FakeBackend
 
 REPO = Path(__file__).resolve().parents[1]
@@ -459,6 +459,7 @@ def test_overlay_of_a_run_draws_the_chosen_keyframes_and_lists_them(
         image = cv2.imread(str(folder / entry["image"]))
         assert image.shape[1] == 1280 and image.shape[0] > 720
     assert "into its field by_eye in the list file" in printed
+    assert document["frames_without_mapping"] == []
     # The same seed and count choose the same frames, also from the frame folder of the video.
     other = tmp_path / "again"
     folder_arguments = ["--result", str(video_run["result"]), "--clip", str(video_run["clip_folder"]), "--seed", "3"]
@@ -611,3 +612,83 @@ def test_parser_reads_the_two_commands() -> None:
 def test_image_name_orders_the_images_by_their_place_in_the_list() -> None:
     assert image_name(0, mapped("SNGS-021", 37, 0.5)) == "01_SNGS-021_000038.png"
     assert image_name(9, mapped("SNGS-021", 0, 0.5)) == "10_SNGS-021_000001.png"
+
+
+# --- A video with a dissolve -------------------------------------------------------------------
+
+#: The dissolve clip: 40 frames of one moment, a dissolve of 10 frames, 40 frames of a moment 4 s later.
+DISSOLVE_START, DISSOLVE_FRAMES = 40, 10
+DISSOLVE_CLIP_FRAMES = 2 * DISSOLVE_START + DISSOLVE_FRAMES
+
+
+def dissolve_images() -> list[np.ndarray]:
+    """The frames of the dissolve clip: shot A blended into shot B (scene frames 100 later) over 10 frames."""
+    old = RetimedScene(list(range(DISSOLVE_CLIP_FRAMES)), seed=0)
+    new = RetimedScene([frame + 100 for frame in range(DISSOLVE_CLIP_FRAMES)], seed=0)
+    images = []
+    for frame in range(DISSOLVE_CLIP_FRAMES):
+        weight = min(1.0, max(0.0, (frame - DISSOLVE_START + 1) / (DISSOLVE_FRAMES + 1)))
+        blend = (1.0 - weight) * old.image(frame).astype(np.float32) + weight * new.image(frame)
+        images.append(np.clip(blend, 0, 255).astype(np.uint8))
+    return images
+
+
+def test_a_video_with_a_dissolve_keeps_its_frames_and_overlay_names_the_transition_keyframes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The frames of a dissolve reach the tools as `run` decodes them, and get no mapping and no image.
+
+    The stand-in tools answer with the truth of the hard cut in the middle of the dissolve, as in
+    ``tests/test_shot_cuts.py``. The run drops the mapping of every transition frame; the overlay of
+    the run lists each transition keyframe with that reason and draws no image of it.
+    """
+    monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
+    middle = DISSOLVE_START + DISSOLVE_FRAMES // 2
+    truth = RetimedScene(
+        [frame if frame < middle else frame + 100 for frame in range(DISSOLVE_CLIP_FRAMES)], seed=0
+    )
+    root = tmp_path / "data"
+    video = write_video(root / "footage" / "dissolve.mp4", dissolve_images(), 25.0)
+    assert cli.main(["video-frames", "--video", str(video), "--out", str(root / "videos")]) == 0
+    folder = root / "videos" / "dissolve"
+    images = ImageFolderSource(folder / "img1", "dissolve", fps=25.0)
+    decoded = VideoFileSource(video)
+    assert images.info.n_frames == decoded.info.n_frames == DISSOLVE_CLIP_FRAMES
+    for frame in range(DISSOLVE_CLIP_FRAMES):
+        assert np.array_equal(images.read(frame), decoded.read(frame)), f"frame {frame}"
+    runs = {}
+    for tool, name, payloads in (
+        ("rfdetr", "detections.json", detector_payloads(truth)),
+        ("pnlcalib", "calibration.json", [camera_payload(truth, frame) for frame in range(DISSOLVE_CLIP_FRAMES)]),
+    ):
+        job = tmp_path / "jobs" / f"{tool}.json"
+        arguments = ["clip-job", "--tool", tool, "--config", str(DETECTOR_SETTINGS), "--clip", str(folder)]
+        assert cli.main([*arguments, "--root", str(root), "--out", str(job)]) == 0
+        runs[name] = write_clip_run(job, tmp_path / "tools" / name, payloads)
+    run = ["run", "--clip", str(video), "--config", str(DETECTOR_SETTINGS), "--allow-dirty"]
+    run += ["--detections", str(runs["detections.json"]), "--calibration", str(runs["calibration.json"])]
+    assert cli.main([*run, "--out", str(tmp_path / "runs")]) == 0
+    result_file = tmp_path / "runs" / "dissolve" / "result.json"
+    result = json.loads(result_file.read_text(encoding="utf-8"))["result"]
+    cuts = result["cuts"]
+    transitions = {
+        start for start, end in zip([0, *cuts], [*cuts, DISSOLVE_CLIP_FRAMES], strict=True) if end - start == 1
+    }
+    keyframes = [*range(0, DISSOLVE_CLIP_FRAMES, 12), DISSOLVE_CLIP_FRAMES - 1]
+    on_transition = sorted(transitions & set(keyframes))
+    assert on_transition, f"the test needs a keyframe on a transition frame; transitions {sorted(transitions)}"
+    assert all(result["homographies"][frame]["matrix"] is None for frame in on_transition)
+    capsys.readouterr()
+
+    arguments = ["--result", str(result_file), "--clip", str(video), "--seed", "20261113"]
+    assert cli.main(overlay("run", tmp_path, "list", *arguments, "--count", str(len(keyframes)))) == 0
+    printed = capsys.readouterr().out
+    document = assert_list_file_is_plain_text(tmp_path / "list.json", [tmp_path])
+    reason = "a frame of a transition (a dissolve, or a lone frame between two cuts): the run gives it no mapping"
+    listed = [entry for entry in document["frames_without_mapping"] if entry["reason"] == reason]
+    assert [entry["frame"] for entry in listed] == on_transition
+    assert f"  {reason}: " + ", ".join(f"dissolve {frame}" for frame in on_transition) in printed
+    drawn = {entry["frame"] for entry in document["frames"]}
+    assert not drawn & set(on_transition)
+    assert document["n_frames_with_mapping"] == len(keyframes) - len(document["frames_without_mapping"])
+    assert document["n_chosen"] == document["n_frames_with_mapping"]
