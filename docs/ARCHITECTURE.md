@@ -1719,7 +1719,7 @@ def check_stream_engines(config: PipelineConfig) -> None                 # Value
 class StreamInput: frame: int; people: tuple[PersonDet, ...]; balls: tuple[BallCandidate, ...]; camera: HomographyRecord
     detector_seconds: float | None = None; calibration_seconds: float | None = None
 @dataclass(frozen=True)
-class StreamHeader: clip: str; detector: RfdetrSettings; calibration: PnlcalibSettings
+class StreamHeader: clip: str; detector: DetectorSettings; calibration: PnlcalibSettings   # any detector family
 def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]
 def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[StreamInput]]
 def stand_in_inputs(people, balls, cameras) -> Iterator[StreamInput]
@@ -1780,7 +1780,7 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
   observations), so a long stream keeps a bounded state; with `history_frames` None it keeps
   everything, like the clip path.
 - The line format: a header line `{"format": "pitchvlm-stream-1", "clip": ..., "detector":
-  <RfdetrSettings>, "calibration": <PnlcalibSettings>}`, then one line per frame from frame 0,
+  <DetectorSettings of any family>, "calibration": <PnlcalibSettings>}`, then one line per frame from frame 0,
   `{"frame": i, "detector": {"seconds": s, "payload": <payload of a clip run frame>},
   "calibration": {"seconds": s, "payload": <payload of fallbacks.pnlcalib>}}`; JSON objects, one
   per line, keys sorted. `read_stream_lines` refuses a missing header, another format, a line

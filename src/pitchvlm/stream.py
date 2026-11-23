@@ -75,12 +75,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+from pydantic import TypeAdapter
 
 from pitchvlm.ball import BallCandidate, track_ball
 from pitchvlm.config import PipelineConfig
 from pitchvlm.fallbacks.pnlcalib import homography_from_payload
 from pitchvlm.fallbacks.rfdetr import ball_candidates, expand_rows, people_from_detections
-from pitchvlm.fallbacks.runs import ClipRun, PnlcalibSettings, RfdetrSettings
+from pitchvlm.fallbacks.runs import ClipRun, DetectorSettings, PnlcalibSettings, is_detector
 from pitchvlm.fill import players_in_frame
 from pitchvlm.geometry import apply_homography, invert_homography, matrix_from_record, matrix_to_rows, paint_alignment
 from pitchvlm.kitcolour import KitClusters, fit_kit_clusters, kit_roles, torso_feature
@@ -202,7 +203,7 @@ class StreamHeader:
     """The header line of a stream: the clip and the settings of the two tools."""
 
     clip: str
-    detector: RfdetrSettings
+    detector: DetectorSettings
     calibration: PnlcalibSettings
 
 
@@ -213,7 +214,7 @@ def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]:
     process writes the same lines to a pipe (``docs/DECISIONS.md``, entry of 2026-11-23).
     ``ValueError`` is raised when the two runs are not runs of one clip by the two tools.
     """
-    if not isinstance(detections.tool, RfdetrSettings) or not isinstance(calibration.tool, PnlcalibSettings):
+    if not is_detector(detections.tool) or not isinstance(calibration.tool, PnlcalibSettings):
         raise ValueError("a stream needs the clip run of the detector and the clip run of the calibration")
     if (detections.clip, detections.n_frames) != (calibration.clip, calibration.n_frames):
         raise ValueError(
@@ -255,7 +256,7 @@ def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[Stre
     try:
         header = StreamHeader(
             clip=str(head["clip"]),
-            detector=RfdetrSettings.model_validate(head["detector"]),
+            detector=TypeAdapter(DetectorSettings).validate_python(head["detector"]),
             calibration=PnlcalibSettings.model_validate(head["calibration"]),
         )
     except (KeyError, ValueError) as error:
