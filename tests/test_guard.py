@@ -10,7 +10,10 @@ Run the tests with `python3 -m unittest tests.test_guard` or with pytest.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -20,8 +23,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import traceback
 import unittest
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
@@ -100,6 +105,99 @@ def hook_entries() -> dict[str, str]:
     return entries
 
 
+_TEMPLATE: tempfile.TemporaryDirectory[str] | None = None
+_GUARD_MODULE: ModuleType | None = None
+_GUARD_STREAMS: tuple[str, str, str, str] | None = None
+
+
+def new_repository_template() -> Path:
+    """Return a work tree whose git folder is that of `git init --quiet --template=` with the identity.
+
+    It is made once per test process, with the private environment of the tests, and each
+    test copies its git folder.
+    """
+    global _TEMPLATE
+    if _TEMPLATE is None:
+        folder = tempfile.TemporaryDirectory()
+        base = Path(folder.name).resolve()
+        (base / "home").mkdir()
+        (base / "repo").mkdir()
+        env = private_environment(base / "home", base)
+        for args in (
+            ("init", "--quiet", "--template="),
+            ("config", "--local", "user.name", AUTHOR),
+            ("config", "--local", "user.email", EMAIL),
+        ):
+            subprocess.run(["git", *args], cwd=base / "repo", env=env, capture_output=True, check=True)
+        _TEMPLATE = folder
+    return Path(_TEMPLATE.name).resolve() / "repo"
+
+
+def guard_module() -> ModuleType:
+    """Return tools/guard.py as a module, loaded once per test process."""
+    global _GUARD_MODULE
+    if _GUARD_MODULE is None:
+        spec = importlib.util.spec_from_file_location("guard_in_process", GUARD)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _GUARD_MODULE = module
+    return _GUARD_MODULE
+
+
+def guard_streams() -> tuple[str, str, str, str]:
+    """Return the encoding and the error handler of the output and the error stream of a guard process."""
+    global _GUARD_STREAMS
+    if _GUARD_STREAMS is None:
+        probe = "import sys; o, e = sys.stdout, sys.stderr; print(o.encoding, o.errors, e.encoding, e.errors)"
+        found = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, encoding="utf-8", check=True
+        ).stdout.split()
+        _GUARD_STREAMS = (found[0], found[1], found[2], found[3])
+    return _GUARD_STREAMS
+
+
+def run_guard_in_process(
+    command: list[str], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run `main` of the guard in this process, as `python3 tools/guard.py ...` runs it.
+
+    The environment is `env` during the call; git, which the guard starts, gets it too. The
+    two output streams have the encoding and the error handler of a guard process
+    (`guard_streams`), and are read back as `subprocess.run(..., encoding="utf-8")` reads
+    them. The exit code is that of the process: the value of `main`, the code of a
+    `SystemExit`, or 1 with the traceback for an error that `main` does not catch.
+    """
+    out_encoding, out_errors, err_encoding, err_errors = guard_streams()
+    out, err = io.BytesIO(), io.BytesIO()
+    out_text = io.TextIOWrapper(out, encoding=out_encoding, errors=out_errors, write_through=True)
+    err_text = io.TextIOWrapper(err, encoding=err_encoding, errors=err_errors, write_through=True)
+    with (
+        mock.patch.dict(os.environ, env, clear=True),
+        contextlib.redirect_stdout(out_text),
+        contextlib.redirect_stderr(err_text),
+    ):
+        try:
+            code = guard_module().main(command[2:])
+        except SystemExit as stop:
+            if stop.code is None or isinstance(stop.code, int):
+                code = stop.code or 0
+            else:
+                print(stop.code, file=sys.stderr)
+                code = 1
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            code = 1
+    out_text.flush()
+    err_text.flush()
+
+    def text(data: bytes) -> str:
+        return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+    return subprocess.CompletedProcess(command, code, text(out.getvalue()), text(err.getvalue()))
+
+
 class GuardTestCase(unittest.TestCase):
     """A test case with a temporary git repository that has a neutral local identity."""
 
@@ -114,10 +212,10 @@ class GuardTestCase(unittest.TestCase):
         self.home.mkdir()
         self.repo.mkdir()
         self.env = private_environment(self.home, self.base)
-        self.git("init", "--quiet", "--template=")
+        # A copy of the git folder of `git init --quiet --template=` with the local identity, made
+        # once per test process: three git processes less for each test.
+        shutil.copytree(new_repository_template() / ".git", self.repo / ".git", symlinks=True)
         self.assertTrue((self.repo / ".git").is_dir())
-        self.git("config", "--local", "user.name", AUTHOR)
-        self.git("config", "--local", "user.email", EMAIL)
 
     def git(self, *args: str, exit_code: int = 0, env: dict[str, str] | None = None) -> str:
         """Run git inside the temporary repository, check its exit code and return its output."""
@@ -158,6 +256,22 @@ class GuardTestCase(unittest.TestCase):
         if allow_empty:
             options.append("--allow-empty")
         self.git("-c", "commit.gpgsign=false", "commit", *options, "-m", message, env=env)
+        return self.head_name()
+
+    def head_name(self) -> str:
+        """Return `short_name("HEAD")`, read from the files of the git folder when they hold it.
+
+        A commit writes the name of its branch into `.git/HEAD` and the commit into the file of
+        the branch, or the commit into `.git/HEAD` when no branch is checked out. Reading the two
+        files saves one git process per commit. Any other layout asks git.
+        """
+        git_folder = self.repo / ".git"
+        head = (git_folder / "HEAD").read_text(encoding="ascii").strip()
+        if head.startswith("ref: "):
+            branch_file = git_folder / head.removeprefix("ref: ")
+            head = branch_file.read_text(encoding="ascii").strip() if branch_file.is_file() else ""
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            return head[:10]
         return self.short_name("HEAD")
 
     def short_name(self, revision: str) -> str:
@@ -186,8 +300,16 @@ class GuardTestCase(unittest.TestCase):
         repo: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run the guard against the temporary repository, or against another folder."""
+        """Run the guard against the temporary repository, or against another folder.
+
+        The guard of this repository runs inside the test process, as its process would run it
+        (`run_guard_in_process`). Another script runs as a process of its own. The guard still
+        runs as a process in the tests of the hooks (`HookSettingsTest`), in
+        `test_paths_mode_accepts_relative_paths` and in the tests of the host list.
+        """
         command = [sys.executable, str(script), "--repo", str(repo or self.repo), *args]
+        if script == GUARD:
+            return run_guard_in_process(command, env or self.env)
         return subprocess.run(
             command, env=env or self.env, capture_output=True, encoding="utf-8", check=False
         )

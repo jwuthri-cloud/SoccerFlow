@@ -221,6 +221,7 @@ def test_the_score_is_the_same_every_time_and_at_another_image_size() -> None:
     assert score(image, shifted(truth, 10.0)) < 0.2
 
 
+@pytest.mark.slow
 def test_the_score_separates_good_from_bad_mappings_on_the_synthetic_clip(scene: SyntheticScene) -> None:
     # The run-machine measurement in small: mappings with an error of at most 2 m against
     # mappings with an error above 3 m. tools/synthetic_diagnostics.py measures it on 50 frames.

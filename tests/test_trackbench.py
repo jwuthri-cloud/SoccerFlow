@@ -9,6 +9,9 @@ from pitchvlm.evalx.trackbench import ARMS, FAULTS, CaseResult, run_case, table_
 #: 15 seconds: shorter than the clips of the bench, so that the tests run fast.
 SHORT_CLIP = 375
 
+#: Each case runs the pipeline steps of every arm on 375 frames (about 4 s for the module).
+pytestmark = pytest.mark.slow
+
 
 def by_arm(results: list[CaseResult]) -> dict[str, CaseResult]:
     """Index the results of one case by arm."""

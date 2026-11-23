@@ -36,11 +36,11 @@ label file.
 brew install uv gitleaks
 uv tool install pre-commit
 
-# Main environment: Python 3.13. Then run the offline tests.
+# Main environment: Python 3.13. Then run the offline tests: the full run once here.
 uv venv --python 3.13
 uv pip install -e ".[dev,gemini]"
 source .venv/bin/activate
-python -m pytest
+python -m pytest -m "slow or not slow"
 
 # Pinned package list of this machine. uv.lock is never committed.
 mkdir -p locks
@@ -83,6 +83,27 @@ git -C ~/pitchvlm-data/sn-trackeval rev-parse HEAD
   `provenance.scorer_commit`.
 - The model SDK must be a version 3.x (`google-genai>=3.0,<4` in `pyproject.toml`). An older SDK
   repeats a failed call by itself, and `doctor` then fails before any model call.
+
+The offline tests have two runs (`docs/DECISIONS.md`, entry "A faster default run of the offline
+tests" of 2026-11-22):
+
+```bash
+python -m pytest                          # default run, after each change: all but the 9 slow tests
+python -m pytest -m "slow or not slow"    # full run, before a commit: every test
+python -m pytest -m slow                  # the 9 slow tests alone
+```
+
+- The default run leaves out only the tests marked `slow` (`pyproject.toml`, section
+  `[tool.pytest.ini_options]`). They need a long synthetic clip and check no hard rule. Every
+  check of the guard, the secret scan, the money stops, the cache keys and rule 4 is in the
+  default run.
+- `tests/conftest.py` keeps pure results that many tests compute again (frames of a synthetic
+  scene, frames read from image files, the measured camera motion, the paint alignment, JPEG
+  bytes, the git state of this checkout) once per test process. `PITCHVLM_TEST_CACHE=0 python -m
+  pytest` runs without these caches.
+- On a machine that has the plugin `pytest-xdist`, `python -m pytest -n auto` runs the tests in
+  several processes. The plugin is not a dependency of the project and is not installed on the
+  build machine; such a run was never tried there.
 
 The key lives in the environment variable `GEMINI_API_KEY`. Set it in each new terminal:
 
@@ -798,7 +819,7 @@ Check each one with its first check before you rely on it.
 
 | Part | File | First check | When it fails |
 |---|---|---|---|
-| Offline tests on this machine | `tests/` | `python -m pytest -rs` after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of disk: install the tool. One test of the tool script is skipped without Pillow. Pillow belongs to the environments of the two specialist tools (row "Tool script"): leave this test skipped. A failed test names the code that this machine runs in another way: repair the code, not the test. |
+| Offline tests on this machine | `tests/` | `python -m pytest -m "slow or not slow" -rs` (the full run) after the setup (section 1): every test passes, and the skipped tests are listed with their reason. The tests ran on one machine only, with Python 3.13. Some tests need a disk that tells upper and lower case apart, and some a disk that does not: one of the two groups never ran | A skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of disk: install the tool. One test of the tool script is skipped without Pillow. Pillow belongs to the environments of the two specialist tools (row "Tool script"): leave this test skipped. A failed test names the code that this machine runs in another way: repair the code, not the test. |
 | Setup commands | section 1 | Each command of section 1 ends without an error, and `doctor --no-api` shows the SDK as a version 3.x. Most commands of section 1 never ran: the install with the extra `gemini`, the pinned list, the work tree and the scorer | Read the error of the command. Fact 19 below is about the package age limit of `uv pip`. |
 | Gemini client | `src/pitchvlm/vlm/client.py` | `doctor` with one model (step 2 of day 1). The cost estimate and the budget line must be on the screen before the first check line of a model | Read the failed check and the report file. A failed contract check (`boxes`, `landmarks`, `store flag`, `token sum`, `served tier`, `flex tier`) is a client fault: repair the client before any footage is sent. A value of `box accuracy` or `landmark accuracy` that does not reach the value of the gate file is not a client fault. A line `[info] flex tier: not checked` is no client fault either: the flex tier was busy (section 2). When the check `boxes` fails, read the answers under `contract.<model>.answers` in the report file first: a model that names no person for the coloured rectangles of the synthetic frames fails this check without a client fault. |
 | Download | `src/pitchvlm/datasets.py` | `data --split valid`; then `ls ~/pitchvlm-data/SoccerNetGS-valid` shows about 58 clip folders | Run the command again: it continues the download. An archive whose `.part` file in `~/pitchvlm-data/archives` already holds every byte gets its final name at the next start: the server answers the range with the status 416 and the size of the archive, and the command compares that size with the file. When the sizes differ, or the answer names no size, the command stops with an error that names the `.part` file: compare its size with the size on the dataset page, or delete it to start again. When the host refuses the request or its certificate (the download itself was never run), download `valid.zip` by hand into `~/pitchvlm-data/archives` and run the command again: it then only extracts. |
