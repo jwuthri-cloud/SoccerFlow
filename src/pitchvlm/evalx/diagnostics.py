@@ -33,7 +33,7 @@ import numpy as np
 
 from pitchvlm.evalx.metrics import summarize
 from pitchvlm.schemas import TEAM_ROLES, Box, ClipResult, Track
-from pitchvlm.tracking import TEAM_SLOTS, team_key_runs
+from pitchvlm.tracking import SWAP_MIN_VOTES, TEAM_SLOTS, team_key_runs
 
 #: A box is at the image border when an edge is closer to it than this many box heights.
 BORDER_BOX_HEIGHTS = 1.0
@@ -104,14 +104,18 @@ class TrackDiagnostics:
         return lines
 
 
-def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagnostics:
+def track_diagnostics(
+    result: ClipResult, *, max_speed_mps: float, team_min_votes: int = SWAP_MIN_VOTES
+) -> TrackDiagnostics:
     """Compute the tracking values of a clip result that need no labels.
 
     The positions are those of the frame states at the observations of a track
     (``observed``), so a step is the way between two keyframes, not between two
     filled frames, and no step crosses a cut. ``max_speed_mps`` is the fastest
     plausible speed (the tracking setting of the same name). A team key change
-    is counted with ``tracking.team_key_runs``.
+    is counted with ``tracking.team_key_runs`` and ``team_min_votes`` votes, the
+    number that the split of team swaps of the same engine uses
+    (``SWAP_MIN_VOTES`` times ``pipeline.keyframe_frames``).
     """
     if not 0.0 < max_speed_mps < math.inf:
         raise ValueError(f"max_speed_mps must be a finite number above 0, got {max_speed_mps}")
@@ -138,7 +142,11 @@ def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagn
     )
     speeds = _step_speeds(result)
     all_speeds = np.concatenate(list(speeds.values())) if speeds else np.zeros(0)
-    changes = [len(team_key_runs(track.observations)) - 1 for track in tracks if track.role in TEAM_ROLES]
+    changes = [
+        len(team_key_runs(track.observations, min_votes=team_min_votes)) - 1
+        for track in tracks
+        if track.role in TEAM_ROLES
+    ]
     alive = {key: [_alive(tracks, key, frame) for frame in frames] for key in _TEAM_KEYS}
     teams = {key: _team_counts(tracks, key, frames, alive[key]) for key in _TEAM_KEYS}
     return TrackDiagnostics(
@@ -172,7 +180,8 @@ def _at_border(box: Box, width: int, height: int) -> bool:
 def _step_speeds(result: ClipResult) -> dict[int, np.ndarray]:
     """Return the speeds in metres per second between the observed positions of each track that has a step.
 
-    Two positions in different shots make no step.
+    Two positions in different shots make no step. ``ValueError`` is raised when a track has two
+    observed positions in one frame: the step between them would take no time.
     """
     positions: dict[int, list[tuple[int, float, float]]] = {}
     for state in result.frames:
@@ -182,6 +191,8 @@ def _step_speeds(result: ClipResult) -> dict[int, np.ndarray]:
     speeds: dict[int, np.ndarray] = {}
     for track_id, points in positions.items():
         ordered = np.array(sorted(points), dtype=np.float64)  # (n, 3): frame, x, y
+        if (np.diff(ordered[:, 0]) == 0).any():
+            raise ValueError(f"track {track_id} has two observed positions in one frame")
         shots = np.array([_shot_of(int(frame), result.cuts) for frame in ordered[:, 0]])
         same_shot = shots[1:] == shots[:-1]
         if not same_shot.any():

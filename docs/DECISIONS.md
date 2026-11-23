@@ -1301,6 +1301,161 @@ Open, not fixed (inferred, not measured):
   case-insensitively, or bills a 524; `urllib` applies the timeout to each read, so a server
   that sends bytes slowly can hold a call longer than 300 s.
 
+## 2026-11-22 — Second read of the tracking, cuts, paint alignment and detector engine
+
+A second read of the code that pull requests 5, 6 and 7 brought into `main` (`652c82b`; base
+`f7d788e`), with the hand-resolved merges. Five readers read separate parts (merge seams, the cut
+rule, the two track repairs, kit colours and numbers, texts and rules). Each finding was checked
+by a second reader with a test that fails on the old code or with an exact trace; one more
+reader then tried to refute the fixes. Every number below is synthetic: build machine, synthetic
+clips, stand-ins of the model, the detector and the calibration. None is a result on real
+footage. "Before" is `652c82b`; "after" is the commit of this entry.
+
+1. **Counts.** Major: 4 found, 4 confirmed, 3 fixed, 1 open (item 5). Minor: 8 found, 8
+   confirmed, 7 fixed, 1 kept as a written limit (item 3, last point). Small: 13 found, 9
+   confirmed and fixed, 4 refuted or taken back (item 6). The read of the fixes found 1 small
+   regression of this review (fixed, item 4) and 1 change of this review that it argued
+   against (taken back, item 6).
+2. **Major, fixed.**
+   - `tracking.link_team_slots` checked the numbers of each link alone, so a chain 1, (no
+     number), 13 of one goalkeeper slot became one track and number 13 was lost. A link is now
+     refused when the chain it makes shows two displayed numbers or two most frequent per-frame
+     numbers. Test: `test_team_slots_do_not_chain_two_numbers_through_a_track_without_one`.
+   - The detector engine counted two keyframe limits in frames: a team-key change of
+     `split_team_swaps` needed 4 votes = 4 frames (0.16 s at 25 fps) instead of 1.9 s, and the
+     label penalty of `associate` grew per missed frame instead of per missed keyframe (a
+     detection with another kit key could not match after 4 missed frames). Found by three
+     readers. `pipeline.keyframe_frames` (12 frames at 25 fps; 1 for the model engine) now
+     scales both: `associate(keyframe_frames=)`, `split_team_swaps(min_votes=4 * 12)`, and the
+     team-key changes of the tracking values (`track_diagnostics(team_min_votes=)`). The model
+     engine is unchanged (1 and 4). Tests in `tests/test_tracking.py` (penalty per interval,
+     a 4-frame flip next to an opponent is no change, a 120-frame swap is cut) and
+     `tests/test_detector_engine.py` (the split gets 48 votes). Measured: see item 7.
+   - `kitcolour.fit_kit_clusters` ran one k-means++ start. On the synthetic scene (250 frames,
+     seeds 0 to 9) it split the referee against both teams in 4 of 10 seeds (1, 5, 6, 8): the
+     referee got the key `A` and 41 % to 42 % of the player boxes got `none`. Now 10 starts
+     (`KMEANS_STARTS`), the fit with the smallest sum of squared distances is kept: 0 of 10
+     seeds, players in their own cluster 0.933 to 0.998 (before, in the 6 good seeds, 0.960 to
+     0.994). Test: `test_the_kit_clusters_are_the_two_teams_and_the_referee_is_an_outlier`
+     (50 frames, seed 0, fails before). The test of two kits with 40 noisy copies each was
+     changed: with the new fit one blue copy of 40 lies beyond the outlier limit (0.119 against
+     0.114), which the rule (median plus 3 scaled deviations of a skewed distance) allows; the
+     old fit passed because an outlier inside the cluster widened the limit. The test now
+     asks for distinct team keys, no copy with the key of the other team, and at most one
+     outlier per team.
+3. **Minor, fixed.**
+   - A shown number joined two tracks across a cut only when their positions on the two sides
+     were within the reach of a runner (`_one_person_per_number` compared positions across the
+     cut), so after a replay or another camera the number was taken from all but the longest
+     track. Across a cut the number alone decides now; inside a shot the test of the way stays.
+   - Without kit clusters (one torso feature, or none) every track of the detector engine
+     became a referee or a goalkeeper (`kit_roles` read every `none` as an outlier kit). Now
+     `kit_roles` runs only when a person of the clip has the key `A` or `B`.
+   - Noisy crops of one kit were split into two "teams" (the check asked only for two
+     different features). `KitClusters.two_kits` (each centre beyond the outlier limit of the
+     other) now refuses such clusters with a warning.
+   - The comment of `SWAP_MIN_VOTES` said a false change has a chance of 0.6 % per track of 60
+     observations. The weak runs join their neighbours, so 4 votes need not come in a row.
+     Monte Carlo (10 % wrong keys, 10 % no key, one by one; 2,000 tracks per length, seed 0):
+     2.15 % at 60 observations, 9.30 % at 250, 26.6 % at 750; with 48 votes 0 of 2,000 at 250
+     and at 750. The comment now says so.
+   - RUNBOOK section 12: step 1 ran `data --split train`, which the command refuses; step 3
+     imported `rfdetr` in a `python -c` line, against rule 4. Both are now written as "to
+     build", the training as a job of `tools/run_tool.py`.
+   - "A pan above about 100 px per frame counts as a cut" (ARCHITECTURE; the paint-and-cuts
+     entry, item 6) was not measured. Measured now: at 100 px per frame no pair is below 0.5
+     (lowest 0.873), at 125 px 7 of 39 pairs are, at 150 px 15 of 39. ARCHITECTURE says so.
+   - Kept as a written limit, not fixed: `link_team_slots` counts every track of a group as a
+     person, so a second box of one person, a wrong-team piece or a referee with a team key
+     can force one link between two people. Two of these causes are fixed above; the limit is
+     in the docstring.
+4. **Small, fixed.** `run` printed no ball count (`demo` did). The radar drew trails across a
+   cut (`RadarRenderer(cuts=)`, `render_clip` passes `result.cuts`). OpenCV hue 2 and hue 178
+   (one red) fell in the first and the last hue bin, distance sqrt(2); the bins now start half
+   a bin before hue 0. `shot_correlation` raised `ZeroDivisionError` on an image whose 160 px
+   copy has fewer rows than the grid (empty blocks). `load_clip_run` looked for an older part
+   only at `parts + 1`; it now looks at every 4-digit part above the run, with the name escaped
+   for `glob` (the escape also in `tools/run_tool.later_parts`; a stem with `[` was the
+   regression that the read of the fixes found). `track_diagnostics` gave an infinite speed for
+   two positions of one track in one frame; it raises `ValueError` now. Texts: ARCHITECTURE
+   on the keyframe check of `run` and `demo` (model engine only), on `BallState` defaults, on
+   the chain rule of the slots, and the contracts of every changed function.
+5. **Major, open: a dissolve is not a cut.** `is_cut` compares neighbouring frames; in a
+   dissolve each frame differs from the next by a small blend step. Measured
+   (`tools/synthetic_diagnostics.py`, seed 0, two shots of the synthetic match 100 frames apart):
+   a hard cut 0.033, a dissolve of 5 frames lowest pair 0.900, of 10 frames 0.929; so the motion
+   chain, the tracks and the fill run through it, and a mapping carried across a 10-frame
+   dissolve was 39 m off at the frames after it (one reader, scratch script). No fix is small:
+   a test over a window of frames needs its own measurement, and a fast pan must not become a
+   cut. ARCHITECTURE names the limit. Owner decision: build a window test before the demo
+   clip, or accept the limit (the clips of SoccerNet GSR have no cut).
+6. **Refuted or taken back.** (a) Flat or tiny frames are always a cut: by design and written.
+   (b) The change point of `team_key_runs` after merges (for example A10 B3 A3 B10): the contact
+   is tested from the last vote of the merged run to the first vote of the next, the right
+   window. (c) The engine table names `model` for the number step when no number request is
+   sent (no mapping): older than these pull requests, and `run` prints that no player has a
+   number; the ball step names the tracker, and the detector of its candidates is named in
+   `people`. (d) Taken back: this review first refused slot links between different export
+   numbers; an export number can come from one low-confidence crop, so one misread crop would
+   block a link. The display number stays the evidence. (e) `min_observations` of the detector
+   engine stays 2, of frames (0.08 s): a noise filter whose value G2 and G4 decide; written in
+   `every_frame_tracking`.
+7. **Measured, before and after** (build machine; commands from the top folder with
+   `PYTHONPATH=src`):
+   - `python -m pitchvlm.evalx.trackbench --seeds 20` (seeds 0 to 19): before, every number of
+     the table of the track-repairs entry, item 8, again to the last digit. This also checks the
+     claim of that entry, item 10, that the cut changes leave the clips without a cut alone.
+     After: the same table to the last digit (the chain rule of the slots changes no case of the
+     bench). A first run with the export-number check of item 6 (d) changed one row (mixed,
+     both: track ratio 1.154, purity 0.985, 26.6 tracks).
+   - `python tools/synthetic_diagnostics.py`: before, every number of the paint-and-cuts entry,
+     items 5 and 6, again (median scores per shift, AUROC 0.948 and 0.987, the mirrored
+     mappings, 448 pairs lowest 0.881, 8 cuts highest 0.055, the jump 0.918). The script now
+     also prints the time of one score (17.5 ms median, n 2,450, on the build machine while
+     other sessions ran; the earlier "about 12 ms" was not measured by a script), the limits of
+     items 3 and 5, and the detector-engine numbers of the detector entry, item 5: 250 frames,
+     seed 3, without slots 27 tracks, 4 switches, coverage 0.972, track ratio 1.174; with slots
+     23, 0, 1.000, 1.000; a cut at frame 54: 33 tracks, 0 across the cut, paint of 10 keyframe
+     cameras 0.996 to 1.000. The same numbers before and after.
+   - Detector engine, split of team swaps (scratch scripts of the review, kept in the notes of
+     the session, not in the repository; stand-in detector, true camera, 10 s clips, seeds 0 to
+     9, a team-A player passes in front of a team-B player, depth gap 0.5 m):
+
+     | case | far player wrongly cut, before | after | switches without split; with split, before; after |
+     |---|---|---|---|
+     | pass 0.5 m/s | 10 of 10 | 0 of 10 | 38; 184; 38 |
+     | pass 1 m/s | 10 of 10 | 0 of 10 | 38; 80; 38 |
+     | pass 2 m/s | 10 of 10 | 0 of 10 | 38; 76; 38 |
+     | pass 4 m/s | 0 of 10 | 0 of 10 | 38; 38; 38 |
+     | mark 1 s | 10 of 10 | 0 of 10 | 38; 156; 38 |
+     | mark 2 s | 10 of 10 | 10 of 10 | 38; 260; 260 |
+     | depth gap 1 m: pass 0.5, 1 m/s; mark 1 s | 2, 1, 4 of 10 | 0, 0, 0 of 10 | 38; 62, 44, 72; 38 |
+
+     The before column was measured with a best-of-20 k-means fit in the script, so that the
+     cluster failure of item 2 did not hide the split; the after column with the code of this
+     entry. A mark of 2 s shows the shirt of the other kit for longer than the 1.9 s of the
+     keyframe design, so it is still cut: the limit that the track-repairs entry, item 2, names
+     for the model engine.
+   - Detector engine, injected swaps (the swap of `trackbench` applied to the output of
+     `associate`, 15 s clips, seeds 0 to 9): switches over 10 clips (19 swaps
+     after, 18 before), before then after: clean without repair 90 and 90, clean with the split
+     92 and 90; with the swaps, no repair 126 and 128, split 106 and 118, slots 41 and 46, both
+     18 and 36. The split now takes back 10 of the 38 switches that the swaps cost (20 of 36
+     before): a swap must hold for 48 frames on each side, and on these clips the tracks of the
+     detector engine are often shorter after a swap. This is the cost of the fix. Whether the
+     detector engine should use a shorter time than the keyframe design is for G4 on the dev
+     clips.
+   - Natural scene (30 s, seeds 0 to 9): tracks of a team with a run of 4 or more wrong kit
+     votes: 1 of 532 (5 frames, seed 4); wrong cuts of the split 2 before and 0 after; switches
+     263 without the split, with it 265 before and 263 after.
+8. **Not verified.** Nothing ran on real footage, a real detector or a real model. The new
+   `two_kits` check has no measurement on real crops: on simulated two-kit features its margin
+   was 0.79 to 0.99 against limits of 0.53 to 0.66 (4 cases, one reader); similar real kits
+   could fail it, and the clip then has no team keys. The 10 k-means starts were measured on
+   flat synthetic kits only. The `keyframe_frames` scaling keeps the time of the keyframe
+   design; whether 1.9 s is the right time for a kit-colour swap is for G4. The swap of two
+   teammates and the dissolve stay unseen.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

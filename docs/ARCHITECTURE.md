@@ -243,7 +243,7 @@ def paint_alignment(image: np.ndarray, H: np.ndarray) -> PaintAlignment
   0.2% of the frame is paint, or when 50% or more of it lies within the tolerance of paint. The
   pitch markings are symmetric, so a mapping that swaps the halves or the sides of the pitch gets
   the same score; `check_homography` finds it. Deterministic, numpy and `cv2` only, about 12 ms
-  for 1280 x 720 on the build machine. The constants (`PAINT_*` in `geometry.py`) were chosen on
+  for 1280 x 720 on the build machine (`tools/synthetic_diagnostics.py` prints the time). The constants (`PAINT_*` in `geometry.py`) were chosen on
   the synthetic clip only.
 
 ### `motion.py` — camera motion between frames
@@ -303,10 +303,13 @@ Hard cuts (2026-11-22):
   blocks or more. The answer is the best median, or None when no motion counts. The median of
   blocks keeps a static score graphic from making two shots look alike.
 - `is_cut` is True when the correlation is below 0.5 (`MIN_SHOT_CORRELATION`) or None. A pan
-  that is too fast for the optical flow (above about 100 px per frame at 1280 px on the
-  synthetic clip) therefore counts as a cut. A jump in time that one camera motion explains (the
-  same camera, a pose that the optical flow can reach) is not found: the test compares the
-  picture of the camera, not the people.
+  that is too fast for the optical flow therefore counts as a cut (synthetic clip at 1280 px,
+  `tools/synthetic_diagnostics.py`: at 100 px per frame no pair is below 0.5, at 125 px 7 of 39
+  pairs are). A jump in time that one camera motion explains (the same camera, a pose that the
+  optical flow can reach) is not found: the test compares the picture of the camera, not the
+  people. A dissolve is not found either: each frame differs from the next by a small blend step
+  (a dissolve of 5 frames keeps every pair at 0.900 or more on the synthetic clip), so the
+  motion chain, the tracks and the fill run through it.
 - `compute_motion_field` tests every pair of neighbouring frames with the measured motion and
   the last measured motion of the same shot. A cut gets a missing step, also when a motion was
   measured, and goes into `MotionField.cuts`.
@@ -317,7 +320,7 @@ Hard cuts (2026-11-22):
 
 ```python
 def associate(keyframes: Sequence[FramePeople], *, fps: float, warp: MotionWarp, to_pitch: PitchMap,
-              config: TrackingConfig = TrackingConfig()) -> list[Track]
+              config: TrackingConfig = TrackingConfig(), keyframe_frames: int = 1) -> list[Track]
 def stitch_fragments(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
                      config: TrackingConfig = TrackingConfig()) -> list[Track]
 def vote_role_team(track: Track) -> tuple[Role, TeamKey]
@@ -407,17 +410,18 @@ SWAP_CONTACT_BOX_HEIGHTS = 1.0     # contact at a team-key change, foot points i
 TEAM_SLOTS = {"player": 10, "goalkeeper": 1}   # people of one team side and role in a clip
 @dataclass(frozen=True)
 class TeamRun: team_key: TeamKey; start: int; stop: int    # observations[start:stop]
-def team_key_runs(observations: Sequence[TrackObs]) -> list[TeamRun]
-def split_team_swaps(tracks: Sequence[Track]) -> list[Track]
+def team_key_runs(observations: Sequence[TrackObs], *, min_votes: int = SWAP_MIN_VOTES) -> list[TeamRun]
+def split_team_swaps(tracks: Sequence[Track], *, min_votes: int = SWAP_MIN_VOTES) -> list[Track]
 def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
                     config: TrackingConfig = TrackingConfig(), cuts: Sequence[int] = ()) -> list[Track]
 ```
 
 - `team_key_runs`: the observations with the key `A` or `B` vote; votes in a row with one key
   are a run, and the strength of a run is its number of votes for its own key. While a run is
-  weaker than `SWAP_MIN_VOTES`, the weakest run (the first in a tie) takes the key of its
+  weaker than `min_votes` (`SWAP_MIN_VOTES` for keyframes; for the detector engine the same
+  time, `SWAP_MIN_VOTES * pipeline.keyframe_frames`, 48 frames at 25 fps), the weakest run (the first in a tie) takes the key of its
   neighbours and joins them. So each change between two runs left is a change of the team key
-  that held for 4 votes on both sides. One run left gets the key of most votes (`A` in a tie).
+  that held for `min_votes` votes on both sides. One run left gets the key of most votes (`A` in a tie).
   A run starts at the first vote of its key; the first run starts at observation 0 and the last
   ends at the last observation; `none` belongs to the run it lies in. No vote gives `[]`.
 - `split_team_swaps` (before `stitch_fragments`, in `pipeline._tracks` when
@@ -441,7 +445,8 @@ def link_team_slots(tracks: Sequence[Track], *, fps: float, to_pitch: PitchMap,
   frequent per-frame numbers, both pitch positions (end of the earlier, start of the later) are
   known, and their distance is at most `max_speed_mps * dt + reach_margin_m`. The links are
   taken by distance (then time gap, then ids), each track with at most one earlier and one
-  later link, until the group holds `s` tracks or no link is left; a group with `s` tracks or
+  later link, until the group holds `s` tracks or no link is left; a link is also refused when
+  the chain that it would make shows two different displayed or most frequent per-frame numbers (a track without a number between a 7 and a 9 joins neither); a group with `s` tracks or
   fewer does not change. A chain becomes one track with the id and place of its earliest track,
   all observations, the team key voted over them, and the numbers of its longest track with a
   displayed number (else of its longest track); the name is set later. Limits: the distance is
@@ -1010,7 +1015,7 @@ class TrackDiagnostics: tracks: int; births_inside: int; ends_inside: int; steps
                         alive_per_keyframe: tuple[tuple[int, int, int], ...]
     def as_dict(self) -> dict[str, object]
     def lines(self) -> list[str]
-def track_diagnostics(result: ClipResult, *, max_speed_mps: float) -> TrackDiagnostics
+def track_diagnostics(result: ClipResult, *, max_speed_mps: float, team_min_votes: int = SWAP_MIN_VOTES) -> TrackDiagnostics
 
 # trackbench.py: synthetic bench of the track repairs (python -m pitchvlm.evalx.trackbench)
 FAULTS = ("none", "swap", "team_noise", "occlusion", "mixed")
@@ -1048,8 +1053,8 @@ def table_lines(results: Sequence[CaseResult]) -> list[str]
 class RenderStyle: ...   # colours per team side / role, trail seconds (4.0), radar scale, font sizes
 def draw_overlay(image: np.ndarray, players: Sequence[PlayerState], style: RenderStyle = RenderStyle()) -> np.ndarray
 class RadarRenderer:
-    def __init__(self, fps: float, style: RenderStyle = RenderStyle())
-    def draw(self, state: FrameState) -> np.ndarray          # keeps trails per track id
+    def __init__(self, fps: float, style: RenderStyle = RenderStyle(), *, cuts: Sequence[int] = ())
+    def draw(self, state: FrameState) -> np.ndarray          # keeps trails per track id; a trail ends at a cut
 def compose(overlay: np.ndarray, radar: np.ndarray) -> np.ndarray   # video on top, radar below, same width
 class VideoSink:                                              # context manager, OpenCV writer, fourcc mp4v
     def __init__(self, path: Path, fps: float, size: tuple[int, int])
@@ -1139,7 +1144,8 @@ sends its requests with `httpx2`.
   is missing), no warp (`bridged_warp`), no filled state (`dense_frame_states(cuts=...)`), and
   `associate` and `stitch_fragments` run on each shot on its own; the track ids are then 0..n-1
   in the order of the shots. Only `finalize_tracks` may join two tracks across a cut, by a shown
-  shirt number of one team. `ClipResult.cuts` names the cuts.
+  shirt number of one team; the positions on the two sides of a cut do not decide whether such
+  tracks are two people (the test of the way applies inside a shot only). `ClipResult.cuts` names the cuts.
 - Paint alignment (2026-11-22): every landmark fit, before the plausibility check, gets
   `geometry.paint_alignment` on its keyframe (with the pitch engine `calibration`, the camera
   of the tool at each keyframe, also before its check), in `ClipResult.paint` (`schemas.PaintCheck`:
@@ -1189,7 +1195,9 @@ Money rules of the command line (`cli.py`):
   cost also holds an answer whose line could not be written.
 - `run` and `probe` have the option `--allow-other-images` (`CassetteStore(allow_other_images=True)`).
   A repeat index above 0 prints a line: the stored answers of other repeat indexes are not used.
-- `run` and `demo` refuse a clip with fewer keyframes than `tracking.min_observations`. The clip
+- With the people engine `model`, `run` and `demo` refuse a clip with fewer keyframes than
+  `tracking.min_observations` (the detector engine has people on every frame, and its number
+  step pays only for tracks that exist). The clip
   id of a path is spelled as the disk stores it (`cli.disk_spelling`).
 
 Output files of the command line:
@@ -1410,13 +1418,14 @@ class ToolAnswers:
     balls: Mapping[int, Sequence[BallCandidate]] | None = None    # frame -> ball candidates
     cameras: Sequence[HomographyRecord] | None = None             # every frame
 def every_frame_tracking(config: PipelineConfig, fps: float) -> TrackingConfig
+def keyframe_frames(config: PipelineConfig, fps: float) -> int   # 1 for the model engine; frames of one keyframe interval for the detector
 BALL_MAX_GAP_S = 0.5 ; KIT_CLUSTER_SEED = 0
 
 # kitcolour.py
 def torso_feature(image: np.ndarray, box: Box) -> np.ndarray | None      # shape (15,), unit length
 @dataclass(frozen=True)
-class KitClusters: centres: np.ndarray; limits: tuple[float, float]; def team_key(self, feature) -> TeamKey
-def fit_kit_clusters(features: np.ndarray, *, seed: int = 0) -> KitClusters
+class KitClusters: centres: np.ndarray; limits: tuple[float, float]; def team_key(self, feature) -> TeamKey; def two_kits(self) -> bool
+def fit_kit_clusters(features: np.ndarray, *, seed: int = 0) -> KitClusters   # KMEANS_STARTS = 10 starts, the lowest cost kept
 def kit_roles(tracks: Sequence[Track], mean_position: Mapping[int, tuple[float, float]]) -> list[Track]
 
 # ball.py
@@ -1431,7 +1440,7 @@ def gate_px(box: Box, frames: int, fps: float) -> float
 class StageClock: def stage(self, name) (context manager); def add(self, name, seconds); def report(self, n_frames)
 
 # schemas.py
-class BallState(Record): box: Box; pitch_x: float | None; pitch_y: float | None; observed: bool = False
+class BallState(Record): box: Box; pitch_x: float | None = None; pitch_y: float | None = None; observed: bool = False
 # FrameState gets: ball: BallState | None = None
 
 # fallbacks/runs.py
@@ -1457,15 +1466,20 @@ def load_clip_run(first: Path) -> ClipRun
   pitch are dropped, as for the model. `_kit_team_keys` reads every frame with people, takes the
   torso feature of each box, fits the two kit clusters on all features of the clip and gives each
   person the team key of its cluster or `none` (an outlier, or no feature). A clip without two
-  different features keeps `none` for everyone and logs a warning. Tracks: `tracking.associate`
+  different features, or whose two clusters lie inside each other's outlier limits (one kit:
+  `KitClusters.two_kits`), keeps `none` for everyone and logs a warning; then `kit_roles` is not
+  run, and every track stays a player. Tracks: `tracking.associate`
   with `every_frame_tracking` (the same time for a missed person as in the keyframe design: 4
-  keyframes of 0.48 s become 48 frames at 25 fps), then `kitcolour.kit_roles`, then
+  keyframes of 0.48 s become 48 frames at 25 fps) and `keyframe_frames` (12 frames at 25 fps
+  stand for one keyframe interval: the label penalty grows per interval, and a team-key change
+  of the split must hold for 4 intervals; `min_observations` stays 2, of frames), then
+  `kitcolour.kit_roles`, then
   `tracking.stitch_fragments`, on each shot on its own as in the model engine (no track crosses
   a cut; ids 0..n-1 in the order of the shots). With `tracking.split_team_swaps` the split runs
   after `kit_roles` and before the joins of the shot; `tracking.team_slots` runs in the shared
-  `finalize_tracks` with the cuts. `tracking.py` is used as it is. The tracking values without
+  `finalize_tracks` with the cuts. The tracking values without
   labels (`evalx.diagnostics`) are written and printed for this engine too; they count every
-  observed frame, not keyframes.
+  observed frame, not keyframes, and count a team-key change with the votes of the split.
 - `kit_roles`: a track whose observations are mostly `none` by box height is a goalkeeper when
   its mean pitch position lies in a goal zone (`tracking.goal_side`) with `|y|` at most the half
   width of the penalty area (20.16 m), and a referee otherwise (a linesman stands near a

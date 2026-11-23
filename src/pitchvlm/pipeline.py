@@ -67,6 +67,7 @@ from pitchvlm.schemas import (
 )
 from pitchvlm.timing import StageClock
 from pitchvlm.tracking import (
+    SWAP_MIN_VOTES,
     PitchMap,
     associate,
     finalize_tracks,
@@ -255,7 +256,13 @@ def run_clip(
             on_pitch = _kit_team_keys(source, on_pitch)
         with clock.stage("tracks"):
             tracks = _detector_tracks(
-                on_pitch, warp, to_pitch, info.fps, every_frame_tracking(config, info.fps), field
+                on_pitch,
+                warp,
+                to_pitch,
+                info.fps,
+                every_frame_tracking(config, info.fps),
+                field,
+                keyframe_frames=keyframe_frames(config, info.fps),
             )
     else:
         with clock.stage("tracks"):
@@ -309,10 +316,26 @@ def every_frame_tracking(config: PipelineConfig, fps: float) -> TrackingConfig:
     The limits of ``config.tracking`` were set for keyframes ``config.keyframe_interval_s``
     apart. A track ends after ``max_missed_keyframes`` keyframes without a match: on every
     frame this becomes the same time in frames, so a person may be hidden for as long as in
-    the keyframe design. The other limits are in seconds, metres or box heights and stay.
+    the keyframe design. The limits in seconds, metres or box heights stay. Two other counts
+    of keyframes take their time from ``keyframe_frames``: the growth of the label penalty of
+    ``tracking.associate`` and the votes of a team-key change (``tracking.split_team_swaps``).
+    ``min_observations`` stays a count, of frames here: a fragment of 2 frames (0.08 s at 25
+    fps) is kept for the joins, where the keyframe design asks for 2 keyframes.
     """
     missed_s = config.tracking.max_missed_keyframes * config.keyframe_interval_s
     return config.tracking.model_copy(update={"max_missed_keyframes": round(missed_s * fps)})
+
+
+def keyframe_frames(config: PipelineConfig, fps: float) -> int:
+    """Return how many observations of a track stand for one keyframe interval: 1 for the people engine ``model``.
+
+    The detector engine observes every frame, so one keyframe interval is
+    ``config.keyframe_interval_s * fps`` frames (at least 1). A limit that counts
+    observations and was set for keyframes is multiplied by this number to keep its time.
+    """
+    if config.engines.people != "detector":
+        return 1
+    return max(1, round(config.keyframe_interval_s * fps))
 
 
 # --- Engines and tool answers ----------------------------------------------------
@@ -872,8 +895,9 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
 
     The two kit clusters are fitted on the torso features of all people of the clip. A
     person whose kit fits neither cluster, or whose torso is too small for a feature, gets
-    the team key ``none``. When the clip does not have two different kit colours, every
-    person keeps the team key ``none`` and a warning says so.
+    the team key ``none``. When the clip does not have two different kit colours (fewer than
+    two different features, or two clusters that are not two kits: ``KitClusters.two_kits``),
+    every person keeps the team key ``none`` and a warning says so.
     """
     features: list[list[np.ndarray | None]] = []
     for frame_people in people:
@@ -891,6 +915,14 @@ def _kit_team_keys(source: FrameSource, people: Sequence[FramePeople]) -> list[F
         )
         return list(people)
     clusters = fit_kit_clusters(np.stack(known), seed=KIT_CLUSTER_SEED)
+    if not clusters.two_kits():
+        logger.warning(
+            "clip %s: the %d torso features form one kit colour, not two (the two clusters lie inside each "
+            "other's outlier limits): no person gets a team key",
+            source.info.clip_id,
+            len(known),
+        )
+        return list(people)
     return [
         FramePeople(
             frame=frame_people.frame,
@@ -910,6 +942,8 @@ def _detector_tracks(
     fps: float,
     config: TrackingConfig,
     motion: MotionField,
+    *,
+    keyframe_frames: int,
 ) -> list[Track]:
     """Link the people of every frame into tracks, give the tracks of outlier kits their role, then join broken tracks.
 
@@ -921,16 +955,28 @@ def _detector_tracks(
     person of the other kit cluster (``tracking.split_team_swaps``), after the kit roles
     (a goalkeeper or a referee has the team key ``none`` and is never cut) and before the
     joins of its shot, which link the pieces.
+
+    ``keyframe_frames`` frames stand for one keyframe interval (``keyframe_frames``): the label
+    penalty of ``associate`` grows per interval, and a team-key change must hold for
+    ``SWAP_MIN_VOTES`` intervals of votes, the time of the keyframe design. With 4 votes, 4
+    frames of a torso window that shows the shirt of an overlapping opponent would cut a track.
+
+    Without kit clusters (no person of the clip has the team key ``A`` or ``B``, see
+    ``_kit_team_keys``) no kit is an outlier, so no track gets a role from its kit: every
+    track stays a player without a team key.
     """
+    has_kits = any(person.team_key in ("A", "B") for frame_people in people for person in frame_people.people)
     shots: dict[int, list[FramePeople]] = {}
     for frame_people in people:
         shots.setdefault(motion.shot_of(frame_people.frame), []).append(frame_people)
     tracks: list[Track] = []
     for shot in sorted(shots):
-        fragments = associate(shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config)
-        with_roles = kit_roles(fragments, _mean_positions(fragments, to_pitch))
+        fragments = associate(
+            shots[shot], fps=fps, warp=warp, to_pitch=to_pitch, config=config, keyframe_frames=keyframe_frames
+        )
+        with_roles = kit_roles(fragments, _mean_positions(fragments, to_pitch)) if has_kits else fragments
         if config.split_team_swaps:
-            with_roles = split_team_swaps(with_roles)
+            with_roles = split_team_swaps(with_roles, min_votes=SWAP_MIN_VOTES * keyframe_frames)
         for track in stitch_fragments(with_roles, fps=fps, to_pitch=to_pitch, config=config):
             tracks.append(track.model_copy(update={"track_id": len(tracks)}))
     return tracks

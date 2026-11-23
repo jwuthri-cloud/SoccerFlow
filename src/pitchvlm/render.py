@@ -217,9 +217,13 @@ class RadarRenderer:
     that were drawn one after the other. Where a track had no state in a frame
     that was drawn, its trail has a gap: nobody measured the way of the person
     there, so no line is drawn across it.
+
+    ``cuts`` are the frames that start a new shot (``ClipResult.cuts``). A
+    position of one shot says nothing about the pitch of the next, so every
+    trail ends at a cut: the first frame of a shot shows no trail from before.
     """
 
-    def __init__(self, fps: float, style: RenderStyle = RenderStyle()) -> None:
+    def __init__(self, fps: float, style: RenderStyle = RenderStyle(), *, cuts: Sequence[int] = ()) -> None:
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
         self._style = style
@@ -235,6 +239,7 @@ class RadarRenderer:
         self._drawn_frames: deque[int] = deque()
         #: Track id -> colour of the track when it was last seen.
         self._colours: dict[int, Colour] = {}
+        self._cuts = tuple(cuts)
 
     def draw(self, state: FrameState) -> np.ndarray:
         """Return the radar of one frame as a new BGR image.
@@ -274,7 +279,9 @@ class RadarRenderer:
         track_ids = [player.track_id for player in state.players]
         if len(set(track_ids)) != len(track_ids):
             raise ValueError(f"a track id appears more than once in frame {state.frame}")
-        oldest_frame = state.frame - self._trail_frames
+        # A trail keeps no position from another shot: the oldest frame is the start of the shot at most.
+        shot_start = max((cut for cut in self._cuts if cut <= state.frame), default=0)
+        oldest_frame = max(state.frame - self._trail_frames, shot_start)
         while self._drawn_frames and self._drawn_frames[-1] >= state.frame:
             self._drawn_frames.pop()
         while self._drawn_frames and self._drawn_frames[0] < oldest_frame:
@@ -415,9 +422,11 @@ def _crop_to_even(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image[: height - height % 2, : width - width % 2])
 
 
-def _video_frames(source: FrameSource, states: Sequence[FrameState], style: RenderStyle) -> Iterator[np.ndarray]:
+def _video_frames(
+    source: FrameSource, states: Sequence[FrameState], style: RenderStyle, cuts: Sequence[int]
+) -> Iterator[np.ndarray]:
     """Yield the video image of every state: the overlay on top and the radar below."""
-    radar = RadarRenderer(source.info.fps, style)
+    radar = RadarRenderer(source.info.fps, style, cuts=cuts)
     for state in states:
         overlay = draw_overlay(source.read(state.frame), state.players, style)
         if state.ball is not None:
@@ -440,7 +449,7 @@ def render_clip(source: FrameSource, result: ClipResult, out_path: Path, style: 
     fails removes the unfinished file.
     """
     out_path = Path(out_path)
-    images = _video_frames(source, _states_by_frame(result, source.info.n_frames), style)
+    images = _video_frames(source, _states_by_frame(result, source.info.n_frames), style, result.cuts)
     first = next(images)
     height, width = first.shape[:2]
     out_path.parent.mkdir(parents=True, exist_ok=True)

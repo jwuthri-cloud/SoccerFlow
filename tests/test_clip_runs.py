@@ -94,6 +94,10 @@ def test_run_of_two_parts_is_read_in_frame_order(tmp_path: Path) -> None:
             "part of another run",
         ),
         (
+            lambda folder: write(folder / "detections-0004.json", part(4, 4, frames_of(range(2, 4)))),
+            "detections-0004.json lies next to a run of 2 parts",
+        ),
+        (
             lambda folder: write(folder / "detections-0002.json", part(2, 2, frames_of(range(2, 3)))),
             "1 frames are missing",
         ),
@@ -125,6 +129,16 @@ def test_wrong_series_of_parts_is_refused(tmp_path: Path, change: Any, words: st
     first = two_parts(tmp_path)
     change(tmp_path)
     with pytest.raises(ValueError, match=words):
+        load_clip_run(first)
+
+
+def test_a_part_of_an_older_run_is_found_when_the_name_holds_glob_characters(tmp_path: Path) -> None:
+    first = write(tmp_path / "run[a].json", part(1, 2, frames_of(range(0, 2))))
+    write(tmp_path / "run[a]-0002.json", part(2, 2, frames_of(range(2, 4))))
+    write(tmp_path / "run[a]-0004.json", part(4, 4, frames_of(range(2, 4))))
+    write(tmp_path / "runa-0005.json", part(5, 5, frames_of(range(2, 4))))  # a part of another run
+
+    with pytest.raises(ValueError, match=r"run\[a\]-0004.json lies next to a run of 2 parts"):
         load_clip_run(first)
 
 

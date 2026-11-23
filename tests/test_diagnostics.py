@@ -219,3 +219,15 @@ def test_a_clip_without_tracks_has_empty_values() -> None:
 def test_diagnostics_refuse_a_wrong_speed_limit(speed: float) -> None:
     with pytest.raises(ValueError, match="max_speed_mps"):
         track_diagnostics(result_of([]), max_speed_mps=speed)
+
+
+def test_diagnostics_refuse_two_positions_of_one_track_in_one_frame() -> None:
+    # A result that holds the state of frame 0 two times would give a step of no time: an infinite speed.
+    first = PlayerState(track_id=0, pitch_x=0.0, pitch_y=0.0, role="player", observed=True)
+    second = PlayerState(track_id=0, pitch_x=3.0, pitch_y=0.0, role="player", observed=True)
+    frames = (FrameState(frame=0, players=(first,)), FrameState(frame=0, players=(second,)))
+    later = tuple(FrameState(frame=frame) for frame in range(1, INFO.n_frames))
+    result = ClipResult(info=INFO, frames=frames + later, tracks=(track(0, [0]),), homographies=(), cuts=())
+
+    with pytest.raises(ValueError, match="two observed positions in one frame"):
+        track_diagnostics(result, max_speed_mps=12.0)
