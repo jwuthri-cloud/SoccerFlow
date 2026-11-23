@@ -1226,6 +1226,199 @@ Items 5 and 6 come from the checks of the change of item 4.
    synthetic kits; the ball with a stand-in ball that the synthetic picture does not show. The
    values of the table above were read by one agent and not checked by a second reader.
 
+## 2026-11-22 — A faster default run of the offline tests
+
+1. **Goal and result.** The owner called the wait for the offline tests unusable (3,090 tests,
+   181 s on `main` 652c82b, measured by the orchestrator). The goal was a default run of about
+   30 s after each change, with every test still in one full run. **The goal is missed.** The
+   default run went from 258 s to 150 s (mean of two runs each, below), 42 % shorter. Most of
+   what is left is the tests of the guard and of the command line, which start git, the guard,
+   the secret scanner and the hook runner as processes. They check hard rules and stay in the
+   default run. All numbers here are measured on the build machine while other sessions ran
+   (load average 3 to 17 on 14 cores); the absolute seconds depend on that load.
+
+2. **Before and after.** Wall time of `python -m pytest`, base and new checkout run one after the
+   other with the same machine load (the series of item 9).
+
+   | Run | Tests | Run 1, s | Run 2, s | Load average at the start (1 min) |
+   |---|---|---|---|---|
+   | Before: `main` 652c82b, every test | 3,090 (1 skipped) | 255.6 | 261.0 | 3.0, 6.4 |
+   | After: default run, `python -m pytest` | 3,081 (1 skipped) | 150.0 | 150.3 | 7.4, 6.2 |
+   | After: slow tier, `python -m pytest -m slow` | 9 | 18.2 | 20.4 | 7.0, 10.5 |
+   | After: full run, `python -m pytest -m "slow or not slow"` | 3,090 (1 skipped) | 164.3 | 177.0 | 6.3, 8.9 |
+   | After: full run, test files in reversed order | 3,090 (1 skipped) | 169.9 | - | 16.6 |
+   | After: full run without the caches (`PITCHVLM_TEST_CACHE=0`) | 3,090 (1 skipped) | 230.6 | - | (with the fault check beside it) |
+
+   Two earlier runs of the base, before any change, under a load of 5 to 10: 264.7 s and 306.3 s.
+   The skipped test is `tests/test_run_tool.py:528` (Pillow is not installed), in every run.
+
+   Seconds per test file (sum of the test times, mean of the two runs of each row above):
+
+   | File | Tests before | Before, s | Tests in the default run | After, s |
+   |---|---|---|---|---|
+   | `test_guard.py` | 143 | 82.7 | 143 | 64.3 |
+   | `test_cli.py` | 303 | 62.0 | 303 | 35.6 |
+   | `test_detector_engine.py` | 33 | 42.3 | 32 | 12.3 |
+   | `test_pipeline.py` | 90 | 26.4 | 89 | 10.4 |
+   | `test_shot_cuts.py` | 12 | 8.1 | 12 | 3.5 |
+   | `test_tool_probe.py` | 126 | 7.2 | 126 | 3.0 |
+   | `test_trackbench.py` | 6 | 4.3 | 0 | 0 |
+   | `test_paint_alignment.py` | 36 | 4.7 | 35 | 2.4 |
+   | `test_probes.py`, `test_run_tool.py` | 192 | 6.2 | 192 | 4.4 |
+   | the other 31 files | 2,149 | 8.6 | 2,149 | 8.2 |
+
+   Collection takes 2.6 to 4.4 s (imports of cv2 and scipy; `import pitchvlm.cli` alone takes
+   1.2 s, half of it `scipy.stats`, imported by `evalx/metrics.py`).
+
+3. **Causes, before the change.** One run of the base under `cProfile` (311 s profiled; the
+   profiler adds time, so the seconds are larger than in a plain run), and a count of every
+   child process with its wall time:
+   - Processes started by tests: 120 s for 1,958 processes. The guard as a process 52 s (most
+     of it in `test_guard.py`; each run starts Python, imports the guard and starts its own git
+     calls), git 49 s, the hook runner 11 s (8 runs), other Python scripts 6 s, the command line
+     as a process 1.4 s (1 run). Starting a process costs 12 ms (`/usr/bin/true`), git 26 to 30
+     ms and `python -c pass` 48 ms on this machine.
+   - Pipeline runs (`run_clip`, 118 runs, inside many tests): 120 s. In it the measured camera
+     motion 57 s (64 measurements), the frames of the synthetic scenes 39 s (6,627 frames drawn,
+     7 ms each, often the same frames again), the paint alignment 21 s (1,030 scores), reading
+     frame images from files 15 s (1,694 reads), JPEG encoding 6 s (6,180 crops).
+   - Real waits: 6.4 s (93 sleeps of the tests of signals and of answers in flight).
+   - Repeated parsing of settings: 1.5 s (463 YAML loads); not changed.
+
+4. **Changes.** Only the tests and the test settings changed; nothing under `src/` or `tools/`.
+   - `tests/conftest.py` (new): caches of six pure results, each computed once per test process:
+     the frames of a synthetic scene (key: the settings of the scene), frame images read from
+     files (key: the SHA-256 of the file), the measured camera motion (key: the source, the
+     people boxes and the scale), the paint alignment (key: the SHA-256 of the frame and the
+     matrix), the JPEG bytes of a request image (key: the SHA-256 of the pixels and the quality)
+     and the git state of this checkout (key: the git variables of the environment). A cached
+     frame is read-only and every caller gets a copy; a cached motion is built again as a new
+     `MotionField` and writes its log lines again. The caches are off in the modules that test
+     these functions (`test_synth`, `test_motion`, `test_frames`, `test_geometry`,
+     `test_vlm_steps`) and while a test has replaced a function of `motion`, `geometry` or `cv2`.
+     `PITCHVLM_TEST_CACHE=0` turns them off; the full run passes that way too (table above).
+   - `tests/test_guard.py`: the guard of the repository runs inside the test process, with the
+     environment of the test, its output streams in the encoding of a guard process and its
+     exit code as the process would give it. It still runs as a process in the hook tests
+     (`HookSettingsTest`, through the hook runner), in `test_paths_mode_accepts_relative_paths`,
+     for the copies of the guard with another host list, and in `test_vlm_cost.py`. Each test
+     copies the git folder of one `git init` with the local identity (made once per process)
+     instead of three git calls, and a commit reads its name from `.git/HEAD` and the branch
+     file instead of one more `git rev-parse` (git is asked when the files do not hold it).
+   - `pyproject.toml`: the marker `slow`, left out by `addopts = "-q -m 'not slow'"`.
+   - Saved per cause (difference of the per-file table, mean of two runs): the caches about 75 s
+     (`test_cli.py` 26 s, `test_detector_engine.py` 25 s, `test_pipeline.py` 13 s, the rest 11 s);
+     the guard inside the test process and the copied git folder 18 s; the slow tier 14 s.
+
+5. **The slow tier (9 tests).** Each needs a long synthetic clip for its claim, and none checks a
+   hard rule. Times of the two slow runs:
+
+   | Test | s | Why it stays slow |
+   |---|---|---|
+   | `test_detector_engine.py::test_team_slots_link_the_fragments_of_the_detector_engine` | 5.3, 6.7 | two pipeline runs on 250 frames with measured motion; the claim (4 people break into two tracks) needs that length |
+   | `test_pipeline.py::test_clip_of_thirty_seconds_keeps_one_track_per_person` | 2.9, 3.0 | 750 frames: people must leave the picture and come back |
+   | `test_paint_alignment.py::test_the_score_separates_good_from_bad_mappings_on_the_synthetic_clip` | 1.8, 2.0 | 20 mappings on each of its frames; a smaller sample changes the AUROC claim |
+   | `test_trackbench.py` (6 tests, `pytestmark`) | 3.7, 3.9 together | each bench case runs every arm on 375 frames; the repairs are also checked in `test_tracking.py` and `test_detector_engine.py` |
+
+   The cut tests (`test_shot_cuts.py`, 3.5 s) stay in the default run: the cut rule is checked in
+   every place that links or fills over time.
+
+6. **What stays slow in the default run.** `test_guard.py` (64 s): about 1,900 git processes,
+   at 25 to 35 ms each under load; the guard itself starts most of them (repository root,
+   identity, index, objects, remotes), and the hook tests start the hook runner, which starts
+   the guard and the secret scanner. `test_cli.py` (36 s): 21 s are about 480 child processes
+   that the commands under test start (the doctor checks of the hooks, the stand-in scorer
+   scripts, the secret scanner, the guard of `sync`, git for the results work tree, two runs of
+   the command line as a process that test its output buffering). These check rules 6, 9 and the
+   secret scan, and they stay.
+
+7. **Proof that no check was lost.**
+   - Test ids: the full run collects the 3,090 ids of `main` 652c82b, the same list (no test
+     split or renamed). The default run collects 3,081, the slow tier 9.
+   - Order: every changed test file alone passes (`test_guard.py`, `test_detector_engine.py`,
+     `test_pipeline.py`, `test_paint_alignment.py`, `test_trackbench.py`); the full run in
+     reversed file order passes; the default run passes two times in a row (item 2).
+   - Fault check: 36 hand-made faults, one at a time, undone after each: 34 in 24 modules under
+     `src/` and 2 in `tools/guard.py`. Eight of them are in the cached functions (frames, motion,
+     paint alignment, JPEG, git state). A control run without a fault passes. **The default run
+     catches 33 of 36** (31 of 34 in `src/`, 2 of 2 in the guard), every cached-function fault
+     but one included. The slow tier catches none of the other 3; the full run of `main`
+     652c82b does not catch them either (the old suite has the same gaps):
+     - F01, `synth.py`: the people are drawn far over near. No test looks at the order.
+     - F31, `fallbacks/fake.py`: the stand-in ball moves at half speed. The tests take the true
+       ball from the same function, so the fault changes the truth and the answer alike.
+     - F33, `pipeline.py`: a guarded `import google.genai` at the top of the module. Rule 4 has
+       one test (`test_vlm_client.py::test_sdk_is_imported_only_inside_a_function`); it checks
+       `client.py` only, so an SDK import in another module is not found. A test over every
+       module of the package would close this gap (a follow-up for the review of rule 4).
+
+   | Fault | Module | Change | Caught by the default run | First failing file |
+   |---|---|---|---|---|
+   | F01 | `synth.py` | far people drawn over near people | **no** | - |
+   | F02 | `synth.py` | no grass texture | yes | `test_cuts.py` |
+   | F03 | `motion.py` | measured motion never finds a cut | yes | `test_cuts.py` |
+   | F04 | `motion.py` | step converted back to full size the wrong way | yes | `test_detector_engine.py` |
+   | F05 | `motion.py` | a pair without a correlation is no cut | yes | `test_cuts.py` |
+   | F06 | `geometry.py` | score without the spread | yes | `test_paint_alignment.py` |
+   | F07 | `vlm/steps.py` | quality ignored | yes | `test_vlm_steps.py` |
+   | F08 | `cli.py` | a changed work tree is clean | yes | `test_cli.py` |
+   | F09 | `vlm/client.py` | Gemini call stored by the provider | yes | `test_cli.py` |
+   | F10 | `vlm/client.py` | OpenRouter routing allows data collection | yes | `test_vlm_openrouter.py` |
+   | F11 | `vlm/cost.py` | hard stop 1 USD late | yes | `test_cli.py` |
+   | F12 | `vlm/cost.py` | run stops at 2x its limit | yes | `test_cli.py` |
+   | F13 | `vlm/types.py` | prompt left out | yes | `test_cli.py` |
+   | F14 | `vlm/types.py` | provider left out | yes | `test_vlm_openrouter.py` |
+   | F15 | `vlm/cache.py` | stored answer of other pixels is used | yes | `test_cli.py` |
+   | F16 | `pipeline.py` | repeated boxes kept as two people | yes | `test_pipeline.py` |
+   | F17 | `pipeline.py` | crops half a second apart | yes | `test_pipeline.py` |
+   | F18 | `frames.py` | last frame not a keyframe | yes | `test_cli.py` |
+   | F19 | `fill.py` | states filled across a cut | yes | `test_fill.py` |
+   | F20 | `vlm/coords.py` | model point read as [x, y] | yes | `test_cli.py` |
+   | F21 | `evalx/metrics.py` | identity switches counted wrong | yes | `test_metrics.py` |
+   | F22 | `pitch.py` | width taken as length | yes | `test_geometry.py` |
+   | F23 | `export_gsr.py` | goalkeeper gets a jersey | yes | `test_cli.py` |
+   | F24 | `export_gsr.py` | jersey of a goalkeeper not refused | yes | `test_export_gsr.py` |
+   | F25 | `roster.py` | left team reads the right roster | yes | `test_pipeline.py` |
+   | F26 | `timing.py` | ms per frame off by 10 | yes | `test_detector_engine.py` |
+   | F27 | `ball.py` | gate does not grow with the frames | yes | `test_ball.py` |
+   | F28 | `kitcolour.py` | outlier limit without the margin | yes | `test_kitcolour.py` |
+   | F29 | `datasets.py` | archive member with '..' accepted | yes | `test_datasets.py` |
+   | F30 | `config.py` | other keyframe interval | yes | `test_cli.py` |
+   | F31 | `fallbacks/fake.py` | ball moves at half speed | **no** | - |
+   | F32 | `vlm/client.py` | privacy check of the routing passes anything | yes | `test_cli.py` |
+   | F33 | `pipeline.py` | the pipeline imports the model SDK | **no** | - |
+   | F34 | `schemas.py` | union counts the overlap two times | yes | `test_cli.py` |
+   | F35 | `tools/guard.py` | Google key pattern one character too long | yes | `test_cli.py` |
+   | F36 | `tools/guard.py` | home folders in names not found | yes | `test_guard.py` |
+
+8. **Proposed text for `CLAUDE.md`** (section "Commands"; the owner applies it):
+
+   ```bash
+   python -m pytest                          # offline tests, default run: all but the slow tests
+   python -m pytest -m "slow or not slow"    # full run, before a commit: every test
+   python -m pitchvlm.cli demo --out outputs/demo   # synthetic clip, fake model, no network
+   python3 tools/guard.py --tracked      # leak check of all tracked files
+   python3 tools/guard.py --push         # leak check of what a push can send: commits, tags, new names
+   ```
+
+   and in "How to work": "Small, tested changes. The default run of `pytest` passes after each
+   change, and the full run before a commit, offline and with no SDK installed."
+
+9. **Open: an owner decision for about 30 s.** With the guard tests in the default run the
+   default cannot reach 30 s on this machine: `test_guard.py` alone takes 64 s, because of the
+   git processes. Two ways, neither applied: (a) a third marker `git` for the tests that start
+   git, the guard, the hook runner or the secret scanner as processes, run with the full run
+   before each commit. The default run would then take roughly 60 s, estimated from the
+   per-file table (150 s less 64 s of `test_guard.py` and about 25 s of the process tests of
+   `test_cli.py`); the hooks still run the guard and the scan on every commit and push. It
+   takes checks of hard rules out of the default run, which this task did not allow. (b) Run in
+   several processes with `pytest-xdist` (`-n auto`) on a machine that has it. It is not a
+   dependency and not installed here; it was not tried.
+
+10. **Not verified.** No run on a quiet machine: every time here is under the load of other
+    sessions (base 256 to 306 s against 181 s on the orchestrator's earlier run). The caches
+    were tested on this machine and Python 3.13 only; a run with `pytest-xdist` was never tried.
+
 ## Open questions (to settle with measurements)
 
 - Can Gemini point at pitch landmarks well enough for a homography (gate G3)?

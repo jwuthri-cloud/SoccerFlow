@@ -559,6 +559,7 @@ def test_every_frame_has_a_pitch_mapping_that_follows_the_camera(result: ClipRes
     assert float(np.median(np.concatenate(errors))) < 0.5
 
 
+@pytest.mark.slow
 def test_clip_of_thirty_seconds_keeps_one_track_per_person() -> None:
     """A clip of 750 frames: the camera pans over the whole pitch, so people leave the picture and come back.
 

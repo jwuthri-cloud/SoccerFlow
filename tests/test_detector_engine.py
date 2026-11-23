@@ -256,6 +256,7 @@ def test_split_of_team_swaps_runs_per_shot_after_the_kit_roles(
     assert [track.track_id for track in repaired.tracks if track.first_frame < CUT <= track.last_frame] == []
 
 
+@pytest.mark.slow
 def test_team_slots_link_the_fragments_of_the_detector_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     """On 250 frames the plain detector engine breaks 4 people into two tracks; the slots link them right."""
     long_scene = SyntheticScene(n_frames=250, seed=3)

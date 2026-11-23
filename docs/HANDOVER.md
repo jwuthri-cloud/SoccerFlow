@@ -125,7 +125,7 @@ machine.
 
 | # | Step | Done when |
 |---|---|---|
-| 6 | Make the environment with Python 3.13, install the package with the extras `dev` and `gemini`, run `python -m pytest -rs`. In each new terminal: `source .venv/bin/activate` | Every test passes. A skipped test names its reason |
+| 6 | Make the environment with Python 3.13, install the package with the extras `dev` and `gemini`, run `python -m pytest -m "slow or not slow" -rs` (the full run). In each new terminal: `source .venv/bin/activate` | Every test passes. A skipped test names its reason |
 | 7 | Write the pinned list `locks/run-machine.txt`. Then do the check of fact 19 (RUNBOOK, section 8): it shows whether `uv pip` reads the package age limit of `pyproject.toml`. Write the second list of that check outside the repository, for example into `~/pitchvlm-data` | The file exists. The two lists of the check are equal, or the owner knows that they differ |
 | 8 | Owner: install the hooks: `pre-commit install --hook-type pre-commit --hook-type pre-push` | `doctor --no-api` shows `[ok  ] guard hooks` |
 | 9 | Owner: set the git identity of this clone, with the name and e-mail of the commits of the build machine (`git log -1 --no-merges --format='%an <%ae>'` prints them; a merge commit that the git host made has another e-mail, so leave it out) | `git config --local --get user.name` and `git config --local --get user.email` print the same two values |

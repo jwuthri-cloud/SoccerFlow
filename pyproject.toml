@@ -32,7 +32,11 @@ packages = ["src/pitchvlm"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
-addopts = "-q"
+# The default run leaves out the tests marked slow. The full run: python -m pytest -m "slow or not slow"
+addopts = "-q -m 'not slow'"
+markers = [
+    "slow: needs a long synthetic clip and checks no hard rule; left out of the default run (docs/RUNBOOK.md, section 1)",
+]
 
 [tool.uv]
 # Supply-chain cooldown: never resolve a release younger than 7 days.
