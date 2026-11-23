@@ -1789,6 +1789,78 @@ python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json 
   of the total per frame plus that of the slower tool below 40 ms at 25 fps, with the tools and
   the stream on the same machine at the same time. Write the measured values into
   `docs/DECISIONS.md` with the device and the load average.
-- A live pipe is not built: `tools/run_tool.py` has no mode that prints the lines of a stream yet
-  (the entry of 2026-11-23 says what it must print), and the package reads the picture of each
-  frame from `--clip`, so the pipe must come from the same frames.
+- The lines of a stream have the format `pitchvlm-stream-2` (since the live feed): the header
+  names the number of frames and the video, and `stream` refuses lines of another clip, of
+  another number of frames, or of other pixels than `--clip` (a video file against the
+  SHA-256 that the tools read; a folder of images against none). An option that does not apply
+  to the input (`--frames` without `--synthetic`, `--fps` with a video, `--queue` without
+  `--lines`, ...) is refused, not ignored.
+
+### Live run (built 2026-11-23; run only with stand-ins on the build machine)
+
+Each tool writes a feed as it goes (`tools/run_tool.py --feed`): a header, then one flushed line
+per frame with its answer, its time and the time the frame came to the tool. `merge-feeds` joins
+the two feeds by frame into the lines of a stream, and `stream --lines -` decides each frame.
+The policy of the merger, of the queue of the stream and of the tools when they fall behind is
+in `docs/DECISIONS.md`, entry "The live feed of the detector engine" of 2026-11-23. The clip
+jobs are those of section 11 (`clip-job`); `--out` of a live tool gets a copy of its feed (no
+clip run), and `<stem>-runner.json` next to it the facts of the run (device, versions, script,
+the self-check of a transformers detector). `--pace 25` plays the frames of the clip as a camera at 25 fps would send them: frame
+`i` is not read before the start plus `i / 25` s. Give both tools one start with `--start-at`
+(seconds since the epoch, after both tools have loaded their models: `START` below, written
+again for each run), so that they share one clock; without it each tool starts its clock when
+it is ready, and the frames of the tool that was ready later go out late. Start the three terminals in this order; a named
+pipe waits until both of its ends are open.
+
+```bash
+# Once: the clip jobs of section 11, and two named pipes.
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+SETTINGS=configs/engines/detector_calibration.yaml
+LIVE=~/pitchvlm-data/live/<clip>
+START=1795500000   # one start for both tools, seconds since the epoch: python3 -c "import time; print(int(time.time()) + 60)"
+mkdir -p $LIVE
+mkfifo $LIVE/detector.pipe $LIVE/calibration.pipe
+
+# Terminal 1: the detector writes one line per frame into its pipe.
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python tools/run_tool.py rfdetr \
+    --job ~/pitchvlm-data/jobs/<clip>/rfdetr.json --root ~/pitchvlm-data --device cuda:0 \
+    --out $LIVE/detector-feed.jsonl --feed $LIVE/detector.pipe --pace 25 --start-at $START
+
+# Terminal 2: the calibration; --skip-behind takes the newest frame when it is behind.
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/pnlcalib/bin/python tools/run_tool.py pnlcalib \
+    --job ~/pitchvlm-data/jobs/<clip>/pnlcalib.json --root ~/pitchvlm-data --device cuda:0 \
+    --repo ~/pitchvlm-data/PnLCalib \
+    --weights-kp ~/pitchvlm-data/weights/pnlcalib/SV_kp \
+    --weights-lines ~/pitchvlm-data/weights/pnlcalib/SV_lines \
+    --out $LIVE/calibration-feed.jsonl --feed $LIVE/calibration.pipe --pace 25 --start-at $START --skip-behind
+
+# Terminal 3: merge the two feeds by frame, and decide each frame.
+python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration $LIVE/calibration.pipe --wait 1 \
+    | python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+      --lines - --delay 25 --out ~/pitchvlm-data/runs/dev-live
+
+# Afterwards: the same lines from the two copies of the feeds (files: nothing waits), and the
+# control of the whole clip on them.
+python -m pitchvlm.cli merge-feeds --detector $LIVE/detector-feed.jsonl --calibration $LIVE/calibration-feed.jsonl \
+    | python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+      --lines - --delay clip --out ~/pitchvlm-data/runs/dev-live-control
+```
+
+- `merge-feeds` writes a frame when both parts are in; a part that is not in `--wait` seconds
+  after the first line of its frame came goes out as missing (`late`), as does the part of a
+  tool that skipped the frame (`skipped`) or whose feed ended (`ended`). Its report (error
+  stream) counts them and the dropped lines; exit code 0 when every frame went out whole, 1
+  otherwise, 2 when the feeds do not fit together (clip, number of frames, video, tools).
+- `stream` reads the merged lines on a thread into a queue of `--queue` lines (default 50); when
+  the queue is full the pipe fills and the merger and the tools wait: no frame is dropped. It
+  prints and writes (`result.json`: `latency`, `missing_parts`, `paint_timing`,
+  `transitions_known_at`) the time from the arrival of a frame at the tools to its decision, the
+  same from the arrival of frame `f + delay`, the time in the stream alone, and the largest queue.
+- A dissolve is taken before its window test ends once its span came out the same for 4 judged
+  windows (`--delay` of at least 25 for dissolves up to 20 frames, at least 35 for dissolves of
+  25 frames, on synthetic clips: the entry "The live feed of the detector engine" of 2026-11-23). The paint score of the keyframes runs on its own thread.
+- On the build machine the chain runs with stand-ins of the tools and a simulated time per frame:
+  `PYTHONPATH=src python -m pitchvlm.evalx.livebench --runs 3 --delays 5,25`. What only the run
+  machine can say: the time of the real tools, together with the stream, at 25 fps; whether the
+  calibration needs `--skip-behind` (its published time is 439 ms per frame); a camera that
+  sends frames (here the frames are files of a recorded clip, read at the pace of a camera).

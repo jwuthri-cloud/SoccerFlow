@@ -28,8 +28,8 @@ Words:
 | Milestone | M1 (first build) is done. M2 was planned to start on 17 Nov; on 23 Nov it has not started (`docs/PLAN.md`, "Milestones"; section 12 below) |
 | Code | Branch `main` of the remote (public since 14 Nov 2026). Package `pitchvlm` under `src/`, tests under `tests/` |
 | Added on 22 Nov | A second model provider (OpenRouter, RUNBOOK section 10), the paint alignment of pitch mappings and the cut test (section 3), two track repairs as arms of G4 (`configs/arms`, section 4), a detector engine with `clip-job`, `run --detections --calibration` and `video-frames` (section 11), the check images of G3 (`overlay`, section 3), two test tiers (section 1), a faster guard |
-| Added on 23 Nov | Video input for the model steps: `doctor --video` and three experiment files `people_probe_video*.yaml` (RUNBOOK section 13); a second detector family, D-FINE and RT-DETRv2 through transformers, with five experiment files and an install proposal (section 11); the streaming path `stream` (section 14); new tests of the money guards |
-| Offline tests | `3444 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run on 23 Nov of `main` 7e89517 (the review fixes of round 5) with the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have |
+| Added on 23 Nov | Video input for the model steps: `doctor --video` and three experiment files `people_probe_video*.yaml` (RUNBOOK section 13); a second detector family, D-FINE and RT-DETRv2 through transformers, with five experiment files and an install proposal (section 11); the streaming path `stream` (section 14); new tests of the money guards; the review fixes of round 5; the live feed: `tools/run_tool.py --feed`, `merge-feeds`, `stream --lines -` from a pipe (section 14, "Live run") |
+| Offline tests | `3501 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run on 23 Nov of `main` 6b6a803 (the review fixes and the live feed of round 6) with the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have |
 | Demo | `demo` gives a video, a radar and a valid prediction file from a synthetic clip and a fake model; `demo --engine detector` does the same with stand-ins of the two tools |
 | Reviews | Two reviews tested the first build, a third one the measurement of the two specialist tools, a fourth one the fixes of the third, and a fifth one the fixes of the fourth; two more read the code of 22 Nov. Each finding was repaired, kept with its reason, or recorded as not built or as an open owner decision (`docs/DECISIONS.md`) |
 | Rehearsal | On 22 Nov this file and the RUNBOOK were walked from the first line to the last on the build machine, with a synthetic dataset, the fake model, a stand-in scorer and stand-ins of the tools (`docs/DECISIONS.md`, entry "Rehearsal of the handover and the runbook"). On 23 Nov the commands of 23 Nov were walked the same way, and the estimates of every paid step were printed at both prices (entry "Rehearsal of the commands of 23 Nov, the budget at both prices and the owner decisions") |
@@ -196,7 +196,7 @@ of G3) and is worth the same session. The other steps are optional.
 | 20 | Doctor with the video check | paid | 0.144 / 0.289 | optional |
 | 21 | Cost pilot of the video input | paid | 0.175 / 0.350 | optional |
 | 22 | First check of the second detector family | free (downloads; owner's yes) | - | optional |
-| 23 | Streaming path on a dev clip | free | - | optional |
+| 23 | Streaming path on a dev clip, then the live run | free | - | optional |
 
 Money: a paid step starts only after the owner's go-ahead for that step. Run one paid command at
 a time, and never pass `--cache`. Before each paid step, read its estimate line first: the
@@ -232,8 +232,8 @@ python tools/run_tests.py -m "slow or not slow"
   on it is the test run after each change: `python tools/run_tests.py` (default run) and
   `python tools/run_tests.py -m "slow or not slow"` (full run, before a commit).
 - Passes: no failure, and the second command prints the same counts of passed and skipped tests
-  as the first, with exit code 0. On 23 Nov the build machine printed `3444 passed, 1 skipped` for
-  `main` 7e89517 with the tests of the documents (later commits add tests). Here one more group of tests
+  as the first, with exit code 0. On 23 Nov the build machine printed `3501 passed, 1 skipped` for
+  `main` 6b6a803 with the tests of the documents (later commits add tests). Here one more group of tests
   can run or be skipped: some tests need a disk that tells upper and lower case apart, some one
   that does not.
 - When not: a skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of
@@ -551,10 +551,10 @@ RT-DETRv2 (2026-11-23)": the install block, then the three commands of
 - When not: a stop of the self-check of the first call means that the output of the model is
   not the one that the script was written for: tell the owner; do not loosen the check.
 
-**Step 23. The streaming path on a dev clip.** Free. Needs the clip runs of both tools for one
-clip of the group `dev` (RUNBOOK, section 11, the three commands; steps 16 and 17 first).
-RUNBOOK, section 14, the second command, then the same with `--delay clip` and another `--out`
-(the control).
+**Step 23. The streaming path on a dev clip, then the live run.** Free. Needs the clip runs of
+both tools for one clip of the group `dev` (RUNBOOK, section 11, the three commands; steps 16 and
+17 first). RUNBOOK, section 14, the second command, then the same with `--delay clip` and another
+`--out` (the control).
 
 - Passes: the first line `clip <clip>: 750 frames, 25 frames per second; streaming path with a
   delay of ...`, the lines of the times per frame of each stage (median / 95th percentile /
@@ -564,6 +564,25 @@ RUNBOOK, section 14, the second command, then the same with `--delay clip` and a
   (RUNBOOK, section 14).
 - When not: an error line that names the settings: only the engines of
   `configs/engines/detector_calibration.yaml` stream (no number step).
+
+Then the live run of the same clip, with the three terminals of RUNBOOK, section 14, "Live run"
+(`tools/run_tool.py --feed --pace 25 --start-at`, `merge-feeds`, `stream --lines -`), and its
+control from the copies of the feeds. On the build machine the same chain ran on 23 Nov with
+`tools/stand_in_tool.py` in the place of each tool, on a synthetic clip of 750 frames: the words
+below are the words that it printed.
+
+- Passes: each tool ends with `live run: <n> frames skipped; copy of the feed: ...; facts of the
+  run: .../<stem>-runner.json`; `merge-feeds` reports `merge-feeds: 750 of 750 frames went out`
+  and ends with exit code 0; `stream` prints the latency lines (from the arrival of a frame at the
+  tools to its decision, from the arrival of frame `f + delay`, from the reading of its line) and
+  `lines waiting in the queue: ...`, then `result: ...`, exit code 0. The control gives the result
+  of the whole clip on the same lines. Write the 95th percentiles of the latency and of the
+  stages, the skipped frames of each tool and the device into `docs/DECISIONS.md`: they decide
+  decisions 37, 38, 39 and 43 of section 11.1.
+- When not: `merge-feeds` exit code 1 means that a frame went out with a missing part (`late`,
+  `skipped` or `ended` in its report); exit code 2 means that the two feeds do not fit together.
+  `stream` refuses lines of other pixels or of another number of frames than `--clip`, and an
+  option that does not apply to its input (RUNBOOK, section 14).
 
 M3 then measures both tools on all frames of the people probe and the pitch probe (RUNBOOK,
 section 3), with the check images of M3 (`--count 10`). Since 22 Nov the pipeline can also use
@@ -790,9 +809,10 @@ The streaming path (live):
 | # | Decision [source] | Options | Recommendation | If nothing is decided | Blocks |
 |---|---|---|---|---|---|
 | 36 | Default delay of `stream` [entry "A streaming path for the detector engine" of 23 Nov, item 10] | 25 frames (1 s); 5 or 12 frames | 25 frames | 25 frames (the code) | nothing |
-| 37 | A dissolve within the delay [same entry, item 10] | accept that it is linked through; a delay of at least about 42 frames for clips with dissolves; a shorter window of the dissolve test for the stream (a new measurement) | none given by the entry | linked through | live runs with dissolves |
-| 38 | The paint score of the keyframes in a live run [same entry, item 10] | keep it (it sets most of the 95th percentile); another thread; leave it out of `stream` | none given by the entry | kept | a claim of real time |
-| 39 | The live mode of `tools/run_tool.py` and a merger of the two tool pipes [same entry, item 10] | build; not | none given by the entry | `stream --lines` reads one file or one pipe (the live mode of the script is being built in round 6; the merger is not) | a live run with both tools |
+| 37 | A dissolve within the delay [entries "A streaming path for the detector engine", item 10, and "The live feed of the detector engine" of 23 Nov, item 13] | the early dissolve test on by default (a dissolve is taken once its span came out the same for 4 judged windows) with the delay of 25 frames, and a delay of at least 35 frames for dissolves of 25 frames; the early test off; a longer delay for every clip | The live-feed session: keep the early test on with the delay of 25 (on synthetic clips it removes the gap for dissolves up to 20 frames at no cost on clips without one); at least 35 for longer dissolves | on, with the delay of 25 (the code) | live runs with dissolves longer than 20 frames |
+| 38 | The paint score of the keyframes in a live run [same entries, items 10 and 13] | keep it (it runs on its own thread since the live feed, but under load it still competes for a core); leave it out of live runs | The live-feed session: leave it out of live runs if the run machine shows the 95th percentile of a frame above 40 ms | kept, on its own thread | a claim of real time |
+| 39 | The wait of `merge-feeds` for the part of the slower tool [entry "The live feed of the detector engine", item 13; the live mode of `tools/run_tool.py` and the merger, item 10 of the round-5 entry, are built] | 1 s (the default of `--wait`); another value | The live-feed session: a wait above the time per frame of the slower tool, or most of its parts go out late; 1 s bounds what a stalled tool costs | 1 s | a live run with a slow tool |
+| 43 | The calibration in a live run [entry "The live feed of the detector engine", item 13] | `--skip-behind` (the tool takes the newest frame when it is behind, and the skipped frames go out as missing parts); the stream waits for it | The live-feed session: `--skip-behind` when the calibration takes more than 40 ms per frame on the run machine (its published time is 439 ms); else let the stream wait | the stream waits (no `--skip-behind`; RUNBOOK 14 gives it in its command) | a live run at 25 frames per second |
 
 Results and publishing:
 
@@ -838,8 +858,9 @@ Proposed order of the steps, without dates (the owner sets them):
 4. The dev clips (M5), then the fixes, the fresh clips and the freeze tag (M6), then the test
    clips once, the demo and the report (M7), as the plan orders them.
 5. Optional, after the numbers of step 2 and only with a budget line: the video arms, the
-   OpenRouter models, the second detector family, the streaming path on real clip runs (section
-   6, steps 13 and 20 to 23). They are the "extra models" of the first cut of the plan.
+   OpenRouter models, the second detector family, the streaming path and the live run on real
+   clip runs (section 6, steps 13 and 20 to 23). They are the "extra models" of the first cut of
+   the plan.
 
 ## 13 When something fails
 

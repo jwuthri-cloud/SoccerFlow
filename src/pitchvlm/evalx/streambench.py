@@ -57,19 +57,24 @@ CLIP_FRAMES = 250
 #: At 4 s (the jump of the dissolve test of the video path) the window test sees no change at frame 120,
 #: and at 20 s the camera pan (period 16 s) is back near the same view.
 JUMP_FRAMES = 250
-#: Length of the dissolve, frames, and its first frame.
+#: Length of the dissolve, frames, and its first frame. The kind ``dissolve-20`` (not in ``KINDS``) has 20 frames.
 DISSOLVE_FRAMES = 10
 DISSOLVE_START = 120
-#: The arms of the stream: delay frames (None: the whole clip), and whether the kit clusters of the clip are given.
-STREAM_ARMS: Mapping[str, tuple[int | None, bool]] = {
-    "L0": (0, False),
-    "L5": (5, False),
-    "L12": (12, False),
-    "L25": (25, False),
-    "clip": (None, False),
-    "clip-kits": (None, True),
+DISSOLVE_KINDS: Mapping[str, int] = {"dissolve": DISSOLVE_FRAMES, "dissolve-20": 20}
+#: The arms of the stream: delay frames (None: the whole clip), whether the kit clusters of the clip are given,
+#: and whether the early dissolve test runs (``StreamSettings.early_dissolve_windows``).
+STREAM_ARMS: Mapping[str, tuple[int | None, bool, bool]] = {
+    "L0": (0, False, True),
+    "L5": (5, False, True),
+    "L12": (12, False, True),
+    "L25": (25, False, True),
+    "clip": (None, False, True),
+    "clip-kits": (None, True, True),
+    "L25-late": (25, False, False),
+    "L50": (50, False, True),
 }
-ARMS: tuple[str, ...] = ("offline", *STREAM_ARMS)
+#: The arms of a default run: those of round 5 (``L25-late`` and ``L50`` are chosen with ``--arms``).
+ARMS: tuple[str, ...] = ("offline", "L0", "L5", "L12", "L25", "clip", "clip-kits")
 #: Two people are matched when they are at most this far apart, metres (``identity_scores``).
 MATCH_M = 5.0
 DETECTOR_ONLY = EngineSettings(people="detector", pitch_mapping="calibration", number="none")
@@ -117,14 +122,15 @@ def clip_of(kind: str, seed: int, n_frames: int = CLIP_FRAMES) -> tuple[Syntheti
         frames = [frame if frame < middle else frame + JUMP_FRAMES for frame in range(n_frames)]
         scene = RetimedScene(frames, seed=seed)
         return scene, [scene.image(frame) for frame in range(n_frames)]
-    if kind == "dissolve":
-        switch = DISSOLVE_START + DISSOLVE_FRAMES // 2
+    if kind in DISSOLVE_KINDS:
+        length = DISSOLVE_KINDS[kind]
+        switch = DISSOLVE_START + length // 2
         truth = RetimedScene([frame if frame < switch else frame + JUMP_FRAMES for frame in range(n_frames)], seed=seed)
         old = RetimedScene(list(range(n_frames)), seed=seed)
         new = RetimedScene([frame + JUMP_FRAMES for frame in range(n_frames)], seed=seed)
         images = []
         for frame in range(n_frames):
-            weight = min(1.0, max(0.0, (frame - DISSOLVE_START + 1) / (DISSOLVE_FRAMES + 1)))
+            weight = min(1.0, max(0.0, (frame - DISSOLVE_START + 1) / (length + 1)))
             if weight == 0.0:
                 images.append(old.image(frame))
             elif weight == 1.0:
@@ -186,9 +192,11 @@ def run_case(
         if arm == "offline":
             results.append(_scored(kind, condition, seed, arm, offline, truth, offline, offline_seconds))
             continue
-        delay, given = STREAM_ARMS[arm]
+        delay, given, early = STREAM_ARMS[arm]
         history = None if delay is None else default_history_frames(config, info.fps)
         warmup = {} if kit_warmup_frames is None else {"kit_warmup_frames": kit_warmup_frames}
+        if not early:
+            warmup["early_dissolve_windows"] = None  # type: ignore[assignment]
         settings = StreamSettings(delay_frames=delay, history_frames=history, **warmup)
         kits = _clip_kits(source, people, offline) if given else None
         start = time.perf_counter()
@@ -250,16 +258,26 @@ def _scored(
     )
 
 
-def _case(job: tuple[str, str, int, int | None]) -> list[ArmResult]:
-    kind, condition, seed, warmup = job
-    return run_case(kind, condition, seed, kit_warmup_frames=warmup)
+def _case(job: tuple[str, str, int, int | None, tuple[str, ...]]) -> list[ArmResult]:
+    kind, condition, seed, warmup, arms = job
+    return run_case(kind, condition, seed, kit_warmup_frames=warmup, arms=arms)
 
 
 def run_bench(
-    seeds: Sequence[int], *, kit_warmup_frames: int | None = None, workers: int = 1
+    seeds: Sequence[int],
+    *,
+    kit_warmup_frames: int | None = None,
+    workers: int = 1,
+    kinds: Sequence[str] = KINDS,
+    arms: Sequence[str] = ARMS,
 ) -> list[ArmResult]:
-    """Run every arm on every (kind, condition, seed), in several processes when ``workers`` is above 1."""
-    jobs = [(kind, condition, seed, kit_warmup_frames) for kind in KINDS for condition in CONDITIONS for seed in seeds]
+    """Run the arms on every (kind, condition, seed), in several processes when ``workers`` is above 1."""
+    jobs = [
+        (kind, condition, seed, kit_warmup_frames, tuple(arms))
+        for kind in kinds
+        for condition in CONDITIONS
+        for seed in seeds
+    ]
     if workers <= 1:
         return [result for job in jobs for result in _case(job)]
     with ProcessPoolExecutor(max_workers=workers) as pool:
@@ -277,9 +295,10 @@ def table_lines(results: Sequence[ArmResult]) -> list[str]:
         "| equal to offline |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for kind in KINDS:
+    kinds = [*KINDS, *(kind for kind in DISSOLVE_KINDS if kind not in KINDS)]
+    for kind in kinds:
         for condition in CONDITIONS:
-            for arm in ARMS:
+            for arm in ("offline", *STREAM_ARMS):
                 chosen = [r for r in results if (r.kind, r.condition, r.arm) == (kind, condition, arm)]
                 if not chosen:
                     continue
@@ -297,7 +316,7 @@ def table_lines(results: Sequence[ArmResult]) -> list[str]:
         "|---|---|---|---|---|---|---|",
     ]
     base = {(r.kind, r.condition, r.seed): r for r in results if r.arm == "offline"}
-    for kind in KINDS:
+    for kind in kinds:
         for condition in CONDITIONS:
             for arm in STREAM_ARMS:
                 chosen = [r for r in results if (r.kind, r.condition, r.arm) == (kind, condition, arm)]
@@ -395,11 +414,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--kit-warmup", type=int, default=None, help="kit warm-up frames (default: the stream's)")
     parser.add_argument("--workers", type=int, default=1, help="processes (default 1)")
     parser.add_argument("--time", action="store_true", help="time the stream per frame instead (3 rounds)")
+    parser.add_argument("--kinds", default=",".join(KINDS), help=f"clip kinds, of {', '.join([*KINDS, 'dissolve-20'])}")
+    parser.add_argument("--arms", default=",".join(ARMS), help=f"arms, of offline, {', '.join(STREAM_ARMS)}")
     args = parser.parse_args(argv)
     if args.time:
         print("\n".join(time_lines(CLIP_FRAMES, args.seeds[0], (0, 5, 12, 25), 3)))
         return 0
-    results = run_bench(args.seeds, kit_warmup_frames=args.kit_warmup, workers=args.workers)
+    kinds = args.kinds.split(",")
+    arms = args.arms.split(",")
+    unknown = [kind for kind in kinds if kind not in (*KINDS, "dissolve-20")] + [
+        arm for arm in arms if arm != "offline" and arm not in STREAM_ARMS
+    ]
+    if unknown or "offline" not in arms:
+        parser.error(f"unknown kinds or arms {unknown}; the arms must hold offline")
+    results = run_bench(args.seeds, kit_warmup_frames=args.kit_warmup, workers=args.workers, kinds=kinds, arms=arms)
     print("\n".join(table_lines(results)))
     return 0
 

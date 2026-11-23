@@ -31,6 +31,7 @@ from pitchvlm.motion import DISSOLVE_WINDOW_FRAMES, MotionField, ShotMeter, meas
 from pitchvlm.pipeline import ToolAnswers, _people_on_pitch, _pitch_map, clip_kit_clusters, run_clip
 from pitchvlm.schemas import Box, FramePeople, HomographyRecord, PersonDet, PlayerState, Track, TrackObs
 from pitchvlm.stream import (
+    EARLY_DISSOLVE_WINDOWS,
     STREAM_FORMAT,
     DetectorStream,
     StreamInput,
@@ -477,7 +478,12 @@ def test_stream_command_gives_the_same_result_from_clip_runs_and_from_lines(
     first = json.loads((tmp_path / "a" / CLIP_ID / "result.json").read_text(encoding="utf-8"))
     second = json.loads((tmp_path / "b" / CLIP_ID / "result.json").read_text(encoding="utf-8"))
     assert first["result"] == second["result"]
-    assert first["provenance"]["stream"] == {"delay_frames": 5, "history_frames": 123, "kit_warmup_frames": 25}
+    assert first["provenance"]["stream"] == {
+        "delay_frames": 5,
+        "history_frames": 123,
+        "kit_warmup_frames": 25,
+        "early_dissolve_windows": EARLY_DISSOLVE_WINDOWS,
+    }
     assert set(first["frame_timing"]) >= {"read", "motion", "camera", "kit_colour", "tracks", "decide", "total"}
     assert first["prediction_file"]["problems"] == []
     assert first["result"]["engines"]["tracks"] == "code:stream"
@@ -576,3 +582,119 @@ def test_a_wrong_history_is_a_usage_error_and_the_ball_tracker_takes_an_empty_cl
     assert cli.build_parser().parse_args(["stream", "--synthetic", "--out", "o", "--history", "clip"]).history is None
     empty = track_ball({}, 0, fps=25.0, warp=lambda src, dst, xy: xy, max_gap_frames=3)
     assert dict(empty.boxes) == {} and empty.observed == frozenset()
+
+
+# --- Round 6: the early dissolve test --------------------------------------------------------------------
+
+
+def test_the_shot_meter_takes_the_final_span_of_a_dissolve_before_its_window_test_ends() -> None:
+    """The span of the open run is taken once it came out the same for 3 judged windows; it is the final span,
+    and it is known within 25 frames of the start of the dissolve (the final one about a window later)."""
+    scene, images = clip_of("dissolve", 0, n_frames=200)
+    meter = ShotMeter((scene.info.width, scene.info.height))
+    early_at, early, final_at = None, None, None
+    for frame, image in enumerate(images):
+        meter.add(image)
+        if frame == 0:
+            continue
+        if meter.update_transitions() and final_at is None:
+            final_at = frame
+        found = meter.open_transition(3)
+        if found is not None and early is None:
+            early_at, early = frame, found
+    tests = meter.finish()
+    start = tests.transitions[0][0]
+    assert early == tests.transitions[0]
+    assert early_at is not None and final_at is not None and early_at <= start + 25 < final_at
+    with pytest.raises(ValueError, match="at least 1"):
+        meter.open_transition(0)
+
+
+def test_the_shot_meter_takes_nothing_early_on_a_clip_without_a_cut() -> None:
+    scene, images = clip_of("plain", 0, n_frames=120)
+    meter = ShotMeter((scene.info.width, scene.info.height))
+    for frame, image in enumerate(images):
+        meter.add(image)
+        if frame:
+            meter.update_transitions()
+            assert meter.open_transition(1) is None
+
+
+@pytest.mark.slow
+def test_with_the_early_test_a_delay_of_25_gives_no_state_on_the_blend_frames_of_a_dissolve() -> None:
+    """Without it the states of the blend frames were given before the dissolve was known (round 5)."""
+    scene, images = clip_of("dissolve", 0, n_frames=180)
+    source = ArraySource(scene.info, images)
+    people, balls = fake_detector_answers(scene)
+    cameras = fake_calibration_answers(scene)
+    offline = run_clip(source, None, CONFIG, tools=ToolAnswers(people=people, balls=balls, cameras=cameras))
+    blends = sorted(MotionField([None] * 179, offline.cuts).transition_frames())
+    assert blends
+    given = {}
+    for windows in (None, 3):
+        settings = StreamSettings(delay_frames=25, history_frames=default_history_frames(CONFIG, 25.0),
+                                  early_dissolve_windows=windows)
+        result = run_stream(stand_in_inputs(people, balls, cameras), source.read, CONFIG, settings,
+                            clip_id="c", fps=25.0, size=(scene.info.width, scene.info.height))
+        given[windows] = sum(len(result.frames[frame].players) for frame in blends)
+        assert result.cuts == offline.cuts
+    assert given[None] > 0 and given[3] == 0
+
+
+# --- Round 6: second read of stream.py -------------------------------------------------------------------
+
+
+def test_the_control_matches_the_first_frame_of_a_shot_without_a_camera_with_a_later_camera() -> None:
+    """Second read of 2026-11-23, finding 1: frame 30 starts a shot and has no camera. At arrival the stream has no
+    camera for it; the clip path takes the camera of frame 31. Before the fix 29 or 30 of 60 frames differed."""
+    scene, images = clip_of("cut", 1, n_frames=60)
+    source = ArraySource(scene.info, images)
+    people, balls = fake_detector_answers(scene, miss_rate=0.3, box_noise_px=4.0, seed=1)
+    cameras = [HomographyRecord(frame=camera.frame) if camera.frame == 30 else camera for camera in fake_calibration_answers(scene)]
+    offline = run_clip(source, None, CONFIG, tools=ToolAnswers(people=people, balls=balls, cameras=cameras))
+    assert offline.cuts == (30,)
+    _, kits = offline_and_kits_of(source, people, balls, cameras)
+    result = run_stream(stand_in_inputs(people, balls, cameras), source.read, CONFIG,
+                        StreamSettings(delay_frames=None, history_frames=None), clip_id=scene.info.clip_id,
+                        fps=scene.info.fps, size=(scene.info.width, scene.info.height), kit_clusters=kits)
+    assert result.frames == offline.frames
+
+
+def offline_and_kits_of(source: Any, people: Any, balls: Any, cameras: Any) -> tuple[Any, Any]:
+    offline = run_clip(source, None, CONFIG, tools=ToolAnswers(people=people, balls=balls, cameras=cameras))
+    to_pitch = _pitch_map(offline.homographies)
+    on_pitch = [_people_on_pitch(item, to_pitch, CONFIG.pitch_margin_m) for item in people]
+    clusters, _ = clip_kit_clusters(source, on_pitch)
+    return offline, clusters
+
+
+def test_a_ball_candidate_of_another_frame_is_refused_at_its_push() -> None:
+    """Second read, finding 4: before, the error came 5 frames later, named frame 0 and left the stream broken."""
+    scene = SyntheticScene(n_frames=8, seed=2)
+    people, balls = fake_detector_answers(scene)
+    item = next(stand_in_inputs(people, balls, fake_calibration_answers(scene)))
+    wrong = BallCandidate(frame=7, box=Box(x1=1.0, y1=1.0, x2=5.0, y2=5.0), score=0.9)
+    detector = DetectorStream(CONFIG, StreamSettings(delay_frames=5, history_frames=5), clip_id="c", fps=25.0,
+                              size=(scene.info.width, scene.info.height))
+    with pytest.raises(ValueError, match="a ball candidate of frame 0 names another frame"):
+        detector.push(StreamInput(frame=0, people=item.people, balls=(wrong,), camera=item.camera), scene.image(0))
+    assert detector.n_frames == 0
+    assert detector.push(item, scene.image(0)) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        ("[" * 100_000 + "]" * 100_000, "line 2: no JSON"),  # finding 3: RecursionError escaped
+        (None, "line 2: Infinity is not a number of JSON"),  # finding 2: Infinity passed
+    ],
+)
+def test_a_line_that_breaks_the_reader_is_refused_with_its_line_number(
+    clip_runs: tuple[Path, Path], text: str | None, words: str
+) -> None:
+    lines = list(clip_run_lines(load_clip_run(clip_runs[0]), load_clip_run(clip_runs[1])))
+    if text is None:
+        text = lines[1].replace('"seconds": 0.02', '"seconds": Infinity', 1)
+        assert "Infinity" in text
+    with pytest.raises(ValueError, match=words):
+        list(read_stream_lines(iter([lines[0], text]))[1])

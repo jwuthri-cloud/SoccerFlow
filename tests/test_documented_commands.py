@@ -523,10 +523,17 @@ def inline_command_problems(text: str) -> list[str]:
         elif children and not rest[0].startswith("-"):
             problems.append(f"`{span}`: {words[0]} has no sub-command {rest[0]!r}")
             continue
+        # An option right after a program with sub-commands (`tools/run_tool.py --feed`) is an
+        # option of one of them.
+        options = (
+            {word: action for child in children.values() for word, action in child._option_string_actions.items()}
+            if children and rest and rest[0].startswith("-") and rest[0] not in parser._option_string_actions
+            else parser._option_string_actions
+        )
         for position, word in enumerate(rest):
             if not word.startswith("--"):
                 continue
-            action = parser._option_string_actions.get(word)
+            action = options.get(word)
             if action is None:
                 problems.append(f"`{span}`: {words[0]} has no option {word}")
                 continue
@@ -634,7 +641,8 @@ Run the file `configs/experiments/people_probe_video_huge.yaml`, the file `peopl
 and the module `vlm/costs.py`. The split list `configs/splits.json` is written on the run machine.
 The doctor with `doctor --vidoe`, a clip job with `clip-job --tool yolo`, the script with
 `tools/run_tool.py yolo`, and the probe `probe people --video-dir ~/x`. A doctor line `data policy`.
-Also `python -m pitchvlm.cli sync --result x`, `python tools/run_tool.py dfine --gpu 0` and `run x --bogus`.
+Also `python -m pitchvlm.cli sync --result x`, `python tools/run_tool.py dfine --gpu 0`, `run x --bogus`
+and `tools/run_tool.py --fed`; but `tools/run_tool.py --device` names an option of its sub-commands.
 The stream takes `--delay soon`, `--delay clip`, `--delay N`, `--histroy` and `--exclude-newer`.
 See RUNBOOK, section 15, RUNBOOK, section 1, "A heading", RUNBOOK, section 1, "No heading"
 and HANDOVER, section 1.3. Also section 16 of the RUNBOOK and RUNBOOK, sections 1 to 17.
@@ -649,13 +657,14 @@ def test_reader_of_the_text_finds_missing_files_commands_options_and_sections() 
         "`vlm/costs.py`: the file src/pitchvlm/vlm/costs.py does not exist",
     ]
     commands = inline_command_problems(PLANTED_PROSE)
-    assert len(commands) == 6, commands
+    assert len(commands) == 7, commands
     assert "doctor has no option --vidoe" in commands[0]
     assert "--tool takes one of" in commands[1]
     assert "tools/run_tool.py has no sub-command 'yolo'" in commands[2]
     assert "sync has no option --result" in commands[3]
     assert "tools/run_tool.py has no option --gpu" in commands[4]
     assert "run has no option --bogus" in commands[5]
+    assert "tools/run_tool.py has no option --fed" in commands[6]
     options = inline_option_problems(PLANTED_PROSE)
     assert len(options) == 2, options
     assert "`--delay soon`: --delay does not take 'soon'" in options[0]

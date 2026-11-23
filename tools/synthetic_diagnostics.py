@@ -52,6 +52,7 @@ import argparse
 import math
 import time
 from collections.abc import Callable, Sequence
+from typing import Any
 from dataclasses import dataclass, field
 
 import cv2
@@ -71,6 +72,7 @@ from pitchvlm.motion import (
     DISSOLVE_WINDOW_FRAMES,
     MAX_TRANSITION_CORRELATION,
     MIN_SHOT_CORRELATION,
+    ShotMeter,
     ShotTests,
     _chain,
     _correlations,
@@ -82,6 +84,7 @@ from pitchvlm.motion import (
     estimate_motion,
     measure_shots,
     shot_correlation,
+    transition_span,
     window_correlations,
 )
 from pitchvlm.pipeline import ToolAnswers, run_clip
@@ -685,6 +688,115 @@ def measure_dissolve_held_out() -> None:
     _cut_test_time()
 
 
+#: Seeds of the early dissolve test of the streaming path: fresh seeds (0 to 19, 100 to 109 and 200 to 209 were used).
+EARLY_FIT_SEEDS = range(300, 310)
+EARLY_HELD_OUT_SEEDS = range(400, 410)
+#: The numbers of judged windows in a row with the same span that were tried (``ShotMeter.open_transition``).
+EARLY_WINDOWS = (1, 2, 3, 4, 6, 8)
+
+
+def _early_spans(source: Any) -> tuple[list[tuple[int, int, int, tuple[int, int]]], list[tuple[int, int]], dict]:
+    """Run a clip through ``ShotMeter`` frame by frame, as the stream does.
+
+    Returns the span of the open run each time its last frame moved on (newest frame, first,
+    last, span), the final transitions, and the newest frame at which each final transition
+    was first known.
+    """
+    meter = ShotMeter((source.info.width, source.info.height))
+    spans: list[tuple[int, int, int, tuple[int, int]]] = []
+    known: dict[tuple[int, int], int] = {}
+    last_seen: int | None = None
+    for frame in range(source.info.n_frames):
+        meter.add(source.read(frame))
+        if frame == 0:
+            continue
+        for span in meter.update_transitions():
+            known.setdefault(span, frame)
+        run = meter.open_run
+        if run is None:
+            last_seen = None
+        elif run[1] != last_seen:
+            last_seen = run[1]
+            spans.append((frame, run[0], run[1], transition_span(meter.images, meter.test_steps, run[0], run[1])))
+    tests = meter.finish()
+    for span in tests.transitions:
+        known.setdefault(span, source.info.n_frames - 1)
+    return spans, list(tests.transitions), known
+
+
+def _early_take(spans: Sequence[tuple[int, int, int, tuple[int, int]]], windows: int) -> list[tuple[int, tuple[int, int]]]:
+    """Return (newest frame, span) of each transition that ``open_transition(windows)`` takes, from ``_early_spans``."""
+    taken: list[tuple[int, tuple[int, int]]] = []
+    first_of_run, count, previous, done = None, 0, None, False
+    for frame, first, last, span in spans:
+        if first != first_of_run:
+            first_of_run, count, previous, done = first, 0, None, False
+        if done:
+            continue
+        count = count + 1 if span == previous else 1
+        previous = span
+        if count >= windows and span[1] <= last:
+            taken.append((frame, span))
+            done = True
+    return taken
+
+
+def _run_early(seeds: range) -> None:
+    rows: dict[tuple[str, int], dict[str, list[Any]]] = {}
+    for seed in seeds:
+        cases: dict[str, Any] = {f"dissolve of {length} frames": TwoShotSource(seed, "dissolve", length)
+                                 for length in DISSOLVE_LENGTHS}
+        cases.update(_controls(seed))
+        for name, source in cases.items():
+            spans, final, known = _early_spans(source)
+            for windows in EARLY_WINDOWS:
+                row = rows.setdefault(
+                    (name, windows),
+                    {"n": [], "early": [], "equal": [], "lag": [], "final_lag": [], "false": [], "start": [], "stop": []},
+                )
+                taken = _early_take(spans, windows)
+                row["n"].append(1)
+                row["early"].append(len(taken))
+                row["equal"].append(sum(span in final for _, span in taken))
+                for _, span in taken:
+                    near = min(final, key=lambda done: abs(done[0] - span[0]) + abs(done[1] - span[1]))
+                    row["start"].append(span[0] - near[0])
+                    row["stop"].append(span[1] - near[1])
+                if name.startswith("dissolve"):
+                    row["lag"].extend(frame - SHOT_FRAMES for frame, _ in taken)
+                    row["final_lag"].extend(known[span] - SHOT_FRAMES for span in final)
+                else:
+                    row["false"].append(len(taken) + len(final))
+    for (name, windows), row in rows.items():
+        lags = row["lag"]
+        lag = f"{min(lags)} to {max(lags)} (median {np.median(lags):.0f})" if lags else "-"
+        final_lags = row["final_lag"]
+        final_lag = f"{min(final_lags)} to {max(final_lags)}" if final_lags else "-"
+        false = sum(row["false"]) if row["false"] else "-"
+        ends = (
+            f"start {min(row['start']):+d} to {max(row['start']):+d}, stop {min(row['stop']):+d} to {max(row['stop']):+d}"
+            if row["start"]
+            else "-"
+        )
+        print(
+            f"  {name}, {windows} windows: clips {sum(row['n'])}, taken early {sum(row['early'])}, "
+            f"equal to the final span {sum(row['equal'])} (early minus final: {ends}), known after the start (frames) {lag}, "
+            f"final known after the start {final_lag}, transitions on a control {false}"
+        )
+
+
+def measure_dissolve_early_fit() -> None:
+    """Print the early dissolve test of the streaming path on its fit seeds."""
+    print(f"early dissolve test, synthetic, fit seeds {EARLY_FIT_SEEDS.start} to {EARLY_FIT_SEEDS.stop - 1}:")
+    _run_early(EARLY_FIT_SEEDS)
+
+
+def measure_dissolve_early_held_out() -> None:
+    """Print the early dissolve test of the streaming path on its held-out seeds."""
+    print(f"early dissolve test, synthetic, held-out seeds {EARLY_HELD_OUT_SEEDS.start} to {EARLY_HELD_OUT_SEEDS.stop - 1}:")
+    _run_early(EARLY_HELD_OUT_SEEDS)
+
+
 SECTIONS = {
     "paint": measure_paint,
     "cuts": measure_cuts,
@@ -692,6 +804,8 @@ SECTIONS = {
     "detector": measure_detector_engine,
     "dissolve-fit": measure_dissolve_fit,
     "dissolve-held-out": measure_dissolve_held_out,
+    "dissolve-early-fit": measure_dissolve_early_fit,
+    "dissolve-early-held-out": measure_dissolve_early_held_out,
 }
 
 

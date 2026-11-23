@@ -593,6 +593,26 @@ def test_clip_job_of_dfine_gives_a_clip_run_that_the_package_reads(
     assert run.runner["checkpoint"] == "ustc-community/dfine-medium-coco"
 
 
+def test_live_run_of_dfine_checks_its_boxes_and_keeps_the_facts_of_the_run(
+    tmp_path: Path, transformers: SimpleNamespace
+) -> None:
+    """A live run (--feed) checks the boxes on the warm-up call as a clip run does, and writes the facts of
+    the run, with the self-check, next to the copy of the feed (live feed of round 6)."""
+    frames = small_frames(tmp_path / "data", 4)
+    job = {"format": runs.CLIP_JOB_FORMAT, "clip": "CLIP-A", "tool": dict(DFINE), "images": [e["image"] for e in frames]}
+    (tmp_path / "job.json").write_text(json.dumps(job), encoding="utf-8")
+    copy, feed = tmp_path / "runs" / "feed.jsonl", tmp_path / "feed.jsonl"
+    arguments = ["dfine", "--job", str(tmp_path / "job.json"), "--root", str(tmp_path / "data"), "--out", str(copy)]
+    assert run_tool.main([*arguments, "--device", "cuda:0", "--feed", str(feed)]) == 0
+    lines = [json.loads(text) for text in feed.read_text(encoding="utf-8").splitlines()]
+    assert [line.get("frame") for line in lines] == [None, 0, 1, 2, 3]
+    assert lines[1]["payload"]["labels"] == ["person"]
+    facts = json.loads((tmp_path / "runs" / "feed-runner.json").read_text(encoding="utf-8"))
+    assert facts["runner"]["self_check_detections"] >= 1
+    assert facts["runner"]["checkpoint"] == "ustc-community/dfine-medium-coco"
+    assert (facts["answered_frames"], facts["skipped_frames"]) == (4, 0)
+
+
 # --- The package -----------------------------------------------------------------------
 
 

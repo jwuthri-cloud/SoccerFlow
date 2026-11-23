@@ -820,6 +820,9 @@ class ShotMeter:
         #: The open run of low window values, (first, last), or None.
         self._run: tuple[int, int] | None = None
         self.transitions: list[tuple[int, int]] = []
+        #: The open run as last tested by ``open_transition``: (first, last, span, times in a row), and whether it is taken.
+        self._open: tuple[int, int, tuple[int, int], int] | None = None
+        self._open_taken = False
         self._finished = False
 
     @property
@@ -911,6 +914,46 @@ class ShotMeter:
         if final and self._run is not None:
             self._close_run()
         return list(self.transitions)
+
+    @property
+    def open_run(self) -> tuple[int, int] | None:
+        """The open run of low window values, (first, last) judged frame, or None."""
+        return self._run
+
+    def open_transition(self, stable_windows: int) -> tuple[int, int] | None:
+        """Return the transition of the open run of low windows when it is known before the run ends, else None.
+
+        For the streaming path only: ``measure_shots`` and ``finish`` never call it, so the clip
+        path is unchanged. A transition is final when its run of low windows has ended
+        (``update_transitions``), about ``DISSOLVE_WINDOW_FRAMES`` frames after the dissolve
+        starts. While the run is open, ``transition_span`` is taken with the newest judged frame
+        of the run as the anchor of the new shot. While that anchor is still a blend, the end of
+        the span moves with it; once the anchor shows the new shot alone, the span stays the same.
+        The span is taken when it came out the same for ``stable_windows`` judged windows in a
+        row and its new shot starts at or before the anchor; from then on it is returned until
+        the run ends, and then the final span of ``update_transitions`` replaces it. Call it
+        after ``update_transitions``, once per added frame.
+        """
+        if stable_windows < 1:
+            raise ValueError(f"stable_windows must be at least 1, got {stable_windows}")
+        if self._run is None:
+            self._open, self._open_taken = None, False
+            return None
+        first, last = self._run
+        known = self._open
+        if known is None or known[0] != first:
+            known, self._open_taken = None, False
+        if known is None or known[1] != last:
+            if self._open_taken and known is not None:
+                self._open = (first, last, known[2], known[3])
+            else:
+                span = transition_span(self.images, self.test_steps, first, last)
+                count = known[3] + 1 if known is not None and known[2] == span else 1
+                self._open = (first, last, span, count)
+        _, last, span, count = self._open
+        if not self._open_taken and count >= stable_windows and span[1] <= last:
+            self._open_taken = True
+        return span if self._open_taken else None
 
     def _close_run(self) -> None:
         assert self._run is not None
