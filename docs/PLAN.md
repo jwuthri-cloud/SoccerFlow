@@ -202,19 +202,21 @@ pitch-mapping error.
   4 in parallel, throttled below the 10 USD per 10 minutes limit of the first billing tier).
 - If a date slips by more than 2 days, cut in this order: extra models, Gemini-carried IDs, test set
   from 10 to 6 clips, names. The video + radar and one measured score are protected.
-- State on 22 Nov 2026: no step of M2 has run, so every date from M2 on has slipped by at least
-  5 days. The dates in the table are those of the plan. New dates are an owner decision
-  (`docs/DECISIONS.md`, entry "Rehearsal of the handover and the runbook" of 2026-11-22); the
-  price change of 1 Dec stays fixed.
+- State on 23 Nov 2026: no step of M2 has run. The dates of M2 and of the demo clip have passed,
+  M3 to M5 cannot hold, and M6 and M7 are at risk (`docs/HANDOVER.md`, section 12, with a proposed
+  order of the steps). The dates in the table are those of the plan. New dates are an owner
+  decision (`docs/HANDOVER.md`, section 11.1); the price change of 1 Dec stays fixed.
 
 ## Budget (your money)
 
 Estimates until the cost pilot measures real tokens. One clip is about 2.3 USD (64 keyframes x two
-calls + about 50 number calls + legend) at the standard price before 1 Dec, and the same after
-1 Dec through Flex (`service_tier="flex"`, half price, slower, best effort). The 50 number calls
-are a guess from the synthetic clip of 30 seconds (48 to 50 requests). The table below was made
-with 25 number calls (2.1 USD per clip): the 27 clip passes of the table cost about 6 USD more,
-which comes out of the reserve until the cost pilot gives real numbers.
+calls + about 50 number calls + legend; the code prints 2.345 USD) at the standard price before 1
+Dec, and the same after 1 Dec through Flex (`service_tier="flex"`, half price, slower, best
+effort). At the standard price after 1 Dec it is 4.690 USD. The estimates of every paid step at
+both prices, and of this table at both prices and tiers, are in `docs/HANDOVER.md`, section 8. The
+50 number calls are a guess from the synthetic clip of 30 seconds (48 to 50 requests). The table
+below was made with 25 number calls (2.1 USD per clip): the 27 clip passes of the table cost about
+6 USD more, which comes out of the reserve until the cost pilot gives real numbers.
 
 | Item | USD |
 |---|---|
@@ -235,6 +237,12 @@ which comes out of the reserve until the cost pilot gives real numbers.
   Hard stop at 135 USD. A budget alert on the Google project is the backstop.
 - If Flex does not work, a clip costs about 4.7 USD after 1 Dec. Then: one dev pass instead of two,
   and 6 test clips instead of 10.
+- Printed by the code on 23 Nov (estimates, `docs/HANDOVER.md`, section 8): one pass of each item
+  of the table costs 75.92 USD at the standard price before 1 Dec and 76.67 USD through Flex after
+  it, but 151.81 USD at the standard price after it: above the hard stop. The line of the number
+  probe (two settings of 408 tracks) is 7.98 USD before 1 Dec and 15.96 USD at the standard price
+  after it, above its 11 USD. Not in the table: the three video arms of the people probe (6.75 USD
+  before 1 Dec) and the number step of the detector engine (0.463 USD per clip before 1 Dec).
 - A Flex request that gets the status 503 or 429 (no capacity) is tried again for 900 seconds
   before the run stops. These attempts are not billed.
 
@@ -291,6 +299,10 @@ be tested on the build machine; `doctor` is its first real test.
 | 4 | Tell me the personal git name and e-mail for the commits of both machines | before the first commit |
 | 5 | Demo clip: one continuous main-camera shot, 1080p, 10-30 s, plus a roster file (team, number, name) | 22 Nov |
 
+State on 23 Nov 2026: to-do 3 is done (14 Nov) and to-do 4 is done (the commits have the identity).
+The dates of to-dos 1, 2 and 5 have passed; whether they are done cannot be seen on the build
+machine.
+
 ## Defaults I chose (change any of them when you review)
 
 - Matching players between keyframes is plain code. Gemini-carried IDs are measured and used only
@@ -301,8 +313,9 @@ be tested on the build machine; `doctor` is its first real test.
 ## Risks and limits
 
 - Pitch mapping from Gemini landmarks may fail, mainly in midfield views with few line crossings.
-  It is measured first (19-24 Nov). Its fallback, PnLCalib, has a tested adapter; the tool itself
-  never ran, and the pipeline cannot use its answers yet.
+  It is measured first (planned for 19-24 Nov; not started on 23 Nov). Its fallback, PnLCalib, has
+  a tested adapter, and since 22 Nov the pipeline can use its answers (the calibration engine,
+  `docs/RUNBOOK.md`, section 11); the tool itself never ran.
 - Shirt numbers are often unreadable in wide shots. The radar then shows team colours for all
   players and numbers or names for some.
 - The Gemini client and the scorer wrapper are written on the build machine without a real test.
