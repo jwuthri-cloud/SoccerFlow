@@ -195,9 +195,14 @@ run it again here when the code changed since then (RUNBOOK, section 1):
 
 ```bash
 python -m pytest -m "slow or not slow" -rs
+python tools/run_tests.py -m "slow or not slow"
 ```
 
-- Passes: no failure. On 22 Nov the build machine printed `3203 passed, 1 skipped`. Here one more group of tests
+- The second command runs the same tests in several processes (RUNBOOK, section 1). From here
+  on it is the test run after each change: `python tools/run_tests.py` (default run) and
+  `python tools/run_tests.py -m "slow or not slow"` (full run, before a commit).
+- Passes: no failure, and the second command prints the same counts of passed and skipped tests
+  as the first, with exit code 0. On 22 Nov the build machine printed `3203 passed, 1 skipped`. Here one more group of tests
   can run or be skipped: some tests need a disk that tells upper and lower case apart, some one
   that does not.
 - When not: a skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of
@@ -316,7 +321,7 @@ python -c "import json; from pathlib import Path; a, b = (json.loads(Path(p).exp
 after "measured cost" of step 9 (all four model steps; the output count is the out tokens plus
 the thinking tokens) into `DEFAULT_TOKEN_ESTIMATES` (`src/pitchvlm/vlm/cost.py`), into
 `docs/ARCHITECTURE.md` (section `vlm/cost.py`) and into `docs/DECISIONS.md`, with the owner's
-go-ahead. Run `python -m pytest`, and commit when the owner asks (RUNBOOK, section 2).
+go-ahead. Run `python tools/run_tests.py`, and commit when the owner asks (RUNBOOK, section 2).
 
 - Passes: the tests pass, and a probe of step 9 with `--replay` now prints a cost estimate near
   the cost that step 9 measured.
@@ -500,7 +505,9 @@ The guard refuses them. Do not bypass it (rule 9).
 
 ## 10 Code changes on the run machine
 
-- Small, tested changes on the code branch. `python -m pytest` must pass before a commit.
+- Small, tested changes on the code branch. The default run `python tools/run_tests.py` passes
+  after each change, and the full run `python tools/run_tests.py -m "slow or not slow"` before a
+  commit (RUNBOOK, section 1; `python -m pytest` runs the same tests in one process).
   Commit when the owner asks.
 - A paid command refuses to start when the git work tree has changes.
 - After a change of `tools/`, `.gitleaks.toml`, `.gitignore` or `.pre-commit-config.yaml`, merge

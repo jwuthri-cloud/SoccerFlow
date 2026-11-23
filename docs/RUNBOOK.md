@@ -85,13 +85,34 @@ git -C ~/pitchvlm-data/sn-trackeval rev-parse HEAD
   repeats a failed call by itself, and `doctor` then fails before any model call.
 
 The offline tests have two runs (`docs/DECISIONS.md`, entry "A faster default run of the offline
-tests" of 2026-11-22):
+tests" of 2026-11-22). Each run works in one process or in several processes at once with the
+same tests and the same results (entry "The offline tests in several processes" of 2026-11-22):
 
 ```bash
-python -m pytest                          # default run, after each change: all but the 9 slow tests
-python -m pytest -m "slow or not slow"    # full run, before a commit: every test
-python -m pytest -m slow                  # the 9 slow tests alone
+python tools/run_tests.py                          # default run, after each change: all but the 9 slow tests
+python tools/run_tests.py -m "slow or not slow"    # full run, before a commit: every test
+python -m pytest                                   # the default run in one process
+python -m pytest -m "slow or not slow"             # the full run in one process
+python -m pytest -m slow                           # the 9 slow tests alone
 ```
+
+- `tools/run_tests.py` imports only the standard library. It lists the tests with one
+  `python -m pytest --collect-only`, splits them over one worker per core (`-j N` for another
+  number), and starts each worker as a plain `python -m pytest` with its own temporary folder.
+  It passes on `-m`, `-k`, `-x` and test paths, and refuses any other option of pytest. Run it
+  from the top folder, with the Python of the environment (`source .venv/bin/activate`).
+- It fails (exit code not 0) when a test fails, when a worker crashes or ends in another way
+  than pytest's normal end, when a worker writes nothing for 120 s (`--silence-limit`; the
+  worker and its child processes are killed, and the run names the file and the test), and when
+  the tests that the workers ran differ from the collected list (a test missing or run twice).
+  It prints the full failure text of each failed test and one summary line. Ctrl-C stops every
+  worker and its child processes. Exit codes: 0 passed, 1 a test failed, 2 the run cannot be
+  trusted (the last line starts with `error:`), 130 stopped by Ctrl-C.
+- It balances the workers by the time of each test in its last run in this checkout
+  (`.pytest_cache/run-tests-times.json`, ignored by git). Without that file (a new clone) it
+  balances by test count: the run is correct, only slower.
+- `--results FILE` writes the outcome of each test, one line per test, to compare two runs.
+- The hooks of git run the guard and the secret scan, never the tests.
 
 - The default run leaves out only the tests marked `slow` (`pyproject.toml`, section
   `[tool.pytest.ini_options]`). They need a long synthetic clip and check no hard rule. Every
@@ -100,10 +121,7 @@ python -m pytest -m slow                  # the 9 slow tests alone
 - `tests/conftest.py` keeps pure results that many tests compute again (frames of a synthetic
   scene, frames read from image files, the measured camera motion, the paint alignment, JPEG
   bytes, the git state of this checkout) once per test process. `PITCHVLM_TEST_CACHE=0 python -m
-  pytest` runs without these caches.
-- On a machine that has the plugin `pytest-xdist`, `python -m pytest -n auto` runs the tests in
-  several processes. The plugin is not a dependency of the project and is not installed on the
-  build machine; such a run was never tried there.
+  pytest` runs without these caches. Each worker of `tools/run_tests.py` has its own caches.
 
 The key lives in the environment variable `GEMINI_API_KEY`. Set it in each new terminal:
 

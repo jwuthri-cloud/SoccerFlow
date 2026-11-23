@@ -4,8 +4,8 @@ The owner follows ``docs/HANDOVER.md`` and ``docs/RUNBOOK.md`` to the letter on 
 machine. This test reads every fenced block of ``CLAUDE.md`` and of these two files:
 
 - A shell command that calls the package (``python -m pitchvlm.cli ...``), the tool script
-  (``tools/run_tool.py ...``) or the guard (``tools/guard.py ...``) must parse with the argument
-  parser of that program: the sub-command and every option exist, and every value has a form
+  (``tools/run_tool.py ...``), the guard (``tools/guard.py ...``) or the test runner
+  (``tools/run_tests.py ...``) must parse with the argument parser of that program: the sub-command and every option exist, and every value has a form
   that the parser takes (a model name of ``--models``, a positive ``--max-clips``, ...).
 - A file below ``configs/`` that such a command names must exist, and an experiment file or a
   settings file must load. The kind of a probe must be the probe of its experiment file. One
@@ -91,11 +91,16 @@ def _parse_guard(arguments: list[str]) -> object:
     return _load_module("guard_of_the_documents", REPO / "tools" / "guard.py").parse_arguments(arguments)
 
 
+def _parse_run_tests(arguments: list[str]) -> object:
+    return _load_module("run_tests_of_the_documents", REPO / "tools" / "run_tests.py").parse_options(arguments)
+
+
 #: The programs whose calls are checked: the word that names the program, and its parser.
 PROGRAMS: dict[str, Callable[[list[str]], object]] = {
     "pitchvlm.cli": _parse_package,
     "tools/run_tool.py": _parse_run_tool,
     "tools/guard.py": _parse_guard,
+    "tools/run_tests.py": _parse_run_tests,
 }
 
 
@@ -139,11 +144,11 @@ def shell_commands(block: str) -> Iterator[list[str]]:
 
 
 def program_call(words: Sequence[str]) -> tuple[str, list[str]] | None:
-    """Return the program and its arguments when a command calls the package, the tool script or the guard."""
+    """Return the program and its arguments when a command calls the package, a tool script, the guard or the test runner."""
     for position, word in enumerate(words):
         if word == "pitchvlm.cli" and position > 0 and words[position - 1] == "-m":
             return "pitchvlm.cli", list(words[position + 1 :])
-        if word in ("tools/run_tool.py", "tools/guard.py"):
+        if word in ("tools/run_tool.py", "tools/guard.py", "tools/run_tests.py"):
             return word, list(words[position + 1 :])
     return None
 
@@ -299,6 +304,21 @@ python3 tools/guard.py --everything
     assert "of the probe pitch" in problems[0]
     assert "--models" in problems[1]
     assert "guard.py --everything" in problems[2]
+
+
+def test_reader_finds_an_option_that_the_test_runner_does_not_pass_on() -> None:
+    text = """
+```bash
+python tools/run_tests.py -m "slow or not slow"
+python tools/run_tests.py -x -k guard tests/test_guard.py
+python tools/run_tests.py --tb=short
+python tools/run_tests.py -j 0
+```
+"""
+    problems = command_problems(text)
+    assert len(problems) == 2, problems
+    assert "unrecognized arguments: --tb=short" in problems[0]
+    assert "-j must be 1 or more" in problems[1]
 
 
 def test_reader_finds_an_import_that_the_package_does_not_have() -> None:
