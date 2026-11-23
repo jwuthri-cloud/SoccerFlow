@@ -2099,7 +2099,178 @@ on real footage.
    - Not verified: any git other than 2.56 on macOS, the run machine, and Linux. The features
      used (`rev-parse` with two options, `cat-file --batch-check` reading one name at a time)
      are old, but the equality of the `HEAD` answers was tried on this git only.
-||||||| 81bb2d9
+
+## 2026-11-22 — The offline tests in several processes
+
+1. **Goal and result.** The default run of the offline tests took 110 to 155 s in one process.
+   Hypothesis: the test files can run in N processes with the same collected tests and the same
+   outcomes as one process, and the default run then takes at most 40 s on the build machine.
+   Baseline: `python -m pytest` in one process on the same tree. **Result: met on the build
+   machine.** The new runner `tools/run_tests.py` ran the default run in 27.4 to 37.2 s (14 runs,
+   load average 5.7 to 27 on 14 cores), against 142.5 to 144.5 s in one process (4 runs). The
+   full run took 28.3 to 36.4 s against 164.3 s. Same test ids and the same outcome of every
+   test. Every time here is measured on the build machine while other sessions ran; the load
+   average (1 min) is given with each run. Nothing ran on the run machine.
+
+2. **Design.** `tools/run_tests.py` imports only the standard library and starts plain
+   `python -m pytest` processes; no package and no plugin was added. One
+   `python -m pytest --collect-only` with the options of the run lists the test ids, as one
+   process collects them. The ids are split over one worker per core (`-j N`): a file whose time
+   is more than half the share of one worker is cut into parts in collection order, and the parts
+   are given out longest first, each to the worker with the least time so far; each worker runs
+   its ids in collection order. The time of each test comes from the last run in this checkout
+   (`.pytest_cache/run-tests-times.json`, ignored by git, written by the runner). Without that file
+   the runner balances by test count and says so; the run is correct, only slower (first run of
+   the default tier in a new checkout: 63.8 s). Each worker gets its own base temporary folder
+   (`--basetemp`), its own pytest cache folder (`-o cache_dir=`), its own JUnit XML file, its own
+   process group, and the options `-m`, `-k`, `-x` and the test ids. Any other option of pytest
+   is refused.
+
+3. **Checks in every run.** The run fails when:
+   - a test fails or has an error (exit code 1; the full failure text of each failed test is
+     printed with its id, then one summary line: passed, failed, errors, skipped, deselected,
+     wall time);
+   - a worker ends in another way than pytest's normal end (exit code not 0 or 1, no JUnit XML
+     file, a count of collected tests other than the count of its ids, an exit code that does not
+     fit its JUnit XML file): exit code 2, the output of that worker is printed;
+   - a worker writes nothing for 120 s (`--silence-limit`): its process group is killed, and the
+     run names the file and the last test that started (exit code 2; pytest's `faulthandler`
+     prints the stack of the hanging test after half the limit);
+   - the ids that the workers ran differ from the collected ids: a test that ran twice, a test
+     that the collection does not list, a collected test that did not run (exit code 2). With
+     `-x`, the tests after the first failure are allowed to be missing.
+   Ctrl-C (and SIGTERM, SIGHUP) stops every worker group: SIGTERM, 5 s, then SIGKILL (exit code
+   130). The JUnit XML name of a test (`classname`, `name`) is mapped back to its id with the rule
+   of pytest 9; a change of that rule fails the id check instead of losing tests.
+
+4. **What is shared beside other processes, and what was found.**
+   - pytest's base temporary folder and cache folder: each worker gets its own, inside one
+     folder of the system's temporary folder per run, removed after a run that can be trusted
+     and kept (with the output of each worker) after exit code 2.
+   - Fixed file names under `/tmp`, fixed ports, `HOME`, environment variables: no test writes a
+     fixed name under `/tmp` (every test uses `tmp_path` or `tempfile`), none opens a port, the
+     tests that start git set a private `HOME` and `GIT_CONFIG_NOSYSTEM` (`private_environment` of
+     `test_guard.py`, the fixture `private_git` of `test_cli.py`), and environment variables
+     belong to one process.
+   - The git folder of this checkout: only read (`git rev-parse`, `git status`, `git ls-files`).
+     `git status` may refresh the index; a second process that finds the lock skips the refresh.
+     The checkout stays unchanged after a run (`git status --porcelain --ignored` before and
+     after: only `.pytest_cache/`), and no `~/pitchvlm-data` was made.
+   - The caches of `tests/conftest.py` and the git template of `test_guard.py` are per process;
+     each worker builds its own. `tests/conftest.py` needed no change.
+   - `tests/test_guard.py` and `tests/test_cli.py` are split by test ids over 5 to 10 workers; the
+     same outcomes in every run show that their tests are safe apart.
+   - In 43 runs with the runner and no planted fault, 3 had a failed test: 2 were the runner
+     test of (a) below; the output of the third (item 6) was not kept, so its test is not known.
+     Both flaky tests that were found are tests of the runner itself, and each showed a defect of
+     the runner, fixed with a test:
+     (a) `test_first_failure_stops_the_other_workers` failed in 2 of 13 runs (and probably in 1
+     of 8 runs of item 6, whose output was not kept): with `-x`, when the other worker ended by
+     itself before the failing one, the tests skipped by pytest's own `-x` counted as missing
+     (exit code 2 instead of 1). The new test
+     `test_first_failure_ends_its_worker_after_the_other_workers_ended` forces that order and
+     failed before the fix. (b) `test_ctrl_c_stops_every_worker_and_their_children` failed once
+     in 17 one-process runs: `os.killpg` on macOS gave `PermissionError` for a worker that was
+     ending at the moment of the Ctrl-C (read from the code of macOS's `killpg`: no process of the
+     group could take the signal; not proved), and the cleanup stopped. The runner now takes that
+     answer as "nothing left to signal" and kills the worker itself before it waits for it; 8
+     runs of the runner tests in a row passed after the fix.
+   - Process starts are a shared limit of the machine: about 180 starts of `/usr/bin/true` per
+     second and 250 of `git --version` per second, the same from 2 to 14 parallel streams. The
+     suite starts about 3,000 processes (mostly git in `test_guard.py`), so about 12 to 15 s of
+     any run are process starts that more workers cannot shorten.
+
+5. **Same outcomes as one process** (full run, `-m "slow or not slow"`, back to back, load 15.4
+   and 14.3). One process: 3,224 passed, 1 skipped, 164.3 s. Runner: 3,224 passed, 1 skipped,
+   36.4 s. The outcome of each of the 3,225 tests (from the JUnit XML file of the one process,
+   and `--results` of the runner) is the same: `diff` of the two sorted lists is empty.
+
+6. **Time per number of workers** (default run, 3,215 tests, order 2, 4, 8, 14, 14, 8, 4, 2):
+
+   | Workers | Wall, s (load before) |
+   |---|---|
+   | 2 | 74.1 (13.1), 75.6 (19.5) |
+   | 4 | 43.9 (7.7), 42.9 (20.0) |
+   | 8 | 30.6 (9.6), 33.5 (19.6) |
+   | 14 | 33.9 (14.1), 34.0 (18.5) |
+
+   It stops paying between 8 and 14 workers on this machine (process starts, item 4). The
+   default stays one worker per core: no number of this machine is written into the code.
+
+7. **A/B, back to back, both orders** (default run, 3,216 tests; order one, runner, runner, one,
+   one, runner, runner, one; load before each run in brackets):
+
+   | Arm | Wall, s | Mean |
+   |---|---|---|
+   | `python -m pytest` | 142.5 (21.0), 144.4 (17.3), 143.1 (6.4), 144.5 (18.2) | 143.6 |
+   | `python tools/run_tests.py` | 30.3 (8.0), 30.5 (12.9), 29.2 (5.7), 37.2 (13.8) | 31.8 |
+
+   The runner uses about 24 % more processor time than one process (user + system 185 s against
+   149 s for the full run): 14 Python starts with NumPy, OpenCV and SciPy, and caches built in
+   each worker.
+
+8. **Stability.** After the fix of item 4 (a): 10 default runs in a row, all green, each 3,216
+   passed, 1 skipped, 9 deselected, 27.4 to 32.7 s (load 15 to 27); then 3 full runs, all green,
+   each 3,225 passed, 1 skipped, 28.3 to 30.1 s. Before the fix: the same series, 11 of 13 green;
+   the 2 failures are item 4 (a).
+
+9. **Fault check.** Twelve faults planted under `src/`, one at a time, each undone after its
+   runs; for each, the default run in one process and with the runner. The runner exits with
+   code 1 for each fault the one process finds, and names the same failing tests:
+
+   | Fault | Module | Change | Failing tests, one process / runner |
+   |---|---|---|---|
+   | P01 | `ball.py` | gate without the noise of one box width | 1 / 1 |
+   | P02 | `datasets.py` | archive member with `..` accepted | 3 / 3 |
+   | P03 | `export_gsr.py` | goalkeeper gets a jersey | 84 / 84 |
+   | P04 | `vlm/client.py` | Gemini call stored by the provider | 20 / 20 |
+   | P05 | `vlm/cost.py` | default hard stop 136 USD, not 135 | 0 / 0 |
+   | P06 | `vlm/cost.py` | run stops at 2x its estimate | 3 / 3 (and item 4 (b) in the one process) |
+   | P07 | `motion.py` | a pair without a correlation is no cut | 1 / 1 |
+   | P08 | `pitch.py` | pitch 0.5 m too wide | 23 / 23 |
+   | P09 | `schemas.py` | union counts the overlap two times | 44 / 44 |
+   | P10 | `frames.py` | other keyframe interval | 1 / 1 |
+   | P11 | `cli.py` | a changed work tree is clean | 1 / 1 |
+   | P12 | `datasets.py` | absolute archive member accepted | 2 / 2 |
+
+   P05 is a gap of the suite, not of the runner: `test_default_hard_stop_is_135_usd` spends 134
+   and then 136 USD, so a hard stop of 136 passes too. The command line takes the hard stop from
+   `configs/gates.yaml` (135), not from this default. A control run without a fault passes (item
+   8). Three faults of the run itself, on the real suite: a worker killed from outside with
+   SIGKILL (exit code 2, the worker and its files named, no process of the run left); a test file
+   with `time.sleep(10**6)` and `--silence-limit 20` (exit code 2 after 79 s, the file and the
+   test named, no process left); a test file with a syntax error (exit code 2, the `SyntaxError`
+   of the collection printed; the one process ends with exit code 2 too).
+
+10. **The hooks.** The commit hook and the push hook run the guard and the secret scan only
+    (`.pre-commit-config.yaml`); they never ran the tests, and that stays so. The hook setup did
+    not change.
+
+11. **Proposed text for `CLAUDE.md`** (section "Commands"; the owner applies it):
+
+    ```bash
+    python tools/run_tests.py                          # offline tests, default run, in several processes
+    python tools/run_tests.py -m "slow or not slow"    # full run, before a commit
+    python -m pytest                                   # the default run in one process
+    python -m pitchvlm.cli demo --out outputs/demo     # synthetic clip, fake model, no network
+    python3 tools/guard.py --tracked      # leak check of all tracked files
+    python3 tools/guard.py --push         # leak check of what a push can send: commits, tags, new names
+    ```
+
+    and in "How to work": "`pytest` must pass offline, with no SDK installed, in one process
+    and with `tools/run_tests.py`."
+
+12. **Open and not verified.**
+    - No run on the run machine, on Linux, or on a quiet machine. The target of 40 s holds here
+      under a load of 6 to 27; on a machine with fewer cores or slower process starts it can be
+      missed.
+    - The reading of macOS's `PermissionError` in item 4 (b) is inferred from the code of the
+      system, not proved by a test that forces it.
+    - The mapping of JUnit XML names to test ids follows pytest 9.2; another pytest version may
+      fail the id check of every run (it cannot pass a wrong one).
+    - The gap of fault P05 (item 9) is not closed here.
+    - An earlier version of the Ctrl-C test, before fix (b), left two idle test processes on the
+      build machine; they ended by themselves after one hour.
 
 ## Open questions (to settle with measurements)
 

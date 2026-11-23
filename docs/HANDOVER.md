@@ -236,7 +236,9 @@ The guard refuses them. Do not bypass it (rule 9).
 
 ## 10 Code changes on the run machine
 
-- Small, tested changes on the code branch. `python -m pytest` must pass before a commit.
+- Small, tested changes on the code branch. The default run `python tools/run_tests.py` passes
+  after each change, and the full run `python tools/run_tests.py -m "slow or not slow"` before a
+  commit (RUNBOOK, section 1; `python -m pytest` runs the same tests in one process).
   Commit when the owner asks.
 - A paid command refuses to start when the git work tree has changes.
 - After a change of `tools/`, `.gitleaks.toml`, `.gitignore` or `.pre-commit-config.yaml`, merge
