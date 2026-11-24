@@ -5161,8 +5161,15 @@ real model, a real clip or a real cost.
      seeds) ran at a load average of 52 falling to 7.7: paired difference of the median −4.16
      [−14.58, +6.27] ms, of the 95th percentile −0.02 [−17.06, +17.01] ms; in pair 2 the run with
      `none` had a median of 68.8 ms. It decides nothing: on this machine, under the load of the
-     other sessions, 6 pairs cannot show a cost of 1 ms. N1 stays failed as written; a run on a
-     quiet machine (or the run machine) is the open check.
+     other sessions, 6 pairs cannot show a cost of 1 ms. After the merge of the second read of
+     round 7, the 5 s arm again on `165b668` (6 pairs, both orders, the same seeds, the load average
+     of 1 min noted before and after each run: from 7.0 to 36.6, rising during pairs 2 to 4): paired
+     difference of the median +4.66 [−3.67, +12.99] ms (median of the pairs +2.20), of the 95th
+     percentile +14.14 [−20.25, +48.53] ms (−0.77). **Fail as measured.** The two largest
+     differences came with the load rising during the run with numbers (pair 0: 39.7 against
+     20.7 ms at a load of 17.7 to 18.7; pair 2: 25.3 against 20.7 ms while the load rose from 7.0 to
+     20.9); in pair 4 at a load of 35 both arms took 33.6 to 33.9 ms. N1 stays failed as written; a
+     run on a quiet machine (or the run machine) is the open check.
    - **N2, the numbers against the clip path** (hypothesis: at the end of the stream the set of
      (track, number) equals that of the clip path with the same engine file and the same fake
      answers, on all 40 seeds). 500-frame clips (20 s), frames paced at 25 fps, the cap set to 1000 so
