@@ -1227,7 +1227,36 @@ sets the event `cli.STOP_REQUESTED`, which the real backend gets as its stop eve
 request and no new attempt is sent after the signal. A model call that runs in the main thread
 (the kit legend request of `run`, every request of `probe` and of the contract checks of
 `doctor`) is not cut off: the signal is held back until the call has ended and its answer is
-stored and recorded (`cli.finish_in_flight`). A second signal during that call is held back too.
+stored and recorded (`cli.finish_in_flight`). The thread pool of `pipeline._generate_all` holds
+signals back the same way: no request starts after a recorded stop, a warning names the requests
+in flight, and the stop is raised when they have ended. Any number of further signals is held back
+too (`stopsignals.held_stops`, below); Ctrl-\ (SIGQUIT) or `kill -KILL` end the process at once and
+lose the answers in flight (they can still be billed).
+
+### `stopsignals.py` — stop signals that wait for the paid requests in flight (2026-11-23)
+
+```python
+# stopsignals.py
+def reset() -> None                          # a command starts (cli.main)
+def held_stops() -> ContextManager[None]     # main thread: hold signals back; raise the first one at the end
+def hold_back(cause: str) -> bool            # the handler: record a stop when a hold is open or the stop was raised
+def mark_raised() -> None                    # the stop of the command was raised: later signals are only counted
+def held_cause() -> str | None               # the stop that the open hold recorded
+def held_signals() -> int                    # signals recorded since the command started
+def enter_handler() -> bool; def leave_handler() -> None   # a signal inside the handler is only counted
+class StopEvent(threading.Event)             # cli.STOP_REQUESTED: its lock can be taken again by one thread
+```
+
+- Only the main thread holds: a handler of Python runs there and nowhere else. Holds nest; the
+  outermost one raises `KeyboardInterrupt(<cause of the first signal>)` when it ends, also over an
+  error of its block. `cli._interrupt` sets `STOP_REQUESTED` (inside `enter_handler`), then holds
+  the stop back when a hold is open, else raises it. A command is interrupted once: after its stop
+  was raised, later signals are only counted, so they cannot cut short its cleanup, its error line
+  or its exit code 2.
+- Why: a `KeyboardInterrupt` raised at any point of the main thread ended the wait for the
+  requests in flight, and one raised inside the lock of a `threading.Event` (also the one that
+  the handler sets) left the lock taken, so the next signal blocked the handler for ever (a burst
+  of 2,000 signals from another process; `docs/DECISIONS.md`, entry of 2026-11-23).
 
 Providers in the integration layer: `cli.model_backend` (for `run` and `probe`) and
 `cli.recording_backend` (for `doctor`) build a `ProviderBackend` of a `GeminiBackend` and an
@@ -2013,6 +2042,8 @@ def open_live_out(target: str, info: ClipInfo) -> LiveOut               # "-", a
   never go; a reader that goes away ends the output
   (`reader_gone`), not the stream; `close` waits at most `wait_s`, then gives the writer up
   (`undelivered`); an error of the writer that is not one of its reader is raised by `close`.
+  The counts of `LiveReport` are of frame lines and the end line, never of the header, whether it
+  went out or not: after `finish`, `written + dropped + undelivered == given + 1`.
 - Command line: `stream --live-out FILE|-` (`cli.refuse_live_out`: refused inside a work tree of
   the repository through links, inside `--out`, a folder, an input file, the standard output as a
   path). With `-` the output of `stream` goes to the error stream. `result.json` gets `live_out`
@@ -2044,7 +2075,10 @@ def serve(lines, *, host="127.0.0.1", port=0, replay=False, ready=None, stop=Non
   (`default-src 'none'`, the script and the style by their SHA-256, `connect-src 'self'`,
   `frame-ancestors 'none'`), `nosniff`, `X-Frame-Options: DENY` and closes its connection.
 - A line of the feed is parsed and written again as compact JSON before it goes out, so it can
-  add no event. The page writes text only with `textContent` and draws on a canvas.
+  add no event. A number too large for a float (`1e400`), a whole number beyond 2**53, `NaN` and
+  `Infinity` are refused (`RadarError`). The page writes text only with `textContent` and draws on a canvas.
+- `follow_file` raises `RadarError` when the followed file becomes shorter than what was read or
+  another file takes its name (a second `stream` to the same `--live-out`).
 - A new client gets the header and the newest frame; a client more than `CLIENT_MAX_BEHIND`
   frames behind jumps to the newest. `serve` ends when the feed ended and the clients got the
   end (at most `END_WAIT_S`), or when `stop` is set.

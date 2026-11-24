@@ -48,7 +48,7 @@ import numpy as np
 import pytest
 import yaml
 
-from pitchvlm import cli, doctor, pipeline, probes
+from pitchvlm import cli, doctor, pipeline, probes, stopsignals
 from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig
 from pitchvlm.datasets import make_split_manifest
 from pitchvlm.evalx.oracle import TeamSideFacts
@@ -4034,23 +4034,22 @@ def test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_
     """A second stop signal comes while the command waits for the model requests in flight.
 
     Every request takes 300 milliseconds. The third request, which runs in the thread pool, sends
-    SIGTERM when it starts. It sends SIGINT 100 milliseconds after the pool began to wait for its
-    requests, and it is answered 200 milliseconds after that. The cost that the command prints at
-    its end must hold every answer that has a ledger line.
+    SIGTERM when it starts. It sends SIGINT 100 milliseconds after the main thread recorded the
+    first stop (from then on the pool waits only for its requests in flight), and it is answered
+    200 milliseconds after that. The cost that the command prints at its end must hold every
+    answer that has a ledger line.
     """
     scene, root = clip_on_disk
     fake = FakeBackend(scene)
     lock = threading.Lock()
-    pool_waits = threading.Event()
     pool_threads: list[threading.Thread] = []
     answered: list[str] = []
 
-    class WatchedPool(pipeline.ThreadPoolExecutor):
-        """A thread pool that says when the wait for the requests in flight begins (its shutdown)."""
-
-        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            pool_waits.set()
-            super().shutdown(wait, cancel_futures=cancel_futures)
+    def wait_for_the_recorded_stop() -> None:
+        deadline = time.monotonic() + 60.0
+        while stopsignals.held_cause() is None:
+            assert time.monotonic() < deadline, "the main thread did not record the stop"
+            time.sleep(0.01)
 
     class StoppedTwiceBackend:
         """The fake model. Its third request sends the two stop signals while it is in flight."""
@@ -4066,7 +4065,7 @@ def test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_
                     pool_threads.append(threading.current_thread())
             if number == 3:
                 os.kill(os.getpid(), signal.SIGTERM)
-                assert pool_waits.wait(timeout=60.0)
+                wait_for_the_recorded_stop()
                 time.sleep(0.1)
                 os.kill(os.getpid(), signal.SIGINT)
                 time.sleep(0.2)
@@ -4077,7 +4076,6 @@ def test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_
                 answered.append(request.cache_key())
             return response
 
-    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", WatchedPool)
     monkeypatch.setattr(cli, "render_clip", lambda source, result, out_path: out_path)
     monkeypatch.setattr(cli, "model_backend", lambda max_usd_per_10_min: StoppedTwiceBackend())
 
