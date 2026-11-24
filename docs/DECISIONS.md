@@ -5461,6 +5461,28 @@ real model, a real clip or a real cost.
     injected still clock); the number step and the policy in one stream, whose end holds 20 stop
     signals; a dropped decision writes the numbers that came. The bench feeds its frames through
     the frame feeder since `9ab0d29`, as `stream` does.
+13. **N1 and N2 on the merged code** (`9d167b9`, measured 2026-11-24, the other sessions idle; the
+    bench feeds the frame feeder, so the frame sample no longer holds the read and the motion and
+    the times per frame are about 12 ms instead of 20). N1: 6 pairs per answer delay, both orders,
+    seeds 2200 to 2205, the load average of 1 min 2.7 to 11.0 (median 4.4) over the 36 runs.
+
+    | Answer delay | Median per frame, none / model | Paired difference of the median: mean [95% t] (median) | Paired difference of the 95th percentile: mean [95% t] (median) | Verdict |
+    |---|---|---|---|---|
+    | 0.5 s | 11.82 / 12.52 ms | +0.64 [+0.19, +1.09] (+0.54) ms | +0.84 [−0.31, +1.98] (+0.61) ms | pass |
+    | 2 s | 12.35 / 12.27 ms | −0.05 [−0.39, +0.30] (−0.10) ms | −0.17 [−0.57, +0.22] (−0.27) ms | pass |
+    | 5 s | 11.99 / 12.33 ms | +1.87 [−2.42, +6.15] (+0.35) ms | +4.48 [−5.88, +14.84] (+0.56) ms | **fail** |
+
+    **N1 fails as measured, again on the 5 s arm**, by one pair: seed 2205, the run with numbers
+    had a median of 22.4 ms (95th percentile 39.9 ms) while the load average rose from 8.0 to 10.8
+    during it; the 5 other pairs differ by −0.58 to +0.47 ms. With 5 s per answer the first answer
+    comes about 10 s after the start, when the 750 frames (about 9 s) are already decided, so the
+    threads of the pool and the fake model do nothing during the frame samples; the worker only
+    cuts crops and builds requests, as at 0.5 s. I infer a load event, but in all four measurements
+    of the 5 s arm one or two pairs had such a difference, and at 0.5 s and 2 s none: that pattern
+    is not explained, and a run on the run machine is the check. N2 (40 seeds, 0.5 s per answer,
+    paced at 25 fps): 37 of 40 equal, the same three seeds with the same causes as in item 7;
+    requests per clip median 38 (21 to 40); no image dropped; no failure. N3 of that run: median
+    6.21 s, 95th percentile 9.92 s (1,517 lines), as before.
 
 ## Open questions (to settle with measurements)
 
