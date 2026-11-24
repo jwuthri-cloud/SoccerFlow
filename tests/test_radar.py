@@ -503,3 +503,23 @@ def test_connections_above_the_limit_are_closed_at_once() -> None:
     feed.send(header(1))
     feed.send({"end": True, "frames": 0, "written": 0, "dropped": 0})
     running.join()
+
+
+def test_a_replay_gives_each_frame_at_its_time_from_the_first_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--replay`` waits for the first page, then gives frame ``f`` at ``t_s`` of ``f`` after the first frame
+    (a planted bug that gave every frame at once was caught by no test). The clock of the test moves only when the
+    board sleeps."""
+    now = [100.0]
+    slept: list[float] = []
+    board = radar.Board(replay=True)
+
+    def sleep(seconds: float) -> None:
+        slept.append(round(seconds, 9))
+        now[0] += seconds
+
+    monkeypatch.setattr(board, "sleep", sleep)
+    board.first_client.set()
+    lines = [json.dumps(header(4))] + [json.dumps({**frame(index), "t_s": index * 0.5}) for index in range(4)]
+    assert radar.pump([*lines, json.dumps({"end": True})], board, replay=True, clock=lambda: now[0]) == 4
+    assert slept == [0.5, 0.5, 0.5]
+    assert [event.frame for event in board.wait(1, 0.0) if event.kind == "frame"] == [0, 1, 2, 3]
