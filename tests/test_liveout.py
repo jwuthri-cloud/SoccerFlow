@@ -608,3 +608,17 @@ def test_anything_but_a_regular_file_takes_the_pipe_policy(tmp_path: Path) -> No
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_a_live_output_file_that_exists_is_emptied_first(tmp_path: Path) -> None:
+    """A second stream to the same file starts a new feed: lines added after the old ones would give two headers."""
+    scene, result = states_of(4)
+    path = tmp_path / "live.jsonl"
+    path.write_text('{"format": "an old feed"}\n' * 3, encoding="utf-8")
+    live = open_live_out(str(path), scene.info)
+    live.start(delay_frames=0, history_frames=None)
+    live.given(result.frames[0], camera=result.homographies[0], last=0, transition=False, cut=False)
+    live.finish()
+    live.close()
+    lines = read_lines(path)
+    assert [lines[0]["format"], lines[1]["frame"], lines[2]["end"]] == [LIVE_FORMAT, 0, True] and len(lines) == 3
