@@ -60,8 +60,10 @@ frame with the payload of the detector and of the calibration as their adapters 
 the clip runs of the two tools, and ``read_stream_lines`` reads them, from a file or from a
 pipe of a tool process. The picture of each frame comes from the clip (a frame source).
 
-Only the people engine ``detector`` with the pitch engine ``calibration`` and the number
-engine ``none`` streams. The shirt numbers are a paid model step on the crops of a whole track.
+Only the people engine ``detector`` with the pitch engine ``calibration`` streams, with the
+number engine ``none`` or ``model``. The stream itself reads no number: with ``model`` the paid
+number step runs beside it (``livenumbers``), on the crops that the hook ``on_arrived`` hands over,
+and its numbers come as their own lines after the frames (the frame states stay as given).
 """
 
 from __future__ import annotations
@@ -139,6 +141,8 @@ KIT_WARMUP_FRAMES = 25
 #: (``motion.ShotMeter.open_transition``). Fixed on the fit seeds of the decision entry
 #: (``docs/DECISIONS.md``, "The live feed of the detector engine", 2026-11-23).
 EARLY_DISSOLVE_WINDOWS = 4
+#: The number engines that stream: none, or the paid number step beside the stream (``livenumbers``).
+STREAM_NUMBERS = ("none", "model")
 #: The paint scores of the keyframes run on one thread beside the frame path; a frame waits
 #: only when this many scores are still open (so the images they hold stay bounded).
 PAINT_MAX_PENDING = 4
@@ -190,10 +194,10 @@ def default_history_frames(config: PipelineConfig, fps: float) -> int:
 def check_stream_engines(config: PipelineConfig) -> None:
     """Raise ``ValueError`` unless the settings name the engines that stream (module docstring)."""
     engines = config.engines
-    if (engines.people, engines.pitch_mapping, engines.number) != ("detector", "calibration", "none"):
+    if (engines.people, engines.pitch_mapping) != ("detector", "calibration") or engines.number not in STREAM_NUMBERS:
         raise ValueError(
             "the streaming path needs the people engine detector, the pitch engine calibration and the number "
-            f"engine none; the settings name {engines.people}, {engines.pitch_mapping} and {engines.number}"
+            f"engine none or model; the settings name {engines.people}, {engines.pitch_mapping} and {engines.number}"
         )
 
 
@@ -838,6 +842,8 @@ class DetectorStream:
         self._finished = False
         #: Called with each state at the moment it is given, or None (the live output, ``liveout.LiveOut.given``).
         self.on_given: Callable[..., None] | None = None
+        #: Called on arrival with the frame, its image and its people, or None (``livenumbers.LiveNumbers.arrived``).
+        self.on_arrived: Callable[[int, np.ndarray, Sequence[PersonDet]], None] | None = None
 
     # --- Arrival ---------------------------------------------------------------------------------
 
@@ -875,6 +881,9 @@ class DetectorStream:
             if callable(image):
                 with clock.stage("read"):
                     image = image()
+            if self.on_arrived is not None:
+                with clock.stage("numbers"):
+                    self.on_arrived(frame, image, item.people)
             with clock.stage("motion"):
                 self._arrive_motion(image, item.people)
             if frame % self._keyframe_step == 0 and item.camera.valid:

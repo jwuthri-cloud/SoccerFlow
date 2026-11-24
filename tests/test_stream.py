@@ -192,8 +192,10 @@ def test_the_stream_refuses_frames_out_of_order_and_engines_that_do_not_stream()
     wrong_camera = StreamInput(frame=0, people=(), balls=(), camera=HomographyRecord(frame=2))
     with pytest.raises(ValueError, match="names frame 2"):
         stream.push(wrong_camera, scene.image(0))
-    with pytest.raises(ValueError, match="number engine none"):
-        check_stream_engines(PipelineConfig(engines=EngineSettings(people="detector", pitch_mapping="calibration")))
+    with pytest.raises(ValueError, match="number engine none or model"):
+        check_stream_engines(PipelineConfig(engines=EngineSettings(people="model", pitch_mapping="calibration")))
+    with pytest.raises(ValueError, match="number engine none or model"):
+        check_stream_engines(PipelineConfig(engines=EngineSettings(people="detector", pitch_mapping="model")))
     with pytest.raises(ValueError, match="whole clip"):
         StreamSettings(delay_frames=None, history_frames=10)
     with pytest.raises(ValueError, match="0 frames or more"):
