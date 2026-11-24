@@ -69,6 +69,7 @@ and its numbers come as their own lines after the frames (the frame states stay 
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import json
 import logging
 import math
@@ -82,7 +83,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from pitchvlm.ball import BallCandidate, track_ball
 from pitchvlm.config import PipelineConfig
@@ -92,7 +93,7 @@ from pitchvlm.fallbacks.runs import ClipRun, DetectorSettings, PnlcalibSettings,
 from pitchvlm.fill import players_in_frame
 from pitchvlm.geometry import apply_homography, invert_homography, matrix_from_record, matrix_to_rows, paint_alignment
 from pitchvlm.kitcolour import KitClusters, fit_kit_clusters, kit_roles, torso_feature
-from pitchvlm.motion import ShotMeter
+from pitchvlm.motion import PairMeasure, PairMeter, ShotMeter
 from pitchvlm.pitch import inside_pitch
 from pitchvlm.pipeline import (
     BALL_MAX_GAP_S,
@@ -146,6 +147,9 @@ STREAM_NUMBERS = ("none", "model")
 #: The paint scores of the keyframes run on one thread beside the frame path; a frame waits
 #: only when this many scores are still open (so the images they hold stay bounded).
 PAINT_MAX_PENDING = 4
+#: The frame feeder (``FrameFeeder``) reads the pictures and runs the pair tests of the camera motion at most
+#: this many frames ahead of the frame path: enough to keep the frame thread busy, few pictures in memory.
+FEED_AHEAD_FRAMES = 2
 
 
 # --- Settings ----------------------------------------------------------------------------------
@@ -448,8 +452,9 @@ class QueuedLines:
     """The lines of a pipe, read on their own thread into a bounded queue: the back-pressure of the stream.
 
     The policy (``docs/DECISIONS.md``, entry "The live feed of the detector engine", 2026-11-23):
-    no frame is ever dropped, because each frame carries a step of the camera motion and of the
-    matching. When the stream decides more slowly than the lines come, they wait in the queue;
+    the queue drops no line. Without the overload policy (``OverloadPolicy``) no frame is dropped
+    either, because each frame carries a step of the camera motion and of the matching. When the
+    stream decides more slowly than the lines come, they wait in the queue;
     when ``max_lines`` lines wait, the thread stops reading, the pipe fills, and the writer of the
     lines (the merger, and through it the tools) waits too. So a slow stream delays the frames,
     and ``timing.LatencyLog`` shows by how much. The thread notes the time at which it read each
@@ -457,13 +462,18 @@ class QueuedLines:
 
     Iterate over it once. ``last_read_at`` is the time (``clock``) at which the line given last
     was read, and ``last_backlog`` the lines that were waiting in the queue when it was taken.
-    An error of the reading is raised in the reader.
+    An error of the reading is raised in the reader. ``max_lines`` None is a queue without a
+    bound, for the overload policy (``OverloadPolicy``): its reader never waits, so the time at
+    which a line was read is the time it came out of the pipe, and the policy sees every wait.
     """
 
-    def __init__(self, lines: Iterable[str], max_lines: int, clock: Callable[[], float] = time.monotonic) -> None:
-        if max_lines < 1:
+    def __init__(
+        self, lines: Iterable[str], max_lines: int | None, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        if max_lines is not None and max_lines < 1:
             raise ValueError(f"the queue must hold at least 1 line, got {max_lines}")
-        self._queue: queue.Queue[tuple[Any, float]] = queue.Queue(maxsize=max_lines)
+        self._queue: queue.Queue[tuple[Any, float]] = queue.Queue(maxsize=0 if max_lines is None else max_lines)
+        self.max_lines = max_lines
         self._clock = clock
         self.last_read_at: float | None = None
         self.last_backlog = 0
@@ -522,7 +532,20 @@ class _StreamMotion:
         self._forward: dict[int, np.ndarray] = {}
         self._backward: dict[int, np.ndarray] = {}
         self.n_frames = 0
-        self.cuts: tuple[int, ...] = ()
+        self._cuts: tuple[int, ...] = ()
+        #: Chains computed so far, by (src, dst): the same product of the same steps, kept while it cannot change.
+        self._chains: dict[tuple[int, int], np.ndarray | None] = {}
+
+    @property
+    def cuts(self) -> tuple[int, ...]:
+        """The frames that start a new shot, as far as they are known."""
+        return self._cuts
+
+    @cuts.setter
+    def cuts(self, cuts: tuple[int, ...]) -> None:
+        if cuts != self._cuts:
+            self._chains.clear()
+        self._cuts = cuts
 
     def add_frame(self, step: np.ndarray | None) -> None:
         """Add the next frame and the step into it from the frame before (None when missing)."""
@@ -536,7 +559,22 @@ class _StreamMotion:
         self.n_frames += 1
 
     def between(self, src: int, dst: int) -> np.ndarray | None:
-        """Return the matrix from frame ``src`` to frame ``dst`` (as ``MotionField.between``), or None."""
+        """Return the matrix from frame ``src`` to frame ``dst`` (as ``MotionField.between``), or None.
+
+        A chain between two frames that are in is kept: its steps never change, and new cuts or
+        forgotten steps drop it. The answer must not be changed by the caller.
+        """
+        if max(src, dst) >= self.n_frames:
+            return self._chain(src, dst)
+        key = (src, dst)
+        if key in self._chains:
+            return self._chains[key]
+        matrix = self._chains[key] = self._chain(src, dst)
+        if matrix is not None:
+            matrix.setflags(write=False)
+        return matrix
+
+    def _chain(self, src: int, dst: int) -> np.ndarray | None:
         if not self.same_shot(src, dst):
             return None
         if src <= dst:
@@ -564,6 +602,8 @@ class _StreamMotion:
         for steps in (self._forward, self._backward):
             for index in [index for index in steps if index < frame]:
                 del steps[index]
+        for key in [key for key in self._chains if min(key) < frame]:
+            del self._chains[key]
 
 
 def _bridged(motion: _StreamMotion, matrices: Mapping[int, np.ndarray]) -> Any:
@@ -639,28 +679,49 @@ class _PitchMemo:
             )
         return entry[1][foot]
 
+    def mean_points(
+        self, matrices: Mapping[int, np.ndarray], tracks: Sequence[Track]
+    ) -> tuple[dict[int, tuple[float, float]], dict[int, float]]:
+        """Return ``pipeline._mean_positions`` and ``pipeline._mean_pitch_x`` of some tracks in one pass.
+
+        The positions are those of ``point``; ``math.fsum`` is exact, so the means are the same
+        numbers as those of the two functions.
+        """
+        positions: dict[int, tuple[float, float]] = {}
+        pitch_x: dict[int, float] = {}
+        points = self._points
+        for track in tracks:
+            known: list[tuple[float, float]] = []
+            for observation in track.observations:
+                frame = observation.frame
+                matrix = matrices.get(frame)
+                if matrix is None:
+                    continue
+                entry = points.get(frame)
+                if entry is None or entry[0] is not matrix:
+                    entry = points[frame] = (matrix, {})
+                box = observation.box
+                foot = ((box.x1 + box.x2) / 2.0, box.y2)
+                by_foot = entry[1]
+                if foot in by_foot:
+                    found = by_foot[foot]
+                else:
+                    position = apply_homography(matrix, np.array([foot], dtype=np.float64))
+                    found = by_foot[foot] = (
+                        (float(position[0, 0]), float(position[0, 1])) if np.isfinite(position).all() else None
+                    )
+                if found is not None:
+                    known.append(found)
+            if known:
+                mean_x = math.fsum(x for x, _ in known) / len(known)
+                positions[track.track_id] = (mean_x, math.fsum(y for _, y in known) / len(known))
+                pitch_x[track.track_id] = mean_x
+        return positions, pitch_x
+
     def forget_before(self, frame: int) -> None:
         for store in (self._by_frame, self._points):
             for index in [index for index in store if index < frame]:
                 del store[index]
-
-
-def _mean_points(
-    tracks: Sequence[Track], point: Callable[[TrackObs], tuple[float, float] | None]
-) -> tuple[dict[int, tuple[float, float]], dict[int, float]]:
-    """Return ``pipeline._mean_positions`` and ``pipeline._mean_pitch_x`` of some tracks in one pass.
-
-    ``math.fsum`` is exact, so the means are the same numbers as those of the two functions.
-    """
-    positions: dict[int, tuple[float, float]] = {}
-    pitch_x: dict[int, float] = {}
-    for track in tracks:
-        known = [found for found in map(point, track.observations) if found is not None]
-        if known:
-            mean_x = math.fsum(x for x, _ in known) / len(known)
-            positions[track.track_id] = (mean_x, math.fsum(y for _, y in known) / len(known))
-            pitch_x[track.track_id] = mean_x
-    return positions, pitch_x
 
 
 # --- Identities --------------------------------------------------------------------------------
@@ -844,6 +905,17 @@ class DetectorStream:
         self.on_given: Callable[..., None] | None = None
         #: Called on arrival with the frame, its image and its people, or None (``livenumbers.LiveNumbers.arrived``).
         self.on_arrived: Callable[[int, np.ndarray, Sequence[PersonDet]], None] | None = None
+        #: Called with the frame number when a dropped frame is decided (``OverloadPolicy``), or None.
+        self.on_dropped: Callable[[int], None] | None = None
+        #: The frames dropped by the overload policy, in order, and the policy (its text) when a feeder has one.
+        self._dropped: list[int] = []
+        self._dropped_set: set[int] = set()
+        #: Of these: the frames that arrived without being used, and the measured frames whose decision was late.
+        self._not_measured: list[int] = []
+        self._late_decisions: list[int] = []
+        self.overload: str | None = None
+        #: True once a ``FrameFeeder`` runs the pair tests: then frames come through ``push_fed`` only.
+        self._fed = False
 
     # --- Arrival ---------------------------------------------------------------------------------
 
@@ -857,12 +929,84 @@ class DetectorStream:
         """The time of each paint score, seconds, measured on its thread (not in the frame samples)."""
         return list(self._painter.seconds)
 
+    @property
+    def dropped_frames(self) -> tuple[int, ...]:
+        """The frames that the overload policy dropped, in frame order (``OverloadPolicy``)."""
+        return tuple(self._dropped)
+
+    def is_dropped(self, frame: int) -> bool:
+        """Tell whether the overload policy dropped a frame."""
+        return frame in self._dropped_set
+
+    def overload_report(self) -> dict[str, Any]:
+        """What the overload policy dropped: every frame without a state, and why (``OverloadPolicy``)."""
+        return {
+            "dropped": len(self._dropped),
+            "dropped_frames": list(self._dropped),
+            "not_used": list(self._not_measured),
+            "decided_late": list(self._late_decisions),
+        }
+
     def push(self, item: StreamInput, image: np.ndarray | Callable[[], np.ndarray]) -> list[FrameState]:
         """Take the next frame, and return the states that are final now (at most one, ``f = t - L``).
 
         ``image`` is the picture of the frame, or a function that reads it: then the reading is
         the stage ``read`` of the frame sample.
         """
+        if self._fed:
+            raise ValueError("a frame feeder runs the pair tests of this stream: give its frames to push_fed")
+        self._check_input(item)
+        clock = self._clock
+        with clock.frame():
+            if callable(image):
+                with clock.stage("read"):
+                    image = image()
+            with clock.stage("motion"):
+                self._meter.add(image, [person.box for person in item.people])
+                self._booked_motion()
+            self._arrive(item, image)
+            return self._advance(item.frame)
+
+    def push_fed(self, fed: FedFrame) -> list[FrameState]:
+        """Take the next frame from the feeder of this stream (``FrameFeeder``): ``push`` with its picture read and its
+        pair test done; a dropped frame (``fed.dropped``) arrives without any measurement (``OverloadPolicy``)."""
+        if not self._fed:
+            raise ValueError("push_fed takes the frames of a frame feeder of this stream")
+        item = fed.item
+        self._check_input(item)
+        if fed.measure is None or fed.measure.frame != item.frame:
+            raise ValueError(f"frame {item.frame} came from the feeder without its pair test")
+        clock = self._clock
+        delay = self._settings.delay_frames
+        if fed.late and delay and item.frame - delay >= 0:
+            # The decision due now would come later than the policy allows: that frame gets no state.
+            # (With no delay the frame due is this one, and it is not used anyway.)
+            self._drop_decision(item.frame - delay)
+        with clock.frame():
+            if fed.dropped:
+                with clock.stage("dropped"):
+                    self._meter.take(fed.measure)
+                    self._booked_motion()
+                    self._arrive_dropped(item.frame)
+            else:
+                if fed.image is None:
+                    raise ValueError(f"frame {item.frame} came from the feeder without its picture")
+                with clock.stage("motion"):
+                    self._meter.take(fed.measure)
+                    self._booked_motion()
+                self._arrive(item, fed.image)
+            return self._advance(item.frame)
+
+    def _feed_pairs(self) -> PairMeter:
+        """Hand the pair tests of the camera motion to a frame feeder (before the first frame)."""
+        if self._n:
+            raise ValueError("a frame feeder starts before the first frame of the stream")
+        pairs = self._meter.hand_out_pairs()
+        self._fed = True
+        return pairs
+
+    def _check_input(self, item: StreamInput) -> None:
+        """Refuse, before anything changes, an input that cannot be the next frame."""
         if self._finished:
             raise ValueError("the stream is finished")
         if item.frame != self._n:
@@ -871,68 +1015,101 @@ class DetectorStream:
             raise ValueError(f"the camera of frame {item.frame} names frame {item.camera.frame}")
         if any(ball.frame != item.frame for ball in item.balls):
             raise ValueError(f"a ball candidate of frame {item.frame} names another frame")
+
+    def _arrive(self, item: StreamInput, image: np.ndarray) -> None:
+        """The arrival of a measured frame after its motion: the paint score, the camera, the people and the tracks.
+
+        The hook ``on_arrived`` (the live number step) gets the frame, its picture and its people first; a dropped
+        frame (``_arrive_dropped``) has no picture and calls nothing.
+        """
         for name, seconds in (("detector", item.detector_seconds), ("calibration", item.calibration_seconds)):
             if seconds is not None:
                 self.tool_seconds[name].append(seconds)
         clock = self._clock
         frame = item.frame
+        if self.on_arrived is not None:
+            with clock.stage("numbers"):
+                self.on_arrived(frame, image, item.people)
+        if frame % self._keyframe_step == 0 and item.camera.valid:
+            with clock.stage("paint"):
+                self._painter.submit(frame, image, matrix_from_record(item.camera))
+        with clock.stage("camera"):
+            self._arrive_camera(frame, item, image)
+        everyone = FramePeople(frame=frame, people=item.people)
+        on_pitch = _people_on_pitch(everyone, self._arrival_to_pitch, self._config.pitch_margin_m)
+        with clock.stage("kit_colour"):
+            if self._history is None:
+                # The whole clip is matched again in finish, with the cameras of the whole clip, so every
+                # person keeps a team key; the kit clusters learn from the people on the pitch only.
+                kept = {id(person) for person in on_pitch.people}
+                keyed = self._team_keys(frame, image, everyone, [id(person) in kept for person in everyone.people])
+                self._keyed.append(keyed)
+                people = FramePeople(
+                    frame=frame,
+                    people=tuple(
+                        key for key, person in zip(keyed.people, everyone.people, strict=True) if id(person) in kept
+                    ),
+                )
+            else:
+                people = self._team_keys(frame, image, on_pitch, [True] * len(on_pitch.people))
+        with clock.stage("tracks"):
+            self._add_people(frame, people)
+        if item.balls:
+            self._balls[frame] = item.balls
+
+    def _drop_decision(self, frame: int) -> None:
+        """Give a frame no state when it is decided: it was measured, but its decision came too late."""
+        if frame not in self._dropped_set:
+            self._dropped_set.add(frame)
+            bisect.insort(self._dropped, frame)
+            self._late_decisions.append(frame)
+
+    def _arrive_dropped(self, frame: int) -> None:
+        """The arrival of a dropped frame: no people, no ball, no camera of its own (module docstring)."""
+        if frame not in self._dropped_set:
+            self._dropped.append(frame)
+            self._dropped_set.add(frame)
+        self._not_measured.append(frame)
+        matrix = self._camera_of(frame, last=frame)
+        if matrix is not None:
+            self._arrival[frame] = matrix
+        else:
+            self._blind.add(frame)
+        nobody = FramePeople(frame=frame, people=())
+        if self._history is None:
+            self._keyed.append(self._team_keys(frame, None, nobody, []))
+            people = nobody
+        else:
+            people = self._team_keys(frame, None, nobody, [])
+        self._add_people(frame, people)
+
+    def _add_people(self, frame: int, people: FramePeople) -> None:
+        if frame == 0 or frame in self._hard_cuts:
+            self._associators.append(
+                Associator(
+                    fps=self._fps,
+                    warp=_bridged(self._motion, self._arrival),
+                    to_pitch=self._arrival_to_pitch,
+                    config=self._tracking,
+                    keyframe_frames=self._keyframe_frames,
+                )
+            )
+        self._associators[-1].add(people)
+
+    def _advance(self, frame: int) -> list[FrameState]:
+        """Count the frame in, and decide the frame ``frame - L`` when it is due."""
         given: list[FrameState] = []
-        with clock.frame():
-            if callable(image):
-                with clock.stage("read"):
-                    image = image()
-            if self.on_arrived is not None:
-                with clock.stage("numbers"):
-                    self.on_arrived(frame, image, item.people)
-            with clock.stage("motion"):
-                self._arrive_motion(image, item.people)
-            if frame % self._keyframe_step == 0 and item.camera.valid:
-                with clock.stage("paint"):
-                    self._painter.submit(frame, image, matrix_from_record(item.camera))
-            with clock.stage("camera"):
-                self._arrive_camera(frame, item, image)
-            everyone = FramePeople(frame=frame, people=item.people)
-            on_pitch = _people_on_pitch(everyone, self._arrival_to_pitch, self._config.pitch_margin_m)
-            with clock.stage("kit_colour"):
-                if self._history is None:
-                    # The whole clip is matched again in finish, with the cameras of the whole clip, so every
-                    # person keeps a team key; the kit clusters learn from the people on the pitch only.
-                    kept = {id(person) for person in on_pitch.people}
-                    keyed = self._team_keys(frame, image, everyone, [id(person) in kept for person in everyone.people])
-                    self._keyed.append(keyed)
-                    people = FramePeople(
-                        frame=frame,
-                        people=tuple(
-                            key for key, person in zip(keyed.people, everyone.people, strict=True) if id(person) in kept
-                        ),
-                    )
-                else:
-                    people = self._team_keys(frame, image, on_pitch, [True] * len(on_pitch.people))
-            with clock.stage("tracks"):
-                if frame == 0 or frame in self._hard_cuts:
-                    self._associators.append(
-                        Associator(
-                            fps=self._fps,
-                            warp=_bridged(self._motion, self._arrival),
-                            to_pitch=self._arrival_to_pitch,
-                            config=self._tracking,
-                            keyframe_frames=self._keyframe_frames,
-                        )
-                    )
-                self._associators[-1].add(people)
-            if item.balls:
-                self._balls[frame] = item.balls
-            self._n += 1
-            delay = self._settings.delay_frames
-            if delay is not None and frame - delay >= 0:
-                with clock.stage("decide"):
-                    given.append(self._decide(frame - delay, frame, final=False))
-                self._forget(frame - delay + 1)
+        self._n += 1
+        delay = self._settings.delay_frames
+        if delay is not None and frame - delay >= 0:
+            with self._clock.stage("decide"):
+                given.append(self._decide(frame - delay, frame, final=False))
+            self._forget(frame - delay + 1)
         return given
 
-    def _arrive_motion(self, image: np.ndarray, people: Sequence[PersonDet]) -> None:
+    def _booked_motion(self) -> None:
+        """Read what the cut tests know after the newest frame (``ShotMeter.add`` or ``take`` of it)."""
         meter = self._meter
-        meter.add(image, [person.box for person in people])
         frame = meter.n_frames - 1
         if frame == 0:
             self._motion.add_frame(None)
@@ -1003,12 +1180,16 @@ class DetectorStream:
         matrix = self._arrival.get(frame)
         return None if matrix is None else apply_homography(matrix, xy)
 
-    def _team_keys(self, frame: int, image: np.ndarray, people: FramePeople, learn: Sequence[bool]) -> FramePeople:
+    def _team_keys(
+        self, frame: int, image: np.ndarray | None, people: FramePeople, learn: Sequence[bool]
+    ) -> FramePeople:
         """Give each person the team key of the kit clusters (module docstring, "Kit clusters").
 
         The clusters learn from the people whose ``learn`` is true.
         """
-        features = [torso_feature(image, person.box) for person in people.people]
+        if people.people and image is None:
+            raise ValueError(f"frame {frame} has people but no picture")
+        features = [torso_feature(image, person.box) for person in people.people]  # type: ignore[arg-type]
         if self._given_kits is None:
             warmup = self._settings.kit_warmup_frames
             if frame < warmup or self._clusters is None:
@@ -1043,7 +1224,8 @@ class DetectorStream:
             raise ValueError("the stream has no frame")
         self._finished = True
         last = self._n - 1
-        if last % self._keyframe_step != 0 and self._last_camera is not None and self._last_camera.valid:
+        camera = self._last_camera
+        if last % self._keyframe_step != 0 and camera is not None and camera.frame == last and camera.valid:
             assert self._last_image is not None
             self._painter.submit(last, self._last_image, matrix_from_record(self._last_camera))
         self._last_image = None
@@ -1158,17 +1340,17 @@ class DetectorStream:
         tracks: list[Track] = []
         for shot in sorted(pieces):
             ordered = sorted(pieces[shot], key=lambda piece: (piece.first_frame, piece.track_id))
-            fragments = [piece.model_copy(update={"track_id": index}) for index, piece in enumerate(ordered)]
+            fragments = [_copied(piece, track_id=index) for index, piece in enumerate(ordered)]
             if has_kits:
-                fragments = kit_roles(fragments, _mean_points(fragments, point)[0])
+                fragments = kit_roles(fragments, self._memo.mean_points(matrices, fragments)[0])
             if self._tracking.split_team_swaps:
                 fragments = split_team_swaps(fragments, min_votes=SWAP_MIN_VOTES * self._keyframe_frames)
             for track in stitch_fragments(fragments, fps=self._fps, to_pitch=to_pitch, config=self._tracking):
-                tracks.append(track.model_copy(update={"track_id": len(tracks)}))
+                tracks.append(_copied(track, track_id=len(tracks)))
         decided = finalize_tracks(
             tracks,
             readings={},
-            mean_pitch_x=_mean_points(tracks, point)[1],
+            mean_pitch_x=self._memo.mean_points(matrices, tracks)[1],
             fps=self._fps,
             to_pitch=to_pitch,
             config=self._config.tracking,
@@ -1192,8 +1374,16 @@ class DetectorStream:
         """Decide the state of ``frame`` with what is known at frame ``last``, give it, and return it.
 
         ``cache`` holds the window between decisions at the same ``last`` (the end of the
-        stream), when the window is the whole clip.
+        stream), when the window is the whole clip. A dropped frame (``OverloadPolicy``) is decided without a
+        window: no players, no ball, no camera; ``on_dropped`` gets it instead of ``on_given``.
         """
+        if frame in self._dropped_set:
+            state = FrameState(frame=frame, players=(), ball=None)
+            self._states.append(state)
+            self._records.append(HomographyRecord(frame=frame))
+            if self.on_dropped is not None:
+                self.on_dropped(frame)
+            return state
         if cache is not None and self._history is None:
             window = cache.get("window")
             if window is None:
@@ -1269,6 +1459,8 @@ class DetectorStream:
         engines = {**_engines(self._config), "tracks": "code:stream", "fill": "code:stream"}
         engines["delay"] = frames_text(self._settings.delay_frames, self._fps)
         engines["history"] = frames_text(self._settings.history_frames, self._fps)
+        if self.overload is not None:
+            engines["overload"] = self.overload
         return ClipResult(
             info=info,
             frames=tuple(self._states),
@@ -1294,6 +1486,16 @@ def _fit(features: Sequence[tuple[int, np.ndarray]]) -> KitClusters | None:
     return clusters if clusters.two_kits() else None
 
 
+def _copied(track: Track, **update: Any) -> Track:
+    """Return a copy of a window track with a new id or a part of its observations, without validating it again.
+
+    ``Record.model_copy`` validates the update; here the values are known to be valid (a whole
+    number from 0, a non-empty part of observations in frame order), and the window makes many
+    such copies per decision. The copy has the same fields as the validated one.
+    """
+    return BaseModel.model_copy(track, update=update)
+
+
 def _cut(
     fragment: Track, cuts: Sequence[int], blends: frozenset[int], dropped: Callable[[TrackObs], bool]
 ) -> list[Track]:
@@ -1311,7 +1513,7 @@ def _cut(
             pieces.append([])
             shot = here
         pieces[-1].append(observation)
-    return [fragment.model_copy(update={"observations": tuple(piece)}) for piece in pieces if piece]
+    return [_copied(fragment, observations=tuple(piece)) for piece in pieces if piece]
 
 
 def tracks_of_states(states: Sequence[FrameState]) -> list[Track]:
@@ -1346,6 +1548,258 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]:
             )
         )
     return tracks
+
+
+# --- The frame feeder and the overload policy ------------------------------------------------
+
+
+#: Share of ``OverloadPolicy.max_behind_s`` above which a frame is not used: its line waited that long. Above the
+#: whole setting the decision due with it is dropped too, so no state comes later than the setting allows.
+ARRIVAL_SHARE = 0.5
+
+
+class OverloadPolicy:
+    """The overload policy of a live stream: frames whose line waited too long are dropped (``docs/ARCHITECTURE.md``).
+
+    A line waits from the moment the thread of ``QueuedLines`` read it off the pipe (``read_at``,
+    on ``clock``). The policy looks twice at each frame, in frame order:
+
+    - ``drop``: when the frame feeder takes the line, before the picture is read. A frame whose
+      line waited longer than ``ARRIVAL_SHARE * max_behind_s`` is not used at all (no picture,
+      no camera motion, no people).
+    - ``late``: when the frame path takes the frame. A frame whose line waited longer than
+      ``ARRIVAL_SHARE * max_behind_s`` by then is not used either (its picture was read and its
+      motion measured, but nothing else of it is used). When the line waited longer than
+      ``max_behind_s``, the decision that is due with it (frame ``t - L``) is dropped too: it
+      would come later than the setting allows. So every state that is given while the stream
+      runs is decided at most ``max_behind_s`` plus the time of one push after the line that
+      lets it be decided was read. The lower bar for frames keeps the waits below the upper
+      one while the decisions alone keep up, so few measured frames lose their state.
+
+    Frame 0 is never dropped: the pair tests of the camera motion need a picture to start from.
+    Without ``read_at`` there is no clock to judge by, and ``ValueError`` is raised: the policy
+    never guesses. ``waits_s`` and ``late_waits_s`` hold the waits of the lines at the two looks.
+    """
+
+    def __init__(self, max_behind_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+        if isinstance(max_behind_s, bool) or not 0.0 < max_behind_s < math.inf:
+            raise ValueError(f"the overload policy needs a wait of more than 0 seconds, got {max_behind_s!r}")
+        self.max_behind_s = float(max_behind_s)
+        self.unused_after_s = ARRIVAL_SHARE * self.max_behind_s
+        self._clock = clock
+        self.waits_s: list[float] = []
+        self.late_waits_s: list[float] = []
+        self._next = 0
+        self._next_late = 0
+
+    def text(self) -> str:
+        """Describe the policy for the engines of the result."""
+        return (
+            f"drop a frame whose line waited more than {self.unused_after_s:g} s, and a decision due with a line that "
+            f"waited more than {self.max_behind_s:g} s"
+        )
+
+    def _wait(self, frame: int, read_at: float | None) -> float:
+        if read_at is None:
+            raise ValueError(
+                f"the line of frame {frame} has no time at which it was read: the overload policy has no clock"
+            )
+        return self._clock() - read_at
+
+    def drop(self, frame: int, read_at: float | None) -> bool:
+        """Tell whether the frame is not used, before its picture is read (the first look; class docstring)."""
+        if frame != self._next:
+            raise ValueError(f"the overload policy expected frame {self._next}, got frame {frame}")
+        wait = self._wait(frame, read_at)
+        self._next += 1
+        self.waits_s.append(wait)
+        return frame > 0 and wait > self.unused_after_s
+
+    def late(self, frame: int, read_at: float | None) -> tuple[bool, bool]:
+        """Tell, when the frame path takes the frame, whether it is not used and whether the decision due is dropped."""
+        if frame != self._next_late:
+            raise ValueError(
+                f"the overload policy expected frame {self._next_late} on the frame path, got frame {frame}"
+            )
+        wait = self._wait(frame, read_at)
+        self._next_late += 1
+        self.late_waits_s.append(wait)
+        if frame == 0:
+            return False, False
+        return wait > self.unused_after_s, wait > self.max_behind_s
+
+
+@dataclass(frozen=True)
+class FedFrame:
+    """A frame from the frame feeder: its input, its picture (None when dropped) and its pair test.
+
+    ``dropped`` says that the frame is not used (``OverloadPolicy``), ``late`` that its line waited
+    longer than the setting of the policy: then the decision due with it is dropped too. ``read_at`` and ``backlog``
+    are the time at which its line was read off the pipe and the lines that waited in the queue
+    when the feeder took it (None and 0 without a queue of lines).
+    ``read_seconds`` and ``motion_seconds`` are the times of the reading and of the pair test,
+    measured on the thread of the feeder.
+    """
+
+    item: StreamInput
+    image: np.ndarray | None
+    measure: PairMeasure | None
+    dropped: bool = False
+    late: bool = False
+    read_at: float | None = None
+    backlog: int = 0
+    read_seconds: float = 0.0
+    motion_seconds: float = 0.0
+
+
+_END_OF_FRAMES = object()
+
+
+class FrameFeeder:
+    """Read the pictures and run the pair tests of the camera motion on a thread, ahead of the frame path.
+
+    The pair tests of a frame need only the pictures and the boxes of the frame and of the frame
+    before (``motion.PairMeter``), so they run here while the frame thread decides the frame
+    before; ``DetectorStream.push_fed`` books them in frame order, so the numbers are those of
+    ``push``. At most ``ahead`` frames wait for the frame thread. With a ``policy``
+    (``OverloadPolicy``), each frame is judged when its line is taken from ``inputs``, before its
+    picture is read; a dropped frame gets ``PairMeter.repeat`` and no picture. ``line_clock``
+    returns the time at which the line given last was read and the lines then waiting
+    (``QueuedLines``); the policy needs it. An error of the inputs, of the reading or of a pair
+    test is raised by the iterator at its frame. Iterate once; ``close`` stops the thread.
+    """
+
+    def __init__(
+        self,
+        stream: DetectorStream,
+        inputs: Iterable[StreamInput],
+        read_image: Callable[[int], np.ndarray],
+        *,
+        line_clock: Callable[[], tuple[float | None, int]] | None = None,
+        policy: OverloadPolicy | None = None,
+        ahead: int = FEED_AHEAD_FRAMES,
+    ) -> None:
+        if ahead < 1:
+            raise ValueError(f"the feeder must hold at least 1 frame, got {ahead}")
+        if policy is not None and line_clock is None:
+            raise ValueError("the overload policy needs the time at which each line was read (line_clock)")
+        self._pairs = stream._feed_pairs()
+        if policy is not None:
+            stream.overload = policy.text()
+        self._inputs = inputs
+        self._read_image = read_image
+        self._line_clock = line_clock
+        self._policy = policy
+        #: Pictures read, waiting for their pair test; frames tested, waiting for the frame thread.
+        self._pictures: queue.Queue[Any] = queue.Queue(maxsize=ahead)
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=ahead)
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._read_run, name="pitchvlm-feeder-read", daemon=True),
+            threading.Thread(target=self._measure_run, name="pitchvlm-feeder-motion", daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _read_run(self) -> None:
+        """Take the lines in order, judge each frame by the policy, read the picture of each frame that is kept."""
+        try:
+            expected = 0
+            for item in self._inputs:
+                if self._stop.is_set():
+                    return
+                read_at, backlog = (None, 0) if self._line_clock is None else self._line_clock()
+                if item.frame != expected:
+                    # Out of order: push_fed refuses it with the message of push; nothing is measured.
+                    self._put(self._pictures, (item, None, None, read_at, backlog, 0.0))
+                    return
+                expected += 1
+                if self._policy is not None and self._policy.drop(item.frame, read_at):
+                    self._put(self._pictures, (item, None, True, read_at, backlog, 0.0))
+                    continue
+                start = time.perf_counter()
+                image = self._read_image(item.frame)
+                self._put(self._pictures, (item, image, False, read_at, backlog, time.perf_counter() - start))
+        except BaseException as error:  # handed on to the frame thread, which raises it at this frame
+            self._put(self._pictures, error)
+            return
+        self._put(self._pictures, _END_OF_FRAMES)
+
+    def _measure_run(self) -> None:
+        """Run the pair test of each frame in order (``PairMeter``), and hand the frames to the frame thread."""
+        while not self._stop.is_set():
+            try:
+                value = self._pictures.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if value is _END_OF_FRAMES or isinstance(value, BaseException):
+                self._put(self._queue, value)
+                return
+            item, image, dropped, read_at, backlog, read_seconds = value
+            try:
+                if dropped is None:
+                    fed = FedFrame(item=item, image=None, measure=None, read_at=read_at, backlog=backlog)
+                elif dropped:
+                    fed = FedFrame(
+                        item=item,
+                        image=None,
+                        measure=self._pairs.repeat(),
+                        dropped=True,
+                        read_at=read_at,
+                        backlog=backlog,
+                    )
+                else:
+                    start = time.perf_counter()
+                    measure = self._pairs.measure(image, [person.box for person in item.people])
+                    fed = FedFrame(
+                        item=item,
+                        image=image,
+                        measure=measure,
+                        read_at=read_at,
+                        backlog=backlog,
+                        read_seconds=read_seconds,
+                        motion_seconds=time.perf_counter() - start,
+                    )
+            except BaseException as error:  # handed on to the frame thread
+                self._put(self._queue, error)
+                return
+            self._put(self._queue, fed)
+            if dropped is None:
+                return
+
+    def _put(self, target: queue.Queue[Any], value: Any) -> None:
+        while not self._stop.is_set():
+            try:
+                target.put(value, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def __iter__(self) -> Iterator[FedFrame]:
+        """Yield the frames in order; with a policy, each is looked at again when the frame path takes it."""
+        while True:
+            value = self._queue.get()
+            if value is _END_OF_FRAMES:
+                return
+            if isinstance(value, BaseException):
+                raise value
+            if self._policy is not None and value.measure is not None:
+                unused, late = self._policy.late(value.item.frame, value.read_at)
+                if unused or late:
+                    value = dataclasses.replace(value, dropped=value.dropped or unused, late=late)
+            yield value
+
+    def close(self, wait_s: float = 1.0) -> None:
+        """Stop the threads: each ends after the frame it works on (a read of a pipe that waits stays until the end)."""
+        self._stop.set()
+        for waiting in (self._pictures, self._queue):
+            while True:
+                try:
+                    waiting.get_nowait()
+                except queue.Empty:
+                    break
+        for thread in self._threads:
+            thread.join(wait_s)
 
 
 def run_stream(

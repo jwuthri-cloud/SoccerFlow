@@ -193,13 +193,19 @@ def estimate_motion(
     return np.asarray(matrix, dtype=np.float64)
 
 
-def _block_correlation(moved: np.ndarray, target: np.ndarray) -> float | None:
+def _block_correlation(
+    moved: np.ndarray, target: np.ndarray, whole_blocks: dict[tuple[int, int], Any] | None = None
+) -> float | None:
     """Return the median Pearson correlation of two images over the blocks of ``CUT_TEST_GRID``.
 
     ``moved`` is NaN where it covers nothing. A block counts when ``moved``
     covers ``MIN_CUT_TEST_BLOCK_COVER`` of it and both images have contrast
     there (``MIN_CUT_TEST_STD``). The answer is None when fewer than
     ``MIN_CUT_TEST_BLOCKS`` blocks count.
+
+    ``whole_blocks`` keeps, between calls with the same ``target``, what a block of ``target``
+    gives when ``moved`` covers all of it (its contrast test, its values less their mean, and
+    their sum of squares): the same numbers, computed once (``_correlations``).
     """
     height, width = target.shape
     values: list[float] = []
@@ -212,12 +218,23 @@ def _block_correlation(moved: np.ndarray, target: np.ndarray) -> float | None:
             if block.size == 0 or covered.mean() < MIN_CUT_TEST_BLOCK_COVER:  # A very flat image has empty blocks.
                 continue
             first = block[covered]
-            second = target[rows, columns][covered]
-            if first.std() < MIN_CUT_TEST_STD or second.std() < MIN_CUT_TEST_STD:
+            if first.std() < MIN_CUT_TEST_STD:
+                continue
+            whole = whole_blocks is not None and first.size == block.size
+            known = whole_blocks.get((row, column)) if whole and whole_blocks is not None else None
+            if known is None:
+                second = target[rows, columns][covered]
+                flat = second.std() < MIN_CUT_TEST_STD
+                if not flat:
+                    second = second - second.mean()
+                known = (flat, second, None if flat else float((second * second).sum()))
+                if whole and whole_blocks is not None:
+                    whole_blocks[(row, column)] = known
+            flat, second, second_squares = known
+            if flat:
                 continue
             first = first - first.mean()
-            second = second - second.mean()
-            scale = math.sqrt(float((first * first).sum()) * float((second * second).sum()))
+            scale = math.sqrt(float((first * first).sum()) * second_squares)
             values.append(float((first * second).sum()) / scale)
     if len(values) < MIN_CUT_TEST_BLOCKS:
         return None
@@ -242,7 +259,8 @@ def _moved(image: np.ndarray, matrix: np.ndarray) -> np.ndarray:
 
 def _correlations(first: np.ndarray, second: np.ndarray, matrices: Sequence[np.ndarray]) -> list[float | None]:
     """Return the block correlation of ``first`` moved with each matrix onto ``second`` (None where none counts)."""
-    return [_block_correlation(_moved(first, matrix), second) for matrix in matrices]
+    whole_blocks: dict[tuple[int, int], Any] = {}
+    return [_block_correlation(_moved(first, matrix), second, whole_blocks) for matrix in matrices]
 
 
 def shot_correlation(prev: np.ndarray, nxt: np.ndarray, motions: Sequence[np.ndarray]) -> float | None:
@@ -772,6 +790,74 @@ def measure_shots(
     return tests
 
 
+@dataclass(frozen=True)
+class PairMeasure:
+    """What the pair meter measured for one frame (``PairMeter``), before ``ShotMeter.take`` tests and books it.
+
+    ``kind`` is ``first`` (frame 0: no pair), ``pair`` (the frame and the frame before) or
+    ``repeat`` (a frame without a picture, ``PairMeter.repeat``). For a pair, ``step`` is the
+    measured motion in the pixels of the small images (None where it was not measured), and
+    ``previous_test`` the test image of the frame before.
+    """
+
+    frame: int
+    kind: str
+    test_image: np.ndarray
+    step: np.ndarray | None = None
+    previous_test: np.ndarray | None = None
+
+
+class PairMeter:
+    """The part of ``ShotMeter.add`` that needs the pictures: the small images and the camera motion of each pair.
+
+    ``measure`` takes the picture and the people boxes of the next frame: it makes the small
+    grey image and the test image, and measures the camera motion from the frame before
+    (``estimate_motion``, most of the time of a frame, in OpenCV). It holds only what the next
+    pair needs (the small picture and the boxes of the frame before), so it can run on another
+    thread than the ``ShotMeter`` that tests and books its answers (``ShotMeter.take``), as long
+    as one thread calls it, in frame order. ``repeat`` stands for a frame without a picture (a
+    frame that the streaming path dropped): it shows the frame before, so the step into it is
+    the identity and the next pair is measured against the frame before it.
+    """
+
+    def __init__(self, size: tuple[int, int], *, downscale: float = 0.5) -> None:
+        if not 0.0 < downscale <= 1.0:
+            raise ValueError("downscale must be above 0 and at most 1")
+        width, height = size
+        self.full_size = (width, height)
+        self.small_size = (max(1, round(width * downscale)), max(1, round(height * downscale)))
+        self.to_small = _to_small_matrix(self.full_size, self.small_size)
+        self.test_size = _test_size(self.small_size)
+        self._previous: np.ndarray | None = None
+        self._previous_test: np.ndarray | None = None
+        self._previous_boxes: Sequence[Box] = ()
+        self.n_frames = 0
+
+    def measure(self, image: np.ndarray, boxes: Sequence[Box] = ()) -> PairMeasure:
+        """Take the picture and the people boxes (full-size pixels) of the next frame, and measure the pair it ends."""
+        current = _small_grey(image, self.full_size, self.small_size)
+        test_image = _test_image(current, self.test_size)
+        frame = self.n_frames
+        self.n_frames += 1
+        previous, previous_test = self._previous, self._previous_test
+        self._previous, self._previous_test = current, test_image
+        if previous is None or previous_test is None:
+            self._previous_boxes = boxes
+            return PairMeasure(frame=frame, kind="first", test_image=test_image)
+        mask = _people_mask(self.small_size, [*self._previous_boxes, *boxes], self.to_small)
+        self._previous_boxes = boxes
+        step = estimate_motion(previous, current, mask=mask)
+        return PairMeasure(frame=frame, kind="pair", test_image=test_image, step=step, previous_test=previous_test)
+
+    def repeat(self) -> PairMeasure:
+        """Stand for a frame without a picture: it shows the frame before (class docstring)."""
+        if self._previous_test is None:
+            raise ValueError("the first frame needs a picture: no frame before it can stand for it")
+        frame = self.n_frames
+        self.n_frames += 1
+        return PairMeasure(frame=frame, kind="repeat", test_image=self._previous_test)
+
+
 class ShotMeter:
     """The tests of ``measure_shots``, one frame at a time: ``add`` each frame in order, then ``finish``.
 
@@ -790,17 +876,13 @@ class ShotMeter:
     """
 
     def __init__(self, size: tuple[int, int], *, downscale: float = 0.5) -> None:
-        if not 0.0 < downscale <= 1.0:
-            raise ValueError("downscale must be above 0 and at most 1")
-        width, height = size
-        self._full_size = (width, height)
-        self._small_size = (max(1, round(width * downscale)), max(1, round(height * downscale)))
-        self._to_small = _to_small_matrix(self._full_size, self._small_size)
-        self._to_full = np.linalg.inv(self._to_small)
-        test_size = _test_size(self._small_size)
-        self._test_size = test_size
-        self._to_test = _to_small_matrix(self._small_size, test_size)
+        self._pairs: PairMeter | None = PairMeter(size, downscale=downscale)
+        self._to_full = np.linalg.inv(self._pairs.to_small)
+        self._to_small = self._pairs.to_small
+        self._test_size = self._pairs.test_size
+        self._to_test = _to_small_matrix(self._pairs.small_size, self._test_size)
         self._from_test = np.linalg.inv(self._to_test)
+        self._last_step: np.ndarray | None = None
         #: Measured motion of each pair in full-size pixels, None where missing and into a hard cut.
         self.steps: list[np.ndarray | None] = []
         #: The steps of the window test (see ``ShotTests``); a bridge is put in by ``_bridge``.
@@ -809,12 +891,9 @@ class ShotMeter:
         self.hard_cuts: list[int] = []
         #: Test image of every frame; a forgotten image is None.
         self.images: list[np.ndarray | None] = []
-        self._last_step: np.ndarray | None = None
         #: The last motion of each pair without a measured motion that the last motion explains alone.
         self._bridges: dict[int, np.ndarray] = {}
         self._bridged: set[int] = set()
-        self._previous: np.ndarray | None = None
-        self._previous_boxes: Sequence[Box] = ()
         #: Window value of every judged frame (``window_correlations``), in frame order.
         self.window_values: list[float | None] = []
         #: The open run of low window values, (first, last), or None.
@@ -834,18 +913,49 @@ class ShotMeter:
         """Add the next frame and the people boxes of that frame (full-size pixels), and test the pair it ends."""
         if self._finished:
             raise ValueError("the meter is finished: no frame can be added")
-        current = _small_grey(image, self._full_size, self._small_size)
-        self.images.append(_test_image(current, self._test_size))
-        if self._previous is None:
-            self._previous, self._previous_boxes = current, boxes
+        if self._pairs is None:
+            raise ValueError("the pair tests of this meter were handed out: give their answers to take")
+        self.take(self._pairs.measure(image, boxes))
+
+    def hand_out_pairs(self) -> PairMeter:
+        """Hand the pair tests to the caller (``PairMeter``), to run on another thread; ``add`` refuses from then on.
+
+        Only a meter without a frame hands them out, and only once.
+        """
+        if self._pairs is None or self.images:
+            raise ValueError("only a meter without a frame hands out its pair tests, and only once")
+        pairs, self._pairs = self._pairs, None
+        return pairs
+
+    def take(self, measure: PairMeasure) -> None:
+        """Test and book the pair of the next frame (``PairMeter.measure`` or ``repeat``): what ``add`` does next."""
+        if self._finished:
+            raise ValueError("the meter is finished: no frame can be added")
+        frame = len(self.images)
+        if measure.frame != frame:
+            raise ValueError(f"the pair test of frame {measure.frame} came, frame {frame} was expected")
+        if (measure.kind == "first") != (frame == 0):
+            raise ValueError(f"frame {frame} got a pair test of the kind {measure.kind}")
+        self.images.append(measure.test_image)
+        if measure.kind == "first":
             return
-        frame = len(self.images) - 1
-        previous, to_small, to_test, from_test = self._previous, self._to_small, self._to_test, self._from_test
-        mask = _people_mask(self._small_size, [*self._previous_boxes, *boxes], to_small)
-        step = estimate_motion(previous, current, mask=mask)
+        if measure.kind == "repeat":
+            # A frame without a picture shows the frame before: the identity, and no test of the pair.
+            self.pair_values.append(None)
+            self.steps.append(np.eye(3))
+            self.test_steps.append(np.eye(3))
+        else:
+            self._take_pair(frame, measure)
+        # The pair before this one is final now: its bridge needs to know whether this pair has a step.
+        self._bridge(len(self.test_steps) - 2)
+
+    def _take_pair(self, frame: int, measure: PairMeasure) -> None:
+        """Test the pair (the identity, the measured and the last motion) and book it: the test of ``add``."""
+        step, to_test, from_test = measure.step, self._to_test, self._from_test
+        assert measure.previous_test is not None
         motions = [motion for motion in (step, self._last_step) if motion is not None]
         matrices = [to_test @ motion @ from_test for motion in [np.eye(3), *motions]]
-        values = _correlations(_image(self.images, frame - 1), self.images[-1], matrices)
+        values = _correlations(measure.previous_test, measure.test_image, matrices)
         known = [(value, matrix) for value, matrix in zip(values, matrices, strict=True) if value is not None]
         best = max(known, key=lambda pair: pair[0], default=None)  # the first of equal values
         self.pair_values.append(None if best is None else best[0])
@@ -863,14 +973,11 @@ class ShotMeter:
             if self._last_step is not None and values[1] is not None and values[1] >= MIN_SHOT_CORRELATION:
                 self._bridges[len(self.test_steps) - 1] = matrices[1]
         else:
-            self.steps.append(self._to_full @ step @ to_small)
+            self.steps.append(self._to_full @ step @ self._to_small)
             # The measured motion, when it explains the pair alone, else the motion that explains it best.
             measured_explains = values[1] is not None and values[1] >= MIN_SHOT_CORRELATION
             self.test_steps.append(matrices[1] if measured_explains else best[1])
             self._last_step = step
-        self._previous, self._previous_boxes = current, boxes
-        # The pair before this one is final now: its bridge needs to know whether this pair has a step.
-        self._bridge(len(self.test_steps) - 2)
 
     def _bridge(self, index: int) -> None:
         """Give a lone pair without a measured motion between two pairs with a step the last motion.

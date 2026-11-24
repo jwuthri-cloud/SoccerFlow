@@ -690,3 +690,120 @@ def test_stop_signals_at_the_end_of_the_stream_wait_for_the_number_requests_in_f
     assert seen == {"held": "Ctrl-C", "raised": False}
     assert len(backend.number_requests()) == 1 and numbers.answers == 1
     assert "a stop signal came while 1 model requests were in flight" in caplog.text
+
+
+# --- With the frame feeder and the overload policy of the stream ------------------------------------
+
+
+class _StillClock:
+    """A clock that the test sets: the overload policy judges each line by it, not by the machine."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def fed_numbers(
+    scene: SyntheticScene,
+    images: list[Any],
+    waits: list[float] | None,
+    backend: Any,
+    live: LiveOut | None = None,
+) -> tuple[DetectorStream, LiveNumbers, Any]:
+    """A stream fed by a frame feeder, with the overload policy (1 s) and the waits of its lines set by the test
+    (frame ``i`` waited ``waits[i]`` s; above 0.5 s it is dropped), and the live number step. ``finish`` of the
+    number step is left to the caller."""
+    from pitchvlm.stream import FrameFeeder, OverloadPolicy
+
+    info = scene.info
+    history = default_history_frames(NUMBERS, info.fps)
+    stream = DetectorStream(
+        NUMBERS, StreamSettings(delay_frames=25, history_frames=history), clip_id=info.clip_id, fps=info.fps,
+        size=(info.width, info.height),
+    )
+    numbers = LiveNumbers(NUMBERS, backend, NumberSettings(close_frames=history, max_pending_images=QUEUE), info=info)
+    clock = _StillClock()
+    taken = {"frame": -1}
+
+    def line_clock() -> tuple[float | None, int]:
+        return clock.now - (waits[taken["frame"]] if waits is not None else 0.0), 0
+
+    def items() -> Any:
+        for item in inputs_of(scene):
+            taken["frame"] = item.frame
+            yield item
+
+    if live is not None:
+        live.overload(max_behind_s=1.0)
+        stream.on_dropped = live.skipped
+        live.start(delay_frames=25, history_frames=history, numbers=True)
+    writer = wire(stream, numbers, live)
+    feeder = FrameFeeder(
+        stream, items(), lambda frame: images[frame], policy=OverloadPolicy(1.0, clock=clock), line_clock=line_clock
+    )
+    try:
+        for fed in feeder:
+            stream.push_fed(fed)
+    finally:
+        feeder.close()
+    stream.finish()
+    return stream, numbers, writer
+
+
+def test_frames_dropped_in_the_middle_of_tracks_give_the_same_numbers() -> None:
+    scene = SyntheticScene(n_frames=200, seed=2290)
+    images = [scene.image(frame) for frame in range(200)]
+    dropped = {40, 41, 42, 43, 60, 61, 90}  # each waited 0.7 s: above half the setting, so not used
+    waits = [0.7 if frame in dropped else 0.01 for frame in range(200)]
+    stream, numbers, _ = fed_numbers(scene, images, waits, FakeBackend(scene))
+    numbers.finish()
+    with_drops = numbers.lines  # every line: those taken during the stream and those of the end
+    assert set(stream.dropped_frames) == dropped
+    _, control, _ = fed_numbers(scene, images, None, FakeBackend(scene))
+    control.finish()
+    without = control.lines
+    assert {(line.track_id, line.export) for line in with_drops} == {(line.track_id, line.export) for line in without}
+    assert len(with_drops) > 5 and numbers.report()["images_dropped"] == 0
+    assert not any(frame in dropped for line in with_drops for frame in line.crop_frames)
+
+
+def test_the_number_step_and_the_overload_policy_in_one_stream_and_its_end_holds_stop_signals(
+    tmp_path: Path, stop_handler: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    scene = SyntheticScene(n_frames=200, seed=2291)
+    images = [scene.image(frame) for frame in range(200)]
+    waits = [0.7 if frame in (50, 51) else 0.01 for frame in range(200)]
+    gate = threading.Event()
+    backend = StubBackend(gate=gate)  # every number request waits for the gate
+    path = tmp_path / "live.jsonl"
+    live = open_live_out(str(path), scene.info)
+    stream, numbers, writer = fed_numbers(scene, images, waits, backend, live)
+    assert backend.numbers_started.acquire(timeout=60)  # a paid request is in flight at the end of the stream
+
+    def signals_then_release() -> None:
+        _until(lambda: stopsignals._HOLD.depth > 0)
+        for _ in range(20):
+            os.kill(os.getpid(), signal.SIGINT)
+        _until(lambda: stopsignals.held_cause() is not None)
+        time.sleep(3 * pipeline.STOP_LOOK_S)
+        gate.set()
+
+    helper = threading.Thread(target=signals_then_release, daemon=True)
+    helper.start()
+    with caplog.at_level(logging.WARNING, logger="pitchvlm"), pytest.raises(KeyboardInterrupt, match="Ctrl-C"):
+        numbers.finish()
+    helper.join(60)
+    sent = len(backend.number_requests())
+    assert numbers.answers == sent >= 1  # every request that reached the model was answered, and no other sent
+    writer.write(numbers.take(), stream.n_frames - 1)
+    live.finish()
+    live.close()
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["format"] == LIVE_FORMAT_NUMBERS and lines[0]["overload_max_behind_s"] == 1.0
+    frames = [line for line in lines[1:-1] if "kind" not in line]
+    assert {line["frame"] for line in frames}.isdisjoint({50, 51}) and len(frames) == 198
+    assert all("overload_dropped" in line for line in frames) and lines[-1]["overload_dropped"] == 2
+    assert all("overload_dropped" not in line for line in lines if line.get("kind") == "number")
+    assert "a stop signal came while" in caplog.text

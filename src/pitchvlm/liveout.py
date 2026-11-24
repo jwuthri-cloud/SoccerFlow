@@ -22,6 +22,23 @@ for each number that the model read (``number_document``), after the frame lines
 that it was read from. A number line changes no frame line; the pipe policy never leaves one out.
 Without the number step the output is ``pitchvlm-live-1``, as before.
 
+The overload policy of the stream (``stream.OverloadPolicy``, ``overload``) adds two keys, in either
+format and only when the policy is on: ``"overload_max_behind_s"`` in the header and
+``"overload_dropped"`` (the frames dropped so far) on every frame line and the end line; a dropped
+frame has no line. So a stream writes one of four outputs:
+
+| number step | overload policy | format name | lines |
+|---|---|---|---|
+| none | off | ``pitchvlm-live-1`` | header, frames, end: as in round 7, byte for byte |
+| none | on | ``pitchvlm-live-1`` | the same, with the two overload keys |
+| model | off | ``pitchvlm-live-2`` | header, frames, number lines, end |
+| model | on | ``pitchvlm-live-2`` | the same, with the two overload keys (none on a number line) |
+
+A reader of ``pitchvlm-live-1`` reads the first two (an extra key is free to pass over) and refuses
+the name ``pitchvlm-live-2``, whose number lines it would not know. Whether the overload keys
+should get a format name of their own is owner decision 48 (``docs/HANDOVER.md``, 11.1); it is not
+decided here.
+
 A frame line is final: the stream gives each state once and never changes it, so the line of
 frame ``f`` holds the state of frame ``f`` of the result file, value for value
 (``tests/test_liveout.py``). Only two things of the result file can differ from the lines, and
@@ -292,6 +309,9 @@ class LiveOut:
         self.numbers_written = 0
         self._numbers_lost = 0
         self._numbers_undelivered = 0
+        #: The overload policy of the stream (``overload``): its wait, and the frames it dropped so far.
+        self._overload_s: float | None = None
+        self._overload_dropped = 0
 
     @property
     def closed(self) -> bool:
@@ -315,6 +335,28 @@ class LiveOut:
         except OSError as error:
             raise LiveOutError(f"the live output {self._target} cannot be written: {error}") from error
 
+    def overload(self, *, max_behind_s: float) -> None:
+        """Say that the stream drops frames by its overload policy (``stream.OverloadPolicy``); call before ``start``.
+
+        Then the header holds ``overload_max_behind_s``, and every frame line and the end line hold
+        ``overload_dropped``: the frames that the stream dropped so far. A dropped frame has no line
+        (``skipped``). Without this call the lines are those of ``LIVE_FORMAT`` alone.
+        """
+        if self._started:
+            raise ValueError("the overload policy is named before the header")
+        self._overload_s = max_behind_s
+
+    def skipped(self, frame: int) -> None:
+        """Count a frame that the stream dropped (the hook ``DetectorStream.on_dropped``): it gets no line."""
+        if self._overload_s is None:
+            raise ValueError(f"frame {frame} was dropped, but the live output was not told of an overload policy")
+        self._overload_dropped += 1
+
+    def _with_overload(self, document: dict[str, Any]) -> dict[str, Any]:
+        if self._overload_s is not None:
+            document["overload_dropped"] = self._overload_dropped
+        return document
+
     def start(self, *, delay_frames: int | None, history_frames: int | None, numbers: bool = False) -> None:
         """Write the header line (a file), or hand it to the writer thread that starts here (a pipe).
 
@@ -324,11 +366,12 @@ class LiveOut:
             raise ValueError("the live output is already started")
         self._started = True
         self._numbers = numbers
-        header = dumps(
-            header_document(
-                self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy, numbers=numbers
-            )
+        head = header_document(
+            self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy, numbers=numbers
         )
+        if self._overload_s is not None:
+            head["overload_max_behind_s"] = self._overload_s
+        header = dumps(head)
         if not self._pipe:
             self._write(header)
             return
@@ -352,6 +395,7 @@ class LiveOut:
             decided_unix=self._clock(),
             dropped=0,
         )
+        self._with_overload(document)
         self._given += 1
         if not self._pipe:
             self._write(dumps(document))
@@ -412,7 +456,7 @@ class LiveOut:
             self._lock.notify()
 
     def _end_document(self) -> dict[str, Any]:
-        return {"end": True, "frames": self._given, "written": self._written, "dropped": self._dropped}
+        return self._with_overload({"end": True, "frames": self._given, "written": self._written, "dropped": self._dropped})
 
     def _run(self) -> None:
         """Write the waiting lines of a pipe in order, until the end line is out, the reader went away or ``close``."""

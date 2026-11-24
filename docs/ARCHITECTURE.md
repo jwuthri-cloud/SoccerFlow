@@ -1842,7 +1842,7 @@ def stream_frame_line(frame, detector: Mapping, calibration: Mapping) -> str   #
 def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]
 def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[StreamInput]]
 class QueuedLines:                                        # the lines of a pipe, read on a thread into a bounded queue
-    def __init__(self, lines: Iterable[str], max_lines: int, clock=time.monotonic)
+    def __init__(self, lines: Iterable[str], max_lines: int | None, clock=time.monotonic)   # None: no bound
     last_read_at: float | None; last_backlog: int; largest_backlog: int   # iterate once
 def stand_in_inputs(people, balls, cameras) -> Iterator[StreamInput]
 class DetectorStream:
@@ -1927,17 +1927,145 @@ def tracks_of_states(states: Sequence[FrameState]) -> list[Track]
   (also NaN, infinity and a nesting too deep for the parser), a frame out of order or past
   `n_frames`, a part of another form and a payload that the adapter refuses, with the line number.
 - Command line: `stream --out DIR (--synthetic [--frames N] [--seed S] | --clip PATH (--detections
-  FILE --calibration FILE | --lines FILE|- [--queue N])) [--config FILE] [--labels FILE [--split]
+  FILE --calibration FILE | --lines FILE|- [--queue N | --max-behind SECONDS])) [--config FILE] [--labels FILE [--split]
   [--tracker]] [--fps FPS] [--delay N|clip] [--history N|clip|default] [--kit-warmup N]
   [--allow-dirty]`; an option that does not apply to the input is refused (`check_stream_options`).
   It writes the files of `run` (`result.json` with `provenance.stream`, `timing`, `frame_timing`,
-  `tool_timing`, `paint_timing`, `latency` (with `--lines`, `timing.LatencyLog`), `missing_parts`,
+  `feeder_timing`, `tool_timing`, `paint_timing`, `overload` (with `--max-behind`), `latency` (with `--lines`, `timing.LatencyLog`), `missing_parts`,
   `transitions_known_at`, `timing_note`, `identity` for the synthetic clip; the prediction file
   with a label file; the video) and prints the per-frame table with the note that the package
   times hold no detector and no calibration. The header of the stream must name the clip, its
   number of frames, the video of `--clip` (its SHA-256, or none for a folder of images) and the
   tool settings of the settings file. `--lines` reads through `QueuedLines` (default 50 lines,
-  `cli.STREAM_QUEUE_LINES`). The exit codes follow `run`.
+  `cli.STREAM_QUEUE_LINES`; no bound with `--max-behind`), and every input goes through a
+  `FrameFeeder` (below). The exit codes follow `run`.
+
+#### Frame feeder and overload policy (design of 2026-11-23, round 8)
+
+```python
+# motion.py
+@dataclass(frozen=True)
+class PairMeasure: frame: int; kind: str ("first" | "pair" | "repeat"); test_image; step (small pixels) | None; previous_test
+class PairMeter:                              # the picture part of ShotMeter.add: small images, estimate_motion; any one thread
+    def __init__(self, size: tuple[int, int], *, downscale: float = 0.5)
+    def measure(self, image: np.ndarray, boxes: Sequence[Box] = ()) -> PairMeasure
+    def repeat(self) -> PairMeasure           # a frame without a picture (dropped): it shows the frame before
+class ShotMeter:                              # add(image, boxes) == take(pairs.measure(image, boxes))
+    def take(self, measure: PairMeasure) -> None   # the pair test (block correlations), the cut, the step, the bridge
+    def hand_out_pairs(self) -> PairMeter      # the picture part moves to another thread; add() refuses from then on
+# _block_correlation(moved, target, whole_blocks=None): the target side of a fully covered block is computed once per pair
+# render.py: render_clip(..., *, dropped: Collection[int] = ()): a dropped frame is darkened and says DROPPED_TEXT
+# stream.py
+FEED_AHEAD_FRAMES = 2; ARRIVAL_SHARE = 0.5
+class QueuedLines: def __init__(self, lines, max_lines: int | None, clock=time.monotonic)   # None: no bound
+class OverloadPolicy:                          # the rule only; the clock is given (a test gives its own)
+    def __init__(self, max_behind_s: float, clock: Callable[[], float] = time.monotonic)
+    def drop(self, frame: int, read_at: float | None) -> bool                 # first look, at the feeder
+    def late(self, frame: int, read_at: float | None) -> tuple[bool, bool]    # second look: (not used, decision due dropped)
+    def text(self) -> str; max_behind_s; unused_after_s; waits_s; late_waits_s
+@dataclass(frozen=True)
+class FedFrame: item: StreamInput; image: np.ndarray | None; measure: PairMeasure | None; dropped: bool = False
+    late: bool = False; read_at: float | None = None; backlog: int = 0; read_seconds: float = 0.0; motion_seconds: float = 0.0
+class FrameFeeder:                             # two threads: one reads the pictures, one measures the motion
+    def __init__(self, stream: DetectorStream, inputs: Iterable[StreamInput], read_image: Callable[[int], np.ndarray],
+                 *, line_clock: Callable[[], tuple[float | None, int]] | None = None,
+                 policy: OverloadPolicy | None = None, ahead: int = FEED_AHEAD_FRAMES)
+    def __iter__(self) -> Iterator[FedFrame]   # the second look of the policy runs here, on the frame thread
+    def close(self, wait_s: float = 1.0) -> None
+DetectorStream.push_fed(fed: FedFrame) -> list[FrameState]
+DetectorStream.on_dropped: Callable[[int], None] | None   # called instead of on_given when a dropped frame is decided
+DetectorStream.dropped_frames -> tuple[int, ...]; is_dropped(frame) -> bool; overload_report() -> dict
+DetectorStream.overload: str | None            # the text of the policy, named in result().engines["overload"]
+# liveout.py: LiveOut.overload(*, max_behind_s) before start; LiveOut.skipped(frame) (the hook on_dropped)
+```
+
+- Speed (no change of output). The picture of frame `t` (stage `read`) and the camera motion of
+  the pair `t - 1, t` (corners and optical flow, `estimate_motion`, most of the time of a frame)
+  depend only on the pictures and the boxes of the two frames, not on what the stream decided.
+  So the feeder runs them on two threads (one reads, one measures), while the frame thread does
+  the pair test, the camera, the kit colours, the matching and the decision of the frame before.
+  Each thread hands on through a queue of `FEED_AHEAD_FRAMES` frames, so the frame thread works
+  through at most 6 frames (2 + 1 + 2 waiting, and its own) after the feeder took a line. The
+  pair test (the block correlations, Python and small NumPy calls) stays on the frame thread:
+  on the measuring thread it waited for the interpreter lock after each OpenCV call (11.1 ms of
+  wall time for 7.5 ms of work per frame, measured). The frame thread books each `PairMeasure`
+  in frame order (`ShotMeter.take`: the pair test, the hard cuts, the steps, the bridges, the
+  window test), so every number is the number of `add`. The stage `motion` of the frame sample
+  is `take`; `read` and `motion` of the feeder are reported apart (`feeder_timing`), and the
+  wait of the frame thread for the feeder lies outside the frame samples. So the frame total no
+  longer holds the read and the motion, and is not the time per frame of the stream: that is
+  the interval between two frames of the frame path (`docs/DECISIONS.md`, entry "A faster stream
+  and an overload policy"). `push(item, image)` keeps working as before (no feeder); a stream
+  uses one or the other, not both. The clip path (`measure_shots`) calls `add`. Other exact
+  savings: the chains of `_StreamMotion.between` are kept until a cut changes or a step is
+  forgotten, the mean pitch positions of a window are taken in one loop
+  (`_PitchMemo.mean_points`), and the window copies its tracks without validating them again
+  (`_copied`).
+- Overload policy, where: at the head of the frame path, twice: in the feeder when it takes the
+  next line off the queue (before the picture is read), and in the frame thread when it takes
+  the frame from the feeder. Not in `merge-feeds`: the merger does not know how far the stream is
+  behind (it only feels the back-pressure), and a frame it left out would still cost the stream
+  its picture and its motion.
+- By which clock: the monotonic clock of the stream process, from the moment the thread of
+  `QueuedLines` read the line off the pipe (`QueuedLines.last_read_at`) to each look. That is the
+  wait that the stream causes. Not the arrival at the tools (`arrived_at`): it holds the time of
+  the tools and of the merger (about 0.5 s with a slow calibration), which dropping frames in
+  the stream cannot shorten. Under the policy the queue of `QueuedLines` has no bound
+  (`max_lines` None; `--queue` is refused): its reader never waits, so no line waits unseen in
+  the pipe or in the merger (a reader stopped by a full queue would hide that wait; the second
+  read of round 8 showed 0 drops with a real lateness of 2.95 s that way). Its memory grows only
+  while the frame thread stalls; a stalled frame thread drops each waiting frame at almost no cost.
+- The rule (`OverloadPolicy`, setting `S` = `max_behind_s`): a frame whose line waited longer
+  than `ARRIVAL_SHARE * S` (half) at either look is not used. When the line of frame `t` waited
+  longer than `S` at the frame thread, the decision due with it (frame `t - L`) is dropped too,
+  even though that frame was measured. Frame 0 is never dropped (the pair tests need a picture
+  to start from). The bound, by construction: every state given while the stream runs is
+  decided at most `S` plus the time of one push after the line that let it be decided was read.
+  The half bar for frames keeps the waits below `S` while the decisions alone keep up, so few
+  measured frames lose their decision (a single bar made keeping and dropping alternate, and
+  every late line then cost a second frame: on the price model of `evalx.livebench`, factor 2,
+  85% of the frames without a state instead of 47%). The states that `finish` decides at the end
+  of the stream are not judged.
+- What a dropped frame is: a frame without any measurement in the output. Nothing of its line is
+  used (no people, no ball candidate, no camera of the calibration). A frame dropped at the first
+  look has no picture read: the pair tests take the picture of the frame before in its place
+  (`PairMeter.repeat`: the step into it is the identity, the frame is no hard cut, the window
+  test sees the frame before again), so the motion chain over it stays whole. A frame dropped at
+  the second look had its picture read and its motion measured (the chain needs it once the
+  next pair was measured from it), and nothing else of it is used. The matching sees a frame
+  without people. Its decision is made without a window: no players, no ball, no camera
+  (`HomographyRecord(frame=f)`, source `none`); a measured frame whose decision was dropped gets
+  the same. So a dropped frame is never shown as a measured frame. The kept frames around it are
+  decided as always (their window holds the dropped frames as frames without observations).
+  With a video file, a frame that is not read is still decoded at the next read (the decoder
+  reads forward), so a drop saves less of the stage `read` there.
+- Where it is counted: `DetectorStream.dropped_frames` and `overload_report()` (`not_used`,
+  `decided_late`); the frame sample of a dropped frame has the stage `dropped`; `result.json`
+  gets `overload` (`max_behind_s`, `frames`, `dropped`, `dropped_frames`, `not_used`,
+  `decided_late`, `dropped_share`, the waits of the lines at both looks) and
+  `result.engines["overload"]` (the rule in words); the printed output names the counts; the
+  video darkens a dropped frame and writes `dropped: not measured` on it; the prediction file has
+  no box for it (the format has no flag: `result.json` says which frames). The live output gets
+  no frame line for a dropped frame (a gap, as for a line that its writer left out) and, only
+  when the policy is on, the header key `overload_max_behind_s` and, on every frame line and on
+  the end line, `overload_dropped`: the dropped frames before that line (frames are decided in
+  order, so this is the count of the gap so far). Readers of `pitchvlm-live-1` ignore keys they
+  do not know (`radar.feed_documents` does, and its page counts gaps as frames not shown), so
+  the format keeps its version (owner decision 48). With the live number step the same keys come
+  in `pitchvlm-live-2` (section `livenumbers.py`: the four outputs). `latency` counts the given states only (`decided_live` leaves
+  the dropped ones out); `missing_parts` counts the missing parts of every line, dropped or not.
+- Off by default. With the policy off every output is byte-equal to the stream without the
+  feeder (measured on seeds 2000-2019 and both demos). With the policy on and no line waiting
+  longer than `S / 2`, every state, camera, track, cut, transition and paint score is the same;
+  the policy adds its text to the engines, the section `overload` to `result.json`, and its keys
+  to the live output. Only `stream --lines` from a pipe (`-` that is not a regular file, or a
+  named pipe) with a delay in frames takes `--max-behind SECONDS`; `--synthetic`, the clip runs,
+  `--lines` of a regular file (also on the standard input), `--delay clip` and `--queue` refuse
+  it (exit 2). `run` and `demo` do not stream and never drop. An error of the feeder (a picture
+  that cannot be read, a broken line) is raised at its frame in the frame thread, after the
+  frames before it, as without the feeder. Limit: `close` stops the threads after the frame they
+  work on; a reading thread that waits on a pipe that sends nothing stays until the process ends
+  (daemon threads).
 
 ### `feed.py` — the live feeds of the two tools, merged by frame (2026-11-23)
 
@@ -2034,7 +2162,10 @@ def open_live_out(target: str, info: ClipInfo) -> LiveOut               # "-", a
     "observed"}], "ball": {"x", "y", "box", "observed"}|null}`; `x`, `y` are pitch metres (section
     2), `box` is `[x1, y1, x2, y2]` in pixels or null, `number` is the shown shirt number or null,
     `team` the team key, `side` the team side or null, `dropped` the lines left out before this one;
-  - end: `{"end": true, "frames", "written", "dropped"}`.
+  - end: `{"end": true, "frames", "written", "dropped"}`;
+  - with the overload policy of the stream (`LiveOut.overload`, round 8) the header also holds
+    `overload_max_behind_s`, and every frame line and the end line `overload_dropped` (the frames
+    before it that the stream dropped: they have no line). Without it the lines are as above.
 - Contract: a frame line is final. The line of frame `f` equals `frame_document` of
   `result.frames[f]` and `result.homographies[f]` of the finished stream (`tests/test_liveout.py`).
   The result says more in two places, neither a state: `ClipResult.tracks` takes the role, team
@@ -2128,9 +2259,11 @@ def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
 - Engines: `stream` takes the number engine `none` (no worker; every output as before) or
   `model` (this worker). The frame path is the same code in both cases: the stream decides its
   states with no number (`finalize_tracks` with no reading), as with `none`.
-- Hand-over on arrival (frame path): `DetectorStream.on_arrived(frame, image, people)` is called in
-  `push` after the image is read (stage `numbers` of the frame sample; not called and no stage
-  without a worker). On a stride frame (`frame % stride_frames == 0`) and on the frames of the
+- Hand-over on arrival (frame path): `DetectorStream.on_arrived(frame, image, people)` is called at
+  the start of `_arrive`, in the thread of the stream, once the picture of the frame is there
+  (`push`, or `push_fed` with the picture that the frame feeder read; stage `numbers` of the frame
+  sample; not called and no stage without a worker). A frame that the overload policy drops
+  (`_arrive_dropped`) calls nothing, and a decision that it drops gives no state. On a stride frame (`frame % stride_frames == 0`) and on the frames of the
   kit legend (`LEGEND_TIMES_S`), the worker gets a reference to the image and the boxes of the
   frame through a bounded queue of `max_pending_images` items (`put_nowait`): when it is full the
   new item is dropped and counted (`images_dropped`); no image is copied on the frame path.
@@ -2198,8 +2331,23 @@ def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
   the lines of `pitchvlm-live-1` and number lines `{"kind": "number", "id", "number", "export",
   "display", "frames": [first, last], "crops": [frames], "reason", "decided_at", "decided_unix"}`
   (`liveout.number_document`; `number` is the shown number: display, else export). A number line
-  is never left out by the pipe policy (like the header and the end line). With the number engine
-  `none` the output is `pitchvlm-live-1`, byte for byte as before. The radar reads both formats:
+  is never left out by the pipe policy (like the header and the end line), and has counts of its
+  own outside `LiveReport` (`numbers_given`, `numbers_written`, `numbers_undelivered`: after
+  `close` the last two add up to the first). With the number engine `none` the output is
+  `pitchvlm-live-1`, byte for byte as before. The four outputs, with the overload policy of
+  `stream.py` (`--max-behind`, which adds `overload_max_behind_s` to the header and
+  `overload_dropped` to frame and end lines, in either format):
+
+  | number engine | `--max-behind` | format | lines |
+  |---|---|---|---|
+  | none | off | `pitchvlm-live-1` | as in round 7, byte for byte |
+  | none | on | `pitchvlm-live-1` | with the two overload keys |
+  | model | off | `pitchvlm-live-2` | plus number lines |
+  | model | on | `pitchvlm-live-2` | plus number lines, with the two overload keys (none on a number line) |
+
+  A reader of `pitchvlm-live-1` reads the first two and refuses the name `pitchvlm-live-2`. Whether
+  the overload keys get a name of their own is owner decision 48; it would add a third and a
+  fourth name (or one version with both parts optional), and is not decided here. The radar reads both formats:
   it keeps the newest number of every id, sends all of them to a new page after the header, and
   draws the number of an id when its frame line has none.
 - Command line: `stream ... --config configs/engines/detector_calibration_numbers.yaml

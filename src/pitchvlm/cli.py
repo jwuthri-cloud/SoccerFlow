@@ -90,6 +90,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import stat
 import sys
 import time
 import tempfile
@@ -189,6 +190,8 @@ from pitchvlm.stream import (
     KIT_WARMUP_FRAMES,
     STREAM_FORMAT,
     DetectorStream,
+    FrameFeeder,
+    OverloadPolicy,
     QueuedLines,
     StreamInput,
     StreamSettings,
@@ -1919,11 +1922,13 @@ def stream_inputs(
     facts: dict[str, Any] = {}
     queued: QueuedLines | None = None
     if args.lines is not None:
+        # Under the overload policy the queue has no bound: its reader never waits, so the policy sees every wait.
+        limit = None if args.max_behind is not None else args.queue or STREAM_QUEUE_LINES
         if str(args.lines) == "-":
-            queued = QueuedLines(fd_lines(sys.stdin.fileno()), args.queue or STREAM_QUEUE_LINES)
+            queued = QueuedLines(fd_lines(sys.stdin.fileno()), limit)
             facts["lines"] = "standard input"
         else:
-            queued = QueuedLines(_lines_of(args.lines), args.queue or STREAM_QUEUE_LINES)
+            queued = QueuedLines(_lines_of(args.lines), limit)
             facts["lines"] = args.lines.name
         lines: Iterable[str] = queued
     else:
@@ -1998,6 +2003,7 @@ def check_stream_options(args: argparse.Namespace) -> None:
                 ("--fps", args.fps),
                 ("--split", args.split),
                 ("--queue", args.queue),
+                ("--max-behind", args.max_behind),
             )
             if value
         ]
@@ -2011,10 +2017,43 @@ def check_stream_options(args: argparse.Namespace) -> None:
         raise CliError("stream --lines takes no --detections or --calibration: the lines hold the answers of both tools")
     if args.lines is None and args.queue is not None:
         raise CliError("--queue applies only to stream --lines")
+    if args.max_behind is not None:
+        if args.delay is None:
+            raise CliError("--max-behind needs a delay in frames: with --delay clip no frame is decided while it streams")
+        live = args.lines is not None and (_stdin_is_a_pipe() if str(args.lines) == "-" else args.lines.is_fifo())
+        if not live:
+            raise CliError(
+                "--max-behind applies only to a live stream (--lines - from a pipe, or a named pipe): the clip runs and a "
+                "file of lines (also on the standard input) have no clock of arrival, so no frame of them is ever dropped"
+            )
+        if args.queue is not None:
+            raise CliError("--max-behind takes no --queue: under the overload policy the queue of lines has no bound")
     if args.labels is None and (args.split is not None or args.tracker is not None):
         raise CliError("--split and --tracker name the prediction file, which stream writes only with --labels")
     if args.clip is not None and args.clip.is_file() and args.fps is not None:
         raise CliError("--fps applies only to a folder of frame images: a video file has its own frame rate")
+
+
+def overload_document(policy: OverloadPolicy, stream: DetectorStream, n_frames: int) -> dict[str, Any]:
+    """Return the section ``overload`` of the result file: the setting, the dropped frames, their share, the waits."""
+    dropped = stream.overload_report()
+    return {
+        "max_behind_s": policy.max_behind_s,
+        "frames": n_frames,
+        **dropped,
+        "dropped_share": dropped["dropped"] / n_frames,
+        "line_wait_at_the_feeder": percentiles_ms(policy.waits_s) if policy.waits_s else None,
+        "line_wait_at_the_frame_path": percentiles_ms(policy.late_waits_s) if policy.late_waits_s else None,
+    }
+
+
+def _stdin_is_a_pipe() -> bool:
+    """Tell whether the standard input is a pipe or a socket (a live feed), not a file, a device or nothing."""
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
 
 
 def print_latency(report: Mapping[str, Any]) -> None:
@@ -2161,26 +2200,45 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
             print(f"live output: waiting for a reader of the named pipe {args.live_out}")
         live_out = open_live_out(args.live_out, info)
         stack.callback(_close_live_out, live_out)
+        if args.max_behind is not None:
+            live_out.overload(max_behind_s=args.max_behind)
+            stream.on_dropped = live_out.skipped
         live_out.start(
             delay_frames=settings.delay_frames, history_frames=settings.history_frames, numbers=numbers is not None
         )
     writer = wire(stream, numbers, live_out)
     latency = LatencyLog(settings.delay_frames)
     missing: dict[str, dict[str, int]] = {}
-    for item in inputs:
+    policy = None if args.max_behind is None else OverloadPolicy(args.max_behind)
+
+    def read_frame(frame: int) -> np.ndarray:
+        if frame >= info.n_frames:
+            raise CliError(f"the stream holds frame {frame}, the clip has {info.n_frames} frames")
+        return source.read(frame)
+
+    feeder = FrameFeeder(
+        stream,
+        inputs,
+        read_frame,
+        line_clock=None if queued is None else (lambda: (queued.last_read_at, queued.last_backlog)),
+        policy=policy,
+    )
+    stack.callback(feeder.close)
+    feeder_seconds: dict[str, list[float]] = {"read": [], "motion": []}
+    for fed in feeder:
+        item = fed.item
         if item.frame >= info.n_frames:
             raise CliError(f"the stream holds frame {item.frame}, the clip has {info.n_frames} frames")
-        latency.arrived(
-            item.frame,
-            source_at=item.arrived_at,
-            line_at=None if queued is None else queued.last_read_at,
-            backlog=0 if queued is None else queued.last_backlog,
-        )
+        latency.arrived(item.frame, source_at=item.arrived_at, line_at=fed.read_at, backlog=fed.backlog)
         for tool, reason in item.missing:
             missing.setdefault(tool, {}).setdefault(reason, 0)
             missing[tool][reason] += 1
-        for given in stream.push(item, partial(source.read, item.frame)):
-            latency.given(given.frame, wall=time.time(), mono=time.monotonic())
+        if fed.image is not None:  # read and measured (also when the second look of the policy did not use it)
+            feeder_seconds["read"].append(fed.read_seconds)
+            feeder_seconds["motion"].append(fed.motion_seconds)
+        for given in stream.push_fed(fed):
+            if not stream.is_dropped(given.frame):
+                latency.given(given.frame, wall=time.time(), mono=time.monotonic())
     if stream.n_frames != info.n_frames:
         raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
     stream.finish()
@@ -2260,6 +2318,19 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     frame_timing = clock.frame_report()
     print_timing(timing)
     print_frame_timing(frame_timing, stream.tool_seconds)
+    feeder_timing = {name: percentiles_ms(seconds) for name, seconds in feeder_seconds.items() if seconds}
+    for name, values in feeder_timing.items():
+        print(
+            f"  {name} (on the thread of the frame feeder, not in the total): {values['p50_ms']:.2f} / "
+            f"{values['p95_ms']:.2f} / {values['max_ms']:.2f}"
+        )
+    overload = None if policy is None else overload_document(policy, stream, info.n_frames)
+    if overload is not None:
+        print(
+            f"overload policy ({stream.overload}): "
+            f"{overload['dropped']} of {info.n_frames} frames dropped ({len(overload['not_used'])} not used, "
+            f"{len(overload['decided_late'])} measured but decided late); a dropped frame has no state"
+        )
     paint_timing = percentiles_ms(stream.paint_seconds) if stream.paint_seconds else None
     if paint_timing is not None:
         print(
@@ -2278,6 +2349,7 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         "prediction_file": prediction_file,
         "timing": timing,
         "frame_timing": frame_timing,
+        "feeder_timing": feeder_timing,
         "tool_timing": tool_timing,
         "paint_timing": paint_timing,
         "latency": live,
@@ -2293,6 +2365,8 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     }
     if live_report is not None:
         document["live_out"] = dataclasses.asdict(live_report)
+    if overload is not None:
+        document["overload"] = overload
     numbers_failed = False
     if numbers is not None:
         numbers_failed = print_live_numbers(numbers)
@@ -2301,10 +2375,18 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
             "lines": [dataclasses.asdict(line) for line in numbers.lines],
         }
         if live_out is not None:
-            document["numbers"]["number_lines_given_to_live_out"] = live_out.numbers_given
+            document["numbers"]["live_out"] = {
+                "given": live_out.numbers_given,
+                "written": live_out.numbers_written,
+                "undelivered": live_out.numbers_undelivered,
+            }
     write_json(clip_dir / RESULT_NAME, document)
     print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
-    video = render_clip(source, result, clip_dir / f"{info.clip_id}.mp4")
+    video_path = clip_dir / f"{info.clip_id}.mp4"
+    if stream.dropped_frames:
+        video = render_clip(source, result, video_path, dropped=stream.dropped_frames)
+    else:
+        video = render_clip(source, result, video_path)
     print(f"video: {video}")
     return EXIT_FAILED if problems or empty is not None or numbers_failed else EXIT_OK
 
@@ -2568,6 +2650,14 @@ def _wait_seconds(text: str) -> float:
     value = float(text)
     if not 0.0 <= value < float("inf"):
         raise argparse.ArgumentTypeError(f"{text} is not a number of 0 or more seconds")
+    return value
+
+
+def _behind_seconds(text: str) -> float:
+    """Read the wait of ``stream --max-behind``: a finite number of seconds above 0."""
+    value = float(text)
+    if not 0.0 < value < float("inf"):
+        raise argparse.ArgumentTypeError(f"{text} is not a number of seconds above 0")
     return value
 
 
@@ -4749,6 +4839,15 @@ def _add_stream(commands: Any) -> None:
         type=_positive_int,
         metavar="N",
         help=f"with --lines: lines read ahead before the reading waits (default: {STREAM_QUEUE_LINES})",
+    )
+    parser.add_argument(
+        "--max-behind",
+        type=_behind_seconds,
+        metavar="SECONDS",
+        help=(
+            "overload policy of a live stream (--lines - or a named pipe): drop a frame whose line waited longer "
+            "than this before the frame path took it; a dropped frame is not measured and has no state (default: off)"
+        ),
     )
     parser.add_argument(
         "--live-out",
