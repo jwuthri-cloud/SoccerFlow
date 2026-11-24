@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import tempfile
@@ -83,6 +84,7 @@ def stream_case(
     The image of each frame is read inside the frame sample (stage ``read``), as ``stream`` does.
     With ``pace_fps`` frame ``i`` is not pushed before the start plus ``i / pace_fps``.
     """
+    load_before = os.getloadavg()[0]
     scene = SyntheticScene(n_frames=n_frames, seed=seed)
     source = SyntheticSource(scene)
     info = scene.info
@@ -124,6 +126,8 @@ def stream_case(
         "frame_p95_ms": total["p95_ms"],
         "frame_max_ms": total["max_ms"],
         "wall_s": wall_s,
+        "load_1min_before": load_before,
+        "load_1min_after": os.getloadavg()[0],
     }
     if worker is not None:
         result = apply_numbers(result, worker.lines)
