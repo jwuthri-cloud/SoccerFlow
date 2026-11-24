@@ -5268,8 +5268,6 @@ the box recall and the identity values of `evalx.metrics` instead.
     `skipped`, two keys only with the policy), `src/pitchvlm/render.py` (a keyword `dropped` of
     `render_clip`), `src/pitchvlm/cli.py` (the options and the input loop of `stream`; the signal
     handling is not touched), `tests/test_live_feed_planted.py` (one argument of a namespace).
-||||||| 41c5552
-
 
 ## Open questions (to settle with measurements)
 
