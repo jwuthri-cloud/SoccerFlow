@@ -5016,6 +5016,7 @@ during the whole session (other sessions ran tests): it is in each table.
 | S | major | `cli.py:5002-5016`, `pipeline.py:461-533` | item S above: a burst of signals ended the wait for paid requests, or blocked the command for ever | fixed, `tests/test_stopsignals.py` |
 | R1 | minor | `radar.py:251`, `radar.py:176`, `radar.py:269` | a number too large for a float (`1e400`) anywhere but `t_s` passed the check, then the events (JSON without infinity) stopped `radar` with a `ValueError` and a traceback, as a fault of the code; a whole number of 401 digits in `t_s` raised `OverflowError` (found by the second reader in the first fix) | fixed: both refused as wrong input (whole numbers up to 2**53, what the page can hold); `test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault` |
 | R2 | minor | `radar.py:278-291` | a second `stream` to the same `--live-out` file empties it (`O_TRUNC`); the viewer read on from its old place and waited for ever; a file replaced under its name was never seen either | fixed: `RadarError`; `test_the_viewer_stops_when_its_file_is_emptied_or_replaced` |
+| R3 | minor | `radar.py:580` | the queue of connections that wait for their accept held 16, the server takes 32: while the loop of the server was late, connections 17 to 32 were reset (macOS) or hung (Linux); `test_connections_above_the_limit_are_closed_at_once` failed once in the one-process run at a load of 58 (a check without the server loop: the 17th connection is reset at 16, none at 32) | fixed: the queue holds `MAX_CONNECTIONS`; `test_connections_up_to_the_limit_that_come_while_the_server_is_late_wait_for_their_accept` |
 | B1 | minor (a claim) | `evalx/liveoutbench.py:117-128` | the bench `revisions` rebuilds each line from the result with the line's own `decided_at`, `transition` and `cut`, and both sides take `fps=25.0`: its "0 of 40,000 lines differ" covers the people, the ball and the camera of each frame, not those three flags, `t_s` or `delay_frames` | written here; the flags are covered by `tests/test_liveout.py` (planted bugs below) |
 | N1 | nit | `liveout.py:395-413` | `close` can count a line that its writer has just written, but whose lock it has not taken again, as not delivered (`stuck`), and then leaves the file descriptor open | not fixed: a window of a few instructions, only at the end, only the count |
 | N2 | nit | `liveout.py:319`, `346` | the counts of lines not delivered: a header that its reader never took counts as a line (the report says "frame lines and the end line"); a writer that fails with an error that is not one of its reader does not count the line it was making | not fixed: the second needs a value that is not finite, which the records refuse (`FiniteFloat`) |
@@ -5041,9 +5042,21 @@ from its header (`NamedPipeFeed`) gives one reader each line once, from the head
 header reaches `merge-feeds` only in the documented case of a reader that took bytes and left,
 and is then counted as a broken line.
 
-**Planted bugs.** The check of at least 30 single-line bugs in `liveout.py`, `radar.py`, `pipeline.py`,
-`stopsignals.py`, the handler and the resend of the feed runs; its table follows in a later commit
-of this branch.
+**Planted bugs.** 64 single-line bugs, one at a time, each against the tests of its file (`liveout.py`
+and `radar.py`: `tests/test_liveout.py` and `tests/test_radar.py`; the wait, the hold and the
+handler: `tests/test_pipeline.py`, `tests/test_stopsignals.py` and the tests of stop signals of
+`tests/test_cli.py`; the resend and the merger: `tests/test_live_feed.py`,
+`tests/test_live_feed_planted.py`, `tests/test_run_tool.py`, `tests/test_feed.py`), full run with
+`-x`, a time limit of 900 s; script `round8-review-scripts/planted.py`. The bugs of `liveout.py`,
+`radar.py` and the resend ran on 5cc5b8e; those of the wait, the hold and the handler ran again on
+b2b0e72, because the first tree held the stale test of item 2 (b), which failed with every bug.
+First run: **47 caught** (one of them a hang that the time limit ended), **17 missed**. Twelve of
+the missed ones matter and are now caught by a new test (each run again against it); three are
+equivalent (L07 in practice, L10, R03); L12 plants into an option that no caller uses
+(`LiveOut(close_fd=False)`; proposed: remove it); P07 opens a window of a few instructions and has
+no test. Each new test passes on the code and fails with its bug.
+
+
 
 Not verified: Python 3.12 and Linux (CI runs both after the push); the burst on a machine with a
 low load; a real model client (the second reader checked the main thread inside
