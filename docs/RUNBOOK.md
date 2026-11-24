@@ -1940,15 +1940,38 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector-feed.jsonl --calibr
   stream) counts them and the dropped lines; exit code 0 when every frame went out whole, 1
   otherwise, 2 when the feeds do not fit together (clip, number of frames, video, tools).
 - `stream` reads the merged lines on a thread into a queue of `--queue` lines (default 50); when
-  the queue is full the pipe fills and the merger and the tools wait: no frame is dropped. It
-  prints and writes (`result.json`: `latency`, `missing_parts`, `paint_timing`,
-  `transitions_known_at`) the time from the arrival of a frame at the tools to its decision, the
-  same from the arrival of frame `f + delay`, the time in the stream alone, and the largest queue.
+  the queue is full the pipe fills and the merger and the tools wait: without `--max-behind` no
+  frame is dropped. It prints and writes (`result.json`: `latency`, `missing_parts`,
+  `paint_timing`, `transitions_known_at`) the time from the arrival of a frame at the tools to its
+  decision, the same from the arrival of frame `f + delay`, the time in the stream alone, and the
+  largest queue. The pictures and the camera motion of the next frames are read and measured on
+  two threads ahead of the frame path (`feeder_timing`: `read` and `motion` per frame, measured
+  on those threads; the frame table no longer holds `read`).
+- Overload policy (round 8, off by default): `--max-behind SECONDS` (`S`) does not use a frame
+  whose merged line waited longer than `S / 2` in the stream, and drops the decision that is due
+  with a line that waited longer than `S`: no state comes later than `S` plus one frame of work
+  after its line. A dropped frame has no state (no players, no ball, no camera): `result.json`
+  names it (`overload`: `dropped_frames`, `not_used`, `decided_late`, the share), the engine table
+  names the policy, the video darkens it (`dropped: not measured`), and the live output has no
+  line for it and `overload_dropped` on the others. Under the policy the queue of lines has no
+  bound (`--queue` is refused). Only a live pipe takes it (`--lines -` from a pipe, or a named
+  pipe, with a delay in frames); the clip runs, a file of lines (also on the standard input) and
+  the synthetic clip refuse it. Add it to terminal 3 when the stream falls behind:
+  `... stream ... --lines - --delay 25 --max-behind S --out ...`. Choose `S` on the run machine:
+  run once without the option and take `S` above twice the largest wait of a line that the run
+  shows (`line_to_decision`). A feed that comes in groups (a calibration with `--skip-behind`
+  sends about 11 lines at once every 439 ms) makes lines wait even without load: on the build
+  machine `S` = 0.3 s dropped 0 frames of a steady feed, but 12 to 15% of such a grouped feed
+  without load and 33 to 54% with 12 busy processes. The
+  measured latency and price on synthetic clips are in `docs/DECISIONS.md` (entry "A faster
+  stream and an overload policy").
 - A dissolve is taken before its window test ends once its span came out the same for 4 judged
   windows (`--delay` of at least 25 for dissolves up to 20 frames, at least 35 for dissolves of
   25 frames, on synthetic clips: the entry "The live feed of the detector engine" of 2026-11-23). The paint score of the keyframes runs on its own thread.
 - On the build machine the chain runs with stand-ins of the tools and a simulated time per frame:
-  `PYTHONPATH=src python -m pitchvlm.evalx.livebench --runs 3 --delays 5,25`. What only the run
+  `PYTHONPATH=src python -m pitchvlm.evalx.livebench --runs 3 --delays 5,25` (with `--max-behind
+  0.25` each row also runs with the policy; `--busy 12` adds 12 spinning processes; `--price
+  1,2,3 --max-behind 0.25` gives the price of the policy on a model of a slow stream). What only the run
   machine can say: the time of the real tools, together with the stream, at 25 fps; whether the
   calibration needs `--skip-behind` (its published time is 439 ms per frame); a camera that
   sends frames (here the frames are files of a recorded clip, read at the pace of a camera).

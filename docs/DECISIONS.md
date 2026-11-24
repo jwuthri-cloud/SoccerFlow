@@ -4930,6 +4930,175 @@ machine is Linux, the build machine is a Mac (arm64).
     handler can block the wait (reasoning). The docstrings now name the gap of two signals.
 
 
+## 2026-11-23 — A faster stream and an overload policy (session "stream speed" of round 8)
+
+Base `41c5552`. Build machine (14 cores), synthetic clips with the stand-ins of the tools, held-out
+seeds 2000-2039 (2040 for the profile and the smoke runs only). Nothing here is a result on real
+footage, a real tool or the run machine. GS-HOTA was not computed: its evaluator is not installed
+on the build machine (`evalx/scorer.py`), and nothing is installed here; the price is given with
+the box recall and the identity values of `evalx.metrics` instead.
+
+1. **Where the time of a frame goes** (measured, one run per row, median ms per frame of the frame
+   samples, code `41c5552`):
+
+   | case | read | motion | decide | total |
+   |---|---|---|---|---|
+   | `stream --synthetic`, 100 frames (default), idle | 3.29 | 7.35 | 3.80 | 15.69 |
+   | `stream --synthetic`, 250 frames, idle | 3.43 | 7.31 | 8.40 | 20.16 |
+   | `stream --synthetic`, 500 frames, idle | 3.21 | 7.21 | 7.88 | 19.47 |
+   | live input (PNG folder, merged lines file, 300 frames), idle | 5.30 | 7.56 | 9.01 | 22.60 |
+   | the same, 12 busy processes (6 runs, OpenCV threads 14, 1 or 2) | 6.1 to 7.7 | 9.8 to 13.5 | 10.0 to 12.4 | 29.7 to 37.3 |
+
+   Inside `motion`: `estimate_motion` 5.3 ms (corners 1.0, two optical flows about 2.0 each), the
+   block correlations 1.2 ms. Inside `decide` (300 frames): the ball tracker 1.5, the mean pitch
+   positions 1.5, `finalize_tracks` 1.0, the joins 0.7, the kit roles 0.7 ms. Parsing a line
+   (JSON, the adapters) is 0.2 ms, outside the frame sample. The gap from about 15 ms to 39-93 ms
+   in the slow rows of round 7 has three parts: the default synthetic clip of 100 frames never
+   fills the decision window of 148 frames (decide 3.8 against 9 ms), a PNG takes 5.3 ms to read
+   against 3.3 ms for the synthetic picture, and under load every stage takes 1.5 to 3 times
+   longer (the round-7 rows ran at a load of 36 to 68 with the other sessions). The number of
+   OpenCV threads made no clear difference under load (6 single runs, noisy: inferred, weak).
+
+2. **What was built for speed** (no change of output): a frame feeder (`stream.FrameFeeder`)
+   reads the pictures on one thread and measures the camera motion (`motion.PairMeter`: the small
+   images and `estimate_motion`) on a second, at most 2 frames ahead each, while the frame thread
+   does the pair test (`ShotMeter.take`), the camera, the kit colours, the matching and the
+   decision. A first version ran the pair test on the measuring thread too: 11.1 ms of wall time
+   for 7.5 ms of work per frame there (it waited for the interpreter lock after each OpenCV
+   call), so the pair test moved to the frame thread. Exact savings in the window: the chains of
+   the camera motion are kept until a cut changes or a step is forgotten, the mean pitch positions
+   are taken in one loop, the window copies its tracks without validating them again (decide
+   3.7 to 3.25 ms at 100 frames, measured 3 times each), and the target side of a block
+   correlation is computed once per pair.
+
+3. **Hypothesis A1** (fixed before the runs): the time per frame of `stream --synthetic` falls by at
+   least 30% against `41c5552`. The frame total of `result.json` no longer holds the reading and
+   the motion (they run on the feeder), so it would show a drop that is not a speed-up; the
+   metric fixed before the runs is the interval between the ends of two pushes of the frame path
+   (all inputs are ready on the synthetic clip, so it is the time per frame the stream can keep),
+   median per run, one harness for both trees. 10 rounds, seed 2000 + round for both arms, the
+   order turned every round, load 7.3 to 11.3:
+
+   | arm | runs | median interval, mean (range) | CPU of the process per frame, mean |
+   |---|---|---|---|
+   | `41c5552` | 10 | 16.04 ms (15.03 to 16.71) | 23.2 ms |
+   | this branch | 10 | 10.88 ms (10.06 to 12.08) | 25.7 ms |
+
+   Ratio new / base per round: mean 0.678, 95% interval 0.649 to 0.707, range 0.602 to 0.737.
+   **A1 holds, narrowly**: the gate (mean ratio at most 0.70) passes, the upper end of the interval
+   lies just above it. The gain is parallel work, not less work: the process uses 11% more CPU per
+   frame. These timings ran on the code before the second read; the timing after it is item 10.
+   Output: `result.json` (without the measured times and the stamps) and the prediction file
+   byte-equal to `41c5552` on all 20 seeds 2000-2019; the live output lines (without
+   `decided_unix`) equal on all 20 (102 lines each); both demos keep their prediction hashes
+   (`bb50efd43536...`, `1f97af18358d...`).
+
+4. **The overload policy, version 1** (`stream --max-behind S`, design in `docs/ARCHITECTURE.md`
+   before the code): drop a frame whose line waited more than `S` in the stream, judged once, by
+   the feeder, before the picture is read. Hypothesis B1 (fixed before the runs): with 12 busy
+   processes and `S` = 0.25 s, the 95th percentile of the time from the arrival of frame `f + L` at
+   the tools to the decision of `f` stays below 1.0 s in every run. Slow simulated calibration (20
+   and 439 ms, `--skip-behind`), seeds 2020-2024, 5 runs per delay, the policy off and on back to
+   back, the order turned every round. On: 8 of 10 runs below 1 s (557 to 955 ms), 2 above (1034
+   and 1679 ms); off: 10 of 10 above 1 s (1.05 to 10.1 s). **B1 failed for version 1.** The second
+   reader found the causes: the wait was judged up to 6 frames before the frame path took the
+   frame, and a line that waits in a full queue (the reader of the pipe stops) is not seen (a run
+   of the reader: 0 frames dropped, a real lateness of 2.95 s).
+
+5. **The overload policy, version 2** (fixed before its runs): the queue of lines has no bound under
+   the policy, so its reader never waits and every wait is seen; the policy looks at each frame
+   twice, at the feeder and when the frame path takes it; a frame whose line waited more than
+   `S / 2` is not used; when it waited more than `S` at the frame path, the decision due with it
+   (frame `t - L`) is dropped too. So every state given while the stream runs is decided at most
+   `S` plus one push after the line that let it be decided was read. A single bar was tried on the
+   price model first: keeping and dropping then alternate, and every late line cost a second
+   frame (factor 2: 85% of the frames without a state instead of 47%); the half bar for frames
+   keeps the waits below `S`, so few measured frames lose their decision. Setting fixed before the
+   runs: `S` = 0.3 s. Milliseconds, the 95th percentile of each run (n = 250 - L decided frames per
+   run, fewer with the policy on):
+
+   | load | L | arm | after frame f + L, p95 of each run | line to decision, p95 | frames dropped | load average |
+   |---|---|---|---|---|---|---|
+   | 12 busy | 5 | off | 886, 693, 623, 899, 9111 | 467 to 6026 | - | 7.4 to 52.0 |
+   | 12 busy | 5 | on | 527, 527, 537, 535, 884 | 261 to 273 | 83 to 90 of 250 | 23.5 to 55.6 |
+   | 12 busy | 25 | off | 1306, 1478, 1483, 805, 8935 | 657 to 6115 | - | 35.6 to 60.6 |
+   | 12 busy | 25 | on | 497, 485, 500, 497, 619 | 224 to 308 | 102 to 134 of 250 | 37.5 to 52.5 |
+   | none | 5 | off | 502, 501, 502, 509, 511 | 225 to 232 | - | 2.4 to 4.8 |
+   | none | 5 | on | 502, 500, 504, 507, 501 | 185 to 198 | 31 to 33 of 250 | 2.3 to 4.4 |
+   | none | 25 | off | 504, 506, 507, 503, 506 | 245 to 254 | - | 2.3 to 3.9 |
+   | none | 25 | on | 482, 488, 482, 488, 479 | 194 to 201 | 37 to 38 of 250 | 2.2 to 3.8 |
+
+   **B1 holds for version 2**: 10 of 10 runs below 1.0 s (485 to 884 ms) with 12 busy processes,
+   where the policy off gave 623 ms to 9.1 s (6 of 10 above 1 s). The line to decision stays at or
+   below `S` plus one push (224 to 308 ms). The price is large on this feed: the calibration skips
+   behind, so the merged lines come in groups of about 11 every 439 ms, and the last lines of a
+   group wait more than 0.15 s even without load. With 12 busy processes 33 to 54% of the frames
+   were dropped; without load 12 to 15%, for no gain in latency (the 0.5 s is the share of the
+   tools and the merger). `S` must lie above twice the wait of a group (item 9).
+
+6. **Hypothesis B2** (fixed before the runs): without extra load and with the policy on, 0 frames
+   are dropped and the result equals the policy off, seeds 2020-2039. The slow profile is not
+   deterministic from run to run (the calibration skips by timing: a smoke run of seed 2040 gave
+   another result with 0 drops), so B2 used the steady profile (4.4 ms per tool, no skip), `S` =
+   0.3 s, load 2.6 to 50 (falling after the busy runs). **B2 holds**: 0 frames dropped in 20 of 20
+   runs, the result equal to the policy off in 20 of 20; the largest wait of a line at the frame
+   path was 24 ms (the bar is 150 ms); the 95th percentile after frame f + L was 39 to 49 ms off and
+   40 to 47 ms on.
+
+7. **The price on synthetic clips** (a model, not a measurement of an overload:
+   `python -m pitchvlm.evalx.livebench --price 1,1.25,1.5,2,3,4 --seeds 2000-2004 --kinds plain,cut
+   --max-behind 0.3`): a stream that needs `k` frame intervals per used frame gives the wait of each
+   line, the real policy and the real stream do the rest, scored against the synthetic truth.
+   Means over 5 seeds (every other range lies within 0.012 of its mean; id switches 3 to 5 and 4 to 5):
+
+   | kind | k | frames dropped | box recall | box precision | coverage | id switches | tracks per true track |
+   |---|---|---|---|---|---|---|---|
+   | plain | 1 | 0.000 | 1.000 | 0.999 | 0.967 (0.962 to 0.978) | 4.6 (3 to 5) | 1.20 (1.13 to 1.22) |
+   | plain | 1.25 | 0.144 | 0.858 | 0.999 | 0.842 | 4.6 | 1.20 |
+   | plain | 1.5 | 0.324 | 0.674 | 0.999 | 0.655 | 4.6 | 1.20 |
+   | plain | 2 | 0.492 | 0.507 | 0.999 | 0.492 | 4.6 | 1.20 |
+   | plain | 3 | 0.660 | 0.339 | 1.000 | 0.329 | 4.6 | 1.20 |
+   | plain | 4 | 0.744 | 0.255 | 1.000 | 0.247 | 4.4 | 1.19 |
+   | cut | 1 | 0.000 | 1.000 | 1.000 | 0.578 | 22.0 | 1.96 |
+   | cut | 2 | 0.492 | 0.506 | 1.000 | 0.290 | 22.0 | 1.96 |
+   | cut | 4 | 0.744 | 0.255 | 1.000 | 0.144 | 22.0 | 1.96 |
+
+   A dropped frame has no state, so the box recall falls with the share of dropped frames, one for
+   one; the precision, the id switches and the tracks per true track stay: the frames that are kept
+   keep their ids across the gaps. On real footage, where the matching across a gap is harder, this
+   is not known.
+
+8. **Second read.** One subagent with fresh context got the diff, the requirements and the old code.
+   It found 2 major, 6 minor and 9 small points; each was run by it unless said:
+   - Major, fixed: `--max-behind` with `--live-out` always stopped (the live output was told of the
+     policy after its header). Now before; a command-line test runs both
+     (`test_stream_with_a_wait_no_line_can_keep_drops_every_frame_and_says_so_in_every_output`).
+   - Major, fixed: the wait was not seen while the queue of lines was full (item 4); version 2.
+   - Minor, fixed in `docs/ARCHITECTURE.md`: the bound counted 3 frames ahead, the code holds 6;
+     the feeder has two threads; the wait for the feeder lies outside the frame samples; the
+     signatures; "byte-equal with the policy on" now says what the policy adds.
+   - Minor, fixed: a dropped frame looked like an empty measured frame in the video (it is darkened
+     now and says `dropped: not measured`); `result.json` names the frames; the prediction file
+     has no flag of its own (a format limit, written).
+   - Small, fixed: `--lines -` from a regular file was taken (now refused: no live clock); two
+     weak tests (one always true, one without its control) replaced; the count on a live line is
+     now written as what it is (the dropped frames before the line). Written as limits: the
+     missing parts count every line, dropped or not; `latency` counts given states only; with a
+     video file a frame that is not read is still decoded at the next read; a reading thread that
+     waits on a silent pipe stays until the process ends.
+   - Checked and found right by it: no output change on 3 kinds x 3 seeds x 6 settings (72 hashes
+     equal to `41c5552`, 54 through the feeder); the caches; the order of `take`; the errors at their
+     frame; the refusals; the radar reader with the new keys.
+   - The fixes of version 2 were read again by the same reader: item 10.
+
+9. **Proposed owner decisions** (`docs/HANDOVER.md`, section 11.1, numbers 45 to 47): the policy in
+   a live run and its setting (here 0.3 s; on the run machine set `S` above twice the wait of a
+   group of lines, measured there); a dropped frame shows nothing (built) or the gap fill of its
+   window; the live output keeps the version `pitchvlm-live-1` with two more keys. Proposed text
+   of `CLAUDE.md`: none.
+
+10. **After the second read** (filled below by the final measurements).
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same
