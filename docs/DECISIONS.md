@@ -5097,7 +5097,42 @@ the box recall and the identity values of `evalx.metrics` instead.
    window; the live output keeps the version `pitchvlm-live-1` with two more keys. Proposed text
    of `CLAUDE.md`: none.
 
-10. **After the second read** (filled below by the final measurements).
+10. **After the second read.** The same reader checked the fixes of version 2: no major point; 2
+    minor ones fixed (with no delay a late frame was counted twice, as not used and as decided
+    late: now once, test `test_without_delay_a_late_frame_is_not_used_and_counted_once`, which
+    fails without the fix; the RUNBOOK gave 0.3 s as the example where its own rule asks for
+    more: now the rule and the measured values), and small ones fixed (`/dev/null` as the
+    standard input passed the check of a live pipe: now only a pipe or a socket; the feeder times
+    left out frames that the second look did not use; tests for both refusals and for a frame
+    that only the second look drops). B1, B2 and B0 ran on the code before these fixes; they do
+    not touch a delay above 0 with a pipe on the standard input. Final measurements on the last
+    commit, back to back, the order turned every round, load 2.9 to 6.0:
+
+    | measurement | `41c5552` | this branch | n |
+    |---|---|---|---|
+    | A1: median interval of `stream --synthetic`, mean (range) | 15.41 ms (14.95 to 15.84) | 10.21 ms (9.79 to 10.63) | 10 runs per arm, seeds 2000-2009 |
+    | A1: ratio per round | | mean 0.663, 95% interval 0.652 to 0.673 | 10 |
+    | CPU of the process per frame | 22.5 ms | 25.1 ms | 10 |
+    | live input (PNG folder, merged lines file, 300 frames, seed 2040): median interval | 21.6 to 22.0 ms | 13.0 to 13.2 ms | 3 runs per arm |
+
+    **A1 holds** on the last commit (the whole interval below 0.70). Output on the last commit:
+    `result.json` and the prediction file byte-equal to `41c5552` on 20 of 20 seeds (2000-2019),
+    the live lines on 20 of 20, both demo hashes kept. Tests on the last commit: default run 3,602
+    passed, 1 skipped, 11 deselected, exit 0; full run 3,613 passed, 1 skipped, exit 0; one process
+    3,613 passed, 1 skipped, exit 0 (283 s); `tools/guard.py --tracked` exit 0; `stream
+    --synthetic` exit 0.
+
+11. **Not verified.** A real tool, real footage, the run machine, Linux (the threads of the feeder
+    and the reading of a named pipe were run on macOS only), a video file as the clip under the
+    policy, GS-HOTA (its evaluator is not installed here), a setting other than 0.3 s, and the
+    loss of a run with drops on footage, where the matching across a gap is harder than on the
+    synthetic clip. The load of the other sessions was not controlled (the load average of each
+    run is given).
+
+12. **Files outside the area of this session**: `src/pitchvlm/liveout.py` (additive: `overload`,
+    `skipped`, two keys only with the policy), `src/pitchvlm/render.py` (a keyword `dropped` of
+    `render_clip`), `src/pitchvlm/cli.py` (the options and the input loop of `stream`; the signal
+    handling is not touched), `tests/test_live_feed_planted.py` (one argument of a namespace).
 
 ## Open questions (to settle with measurements)
 
