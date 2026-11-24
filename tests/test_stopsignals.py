@@ -225,3 +225,27 @@ def test_no_request_starts_after_a_stop_that_a_hold_recorded() -> None:
         pipeline._generate_all(Model(), list(range(10)), 2)  # type: ignore[arg-type]
     helper.join()
     assert sorted(sent) == [0, 1]
+
+
+def test_a_pool_in_another_thread_is_not_stopped_by_a_stop_that_the_main_thread_holds() -> None:
+    """Only the main thread holds signals back. A thread pool that another thread runs answers all its requests, and
+    raises no internal refusal, while the main thread holds a recorded stop."""
+    results: list[object] = []
+
+    class Model:
+        def generate(self, request: int) -> int:
+            return request
+
+    def other_thread() -> None:
+        try:
+            results.append(pipeline._generate_all(Model(), list(range(6)), 2))  # type: ignore[arg-type]
+        except BaseException as error:  # noqa: BLE001 (the test reports it)
+            results.append(error)
+
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with stopsignals.held_stops():
+            assert stopsignals.hold_back("SIGTERM")
+            thread = threading.Thread(target=other_thread)
+            thread.start()
+            thread.join(timeout=30.0)
+    assert results == [[0, 1, 2, 3, 4, 5]]

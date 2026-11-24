@@ -481,10 +481,12 @@ def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel
     """
     failures: list[Exception] = []
     in_flight = _InFlight()
+    # Only a call in the main thread holds stop signals back; a stop recorded there is not this call's in another thread.
+    held = threading.current_thread() is threading.main_thread()
 
     def generate(request: VLMRequest) -> VLMResponse:
         with in_flight.working():
-            if failures or stopsignals.held_cause() is not None:
+            if failures or (held and stopsignals.held_cause() is not None):
                 raise _NotSent
             try:
                 return backend.generate(request)
