@@ -1,4 +1,4 @@
-# Offline tests, leak check and demos on Linux (docs/RUNBOOK.md, section 15).
+# Offline tests, leak check and demos on Linux (docs/RUNBOOK.md, section 1).
 # No secret, no model call, no footage, no dataset. Every action is pinned by its full commit;
 # the version is in the comment (docs/DECISIONS.md, entry "The offline tests on Linux in CI" of
 # 2026-11-23). The packages come from locks/ci-linux.txt, with hashes.
@@ -42,7 +42,8 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Install the pinned packages
-        run: python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
 
       - name: Show the machine
         run: |
@@ -94,7 +95,8 @@ jobs:
           python-version: "3.13"
 
       - name: Install the pinned packages
-        run: python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
 
       - name: Full offline run in one process
         run: python -m pytest -m "slow or not slow"
