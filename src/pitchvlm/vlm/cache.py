@@ -9,9 +9,11 @@ images, for example the frames of the crops of a shirt-number request
 never holds a box of the request context: the boxes of a probe request are
 boxes of the label files. The boxes that the model answers are part of the
 answer text. So cassettes can leave the machine that has the footage and the
-labels, and they can be read as text anywhere. A video part is kept as the
-hash of its file with its range, its sampling rate and its resolution: never
-the path of the file and never its bytes.
+labels, and they can be read as text anywhere. A video part is kept as its
+identity (for a written file: the frames of the clip, the rate and size at
+which they were written, the range, the sampling rate and the resolution),
+the hash of the bytes that were sent and the hash of the pixels of its frames
+(``VideoPart.stored``): never the path of the file and never its bytes.
 
 A replay is another thing: it builds every request again from the frames of
 the clip, so it runs on the machine that has the footage.
@@ -23,6 +25,13 @@ with the recorded ones. When they differ, the stored answer can describe other
 pixels: the hit raises ``OtherImagesError``, and the model is not asked. A
 store that was opened with ``allow_other_images=True`` returns the stored
 answer and logs a warning.
+
+A written video is in the key by its frames and settings, not by its bytes, so
+the same frames written again with other bytes (another codec or OpenCV build)
+find their stored answer. Such a hit is used, logged and counted
+(``CassetteStore.other_video_bytes``; the commands print the count and write it
+into their cost record): it is neither silent nor an error. A hit whose video
+shows other pixels of its frames follows the rule of other image bytes.
 """
 
 from __future__ import annotations
@@ -56,9 +65,9 @@ def _cassette(request: VLMRequest, response: VLMResponse) -> dict[str, Any]:
     (``VLMRequest.stored_context``): the frame numbers, and never the boxes.
     The cache key stands for the whole context.
 
-    A video part is written as its identity (``VideoPart.identity``): the hash
-    of the file, its range, its sampling rate and its resolution. Its path and
-    its bytes are never written.
+    A video part is written as ``VideoPart.stored``: its identity, the hash of
+    the bytes that were sent and the hash of the pixels of its frames. Its path
+    and its bytes are never written.
     """
     cassette = {
         "key": request.cache_key(),
@@ -74,7 +83,7 @@ def _cassette(request: VLMRequest, response: VLMResponse) -> dict[str, Any]:
     }
     if request.videos:
         # Only a request with video parts gets this entry, so an image cassette keeps the content of before.
-        cassette["videos"] = [video.identity() for video in request.videos]
+        cassette["videos"] = [video.stored() for video in request.videos]
     return cassette
 
 
@@ -98,8 +107,17 @@ def _hash_tuple(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _read_cassette(text: str, path: Path, key: str) -> tuple[VLMResponse, tuple[str, ...]]:
-    """Read the answer and the recorded image hashes out of a cassette text.
+def _video_list(value: Any) -> tuple[dict[str, Any], ...]:
+    """Return the video entries of a cassette as a tuple. A value that is not a list of JSON objects raises TypeError."""
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise TypeError("the videos are not a list of JSON objects")
+    return tuple(value)
+
+
+def _read_cassette(
+    text: str, path: Path, key: str
+) -> tuple[VLMResponse, tuple[str, ...], tuple[dict[str, Any], ...]]:
+    """Read the answer, the recorded image hashes and the recorded videos out of a cassette text.
 
     A cassette that is damaged, or that belongs to another request, raises
     ValueError. It is never treated as a missing answer.
@@ -108,12 +126,13 @@ def _read_cassette(text: str, path: Path, key: str) -> tuple[VLMResponse, tuple[
         cassette = json.loads(text)
         stored_key = cassette["key"]
         image_hashes = _hash_tuple(cassette["image_hashes"])
+        videos = _video_list(cassette.get("videos", []))
         response = VLMResponse.model_validate(cassette["response"])
     except (ValueError, KeyError, TypeError) as error:
         raise ValueError(f"the cassette {path} cannot be read: {error}") from error
     if stored_key != key:
         raise ValueError(f"the cassette {path} belongs to another request: its key is {stored_key!r}")
-    return response, image_hashes
+    return response, image_hashes, videos
 
 
 def _changed_images(request: VLMRequest, recorded_hashes: tuple[str, ...]) -> list[int]:
@@ -125,14 +144,38 @@ def _changed_images(request: VLMRequest, recorded_hashes: tuple[str, ...]) -> li
     return [place for place, (recorded, shown) in enumerate(pairs, start=1) if recorded != shown]
 
 
-def _other_images_text(request: VLMRequest, changed: list[int]) -> str:
-    """Name a request whose stored answer was recorded with other image bytes, and the images that changed."""
+def _changed_videos(request: VLMRequest, recorded: tuple[dict[str, Any], ...]) -> tuple[list[int], list[int]]:
+    """Return the places, counted from 1, of the videos of a request whose frames show other pixels than when the
+    answer was stored, and of those that show the same pixels from other bytes (the same frames written again).
+
+    The key holds the identity of each video, so a hit has the same frames and settings. A
+    video without a recorded entry, a recorded entry without a video, and a written video whose
+    entry has no hash of its pixels count as other pixels. A file that the package did not
+    write has the hash of its bytes in the key, so its bytes cannot differ on a hit.
+    """
+    pixels: list[int] = []
+    sent: list[int] = []
+    for place, (entry, video) in enumerate(zip_longest(recorded, request.videos), start=1):
+        if entry is None or video is None:
+            pixels.append(place)
+        elif video.source is not None and entry.get("pixels_sha256") != video.source.pixels_sha256:
+            pixels.append(place)
+        elif entry.get("sha256") != video.sha256:
+            sent.append(place)
+    return pixels, sent
+
+
+def _other_images_text(request: VLMRequest, changed: list[int], videos: list[int]) -> str:
+    """Name a request whose stored answer was recorded with other image bytes or video pixels, and which changed."""
     meta = request.meta
-    places = ", ".join(str(place) for place in changed)
+    what = []
+    if changed:
+        what.append("changed images, counted from 1: " + ", ".join(str(place) for place in changed))
+    if videos:
+        what.append("videos whose frames show other pixels, counted from 1: " + ", ".join(str(place) for place in videos))
     return (
         f"the stored answer of the {meta.step} request of clip {meta.clip_id} (frame {meta.frame}, "
-        f"item {meta.item}, repeat {meta.repeat}) was recorded with other image bytes "
-        f"(changed images, counted from 1: {places})"
+        f"item {meta.item}, repeat {meta.repeat}) was recorded with other image bytes ({'; '.join(what)})"
     )
 
 
@@ -167,6 +210,14 @@ class CassetteStore:
     def __init__(self, root: Path, *, allow_other_images: bool = False) -> None:
         self.root = Path(root)
         self._allow_other_images = allow_other_images
+        self._lock = threading.Lock()
+        self._other_video_bytes = 0
+
+    @property
+    def other_video_bytes(self) -> int:
+        """The hits so far whose stored answer was recorded from other bytes of the same video frames."""
+        with self._lock:
+            return self._other_video_bytes
 
     def path_for(self, request: VLMRequest) -> Path:
         """Return the cassette file of a request. The file may not exist."""
@@ -178,35 +229,58 @@ class CassetteStore:
         """Return the stored answer of a request, or None when no answer is stored.
 
         The key has no pixels. So the image hashes of the request are compared
-        with the recorded ones. When they differ, ``OtherImagesError`` is
+        with the recorded ones, and so are the hashes of the pixels of the frames
+        of each written video. When they differ, ``OtherImagesError`` is
         raised: the stored answer can describe other pixels. A store with
         ``allow_other_images`` returns the answer and logs a warning instead.
+        A video that shows the same pixels from other bytes (written again) is
+        used: the hit is logged and counted (``other_video_bytes``).
         """
         path = self.path_for(request)
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        response, recorded_hashes = _read_cassette(text, path, request.cache_key())
+        response, recorded_hashes, recorded_videos = _read_cassette(text, path, request.cache_key())
         changed = _changed_images(request, recorded_hashes)
-        if not changed:
-            return response
-        found = _other_images_text(request, changed)
-        if not self._allow_other_images:
-            raise OtherImagesError(
-                f"{found}. It is not used, and the model is not asked. There are two ways out. For new footage: "
-                "give the clip another name (the name of its file or folder), so that it gets answers of its own. "
-                "For the same footage: allow the stored answers with the option allow_other_images of the cassette "
-                "store (the option --allow-other-images of the commands run and probe). Use it after an update of "
-                f"the image library, and for a kit legend that was asked from other frames of the same clip. "
-                f"Cassette: {path}"
+        other_pixels, other_bytes = _changed_videos(request, recorded_videos)
+        if changed or other_pixels:
+            found = _other_images_text(request, changed, other_pixels)
+            if not self._allow_other_images:
+                raise OtherImagesError(
+                    f"{found}. It is not used, and the model is not asked. There are two ways out. For new footage: "
+                    "give the clip another name (the name of its file or folder), so that it gets answers of its own. "
+                    "For the same footage: allow the stored answers with the option allow_other_images of the cassette "
+                    "store (the option --allow-other-images of the commands run and probe). Use it after an update of "
+                    f"the image library, and for a kit legend that was asked from other frames of the same clip. "
+                    f"Cassette: {path}"
+                )
+            logger.warning(
+                "Other image bytes are allowed, so this answer is used: %s. It can describe other pixels. Cassette: %s",
+                found,
+                path,
             )
+        if other_bytes:
+            self._note_rewritten(request, other_bytes, path)
+        return response
+
+    def _note_rewritten(self, request: VLMRequest, places: list[int], path: Path) -> None:
+        """Count and log a stored answer that is used for a video written again with other bytes from the same frames."""
+        with self._lock:
+            self._other_video_bytes += 1
+        meta = request.meta
         logger.warning(
-            "Other image bytes are allowed, so this answer is used: %s. It can describe other pixels. Cassette: %s",
-            found,
+            "The stored answer of the %s request of clip %s (frame %s, item %s, repeat %s) was recorded from "
+            "other bytes of the same video frames (videos, counted from 1: %s): the video was written again. "
+            "It is used, and counted. Cassette: %s",
+            meta.step,
+            meta.clip_id,
+            meta.frame,
+            meta.item,
+            meta.repeat,
+            ", ".join(str(place) for place in places),
             path,
         )
-        return response
 
     def check_writable(self, request: VLMRequest) -> None:
         """Raise ``OSError`` when the cassette of a request could not be written. Nothing is created or changed.

@@ -35,7 +35,7 @@ from pitchvlm.probes import (
 from pitchvlm.schemas import KitDescription, KitLegend
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.vlm import client, steps
-from pitchvlm.vlm.cache import CassetteStore
+from pitchvlm.vlm.cache import CachedBackend, CassetteStore
 from pitchvlm.vlm.client import (
     GeminiBackend,
     OpenRouterBackend,
@@ -57,6 +57,7 @@ from pitchvlm.vlm.cost import (
 from pitchvlm.vlm.fake import FakeBackend
 from pitchvlm.vlm.types import (
     ImagePart,
+    OtherImagesError,
     RequestMeta,
     TextPart,
     Usage,
@@ -65,6 +66,7 @@ from pitchvlm.vlm.types import (
     VLMRequest,
     VLMResponse,
 )
+from pitchvlm.vlm import video as video_module
 from pitchvlm.vlm.video import (
     context_frames,
     file_sha256,
@@ -517,7 +519,8 @@ def test_people_video_request_names_its_targets_by_their_time(tmp_path: Path) ->
     assert "Do not use faces and do not give names" in text and "shirt number" in text
     assert request.parts[1] == part
     assert request.context == {"frames": [24, 48], "video_frames": [0, 12, 24, 36, 48], "times_s": [1.0, 2.0]}
-    assert request.meta.step == "people_video" and request.meta.item == f"video-{part.sha256[:16]}"
+    digest = hashlib.sha256(json.dumps(part.identity(), sort_keys=True).encode("utf-8")).hexdigest()
+    assert request.meta.step == "people_video" and request.meta.item == f"video-{digest[:16]}"
     schema = request.response_schema["properties"]["frames"]
     assert (schema["minItems"], schema["maxItems"]) == (2, 2)
     assert request.stored_context() == {"frames": [24, 48]}
@@ -856,3 +859,153 @@ def test_doctor_without_the_video_option_sends_no_video(contract_scene: Syntheti
     result = doctor.contract_checks(backend, contract_scene, StepSettings(), contract_limits())
     assert doctor.VIDEO_BOXES not in checks_by_name(result)
     assert all(not request.videos for request in backend.requests)
+
+
+# --- The key of a written video: its frames and settings, not its bytes (V3) --------------------------
+
+
+ANSWER = VLMResponse(
+    text='{"frames": []}', usage=Usage(input_tokens=1, output_tokens=1), model="gemini-4-argon", latency_s=0.0,
+    created_at="2026-11-23T10:00:00+00:00",
+)
+WRITTEN = [0, 12, 24]
+
+
+def written_part(folder: Path, *, seed: int = 1, size: tuple[int, int] = (320, 180), frames: list[int] = WRITTEN,
+                 fps: float = 2.0, resolution: str = "low") -> VideoPart:
+    source = SyntheticSource(SyntheticScene(n_frames=30, width=size[0], height=size[1], seed=seed))
+    return frames_video_part(source, frames, folder=folder, step="people_video", fps=fps, resolution=resolution,
+                             send_fps=True)
+
+
+def written_request(part: VideoPart, *, frames: list[int] = WRITTEN, fps: float = 2.0, legend: KitLegend = LEGEND,
+                    settings: StepSettings | None = None) -> VLMRequest:
+    return steps.build_people_video_request(
+        part, legend, clip_id="synthetic", video_frames=frames, targets=[frames[1]], fps=fps, width=320, height=180,
+        settings=settings or StepSettings(resolution="low"),
+    )
+
+
+def rewritten(folder: Path, monkeypatch: pytest.MonkeyPatch, **arguments: Any) -> VideoPart:
+    """Write the same frames again into another folder, as another writer would: the bytes differ, the frames do not."""
+    real = video_module.write_frames_video
+
+    def other_writer(source: Any, frames: Any, path: Path, fps: float) -> None:
+        real(source, frames, path, fps)
+        if path.exists() and not path.read_bytes().endswith(b"other writer"):
+            path.write_bytes(path.read_bytes() + b"other writer")
+
+    monkeypatch.setattr(video_module, "write_frames_video", other_writer)
+    try:
+        return written_part(folder, **arguments)
+    finally:
+        monkeypatch.setattr(video_module, "write_frames_video", real)
+
+
+def test_the_same_frames_written_again_with_other_bytes_find_their_stored_answer_and_are_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = written_part(tmp_path / "first")
+    again = rewritten(tmp_path / "again", monkeypatch)
+    assert again.sha256 != first.sha256 and again.source == first.source
+    store = CassetteStore(tmp_path / "cache")
+    cassette = json.loads(store.put(written_request(first), ANSWER).read_text(encoding="utf-8"))
+
+    assert written_request(again).cache_key() == written_request(first).cache_key()
+    assert CachedBackend(store).generate(written_request(again)) == ANSWER  # a replay: no model behind the store
+    assert store.other_video_bytes == 1
+    assert store.get(written_request(first)) == ANSWER and store.other_video_bytes == 1  # the same bytes: no note
+    # The stored answer keeps the hash of the bytes that were sent, and of the pixels of the frames.
+    assert cassette["videos"][0]["sha256"] == first.sha256
+    assert cassette["videos"][0]["pixels_sha256"] == first.source.pixels_sha256  # type: ignore[union-attr]
+
+
+def test_a_video_written_again_with_another_codec_finds_its_stored_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The case of finding V3: the same frames with avc1 and with mp4v (where both codecs can be opened)."""
+    parts = []
+    for codec in ("avc1", "mp4v"):
+        monkeypatch.setattr(video_module, "VIDEO_CODECS", (codec,))
+        try:
+            parts.append(written_part(tmp_path / codec))
+        except OSError:
+            pytest.skip(f"OpenCV cannot write the codec {codec} here")
+    first, second = parts
+    assert first.sha256 != second.sha256
+    store = CassetteStore(tmp_path / "cache")
+    store.put(written_request(first), ANSWER)
+    assert store.get(written_request(second)) == ANSWER and store.other_video_bytes == 1
+
+
+def test_the_key_of_a_written_video_changes_with_its_frames_range_rate_size_resolution_prompt_and_model(
+    tmp_path: Path,
+) -> None:
+    part = written_part(tmp_path)
+    key = written_request(part).cache_key()
+    other_frames = [0, 12, 25]
+    other_legend = LEGEND.model_copy(update={"referee_kit": "green"})
+    changed = {
+        "one other frame": written_request(written_part(tmp_path, frames=other_frames), frames=other_frames),
+        "write rate": written_request(written_part(tmp_path, fps=1.0), fps=1.0),
+        "frame size": written_request(written_part(tmp_path, size=(160, 90))),
+        "resolution": written_request(part.model_copy(update={"resolution": "high"})),
+        "prompt": written_request(part, legend=other_legend),
+        "model": written_request(part, settings=StepSettings(resolution="low", model="gemini-4-other")),
+    }
+    for what, request in changed.items():
+        assert request.cache_key() != key, what
+    assert len({request.cache_key() for request in changed.values()}) == len(changed)
+    # A video step sends whole files at their own rate; a range and a sampling rate are settings of the part.
+    whole = video_request(part).cache_key()
+    for update in ({"start_s": 0.5}, {"end_s": 1.0}, {"fps": 1.0}, {"fps": None}):
+        assert video_request(part.model_copy(update=update)).cache_key() != whole, update
+
+
+def test_a_stored_answer_of_other_pixels_under_the_same_frames_is_refused_as_for_images(tmp_path: Path) -> None:
+    """New footage under an old clip name has the same frames and settings, so the same key: the hit is refused."""
+    old = written_part(tmp_path / "old", seed=1)
+    new = written_part(tmp_path / "new", seed=2)
+    assert written_request(new).cache_key() == written_request(old).cache_key()
+    store = CassetteStore(tmp_path / "cache")
+    store.put(written_request(old), ANSWER)
+
+    with pytest.raises(OtherImagesError, match="videos whose frames show other pixels, counted from 1: 1"):
+        store.get(written_request(new))
+    allowed = CassetteStore(tmp_path / "cache", allow_other_images=True)
+    assert allowed.get(written_request(new)) == ANSWER and allowed.other_video_bytes == 0
+
+
+def test_the_cassette_of_a_written_video_holds_its_hashes_and_frames_but_no_path_and_no_bytes(tmp_path: Path) -> None:
+    part = written_part(tmp_path)
+    written = CassetteStore(tmp_path / "cache").put(written_request(part), ANSWER).read_text(encoding="utf-8")
+
+    entry = json.loads(written)["videos"][0]
+    assert entry["frames"] == WRITTEN and entry["write_fps"] == 2.0 and entry["size"] == [320, 180]
+    assert str(tmp_path) not in written and ".mp4" not in written
+    assert base64.b64encode(part.path.read_bytes()[:48]).decode() not in written
+    assert set(entry) == {
+        "mime_type", "duration_s", "start_s", "end_s", "fps", "resolution", "frames", "write_fps", "size", "sha256",
+        "pixels_sha256",
+    }
+
+
+def test_a_written_video_must_last_its_frames_at_its_rate(tmp_path: Path) -> None:
+    part = written_part(tmp_path)
+    with pytest.raises(ValidationError, match="lasts 1.5 s, not 3 s"):
+        part.model_copy(update={"duration_s": 3.0})
+
+
+def test_a_rewritten_video_is_counted_also_when_other_image_bytes_are_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second read of round 7: a hit with other image bytes (allowed) and a rewritten video did not count the video."""
+    first = written_part(tmp_path / "first")
+    again = rewritten(tmp_path / "again", monkeypatch)
+    image = ImagePart(data=b"jpeg of the first library")
+    other_image = ImagePart(data=b"jpeg of another library")
+    request = written_request(first)
+    stored_request = request.model_copy(update={"parts": (*request.parts, image)})
+    store = CassetteStore(tmp_path / "cache", allow_other_images=True)
+    store.put(stored_request, ANSWER)
+    replayed = written_request(again)
+    assert store.get(replayed.model_copy(update={"parts": (*replayed.parts, other_image)})) == ANSWER
+    assert store.other_video_bytes == 1

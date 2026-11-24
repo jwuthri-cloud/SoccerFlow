@@ -406,10 +406,14 @@ def test_the_live_chain_gives_the_result_of_the_clip_runs(tmp_path: Path, live_c
 
 def test_the_chain_ends_when_the_stream_stops_before_it_reads(tmp_path: Path, live_clip: LiveClip) -> None:
     """With a pace the tools are still at their first frame when the merger stops (without one, a fast tool can
-    put its whole feed into the pipe before that and end with 0)."""
+    put its whole feed into the pipe before that and end with 0). Second read of round 7: a tool that started
+    after the shared start has every frame due at once, and on a loaded machine (load average 66 to 84) a tool
+    without a time per frame put all 40 lines into the pipe before the merger stopped and ended with 0 (2 of 6
+    runs on 72fad94); 100 ms per frame keep each tool writing for 4 s."""
     start = time.monotonic()
-    outcome = run_live(live_clip, tmp_path / "live", delay=5, pace=25.0, simulated_ms={"detector": 0, "calibration": 0},
-                       timeout_s=60, stream_arguments=["--history", "abc"], start_margin_s=2.0)
+    outcome = run_live(live_clip, tmp_path / "live", delay=5, pace=25.0,
+                       simulated_ms={"detector": 100, "calibration": 100}, timeout_s=60,
+                       stream_arguments=["--history", "abc"], start_margin_s=2.0)
     assert time.monotonic() - start < 60
     assert outcome.codes == {"stream": 2, "merge-feeds": 2, "rfdetr": 2, "pnlcalib": 2}
 
@@ -437,3 +441,181 @@ def test_the_synthetic_clip_still_takes_a_tracker_name(tmp_path: Path, no_video:
     assert cli.main(["stream", "--synthetic", "--frames", "30", "--delay", "5", "--tracker", "mine", "--out", str(out),
                      "--allow-dirty"]) == 0
     assert (out / "predictions" / "SoccerNetGS-demo" / "mine" / "SNGS-999.json").exists()
+
+
+# --- Second read of round 7 ---------------------------------------------------------------------------
+
+
+def test_a_tool_that_stops_before_its_first_frame_ends_the_chain(tmp_path: Path, live_clip: LiveClip) -> None:
+    """F1: a tool that stopped before it opened its named pipe (here: a job file that is not there) left merge-feeds
+    waiting for ever in the open of that pipe, and the other tool with it. The feed is now opened first."""
+    import os
+    import subprocess
+
+    from pitchvlm.evalx.livebench import package_environment, tool_command
+
+    pipes = {tool: tmp_path / f"{tool}.fifo" for tool in ("rfdetr", "pnlcalib")}
+    for path in pipes.values():
+        os.mkfifo(path)
+    environment = package_environment()
+    merge = subprocess.Popen(
+        [sys.executable, "-m", "pitchvlm.cli", "merge-feeds", "--detector", str(pipes["rfdetr"]),
+         "--calibration", str(pipes["pnlcalib"])],
+        env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    calibration = subprocess.Popen(
+        tool_command(live_clip, "pnlcalib", tmp_path / "c.jsonl", pipes["pnlcalib"], delay_ms=0, pace=25.0,
+                     start_at=time.time() + 2.0),
+        env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    broken = tool_command(live_clip, "rfdetr", tmp_path / "d.jsonl", pipes["rfdetr"], delay_ms=0, pace=None,
+                          start_at=None)
+    broken[broken.index("--job") + 1] = str(tmp_path / "no-such-job.json")
+    detector = subprocess.Popen(broken, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        codes = [process.wait(timeout=60) for process in (detector, merge, calibration)]
+    finally:
+        for process in (detector, merge, calibration):
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    assert codes == [2, 2, 2]
+    assert merge.stderr is not None and "the feed of the detector ended before its header" in merge.stderr.read()
+
+
+def test_with_the_feed_on_the_standard_output_a_print_of_the_tool_goes_to_the_error_stream(
+    tmp_path: Path, live_clip: LiveClip
+) -> None:
+    """F2: with --feed -, what a tool printed while it was built went into the feed before the header, and the merger
+    refused the feed. Now the standard output holds the feed alone."""
+    import subprocess
+
+    from pitchvlm.evalx.livebench import STAND_IN, package_environment, tool_command
+
+    noisy = tmp_path / "noisy_stand_in.py"
+    noisy.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(STAND_IN.parent)!r})\n"
+        "import stand_in_tool, run_tool\n"
+        "facts = run_tool.machine_facts\n"
+        "def building(device):\n"
+        "    print('Loading pretrain weights')  # as a tool library may while the script builds the tool\n"
+        "    return facts(device)\n"
+        "run_tool.machine_facts = building\n"
+        "real = stand_in_tool.stand_in\n"
+        "def noisy(by_image, delay_s):\n"
+        "    answer = real(by_image, delay_s)\n"
+        "    def loud(image):\n"
+        "        print('one frame', end='')\n"
+        "        return answer(image)\n"
+        "    return loud\n"
+        "stand_in_tool.stand_in = noisy\n"
+        "sys.exit(stand_in_tool.main())\n",
+        encoding="utf-8",
+    )
+    command = tool_command(live_clip, "rfdetr", tmp_path / "copy.jsonl", Path("-"), delay_ms=0, pace=None,
+                           start_at=None)
+    command[1] = str(noisy)
+    done = subprocess.run(command, env=package_environment(), capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == (tmp_path / "copy.jsonl").read_text(encoding="utf-8")
+    assert json.loads(done.stdout.splitlines()[0])["format"] == feed.TOOL_FEED_FORMAT
+    assert "Loading pretrain weights" in done.stderr and "one frame" in done.stderr
+
+
+def test_the_feed_and_its_copy_cannot_be_one_file(tmp_path: Path, live_clip: LiveClip, stand_in_detector: Calls) -> None:
+    """F4: --feed and --out on one file wrote the lines twice through two handles into one file, over each other."""
+    same = tmp_path / "feed.jsonl"
+    arguments = ["rfdetr", "--job", str(live_clip.jobs["rfdetr"]), "--root", str(live_clip.root), "--device", "cpu"]
+    assert run_tool.main([*arguments, "--out", str(same), "--feed", str(tmp_path / "." / "feed.jsonl")]) == 2
+    assert not same.exists()
+
+
+def _stand_in_feed_command(live_clip: LiveClip, tmp_path: Path, pipe: Path) -> list[str]:
+    from pitchvlm.evalx.livebench import tool_command
+
+    return tool_command(live_clip, "rfdetr", tmp_path / "copy.jsonl", pipe, delay_ms=0, pace=None, start_at=None)
+
+
+def test_a_reader_that_opens_the_pipe_and_goes_away_does_not_stop_the_tool(tmp_path: Path, live_clip: LiveClip) -> None:
+    """The cause of the hangs at a low load: a process opened the named pipe of a waiting tool for reading and closed it
+    again (on the build machine, a program that looks at the files named by a new ``python -m`` process: merge-feeds).
+    The tool was paired with it, its next write broke, it stopped with exit code 2, and merge-feeds waited for ever.
+    Now the tool waits for a reader again and sends the whole feed from its header."""
+    import os
+    import subprocess
+
+    from pitchvlm.evalx.livebench import package_environment
+
+    pipe = tmp_path / "detector.fifo"
+    os.mkfifo(pipe)
+    tool = subprocess.Popen(_stand_in_feed_command(live_clip, tmp_path, pipe), env=package_environment(),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        os.close(os.open(pipe, os.O_RDONLY))  # the reader that goes away: it waits for the tool, then closes at once
+        copy = tmp_path / "copy.jsonl"
+        deadline = time.monotonic() + 60
+        while not (copy.exists() and copy.read_text(encoding="utf-8")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.5)  # the header goes to the pipe right after the copy: its write meets no reader
+        read = subprocess.run(["cat", str(pipe)], capture_output=True, text=True, timeout=30)
+        assert tool.wait(timeout=60) == 0
+    finally:
+        if tool.poll() is None:
+            tool.kill()
+            tool.wait()
+    assert read.stdout == copy.read_text(encoding="utf-8")
+    assert json.loads(read.stdout.splitlines()[0])["format"] == feed.TOOL_FEED_FORMAT
+    assert len(read.stdout.splitlines()) == 41
+    assert tool.stderr is not None and "a new reader got the feed again from its header" in tool.stderr.read()
+    facts = json.loads((tmp_path / "copy-runner.json").read_text(encoding="utf-8"))
+    assert facts["feed_reopened"] == 1
+
+
+def test_a_feed_whose_reader_does_not_come_back_stops_after_its_wait(tmp_path: Path) -> None:
+    import os
+
+    pipe = tmp_path / "feed.fifo"
+    os.mkfifo(pipe)
+    opened: dict[str, Any] = {}
+    writer = threading.Thread(target=lambda: opened.setdefault("feed", run_tool.NamedPipeFeed(str(pipe), wait_s=0.3)))
+    writer.start()
+    os.close(os.open(pipe, os.O_RDONLY))
+    writer.join(timeout=10)
+    start = time.monotonic()
+    with pytest.raises(BrokenPipeError, match="no reader came back within 0.3 s"):
+        opened["feed"].write("line\n")
+    assert 0.3 <= time.monotonic() - start < 5
+
+
+def test_a_feed_that_names_the_job_file_is_refused_and_the_job_is_kept(
+    tmp_path: Path, live_clip: LiveClip, stand_in_detector: Calls
+) -> None:
+    """Second read of round 7: with the feed opened first, --feed on the job file emptied the job before any check."""
+    job = tmp_path / "job.json"
+    job.write_bytes(live_clip.jobs["rfdetr"].read_bytes())
+    arguments = ["rfdetr", "--job", str(job), "--root", str(live_clip.root), "--device", "cpu"]
+    assert run_tool.main([*arguments, "--out", str(tmp_path / "copy.jsonl"), "--feed", str(job)]) == 2
+    assert job.read_bytes() == live_clip.jobs["rfdetr"].read_bytes()
+
+
+def test_the_feed_on_the_standard_output_gives_the_descriptor_back_when_it_is_closed(tmp_path: Path) -> None:
+    """Second read of round 7: --feed - in a process that calls main (a caller, a test run with -s) kept the
+    standard output on the error stream after main returned. A process, so that the descriptor 1 is the real one."""
+    import subprocess
+
+    job = tmp_path / "job.json"
+    job.write_text("{}", encoding="utf-8")
+    arguments = ["rfdetr", "--job", str(job), "--root", str(tmp_path), "--out", str(tmp_path / "out.jsonl"),
+                 "--device", "cpu", "--feed", "-"]
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(SCRIPT.parent)!r})\n"
+        "import run_tool\n"
+        f"code = run_tool.main({arguments!r})\n"
+        "print('after main: to the standard output', flush=True)\n"
+        "sys.exit(code)\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 2
+    assert done.stdout == "after main: to the standard output\n"

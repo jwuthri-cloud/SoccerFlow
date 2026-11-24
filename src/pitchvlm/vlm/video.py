@@ -12,13 +12,16 @@ Rules of the files:
 - They go to a folder outside the repository on the run machine (the data folder),
   never to the cache folder: the cache folder goes to the results branch, which is
   text only (rule 2).
-- A file that is already there is used as it is and is not written again. Its hash
-  is in the cache key of its request, so a file written again with other bytes
-  would miss its stored answer and be paid a second time. The name of a file holds
-  a hash of the decoded pixels of its frames, so new footage under an old clip name
-  gets new files and never the old ones. Two writes of the same
-  frames gave the same bytes on the build machine (H.264 and MPEG-4 Part 2,
-  OpenCV 5.0); this is measured on the build machine only.
+- A file that is already there is used as it is and is not written again. The
+  cache key of its request holds the frames of the clip and the settings of the
+  file, not its bytes (``VideoPart.identity``): a file written again from the same
+  frames can get other bytes (another codec or OpenCV build), and it still finds the
+  stored answer, which keeps the hash of the bytes that were sent and counts a hit
+  on other bytes (``vlm.cache``). The name of a file holds a hash of the decoded
+  pixels of its frames, so new footage under an old clip name gets new files and
+  never the old ones; a stored answer of the old footage is refused as for images.
+  Two writes of the same frames with one codec gave the same bytes on the build
+  machine (H.264 and MPEG-4 Part 2, OpenCV 5.0); the two codecs gave other bytes.
 - A file is written under a hidden name and gets its name when it is complete.
 
 The written frames are compressed by the video codec, so the model sees other
@@ -40,7 +43,7 @@ from pathlib import Path
 import cv2
 
 from pitchvlm.frames import FrameSource
-from pitchvlm.vlm.types import Resolution, VideoPart
+from pitchvlm.vlm.types import Resolution, VideoFrames, VideoPart
 
 #: The video codecs that are tried, in order, as four-character codes of OpenCV: H.264, then
 #: MPEG-4 Part 2. Both pages name the container type video/mp4; neither names a codec.
@@ -153,8 +156,9 @@ def frames_video_part(
     the provider for the rate ``fps`` (Gemini); without it the provider samples
     at its own rate (OpenRouter).
     """
-    clip_id = source.info.clip_id
-    path = Path(folder) / clip_id / video_file_name(clip_id, step, frames, fps, frames_digest(source, frames))
+    info = source.info
+    pixels = frames_digest(source, frames)
+    path = Path(folder) / info.clip_id / video_file_name(info.clip_id, step, frames, fps, pixels)
     write_frames_video(source, frames, path, fps)
     return VideoPart(
         path=path,
@@ -163,6 +167,13 @@ def frames_video_part(
         duration_s=len(frames) / fps,
         fps=fps if send_fps else None,
         resolution=resolution,
+        source=VideoFrames(
+            frames=tuple(operator.index(frame) for frame in frames),
+            write_fps=float(fps),
+            width=info.width,
+            height=info.height,
+            pixels_sha256=pixels,
+        ),
     )
 
 
