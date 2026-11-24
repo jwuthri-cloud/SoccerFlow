@@ -614,7 +614,9 @@ class RadarServer(ThreadingHTTPServer):
 
     daemon_threads = True
     allow_reuse_address = False
-    request_queue_size = 16
+    #: The connections that wait for their accept: as many as the server holds, so that a burst of them up to the
+    #: limit is not reset while the loop of the server is late (a test of 32 connections was reset at a load of 58).
+    request_queue_size = MAX_CONNECTIONS
 
     def __init__(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int, board: Board) -> None:
         self.address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET

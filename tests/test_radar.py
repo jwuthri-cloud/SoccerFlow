@@ -484,6 +484,22 @@ def test_the_viewer_stops_when_its_file_is_emptied_or_replaced(tmp_path: Path) -
             stop.set()
 
 
+def test_connections_up_to_the_limit_that_come_while_the_server_is_late_wait_for_their_accept() -> None:
+    """The loop of the server accepts nothing here (a busy machine). Connections up to ``MAX_CONNECTIONS`` wait in the
+    queue of the system; with a queue of 16 the system reset the others (macOS) or let them hang (Linux), and the test
+    of the limit failed at a load of 58."""
+    server = radar.RadarServer(radar.check_loopback("127.0.0.1"), 0, radar.Board())
+    held: list[socket.socket] = []
+    try:
+        for _ in range(radar.MAX_CONNECTIONS):
+            held.append(socket.create_connection(("127.0.0.1", server.port), timeout=2))
+    finally:
+        for sock in held:
+            sock.close()
+        server.server_close()
+    assert len(held) == radar.MAX_CONNECTIONS
+
+
 def test_connections_above_the_limit_are_closed_at_once() -> None:
     feed = Feed()
     running = Running(feed)
