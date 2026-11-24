@@ -4695,6 +4695,241 @@ nothing ran with a real tool, real footage or a real camera.
    25 fps with the tools on the run machine; hypothesis 1 against `72fad94` at 95% (item 5).
 10. **Proposed text** (no change to `CLAUDE.md`): none.
 
+
+## 2026-11-23 — The offline tests on Linux in CI
+
+Session "eng - linux ci" of round 7. Base `main` 72fad94. The owner approved a workflow in the
+public repository with no secret. Until now nothing of this project had run on Linux; the run
+machine is Linux, the build machine is a Mac (arm64).
+
+1. **The workflow** `.github/workflows/offline-tests.yml`, on every pull request and every push
+   to `main`. Never `pull_request_target`; `permissions: contents: read`; the checkout keeps no
+   credentials (`persist-credentials: false`); no secret and no token beyond the checkout; a
+   `concurrency` group per ref that cancels older runs; `timeout-minutes: 30` per job; the runner
+   image `ubuntu-24.04`. Jobs: "full run, Python 3.12" and "full run, Python 3.13" (the guard on
+   the tracked files, `tools/run_tests.py -m "slow or not slow"`, both demos, `stream
+   --synthetic`, each later step also after a failed one) and "full run in one process, Python
+   3.13" (`python -m pytest -m "slow or not slow" -rs`). `tests/test_workflows.py` loads every
+   workflow with the YAML parser of the project and checks these rules, actions pinned by full
+   commit, a check sum for every download and hashes for every install.
+2. **Actions**, pinned by commit; the commit of each release tag was read on 2026-11-23 through
+   the API of github.com (published, not measured):
+
+   | Action | Version | Commit | Release page, date |
+   |---|---|---|---|
+   | `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | github.com/actions/checkout/releases/tag/v7.0.1, 2026-07-20 |
+   | `actions/setup-python` | v7.1.0 | `6d4fd22b20465ccc0f7354476588e8df7c9ca0e0` | github.com/actions/setup-python/releases/tag/v7.1.0, 2026-10-22 |
+
+3. **Packages.** `locks/ci-linux.txt` holds the versions of the build machine (read from its
+   environment) for the offline tests; `locks/ci-linux-hooks.txt` those of its `pre-commit`.
+   Exact versions with `--require-hashes --only-binary :all:`; each hash is the SHA-256 of a wheel
+   on the JSON page of the release on pypi.org (every wheel for Linux x86_64 with CPython 3.12 or
+   3.13, and the wheel for any platform), read on 2026-11-23 without a download. The date is the
+   first upload of the release; the youngest is 25 days old (published, not measured):
+
+   | Package | Version | Uploaded | | Package | Version | Uploaded |
+   |---|---|---|---|---|---|---|
+   | numpy | 2.5.4 | 2026-10-10 | | pre-commit | 4.7.0 | 2026-10-12 |
+   | opencv-python-headless | 5.0.0.93 | 2026-07-02 | | cfgv | 3.5.0 | 2025-11-19 |
+   | scipy | 1.18.1 | 2026-08-21 | | distlib | 0.4.4 | 2026-10-16 |
+   | pydantic | 2.14.2 | 2026-10-29 | | filelock | 4.2.4 | 2026-10-19 |
+   | pydantic-core | 2.50.2 | 2026-10-29 | | identify | 2.6.20 | 2026-09-26 |
+   | pyyaml | 6.0.3 | 2025-09-25 | | nodeenv | 1.11.0 | 2026-09-26 |
+   | pytest | 9.2.0 | 2026-10-27 | | platformdirs | 4.13.5 | 2026-10-19 |
+   | pluggy | 1.7.0 | 2026-10-15 | | python-discovery | 1.6.4 | 2026-10-19 |
+   | iniconfig | 2.3.1 | 2026-10-06 | | virtualenv | 21.14.5 | 2026-10-02 |
+   | packaging | 26.3 | 2026-08-04 | | | | |
+   | pygments | 2.21.0 | 2026-08-17 | | | | |
+   | annotated-types | 0.8.0 | 2026-07-23 | | | | |
+   | typing-extensions | 4.16.0 | 2026-07-02 | | | | |
+   | typing-inspection | 0.4.4 | 2026-08-12 | | | | |
+
+   `gitleaks` 8.30.1 (the version of the build machine; release of 2026-03-21) comes from the
+   file `gitleaks_8.30.1_linux_x64.tar.gz` of its release page on github.com and is checked
+   against the line of that file in `gitleaks_8.30.1_checksums.txt` (SHA-256 `551f6fc8...70eb`,
+   in the workflow). The model SDK and the external tools are not installed. No lock file of
+   another form is committed (rule 3).
+4. **OpenCV: the headless wheel.** The full wheel `opencv-python` needs the system graphics
+   library (`libGL.so.1`) on Linux; installing a system package needs the package index of the
+   runner image, which is neither pinned nor hashed. The headless wheel of the same version gives
+   the same `cv2` module without the window functions, and the package calls none of them
+   (`imshow`, `namedWindow`, `waitKey`: no hit). `import cv2` is unchanged. The video writer of
+   the Linux wheel has `mp4v` and `MJPG`; it has no H.264 encoder, so `vlm/video.py` falls back
+   from `avc1` to `mp4v` there.
+5. **The leak check in CI has no deny-list** (`.git/guard-deny.txt` stays on each machine): the
+   guard prints its notice and the rule `deny` is off; every other rule of `--tracked` runs, and
+   it passed. `doctor --no-api` is left out: it needs the hooks installed in the clone and the
+   deny-list. The workflow names one host, github.com, which `tools/allowed_hosts.txt` has.
+6. **One process, a second job: yes.** It runs beside the other jobs (no longer wall time than
+   the slowest job), and it is the only run where all tests share one interpreter, as with
+   `python -m pytest`. With `-rs` it also prints the reason of every skipped test.
+7. **Prediction against result.** Hypothesis: the full offline run passes on Linux without a code
+   change. The ranked list was written before the first result (notes of this group of sessions).
+
+   | Predicted (rank) | Result on Linux |
+   |---|---|
+   | 1 live chain with a pace ends with code 2 before the tools end | passed |
+   | 2-5 thread and pipe timing of `test_feed.py`, `test_live_feed.py` | passed |
+   | 6 frame rate of a rewritten mp4 (FFmpeg of the wheel) | passed |
+   | 7 dissolve found on decoded `mp4v` frames | passed |
+   | 8 git process counts and messages of the guard | passed |
+   | 9-10 `avc1` fallback, truncated Motion JPEG | passed |
+   | process start method, `sysctl` (no risk: none used) | no failure |
+   | skips: 9 to 10 | 26 (below) |
+   | not predicted: YAML of the workflow | round 1 refused the file |
+   | not predicted: a stop signal during `Thread.join` on Python 3.12 | round 2 failed (item 8) |
+
+   So the hypothesis failed twice for reasons that the static read did not see: once in the
+   workflow, once in the code (a real defect, item 8). None of the ten predicted risks failed.
+8. **A defect of Python 3.12 in the wait for paid requests in flight.** Round 2 failed on Python
+   3.12 only: `test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight` logged
+   "1 model requests were in flight" instead of 2. Cause (measured on the build machine with its
+   Python 3.12.16 and 3.13.18, stdlib only): on 3.12 a `KeyboardInterrupt` during `Thread.join`
+   of a running thread marks that thread as stopped (`is_alive()` false) and every later join of
+   it returns at once; on 3.13 the thread stays alive and the next join waits. Upstream: CPython
+   issue 90882 on github.com (python/cpython, "Thread spuriously marked dead after interrupting a
+   join call", first filed in 2022 as bpo-46726), closed on 2025-03-05 with the words that it is
+   fixed in Python 3.13 and that 3.12 still has it (read on 2026-11-23; published, not measured).
+   The wait of
+   `pipeline._finish_requests_in_flight` joined the threads of the pool, so on 3.12 a second
+   Ctrl-C ended the wait while a paid request was still in flight: its answer could be lost
+   before it was stored and recorded. Fix: `_InFlight` counts a request when its thread begins
+   it, under one lock with a stop flag; at the stop the set is closed, so a request that has not
+   begun is not sent (also one whose thread took it already, or whose submission an
+   interruption cut short), and the wait sleeps in steps of 10 ms until no request is sent. It
+   joins no thread and waits on no condition or future. The pool is shut down with `wait=False`;
+   its threads end after their last request. A model of the test (the code of `pipeline.py`, a
+   fake model, the first Ctrl-C while two requests are at the model, a real second signal 50 ms
+   after the wait began; 100 runs per arm): Python 3.12.16, old code, the warning named 1 request
+   in 100 of 100 runs and an answer was lost in 43 of 100; new code, 2 requests and both answers
+   in 100 of 100; Python 3.13.18, new code, 100 of 100. Each new test fails with a code that has
+   its defect: joins of the pool that return at once (as on 3.12); a request whose thread took it
+   but had not begun at the stop; a request queued by an interrupted submission; a second Ctrl-C
+   while the pool cancels a queued request (a wait on futures hung there). Two first versions of
+   this fix were wrong and are replaced: commit 2776c9d (only the test: a slow start of the
+   second thread) and commit e5daf53 (a wait on futures: a request queued by an interrupted
+   submission was sent after the return, and a cancel cut short by a second Ctrl-C made the wait
+   hang). Two second readers found both. In the command line a stop also sets the stop flag of
+   the model clients, which refuse a new request, so the risk of these windows was low there.
+   The run machine uses Python 3.13, where the joins of the old code were right; `pyproject.toml`
+   allows 3.12.
+   Planted bugs in the new wait, one at a time, against `tests/test_pipeline.py` and
+   `tests/test_cli.py` (413 tests): no close at the stop, the stop flag ignored, no retry after a
+   second signal, and P01 of the entry "A planted-bug check of the money guards" (no stop after a
+   failure) each end with exit code 1 (2 to 4 tests fail); a wait that returns at once and a count
+   that is never lowered each end with exit code 2 (a worker of the runner did not end normally).
+   6 of 6 found.
+   A third reader (a fuzzer that raised a Ctrl-C at each of 471 points of the calling thread,
+   Python 3.13, and real signals on 3.12 and 3.13) found no fault for one Ctrl-C and one gap that
+   is not new: two different stop signals pending at the same time (for example SIGINT and
+   SIGTERM, or SIGHUP and SIGTERM when a terminal closes). Python runs one handler per check;
+   the second raises at the next check, which can be the jump back of the retry loop or the entry
+   of `_finish_requests_in_flight`, outside its `try`. The function then returns with requests in
+   flight (12 of 12 runs of its script). The code of 72fad94 does the same (3 of 3 runs of the
+   same script on 3.13), so it is not a regression; in the command line the stop flag of the
+   clients still refuses new requests, but the measured cost can be printed before the ledger
+   lines of the answers in flight. A fix needs the signal handler of `cli.py` to hold a second
+   signal back while the pool waits, as it does for a call in the main thread
+   (`_CALL_IN_FLIGHT`): proposed as its own task, not done here. It also named stdlib limits that
+   are not regressions: on 3.13 a Ctrl-C at one jump inside `concurrent.futures.wait` can keep
+   the locks of the futures and hang the exit (a window of microseconds, not hit in 292 runs with
+   a real Ctrl-C); a Ctrl-C inside `Thread.start` of the pool can leave a thread that never
+   starts; a Ctrl-C in a few places of the stdlib becomes `RuntimeError: release unlocked lock`.
+9. **Skipped tests.** The build machine skips 1. Round 2 on Linux skipped 26: 21 tests of the git
+   hooks and the secret scan (`pre-commit` and `gitleaks` were not installed; the run machine has
+   both, so these skips were a hole: CI installs both now), 4 tests of a disk that does not tell
+   letter cases apart (`tests/test_cli.py`: a Linux disk tells them apart, so another spelling is
+   another path; right, and the tests of that side run), and the image reader of
+   `tools/run_tool.py`. Round 3 skipped 5: the 4 tests of letter case and the image reader. The
+   image reader skips on the build machine too (its environment has no Pillow); the script runs
+   in the environment of the tool, which brings its own Pillow, and no version of Pillow is
+   known from the build machine to pin. So Pillow stays out of the pins of CI, and the skip
+   stays: CI tests what the build machine tests.
+10. **Times of round 2** (run 45302990921, one run, 4 CPUs, a shared machine; measured): install
+    13 s, guard below 1 s, full run in 4 processes 132 s (3.12 and 3.13), each demo 6 s, `stream
+    --synthetic` 6 s, a job about 3 min; the job of one process 5 min 46 s (pytest 327 s).
+    `stream --synthetic` on the runner: total per frame median 25.84 ms, 95th percentile 31.99
+    ms, largest 39.07 ms. The runner had Python 3.12.16 and 3.13.18 and pip 26.3.
+11. **What CI does not cover:** no model call, no real tool, no footage, no dataset, no GPU, and
+    a GitHub runner is not the run machine. The full wheel `opencv-python` that `pyproject.toml`
+    installs on the run machine is not tested in CI.
+12. **The build machine** at the time of this work: the three tests of the live chain in
+    `tests/test_live_feed.py` hang there at a low load (a stand-in tool ends with a broken pipe
+    and `merge-feeds` waits in the open of the other named pipe). Session "eng - review round 6"
+    owns that code and its fix; until the fix is on `main` the full run on the build machine can
+    fail in these three tests only. They passed in CI.
+13. **The secret scan of the tests read compiled files.** Round 3 failed in all three jobs in
+    `test_text_of_the_repository_passes_the_secret_scan[tests]`: `gitleaks dir` read the folder
+    on the disk, with the `__pycache__` files that the run had written, where the fake keys of
+    the tests stand without their allow marks (rules `openrouter-key`, `google-auth-key`). The
+    build machine never failed so: its shell sets `PYTHONDONTWRITEBYTECODE=1`, so Python writes no
+    compiled file there; with that variable unset the old test failed on the build machine too.
+    The run machine writes compiled files by default, so its first full run would have failed
+    the same way. The test now scans a copy of the files that git tracks (`git ls-files`), which
+    is what a commit holds; the scan stays on for every folder, and `.github` and `locks` are
+    scanned too. A new test checks that the copy holds no compiled file.
+14. **CI rounds.** Round 1 (6528870): the workflow file was refused (item 7). Round 2 (9f51927,
+    run 45302990921): 3.13 and one process green, 3.12 one failure (item 8), 26 skipped. Round 3
+    (f3731a7, run 45308492172): the stop-signal test passed on 3.12 and 3.13; 3504 passed, 1
+    failed (item 13), 5 skipped in each job; runner 144.8 s (3.13) and 145.6 s (3.12), one
+    process 249.1 s; the checksum of gitleaks passed and the 21 tests of the hooks ran. Round 4
+    (611861c, run 45311659695): green in all three jobs, the first full pass on Linux: 3508
+    passed, 5 skipped in each; runner 206.4 s (3.12) and 207.6 s (3.13), one process 249.9 s.
+15. **Why the run in 4 processes took 132, 145 and 207 s in rounds 2 to 4.** A new clone has no
+    stored test times, so `tools/run_tests.py` balances the workers by test count, and the wall
+    time is that of the slowest worker. Its lines in the log: round 3, workers 38.6 to 138.5 s;
+    round 4, 111.7 to 198.7 s (3 more tests moved the split, and a worker got the heavy files).
+    The run in one process, the same tests in one interpreter, took 249.1 s in round 3 and 249.9
+    s in round 4; round 2 took 326.7 s without the 21 tests of the hooks. So the hooks do not
+    explain the longer runs; the split by count and a shared runner do (one run per round, so the
+    spread of the runner is not known). CI keeps no times file between runs.
+16. **After the merges of round 7** (`main` d0c5589, then aebbf1e: the second read of the live
+    feed, the live output and the radar viewer). Build machine, 14 workers: default run 3,571
+    passed, 1 skipped, 11 deselected, exit 0, 44.1 s (load 6.9); full run 3,582 passed, 1 skipped,
+    exit 0, 49.3 s (load 21.5); the three tests of the live chain passed (also 3 runs of the live
+    feed tests alone at a load of 12 to 17). `guard.py --tracked`: exit 0. The `demo` predictions of
+    both engines are byte-equal to 72fad94 (SHA-256 `bb50efd43536dd71...` and
+    `1f97af18358d652b...`); `stream --synthetic` exit 0. The RUNBOOK now says 11 slow tests (it
+    said 9) and the HANDOVER the counts of this full run.
+17. **The video writer on Linux has no H.264.** Round 5 (4fad128 with `main` d0c5589, run
+    45313141791, green: 3532 passed, 6 skipped in each job; runner 115.0 s on 3.12 and 130.4 s on
+    3.13, one process 272.7 s) skipped one more test: `tests/test_vlm_video.py:931`, "OpenCV
+    cannot write the codec avc1 here". Measured: the headless wheel 5.0.0.93 on the Linux runner
+    cannot open `avc1`, so `vlm/video.py` writes the videos of the model steps with `mp4v`
+    (MPEG-4 Part 2) in an MP4 file; the annotated video (`render.py`) is `mp4v` on every machine.
+    On the build machine (the full wheel 5.0.0.93, macOS) `avc1` opens through the FFmpeg backend
+    of the wheel and through AVFoundation, and `mp4v` through FFmpeg only (a check of
+    `cv2.VideoWriter`, 64 x 48 pixels). Published (read on 2026-11-23): the README of
+    opencv-python (github.com/opencv/opencv-python and its page on pypi.org) says that all wheels
+    ship with FFmpeg under the LGPLv2.1 and that the headless wheels have no GUI; it names no
+    H.264 encoder and does not say that the video input and output of the four packages are the
+    same. So whether the full wheel on Linux (the run machine) opens `avc1` is not known; the same
+    FFmpeg in both is likely (inferred, not measured). The providers: the video page of Gemini
+    (ai.google.dev, now aistudio.google.com/docs/video-understanding) lists MIME types such as
+    `video/mp4` and names no codec; the video page of OpenRouter (openrouter.ai/docs) lists
+    `video/mp4`, `video/mpeg`, `video/mov` and `video/webm` and names no codec. So an `mp4v` file
+    is a `video/mp4` request of an accepted type, and whether the model decodes MPEG-4 Part 2 as
+    well as H.264 is not published. The video cache key of pull request 25 holds the frames of the
+    clip and the settings, not the bytes: an answer stored for an H.264 video of the build machine
+    is found again for the `mp4v` video of the run machine and counted as other bytes (the test
+    above checks it where both codecs open; on Linux it skips). The model would see other pixels
+    than the stored answer saw only on a paid run after a replay that used another machine. What
+    the owner checks on the run machine: the codec (RUNBOOK, section 1, the CI part: one free
+    command), then `doctor --video` (gate G0), whose video checks send a video written by the same
+    code. Open owner decision 44 of `docs/HANDOVER.md`, section 11.1.
+18. **Readers of the change in `pipeline.py`.** Four readers that had not seen my reasoning read
+    the code. The first found the cause on 3.12 (item 8), the second the two faults of e5daf53,
+    the third and the fourth (the fourth from the diff against 72fad94 alone) found no fault for
+    one stop signal, the same normal and failure paths as at 72fad94 (the fourth: 299 random
+    cases, the same answers and the same errors on 3.12 and 3.13), and the gap of two different
+    signals at the same time (item 8; 40 of 40 bursts of 2,000 signals from another process ended
+    the wait early, on 3.12 and 3.13, and 20 of 20 on the code of 72fad94; 0 of 60 at the rate of a
+    person). Both named limits that are not new: a single Ctrl-C logs no warning (the warning is
+    for a second signal), an interruption at two instructions inside `executor.submit` can leave
+    a thread of the pool that never ends, and on 3.12 a third signal inside the lock of a logging
+    handler can block the wait (reasoning). The docstrings now name the gap of two signals.
+
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same

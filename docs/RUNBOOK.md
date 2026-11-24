@@ -89,11 +89,11 @@ tests" of 2026-11-22). Each run works in one process or in several processes at 
 same tests and the same results (entry "The offline tests in several processes" of 2026-11-22):
 
 ```bash
-python tools/run_tests.py                          # default run, after each change: all but the 9 slow tests
+python tools/run_tests.py                          # default run, after each change: all but the 11 slow tests
 python tools/run_tests.py -m "slow or not slow"    # full run, before a commit: every test
 python -m pytest                                   # the default run in one process
 python -m pytest -m "slow or not slow"             # the full run in one process
-python -m pytest -m slow                           # the 9 slow tests alone
+python -m pytest -m slow                           # the 11 slow tests alone
 ```
 
 - `tools/run_tests.py` imports only the standard library. It lists the tests with one
@@ -122,6 +122,70 @@ python -m pytest -m slow                           # the 9 slow tests alone
   scene, frames read from image files, the measured camera motion, the paint alignment, JPEG
   bytes, the git state of this checkout) once per test process. `PITCHVLM_TEST_CACHE=0 python -m
   pytest` runs without these caches. Each worker of `tools/run_tests.py` has its own caches.
+
+### The offline tests on Linux in CI
+
+GitHub Actions runs `.github/workflows/offline-tests.yml` for every pull request and every push
+to `main` (`docs/DECISIONS.md`, entry "The offline tests on Linux in CI" of 2026-11-23). It runs
+on a GitHub runner (`ubuntu-24.04`, x86_64), with no secret and a token that can only read:
+
+| Job | Python | Steps |
+|---|---|---|
+| `full run, Python 3.12` and `full run, Python 3.13` | 3.12, 3.13 | the guard on the tracked files, the full run through `tools/run_tests.py`, both demos, `stream --synthetic` |
+| `full run in one process, Python 3.13` | 3.13 | `python -m pytest -m "slow or not slow"` |
+
+The same commands run on any Linux machine with the pinned packages of CI:
+
+```bash
+python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt -r locks/ci-linux-hooks.txt
+python3 tools/guard.py --tracked
+python tools/run_tests.py -m "slow or not slow"
+PYTHONPATH=src python -m pitchvlm.cli demo --out /tmp/demo-vlm
+PYTHONPATH=src python -m pitchvlm.cli demo --engine detector --out /tmp/demo-detector
+PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --out /tmp/stream
+```
+
+- To read a failure: open the run on the page of the pull request (Checks), then the failed
+  step. `tools/run_tests.py` prints the full text of each failed test and one summary line at
+  the end. The steps after a failed step still run, so one run shows every failure. The step
+  "Show the machine" gives the Python, the kernel, the core count, the start method of
+  processes and the installed packages.
+- CI has no deny-list (`.git/guard-deny.txt` stays on each machine), so the guard prints its
+  notice and the rule `deny` is off; every other rule of `--tracked` runs. CI installs
+  `pre-commit` (`locks/ci-linux-hooks.txt`) and `gitleaks` (the release file of its version on
+  github.com, checked against its SHA-256 in the workflow), so the tests of the hooks and of the
+  secret scan run; without them 21 tests skip. `doctor --no-api` is left out: it needs the hooks
+  installed in the clone and the deny-list.
+- Skipped tests on Linux: 5. Four tests of a disk that does not tell letter cases apart (a
+  Linux disk tells them apart, so another spelling is another path there; the tests of that
+  side run), and the reader of images of `tools/run_tool.py` (Pillow is in the environment of
+  the tool only), as on the build machine. The step "List the skipped tests" names them; the
+  job of one process gives the reasons (`-rs`).
+- OpenCV is the headless wheel (`opencv-python-headless`) of the same version as
+  `opencv-python`: the same `cv2` module without the window functions, which need a system
+  graphics library on Linux. The package does not use those functions.
+- What CI does not cover: a model call, a real tool, footage, a dataset, a GPU. A GitHub runner
+  is not the run machine.
+- The video writer of OpenCV on Linux: in CI it cannot open H.264 (`avc1`), so the videos of the
+  model steps fall back to MPEG-4 Part 2 (`mp4v`); the annotated video is `mp4v` everywhere. On the
+  run machine, check it once (free, no model call): the command prints the codecs that open.
+
+```bash
+python -c "import cv2, tempfile, os; print([c for c in ('avc1', 'mp4v') if cv2.VideoWriter(os.path.join(tempfile.mkdtemp(), 'v.mp4'), cv2.VideoWriter_fourcc(*c), 25.0, (64, 48)).isOpened()])"
+```
+
+  Then `doctor --video` (gate G0, paid) sends a video written by the same code to the model
+  (`docs/HANDOVER.md`, section 11.1, decision 44).
+- To update the pins: change the version in `locks/ci-linux.txt` to the version of the build
+  machine, only for a release that is 7 days old or older. Take each hash from the page
+  `https://pypi.org/pypi/<package>/<version>/json` (the field `digests.sha256` of every wheel
+  for Linux x86_64 with CPython 3.12 or 3.13, and of the wheel for any platform), and write the
+  date of the release in the comment line. `--require-hashes` refuses a package without a hash,
+  so a missing dependency stops the install. The same for `locks/ci-linux-hooks.txt` with the
+  versions of `pre-commit` of the build machine. The actions of the workflow are pinned by
+  commit: take a new commit from the release page of the action and write its version in the
+  comment. For `gitleaks`, take the line of `linux_x64` from the file
+  `gitleaks_<version>_checksums.txt` of its release page.
 
 The key lives in the environment variable `GEMINI_API_KEY`. Set it in each new terminal:
 

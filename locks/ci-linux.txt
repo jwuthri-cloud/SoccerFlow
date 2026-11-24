@@ -1,0 +1,57 @@
+# Pinned packages of the offline tests in CI (.github/workflows/offline-tests.yml), Linux x86_64,
+# Python 3.12 and 3.13. Install with:
+#   python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+# The versions are those of the build machine (docs/DECISIONS.md, entry "The offline tests on
+# Linux in CI" of 2026-11-23). OpenCV is the headless wheel: the same version and the same cv2
+# module as opencv-python, without the window functions and without the system graphics library
+# that the full wheel needs on Linux. The model SDK and the external tools are not in this list.
+# A hash is that of a wheel on the public index (pypi.org, its JSON page of the release): every
+# wheel for Linux x86_64 with CPython 3.12 or 3.13, and the wheel for any platform. The date is
+# the first upload of the release.
+# annotated-types 0.8.0, uploaded 2026-07-23
+annotated-types==0.8.0 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+# iniconfig 2.3.1, uploaded 2026-10-06
+iniconfig==2.3.1 \
+    --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+# numpy 2.5.4, uploaded 2026-10-10
+numpy==2.5.4 \
+    --hash=sha256:fbde6962867ee75b48b0ee29b2b9372ec5d617799dbaf38e82dc0596f2f7738a \
+    --hash=sha256:6ffa07666f8da0eef81d149934a626d0d95fbd6838432a33e66245423a9062c0
+# opencv-python-headless 5.0.0.93, uploaded 2026-07-02
+opencv-python-headless==5.0.0.93 \
+    --hash=sha256:09a872a157c1376ab922a69bbf22f9a95bcc7b658a9d8b436a60212b02b2eeb4 \
+    --hash=sha256:ed709fdf9aa0bd1f2ed8549e71d19449b03a675bb581eb292285f6861953be37
+# packaging 26.3, uploaded 2026-08-04
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+# pluggy 1.7.0, uploaded 2026-10-15
+pluggy==1.7.0 \
+    --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec
+# pydantic 2.14.2, uploaded 2026-10-29
+pydantic==2.14.2 \
+    --hash=sha256:7efbf7507b937931cd32a5755acb00ea1cf5ccb1d4e8067a5850d5069e382118
+# pydantic-core 2.50.2, uploaded 2026-10-29
+pydantic-core==2.50.2 \
+    --hash=sha256:9667637665acba166a7dbbc786f14c50512d3a01f7199e0e1a13b929e92d7c7a \
+    --hash=sha256:31a1fb3ffbd1195b24490f671d12623dd4c9bfa56d6af0a299fa43b516134f5b
+# pygments 2.21.0, uploaded 2026-08-17
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+# pytest 9.2.0, uploaded 2026-10-27
+pytest==9.2.0 \
+    --hash=sha256:07acdcf88ec174f907dc01af70bf52d49b014bbab03faeeade31c96b18c2e588
+# pyyaml 6.0.3, uploaded 2025-09-25
+pyyaml==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6
+# scipy 1.18.1, uploaded 2026-08-21
+scipy==1.18.1 \
+    --hash=sha256:f55fa87b6c612ecd6b058f167c53231b1d14e412efe361d3d6e38b3631c73218 \
+    --hash=sha256:fdaf5ea890a6183d0565f51a61799d67081bd5b1cf03c5f4b3fd3732108625c9
+# typing-extensions 4.16.0, uploaded 2026-07-02
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+# typing-inspection 0.4.4, uploaded 2026-08-12
+typing-inspection==0.4.4 \
+    --hash=sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147

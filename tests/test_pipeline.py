@@ -19,6 +19,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable, Collection, Sequence
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -1652,48 +1653,60 @@ def test_at_most_max_parallel_requests_are_in_flight(
     assert max(in_flight) == 2
 
 
+class AtTheModel:
+    """The fake model of the tests of an interruption. Records each request when it reaches the model, waits for
+    ``release`` (when given), takes ``seconds`` and records the answer."""
+
+    def __init__(self, scene: SyntheticScene, seconds: float, release: threading.Event | None = None) -> None:
+        self.fake = FakeBackend(scene)
+        self.seconds = seconds
+        self.release = release
+        self.reached: list[str] = []
+        self.answered: list[str] = []
+        self.both_reached = threading.Event()
+        self.first_reached = threading.Event()
+        self.lock = threading.Lock()
+
+    def generate(self, request: VLMRequest) -> VLMResponse:
+        with self.lock:
+            self.reached.append(request.cache_key())
+            self.first_reached.set()
+            if len(self.reached) == 2:
+                self.both_reached.set()
+        if self.release is not None:
+            assert self.release.wait(timeout=10.0)
+        time.sleep(self.seconds)
+        response = self.fake.generate(request)
+        with self.lock:
+            self.answered.append(request.cache_key())
+        return response
+
+
+def interrupted_once(event: threading.Event) -> Callable[[object], None]:
+    """A stand-in for the wait of the pool: Ctrl-C comes once ``event`` is set."""
+
+    def interrupted_wait(futures: object) -> None:
+        assert event.wait(timeout=10.0)
+        raise KeyboardInterrupt
+
+    return interrupted_wait
+
+
 def test_interrupted_thread_pool_waits_for_every_request_in_flight(
     scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An interruption returns only after the requests in flight are answered, so that their answers are kept.
-
-    The hard case is an interruption that comes while the pool starts a thread: that thread works, but
-    the pool does not have it in its list and does not wait for it. The pool of this test has forgotten
-    its threads when it shuts down, and the wait for the answers is interrupted after 50 milliseconds.
-    """
+    """Ctrl-C while two requests are at the model returns only after both are answered, so that their answers are
+    kept. The other requests are never sent."""
     _, requests = recorded
-    fake = FakeBackend(scene)
-    answered: list[str] = []
-
-    class SlowBackend:
-        """The fake model. Every request takes 200 milliseconds."""
-
-        def generate(self, request: VLMRequest) -> VLMResponse:
-            time.sleep(0.2)
-            response = fake.generate(request)
-            answered.append(request.cache_key())
-            return response
-
-    class ForgetfulPool(pipeline.ThreadPoolExecutor):
-        """A thread pool that does not know its threads any more when it shuts down."""
-
-        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            self._threads.clear()
-            super().shutdown(wait, cancel_futures=cancel_futures)
-
-    def interrupted_wait(futures: object) -> None:
-        time.sleep(0.05)
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", ForgetfulPool)
-    monkeypatch.setattr(pipeline, "wait", interrupted_wait)
+    model = AtTheModel(scene, 0.2)
+    monkeypatch.setattr(pipeline, "wait", interrupted_once(model.both_reached))
     two_requests = requests_of(requests, "people")[:2]
 
     with pytest.raises(KeyboardInterrupt):
-        pipeline._generate_all(SlowBackend(), [*two_requests, *requests_of(requests, "landmarks")], 2)
+        pipeline._generate_all(model, [*two_requests, *requests_of(requests, "landmarks")], 2)
 
-    # The two requests that were in flight are answered. The other requests were never sent.
-    assert sorted(answered) == sorted(request.cache_key() for request in two_requests)
+    assert sorted(model.answered) == sorted(request.cache_key() for request in two_requests)
+    assert sorted(model.reached) == sorted(model.answered)
 
 
 @pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="this system cannot send a signal to one thread")
@@ -1705,44 +1718,33 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 ) -> None:
     """An operator presses Ctrl-C a second time while the command waits for the answers of the requests in flight.
 
-    The second signal is a real one, sent to the thread of the test. It is sent after the pool began
-    to wait for its threads, and the two requests in flight take 150 milliseconds more from then on.
+    The first Ctrl-C comes while two requests are at the model. The second signal is a real one, sent to the
+    thread of the test 50 milliseconds after the wait began, and the two requests take 150 milliseconds more
+    from then on. On Python 3.12 the signal came during ``Thread.join``, which marked the thread as stopped:
+    the warning named 1 request and the wait could end before both answers (CI on Linux; the wait joins no
+    thread now).
     """
     _, requests = recorded
-    fake = FakeBackend(scene)
-    answered: list[str] = []
-    pool_waits = threading.Event()
     second_signal_sent = threading.Event()
+    model = AtTheModel(scene, 0.15, release=second_signal_sent)
+    wait_begins = threading.Event()
     waiting_thread = threading.get_ident()
 
-    class SlowBackend:
-        """The fake model. A request is answered 150 milliseconds after the second signal."""
-
-        def generate(self, request: VLMRequest) -> VLMResponse:
-            assert second_signal_sent.wait(timeout=10.0)
-            time.sleep(0.15)
-            response = fake.generate(request)
-            answered.append(request.cache_key())
-            return response
-
     class WatchedPool(pipeline.ThreadPoolExecutor):
-        """A thread pool that says when it begins to wait for its threads."""
+        """A thread pool that says when the wait for the requests in flight begins (its shutdown)."""
 
         def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-            pool_waits.set()
+            wait_begins.set()
             super().shutdown(wait, cancel_futures=cancel_futures)
 
-    def interrupted_wait(futures: object) -> None:
-        raise KeyboardInterrupt
-
     def send_second_signal() -> None:
-        assert pool_waits.wait(timeout=10.0)
+        assert wait_begins.wait(timeout=10.0)
         time.sleep(0.05)
         signal.pthread_kill(waiting_thread, signal.SIGINT)
         second_signal_sent.set()
 
     monkeypatch.setattr(pipeline, "ThreadPoolExecutor", WatchedPool)
-    monkeypatch.setattr(pipeline, "wait", interrupted_wait)
+    monkeypatch.setattr(pipeline, "wait", interrupted_once(model.both_reached))
     two_requests = requests_of(requests, "people")[:2]
     # A process that a shell started in the background ignores SIGINT. The test needs the handler of Python.
     earlier_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -1751,8 +1753,8 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 
     try:
         with caplog.at_level(logging.WARNING, logger="pitchvlm.pipeline"), pytest.raises(KeyboardInterrupt):
-            pipeline._generate_all(SlowBackend(), [*two_requests, *requests_of(requests, "landmarks")], 2)
-        in_flight_answered = sorted(answered)
+            pipeline._generate_all(model, [*two_requests, *requests_of(requests, "landmarks")], 2)
+        in_flight_answered = sorted(model.answered)
     finally:
         sender.join()
         signal.signal(signal.SIGINT, earlier_handler)
@@ -1762,46 +1764,184 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
     assert "a stop signal came while 2 model requests were in flight" in caplog.text
 
 
+def test_a_request_that_has_not_begun_at_the_stop_is_not_sent(
+    scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The thread of the second request took it but is held back 200 milliseconds (a busy machine); Ctrl-C comes
+    while the first request is at the model. The second request has not begun: it is never sent."""
+    _, requests = recorded
+    model = AtTheModel(scene, 0.1)
+    submitted = 0
+
+    class LatePool(pipeline.ThreadPoolExecutor):
+        """A thread pool whose thread of the second request begins 200 milliseconds after it took it."""
+
+        def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+            nonlocal submitted
+            submitted += 1
+            delay = 0.2 if submitted == 2 else 0.0
+
+            def begin_late(*inner: Any, **named: Any) -> Any:
+                time.sleep(delay)
+                return fn(*inner, **named)
+
+            return super().submit(begin_late, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", LatePool)
+    monkeypatch.setattr(pipeline, "wait", interrupted_once(model.first_reached))
+    two_requests = requests_of(requests, "people")[:2]
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline._generate_all(model, [*two_requests, *requests_of(requests, "landmarks")], 2)
+    time.sleep(0.4)  # the held-back thread has begun by now
+
+    assert model.reached == model.answered == [two_requests[0].cache_key()]
+
+
+def test_a_request_whose_submission_was_interrupted_is_not_sent_after_the_return(
+    scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C comes inside the submission of the second request, after the pool queued it: the caller never gets
+    its future. Its thread begins 200 milliseconds later. The request must not reach the model after the
+    function returned."""
+    _, requests = recorded
+    model = AtTheModel(scene, 0.1)
+    submitted = 0
+
+    class InterruptedPool(pipeline.ThreadPoolExecutor):
+        def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+            nonlocal submitted
+            submitted += 1
+            delay = 0.2 if submitted == 2 else 0.0
+
+            def begin_late(*inner: Any, **named: Any) -> Any:
+                time.sleep(delay)
+                return fn(*inner, **named)
+
+            future = super().submit(begin_late, *args, **kwargs)
+            if submitted == 2:
+                assert model.first_reached.wait(timeout=10.0)
+                raise KeyboardInterrupt
+            return future
+
+    monkeypatch.setattr(pipeline, "ThreadPoolExecutor", InterruptedPool)
+    two_requests = requests_of(requests, "people")[:2]
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline._generate_all(model, [*two_requests, *requests_of(requests, "landmarks")], 2)
+    reached_at_the_return = list(model.reached)
+    time.sleep(0.4)
+
+    assert model.reached == reached_at_the_return == [two_requests[0].cache_key()]
+
+
+def test_an_interruption_while_the_pool_cancels_a_request_does_not_hang_the_wait(
+    scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second Ctrl-C comes while the pool cancels the queued requests, after it took one off its queue and
+    before it cancelled it: that request stays pending and no thread runs it. The wait still ends."""
+    _, requests = recorded
+    model = AtTheModel(scene, 0.2)
+    real_cancel = Future.cancel
+    cancels = 0
+
+    def cancel_interrupted_once(self: Future[Any]) -> bool:
+        nonlocal cancels
+        cancels += 1
+        if cancels == 1:
+            raise KeyboardInterrupt
+        return real_cancel(self)
+
+    monkeypatch.setattr(Future, "cancel", cancel_interrupted_once)
+    monkeypatch.setattr(pipeline, "wait", interrupted_once(model.first_reached))
+    outcome: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            pipeline._generate_all(model, requests_of(requests, "people")[:3], 1)
+        except BaseException as error:  # noqa: BLE001 - the outcome is checked below
+            outcome.append(error)
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    runner.join(timeout=10.0)
+
+    assert not runner.is_alive(), "the wait for the requests in flight did not end"
+    assert len(outcome) == 1 and isinstance(outcome[0], KeyboardInterrupt)
+    assert cancels >= 2 and len(model.answered) == 1
+
+
 def test_wait_for_the_requests_in_flight_starts_again_after_every_stop_signal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class Worker:
-        """A stand-in for a thread: the first two waits for it are interrupted, the third one ends it."""
+    class InFlight:
+        """A stand-in for the requests in flight: the first two waits are interrupted, the third one ends."""
 
         def __init__(self) -> None:
-            self.joins = 0
+            self.calls: list[str] = []
+            self.waits = 0
 
-        def is_alive(self) -> bool:
-            return self.joins < 3
+        def close(self) -> None:
+            self.calls.append("close")
 
-        def join(self) -> None:
-            self.joins += 1
-            if self.joins < 3:
-                raise KeyboardInterrupt(f"signal {self.joins}")
+        def count(self) -> int:
+            return 1
+
+        def wait(self) -> None:
+            self.waits += 1
+            if self.waits < 3:
+                raise KeyboardInterrupt(f"signal {self.waits}")
 
     class Pool:
-        """A stand-in for the thread pool that counts its shutdown calls."""
+        """A stand-in for the thread pool that records its shutdown calls."""
 
-        def __init__(self) -> None:
-            self.shutdowns: list[bool] = []
+        def __init__(self, in_flight: InFlight) -> None:
+            self.in_flight = in_flight
 
-        def shutdown(self, *, cancel_futures: bool) -> None:
-            self.shutdowns.append(cancel_futures)
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            self.in_flight.calls.append(f"shutdown wait={wait} cancel={cancel_futures}")
 
-    worker, pool = Worker(), Pool()
+    in_flight = InFlight()
     with caplog.at_level(logging.WARNING, logger="pitchvlm.pipeline"):
         with pytest.raises(KeyboardInterrupt, match="signal 2"):
-            pipeline._finish_requests_in_flight(pool, {worker})  # type: ignore[arg-type]
-    assert worker.joins == 3
-    assert pool.shutdowns == [True, True, True]
+            pipeline._finish_requests_in_flight(Pool(in_flight), in_flight)  # type: ignore[arg-type]
+    assert in_flight.waits == 3
+    # No request begins after the stop, and the pool is never asked to join its threads: on Python 3.12 an
+    # interrupted join ends the wait too early.
+    assert in_flight.calls == ["close", "shutdown wait=False cancel=True"] * 3
     assert caplog.text.count("a stop signal came while 1 model requests were in flight") == 2
 
     # Without a signal the wait ends without an error and without a warning.
     caplog.clear()
-    done = Worker()
-    done.joins = 2
-    pipeline._finish_requests_in_flight(Pool(), {done})  # type: ignore[arg-type]
+    done = InFlight()
+    done.waits = 2
+    pipeline._finish_requests_in_flight(Pool(done), done)  # type: ignore[arg-type]
     assert caplog.text == ""
+
+
+def test_the_wait_for_the_requests_in_flight_does_not_rely_on_joining_threads(
+    scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Python 3.12 a stop signal during ``Thread.join`` marks the thread as stopped although it still runs,
+    and every later join of it returns at once. Here every join of a thread of the pool returns at once, on
+    every version: the interrupted call still returns only after both requests in flight are answered."""
+    _, requests = recorded
+    model = AtTheModel(scene, 0.2)
+    real_join = threading.Thread.join
+
+    def join_as_after_an_interruption(self: threading.Thread, timeout: float | None = None) -> None:
+        if self.name.startswith("ThreadPoolExecutor"):
+            return
+        real_join(self, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", join_as_after_an_interruption)
+    monkeypatch.setattr(pipeline, "wait", interrupted_once(model.both_reached))
+    two_requests = requests_of(requests, "people")[:2]
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline._generate_all(model, [*two_requests, *requests_of(requests, "landmarks")], 2)
+
+    assert sorted(model.answered) == sorted(request.cache_key() for request in two_requests)
 
 
 def test_answer_that_cannot_be_parsed_names_its_request(scene: SyntheticScene, source: SyntheticSource) -> None:
