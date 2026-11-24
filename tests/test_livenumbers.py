@@ -1,17 +1,20 @@
 """Tests of the live number step of the streaming path (``livenumbers``, ``stream`` with the number engine model).
 
 The model is a fake: the fake backend of the synthetic scene, or a stub whose answers the test
-sets. The tests use no clock: a request that must stay open waits on an event that the test sets,
-and the order of the worker is the order of its queue. Nothing here says how a real model reads
-a real shirt.
+sets. No test depends on the speed of the machine: a request that must stay open waits on an
+event that the test sets, the order of the worker is the order of its queue, and the queue of
+images is large enough that no image is dropped (``QUEUE``; the drop itself has its own test).
+Nothing here says how a real model reads a real shirt.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -272,8 +275,10 @@ def test_abort_sends_nothing_more_and_waits_for_the_requests_in_flight() -> None
     assert backend.numbers_started.acquire(timeout=60)
     aborting = threading.Thread(target=numbers.abort, daemon=True)
     aborting.start()
-    aborting.join(0.3)
-    assert aborting.is_alive(), "abort returned while a paid request was in flight"
+    deadline = time.monotonic() + 60
+    while not numbers._in_flight._closed and time.monotonic() < deadline:  # the abort refuses new requests now
+        time.sleep(0.01)
+    assert numbers._in_flight._closed and aborting.is_alive(), "abort returned while a paid request was in flight"
     gate.set()
     aborting.join(60)
     assert not aborting.is_alive()
@@ -302,7 +307,7 @@ def numbers_stream(
     history = default_history_frames(NUMBERS, info.fps)
     settings = StreamSettings(delay_frames=delay, history_frames=history)
     stream = DetectorStream(NUMBERS, settings, clip_id=info.clip_id, fps=info.fps, size=(info.width, info.height))
-    numbers = LiveNumbers(NUMBERS, backend, NumberSettings(close_frames=history), info=info)
+    numbers = LiveNumbers(NUMBERS, backend, NumberSettings(close_frames=history, max_pending_images=QUEUE), info=info)
     if live is not None:
         live.start(delay_frames=delay, history_frames=history, numbers=True)
     writer = wire(stream, numbers, live)
@@ -541,3 +546,65 @@ def test_the_stream_wiring_without_numbers_is_the_hook_of_the_live_output(tmp_pa
     assert wire(stream, None, live) is None
     assert stream.on_given == live.given and stream.on_arrived is None
     live.close()
+
+
+def test_a_fault_of_the_reading_of_an_answer_is_a_failure_that_stops_the_asking(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(reading: Any, frame_numbers: Any) -> Any:
+        raise RuntimeError("a fault of the code that reads the answer")
+
+    monkeypatch.setattr(livenumbers, "decide_number", broken)
+    backend = StubBackend()
+    numbers = LiveNumbers(
+        NUMBERS.model_copy(update={"max_parallel": 1}), backend, NumberSettings(max_pending_images=QUEUE), info=INFO
+    )
+    drive(numbers, {0: range(0, 120), 1: range(0, 120), 2: range(0, 120)})
+    assert numbers.finish() == []
+    assert isinstance(numbers.failure, RuntimeError) and len(backend.number_requests()) == 1
+
+
+def test_after_a_fault_of_the_worker_the_frame_path_keeps_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    numbers = LiveNumbers(NUMBERS, StubBackend(), NumberSettings(max_pending_images=QUEUE), info=INFO)
+
+    def broken(state: FrameState) -> None:
+        raise RuntimeError("a fault of the worker")
+
+    monkeypatch.setattr(numbers, "_decided", broken)
+    numbers.given(FrameState(frame=0, players=(player(0),)))
+    deadline = time.monotonic() + 60
+    while numbers.failure is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert isinstance(numbers.failure, RuntimeError)
+    for frame in range(1, 50):
+        numbers.arrived(frame, IMAGE, [PersonDet(box=box_of(0), role="player")])
+        numbers.given(FrameState(frame=frame, players=(player(0),)))
+    assert not numbers._events and not numbers._arrival
+    assert numbers.finish() == []
+
+
+def test_stream_with_numbers_and_a_history_of_zero_frames_runs(tmp_path: Path) -> None:
+    code = cli.main([
+        "stream", "--synthetic", "--frames", "60", "--seed", "2296", "--config", str(NUMBERS_FILE),
+        "--history", "0", "--out", str(tmp_path / "out"), "--allow-dirty",
+    ])
+    assert code == cli.EXIT_OK
+    assert json.loads((tmp_path / "out" / "SNGS-999" / "result.json").read_text())["numbers"]["close_frames"] == 1
+
+
+def test_the_model_session_is_closed_when_the_number_step_cannot_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[Any] = []
+    monkeypatch.setattr(cli, "open_session", lambda *args, **kwargs: type("S", (), {"backend": None})())
+    monkeypatch.setattr(cli, "close_session", lambda opened: closed.append(opened) or {})
+
+    def no_start(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the number step cannot start")
+
+    monkeypatch.setattr(cli, "LiveNumbers", no_start)
+    args = cli.build_parser().parse_args(
+        ["stream", "--out", str(tmp_path), "--clip", str(tmp_path), "--numbers-max", "3", "--cache", str(tmp_path / "c")]
+    )
+    config = PipelineConfig.model_validate(NUMBERS.model_dump())
+    with pytest.raises(RuntimeError, match="cannot start"), contextlib.ExitStack() as stack:
+        cli.open_live_numbers(args, config, INFO, None, StreamSettings(), stack)
+    assert len(closed) == 1

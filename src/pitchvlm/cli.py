@@ -2169,6 +2169,7 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     if config.engines.number == "model":
         numbers_closer = open_live_numbers(args, config, info, scene, settings, stack)
         numbers = numbers_closer.numbers
+        assert numbers is not None
     else:
         print("no step of the settings asks a model: this run makes no model call and costs nothing")
     clock = StageClock()
@@ -2357,13 +2358,14 @@ def check_number_options(args: argparse.Namespace, config: PipelineConfig) -> No
 class _NumbersCloser:
     """The live number step of a ``stream`` and its model session: closed once, at the end or on an early stop."""
 
-    numbers: LiveNumbers
     session: ModelSession | None
+    numbers: LiveNumbers | None = None
     cost: dict[str, Any] | None = None
     closed: bool = False
 
     def finish(self) -> list[Any]:
         """Ask the open tracks, wait for every answer, then close the session (the measured cost)."""
+        assert self.numbers is not None
         try:
             return self.numbers.finish()
         finally:
@@ -2374,7 +2376,8 @@ class _NumbersCloser:
         if self.closed:
             return
         try:
-            self.numbers.abort()
+            if self.numbers is not None:
+                self.numbers.abort()
         finally:
             self._close_session()
 
@@ -2402,6 +2405,9 @@ def open_live_numbers(
     the cache folder records every answer, and the run stops above 1.3 times the estimate.
     """
     cap = DEFAULT_MAX_REQUESTS if args.numbers_max is None else args.numbers_max
+    history = settings.history_frames
+    # A history of 0 frames: no window holds an earlier frame, so an id that is not seen in a frame is closed.
+    number_settings = NumberSettings(max_requests=cap, close_frames=None if history is None else max(1, history))
     session: ModelSession | None = None
     if scene is not None:
         backend: Any = FakeBackend(scene, seed=0 if args.seed is None else args.seed, coords=config.number.coords)
@@ -2426,14 +2432,9 @@ def open_live_numbers(
             f"shirt numbers: at most {cap} number requests in this stream (--numbers-max), the bound of the estimate; "
             "a track that is ready after the cap gets no number, and the stream goes on"
         )
-    numbers = LiveNumbers(
-        config,
-        backend,
-        NumberSettings(max_requests=cap, close_frames=settings.history_frames),
-        info=info,
-    )
-    closer = _NumbersCloser(numbers=numbers, session=session)
-    stack.callback(closer.abort)
+    closer = _NumbersCloser(session=session)
+    stack.callback(closer.abort)  # from here on, any stop closes the session and prints its cost
+    closer.numbers = LiveNumbers(config, backend, number_settings, info=info)
     return closer
 
 
@@ -4567,16 +4568,14 @@ def _cache_dir(args: argparse.Namespace) -> Path:
 
 def _add_model_options(parser: argparse.ArgumentParser) -> None:
     """Add the options that every command with model calls has."""
-    parser.add_argument(
-        "--allow-dirty",
-        action="store_true",
-        help="start although the git work tree of the code has changes; the output file records it",
-    )
-    _add_cache_options(parser)
+    _add_cache_options(parser, allow_dirty=True)
 
 
-def _add_cache_options(parser: argparse.ArgumentParser) -> None:
-    """Add the options of the cache folder and of the hard stop (``stream`` has its own ``--allow-dirty``)."""
+def _add_cache_options(parser: argparse.ArgumentParser, *, allow_dirty: bool = False) -> None:
+    """Add the options of the cache folder and of the hard stop; ``allow_dirty`` adds ``--allow-dirty`` between them.
+
+    ``stream`` has its own ``--allow-dirty``.
+    """
     parser.add_argument(
         "--cache",
         type=_path,
@@ -4586,6 +4585,12 @@ def _add_cache_options(parser: argparse.ArgumentParser) -> None:
             f"(default: ../{RESULTS_WORKTREE}/{RESULTS_FOLDER}/{CACHE_FOLDER} next to the repository)"
         ),
     )
+    if allow_dirty:
+        parser.add_argument(
+            "--allow-dirty",
+            action="store_true",
+            help="start although the git work tree of the code has changes; the output file records it",
+        )
     parser.add_argument(
         "--start-over-budget",
         action="store_true",

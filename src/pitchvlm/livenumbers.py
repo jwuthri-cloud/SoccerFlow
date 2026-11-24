@@ -242,7 +242,12 @@ class LiveNumbers:
     # --- The frame path --------------------------------------------------------------------------
 
     def arrived(self, frame: int, image: np.ndarray, people: Sequence[PersonDet]) -> None:
-        """Note the arrival of a frame; hand a stride frame or a frame of the kit legend to the worker."""
+        """Note the arrival of a frame; hand a stride frame or a frame of the kit legend to the worker.
+
+        After the worker stopped (an early stop, or a fault of its own) nothing is kept.
+        """
+        if self._closed_to_work():
+            return
         self._arrival[frame] = self._clock()
         stride = frame % self._stride == 0
         legend = frame in self._legend_frames
@@ -258,9 +263,14 @@ class LiveNumbers:
         self._wake.set()
 
     def given(self, state: FrameState) -> None:
-        """Hand one given state to the worker. It never blocks and never drops a state."""
+        """Hand one given state to the worker. It never blocks and never drops a state (but keeps none after it stopped)."""
+        if self._closed_to_work():
+            return
         self._events.append((_STATE, state))
         self._wake.set()
+
+    def _closed_to_work(self) -> bool:
+        return self._stopping or self._worker_error is not None
 
     def take(self) -> list[NumberLine]:
         """Return the numbers that came since the last call, with their latency (thread of the stream)."""
@@ -363,6 +373,10 @@ class LiveNumbers:
         except BaseException as error:  # noqa: BLE001 (a fault of the worker must not stop the stream)
             logger.exception("the live number step stopped: no new numbers")
             self._worker_error = error
+            self._events.clear()
+            self._arrival.clear()
+            self._crops.clear()
+            self._ids.clear()
 
     def _drain(self) -> None:
         while self._events and not self._stopping:
@@ -376,6 +390,9 @@ class LiveNumbers:
                 self._decided(event[1])
 
     def _cut(self, frame: int, image: np.ndarray, boxes: Sequence[Box], legend: bool) -> None:
+        if self._failures:
+            boxes = ()  # no request is sent after a failure: no crop is needed (after the cap the crops still
+            # make ids ready, so that the ids without a number are counted in ``refused_by_cap``)
         if self._legend_future is None:
             if legend:
                 self._legend_images[frame] = image
@@ -538,7 +555,11 @@ class LiveNumbers:
                 except Exception as error:
                     self._failures.append(error)
                     raise
-                handle(answer)
+                try:
+                    handle(answer)
+                except Exception as error:  # a fault of the reading of an answer stops the asking too
+                    self._failures.append(error)
+                    raise
         finally:
             if request.meta.step == "kit_legend":
                 self._legend_settled.set()
