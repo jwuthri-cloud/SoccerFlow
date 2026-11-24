@@ -2054,6 +2054,114 @@ def serve(lines, *, host="127.0.0.1", port=0, replay=False, ready=None, stop=Non
   processes: another source tree, no option, a file, a reader of one line per second), `latency`
   (a paced stream, `radar -` and a client as three processes).
 
+### `livenumbers.py` — shirt numbers in the live path (2026-11-24)
+
+The paid number step of the model (the one of `configs/engines/detector_calibration_numbers.yaml`)
+for `stream`, off the frame path: the frame path hands work to one worker thread and never waits
+for a model answer (`docs/DECISIONS.md`, entry "Shirt numbers in the live path" of 2026-11-24).
+
+```python
+# livenumbers.py
+READY_CROPS = 4; MAX_PENDING_IMAGES = 8; POOL_CROPS = 16; DEFAULT_MAX_REQUESTS = 50; LEGEND_TIMES_S = (0.0, 1.0, 2.0)
+@dataclass(frozen=True)
+class NumberSettings: max_requests: int = 50; ready_crops: int = 4; max_pending_images: int = 8
+    stride_frames: int | None = None      # None: the keyframe step of the settings (12 frames at 25 fps)
+    close_frames: int | None = None       # None: never before the end; stream: history_frames of the stream
+@dataclass(frozen=True)
+class NumberLine: track_id: int; export: int | None; display: int | None; first_frame: int; last_frame: int
+    crop_frames: tuple[int, ...]; per_crop: tuple[int | None, ...]; confidence: str; reason: "ready" | "closed" | "end"
+    first_seen_frame: int; latency_s: float | None
+class LiveNumbers:
+    def __init__(self, config, backend, settings, *, clip_id, fps, size, clock=time.monotonic)
+    def arrived(self, frame: int, image: np.ndarray, people: Sequence[PersonDet]) -> None  # hook DetectorStream.on_arrived
+    def given(self, state: FrameState) -> None            # with each given state (the frame path, O(1))
+    def take(self) -> list[NumberLine]                    # answers that came; called in the thread of the stream
+    def finish(self) -> list[NumberLine]                  # after DetectorStream.finish: ask the open tracks, wait for every answer
+    def abort(self) -> None                               # an early stop: send nothing more, wait for the requests in flight
+    def report(self) -> dict                              # counts: requests, answers, refused by the cap, dropped images, ...
+def wire(stream: DetectorStream, numbers: LiveNumbers | None, live_out: LiveOut | None) -> None
+def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
+```
+
+- Engines: `stream` takes the number engine `none` (no worker; every output as before) or
+  `model` (this worker). The frame path is the same code in both cases: the stream decides its
+  states with no number (`finalize_tracks` with no reading), as with `none`.
+- Hand-over on arrival (frame path): `DetectorStream.on_arrived(frame, image, people)` is called in
+  `push` after the image is read (stage `numbers` of the frame sample; not called and no stage
+  without a worker). On a stride frame (`frame % stride_frames == 0`) and on the frames of the
+  kit legend (`LEGEND_TIMES_S`), the worker gets a reference to the image and the boxes of the
+  frame through a bounded queue of `max_pending_images` items (`put_nowait`): when it is full the
+  new item is dropped and counted (`images_dropped`); no image is copied on the frame path.
+  Every other frame costs a time stamp (for the latency of N3). A frame that the frame path drops
+  (an overload policy) simply has no crops: no rule needs every frame of a track.
+- Crops (worker thread): the worker cuts every box of a stride frame out of its image
+  (`pipeline._cut_crop`, the padding of `steps.crop_rect`) and keeps the crops of the frames that
+  are not decided yet, by (frame, box); the image is let go at once. A crop of a frame is dropped
+  when that frame is decided.
+- Hand-over on decision (frame path): with each given state the worker gets a reference to it
+  (an unbounded deque of references: the stream keeps every state anyway, so it costs no copy;
+  `given` never blocks). The worker counts, per stream id (`PlayerState.track_id`, the id of the
+  live feed): its first frame, its observed states by role, and its candidate crops: the crop of
+  each observed state of a stride frame whose box has a crop. The pool of an id keeps at most
+  `POOL_CROPS` crops (`pipeline.crop_choice`: the tallest, at least `MIN_CROP_GAP_S` = 1 s apart).
+- Ready: an id that was not asked yet, whose observed states are voted `player` or `goalkeeper`
+  (`TEAM_ROLES`, most observed states), is asked
+  - when `crop_choice` over its pool gives `ready_crops` = 4 crops (so it was seen for at least
+    3 s, 4 crops at least 1 s apart): reason `ready`; or
+  - when it has had no observed given state for `close_frames` frames (the history of the stream,
+    123 frames at 25 fps: after it the window cannot give the id again), with at least one crop:
+    reason `closed`; or
+  - at the end of the stream, with at least one crop: reason `end`.
+  The request is the request of the clip path (`pipeline._number_request` on a `_CropPlan` with the
+  team key `none`, `crop_choice` of the pool with `number_crops` = 8 crops, enlarged by
+  `crop_upscale`), built on the worker thread. One request per id; an id is never asked again; its
+  pool is freed when it is asked or closed.
+- Kit legend: the number prompt shows the kit legend, as in the clip path. The worker keeps the
+  images at `LEGEND_TIMES_S` (frames 0, 25 and 50 at 25 fps; the ones that came) and sends one
+  kit legend request when the first id is ready; the number requests wait for its answer.
+- Requests: a thread pool of `max_parallel` threads sends them; every request is counted in a
+  `pipeline._InFlight` before it calls the model, and after the first failure (a budget stop
+  of the guard, an error of the model, an answer that cannot be parsed) no request is sent any
+  more: the stream goes on without new numbers, and the report names the failure. The answer is
+  read with `steps.parse_number` and decided with `tracking.decide_number(reading, ())`, the rule
+  of the clip path (export: the most likely number; display: confidence high and two crops agree).
+- The cap (fail closed): at most `max_requests` number requests per stream (`--numbers-max`,
+  default 50, the guess of one clip of `cli.EXPECTED_NUMBER_REQUESTS`). An id that is ready after
+  the cap is reached is not asked and counted (`refused_by_cap`); a warning says it once when it
+  happens, and the command prints the count at the end. With the kit legend, the estimate of the
+  run is 1 kit legend + `max_requests` number requests: a stated bound for a stream of any length.
+  The budget guard of the cost ledger stops the run above 1.3 times this estimate, as for `run`.
+- Answers reach the outputs (thread of the stream): `take` returns the decided numbers that came;
+  the wiring calls it after each given state and writes one number line per answer to the live
+  output (below), after the frame line of that decision. So a number line always comes after the
+  frame lines of the frames that it was read from (they were decided before the crops were
+  taken), and it never changes a frame line.
+- End of the stream: `finish` hands the last states to the worker, asks every open id that has a
+  crop (reason `end`), waits for the kit legend, sends the waiting requests, then waits for every
+  request in flight: they are paid, so their answers are stored and recorded
+  (`pipeline._finish_requests_in_flight`, the wait of the clip path, also for a stop signal during
+  the wait). `abort` (an early stop of the command) sends nothing more and does the same wait.
+- Result: `apply_numbers` gives every state of an id with a number line the `number_export` and
+  `number_display` of that line, and the tracks of the result the same; ids without a line keep
+  none. So at the end the numbers of `result.json`, of the prediction file and of the video equal
+  the number lines of the live feed (`tests/test_livenumbers.py`). Unlike the clip path, no two
+  ids are joined by their number (a given id is final), so two ids of one person each show it;
+  no roster name is given (the `stream` command has no roster).
+- Live output: with the number engine `model` the header names the format `pitchvlm-live-2`:
+  the lines of `pitchvlm-live-1` and number lines `{"kind": "number", "id", "number", "export",
+  "display", "frames": [first, last], "crops": [frames], "reason", "decided_at", "decided_unix"}`
+  (`liveout.number_document`; `number` is the shown number: display, else export). A number line
+  is never left out by the pipe policy (like the header and the end line). With the number engine
+  `none` the output is `pitchvlm-live-1`, byte for byte as before. The radar reads both formats:
+  it keeps the newest number of every id, sends all of them to a new page after the header, and
+  draws the number of an id when its frame line has none.
+- Command line: `stream ... --config configs/engines/detector_calibration_numbers.yaml
+  [--numbers-max N] [--cache DIR] [--replay] [--start-over-budget] [--allow-other-images]`. With
+  `--synthetic` the model is the fake backend of the synthetic scene (no ledger, no cost);
+  otherwise the command opens a model session (`open_session`): it prints the estimate before the
+  first call and the measured cost after, and the cost ledger of the cache folder stays the one
+  memory of the budget guard. `result.json` gets `numbers` (the report and the number lines).
+
 ## 5. Tests
 
 - `pytest` runs offline and without the model SDK. No test may open a network connection.
