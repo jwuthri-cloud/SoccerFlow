@@ -4995,7 +4995,9 @@ during the whole session (other sessions ran tests): it is in each table.
    | control, 1 signal, HEAD | 10 | 0 | 0 | 0 | 0 | 10 | 6.4 to 7.0 |
    | control, 1 signal, 41c5552 | 10 | 0 | 0 | 0 | 0 | 10 | 6.4 to 7.0 |
 
-   S1 holds (measured; intervals: Clopper-Pearson). On 41c5552, in 4 of the 17 early returns the
+   S1 holds (measured; intervals: Clopper-Pearson). Again on the final code (232c9fd, with the
+   rule "interrupted once" of item 2), the same script, 40 runs, load 38 to 53 (the tests ran at
+   the same time): 0 of 40 early, the 4 answers before the return in 40 of 40. On 41c5552, in 4 of the 17 early returns the
    pool then started all 8 requests that were still queued: the fake model does not read the stop
    event; the real clients refuse a new request once `STOP_REQUESTED` is set, so there they would
    not be sent (reasoning, not measured). "Hung elsewhere": the child was stopped by
