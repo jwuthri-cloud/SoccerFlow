@@ -2004,8 +2004,9 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration 
 - A frame line holds the frame and its time, the delay, the wall clock of the decision, the
   camera flag (`landmarks`, `propagated` or `none`), the flags `transition` (a dissolve known at
   the decision) and `cut`, the number of lines left out before it, and for each person the id,
-  role, team key, team side, shirt number (when known; the streaming path has no number step, so
-  `null`), pitch position in metres and box in pixels, and the ball. No pixel, no label value.
+  role, team key, team side, shirt number (when known; the frame lines of the stream have none, so
+  `null`: with the number engine `model` the numbers come as their own lines, section 16), pitch
+  position in metres and box in pixels, and the ball. No pixel, no label value.
 - A line is final: the state of frame `f` in the feed is the state of frame `f` in `result.json`,
   value for value. What the result says more: the tracks of `result.json` take the role and team
   of an id from its last state, and its cuts hold a dissolve that was known only after some of its
@@ -2032,3 +2033,81 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration 
 - A page that is slow gets the newest frame: it jumps to it when it is more than 25 frames behind.
   The bench of the build machine: `PYTHONPATH=src python -m pitchvlm.evalx.liveoutbench latency --seeds 610-612`
   (also `revisions` and `timing`; `docs/DECISIONS.md`).
+
+## 16 Shirt numbers in the live path (built 2026-11-23; fake model only on the build machine)
+
+`stream` with the engine file `configs/engines/detector_calibration_numbers.yaml` runs the paid
+number step of the model beside the stream (`livenumbers`): the frame path hands the images of
+every 12th frame and each decided state to one worker thread and never waits for an answer. The
+worker asks each id of the stream once, after one kit legend request: when 4 of its crops lie at
+least 1 s apart (it was seen for at least 3 s), when it has not been seen for the history of the
+stream (123 frames), or at the end. Each answer becomes a number line of the live output (format
+`pitchvlm-live-2`), after the frame lines it was read from; the frame lines stay as they are, and
+at the end `result.json`, the prediction file and the video take the numbers of the number lines.
+The design is in `docs/ARCHITECTURE.md` (`livenumbers.py`), the decisions and measurements in
+`docs/DECISIONS.md`, entry "Shirt numbers in the live path" of 2026-11-23.
+
+Money: a live stream has no known length, so the command takes a cap: at most `--numbers-max`
+number requests per stream (default 50, the guess of one clip of `run`). The estimate is one kit
+legend request plus the cap, printed before the first call; the run stops above 1.3 times it, and
+the cost ledger of the cache folder records every answer, as for `run`. When the cap is reached,
+a track that is ready gets no request: the stream goes on without new numbers, a warning says it
+once, and the end prints how many tracks got none. At the end the command waits for every request
+in flight (they are paid), also after Ctrl-C.
+
+Estimate of one pilot clip (estimated, not measured; `DEFAULT_TOKEN_ESTIMATES` and the price
+table of `src/pitchvlm/vlm/cost.py`, `gemini-4-argon`, standard tier, an empty cache):
+
+| `--numbers-max` | Calls | Estimate to 2026-11-30 | Estimate from 2026-12-01 | Run stops above (to / from) |
+|---|---|---|---|---|
+| 50 (default) | 1 kit legend + 50 number | 0.463 USD | 0.926 USD | 0.602 / 1.204 USD |
+| 100 | 1 + 100 | 0.913 USD | 1.826 USD | 1.187 / 2.374 USD |
+
+Synthetic clips of 20 s asked 21 to 40 ids, median 38 (40 seeds, the bench of the entry); a real
+clip is not measured. Start with the default 50 on one clip and read `numbers.requests_planned` and
+`numbers.refused_by_cap` of `result.json` before a longer run.
+
+```bash
+# On the build machine: the synthetic clip and the fake model of the scene (no model call, no cost).
+PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --frames 750 --delay 25 --allow-dirty \
+    --config configs/engines/detector_calibration_numbers.yaml --out outputs/stream-numbers \
+    --live-out "$(mktemp -d)/live.jsonl"
+```
+
+The command of the owner on the run machine (paid: it needs the owner's go-ahead; the clip runs
+of the two tools of section 11 must be there; one clip; the default cache folder):
+
+```bash
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+mkdir -p ~/pitchvlm-data/live/<clip>
+python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json \
+    --config configs/engines/detector_calibration_numbers.yaml \
+    --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+    --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+    --delay 25 --numbers-max 50 --out ~/pitchvlm-data/runs/dev-stream-numbers --tracker pitchvlm-stream-numbers \
+    --live-out ~/pitchvlm-data/live/<clip>/numbers.jsonl
+```
+
+The live run of section 14 takes the same three options in terminal 3 (`--config` of the numbers,
+`--numbers-max 50`, `--live-out -` with `radar -` after it, as in section 15). `--replay` reads only
+stored answers (free), `--cache DIR` names another cache folder (do not: one cache folder for all
+paid runs), `--start-over-budget` and `--allow-other-images` are those of `run`. The options of the
+number step are refused with the number engine `none`, and `--cache`, `--replay`,
+`--start-over-budget` and `--allow-other-images` are refused with `--synthetic` (its model is fake).
+
+- What it prints: the cost estimate before the first frame, `shirt numbers: <n> number lines (<k>
+  with a number) from <r> number requests of at most <cap>; images dropped by the worker: <d>`,
+  the cap line when it was reached, and the measured cost. Exit code 1 when the number step
+  stopped after a failure (a budget stop, an error of the model, an answer that cannot be parsed:
+  after the first one no request is sent, and the stream goes on without new numbers).
+- `result.json` gets `numbers`: the counts (`requests_planned`, `answers`, `refused_by_cap`,
+  `closed_without_crop`, `images_dropped`, `kit_legend`, `failure`, `latency_s`) and every number
+  line; `provenance.cost` holds the cost record; `frame_timing` gets the stage `numbers` (the hand-over).
+- A number line: `{"kind": "number", "id", "number" (shown: display, else export), "export",
+  "display", "frames": [first crop, last crop], "crops", "reason" ("ready", "closed", "end"),
+  "decided_at", "decided_unix"}`. The radar keeps the newest number of each id and draws it on the
+  dots of that id; a page that opens late gets every known number first.
+- Unlike `run`, two ids of one person are not joined by their number (the ids of a live feed are
+  final), and no roster name is given (`stream` takes no roster).
+- What only the run machine can say: the real time of an answer (the bench used 0.5, 2 and 5 s),
+  how many ids a real clip gives, how well the model reads crops of a live clip, and the cost.

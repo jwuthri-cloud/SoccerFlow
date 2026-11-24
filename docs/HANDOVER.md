@@ -691,6 +691,23 @@ clip of 30 s with 50 number requests, the guess of the code):
 - Not in the plan of `docs/PLAN.md`: the three video arms (last row) and the number step of the
   detector engine (0.463 USD per clip until 30 Nov, 0.926 USD from 1 Dec;
   `configs/engines/detector_calibration_numbers.yaml`). The detector engine without it is free.
+- The same number step in the live path (`stream` with that engine file, RUNBOOK section 16) is
+  bounded by its cap of number requests per stream (`--numbers-max`, default 50): one kit legend
+  request plus the cap, 0.463 USD until 30 Nov and 0.926 USD from 1 Dec with the default
+  (estimated, not measured); the run stops above 1.3 times it. Not in the plan either. The
+  command of the owner for one clip (paid: only with the owner's go-ahead, after the clip runs
+  of the two tools of RUNBOOK section 11):
+
+  ```bash
+  CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+  mkdir -p ~/pitchvlm-data/live/<clip>
+  python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json \
+      --config configs/engines/detector_calibration_numbers.yaml \
+      --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+      --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+      --delay 25 --numbers-max 50 --out ~/pitchvlm-data/runs/dev-stream-numbers --tracker pitchvlm-stream-numbers \
+      --live-out ~/pitchvlm-data/live/<clip>/numbers.jsonl
+  ```
 - The lines of `docs/PLAN.md` for the people probe (14 USD) and the pitch probe (15 USD) hold
   several settings; one setting prints 2.36 and 1.49 USD until 30 Nov. The line of the number
   probe (11 USD for two settings) is too small at the standard price from 1 Dec (15.96 USD).
@@ -818,6 +835,11 @@ The streaming path (live):
 | 38 | The paint score of the keyframes in a live run [same entries, items 10 and 13] | keep it (it runs on its own thread since the live feed, but under load it still competes for a core); leave it out of live runs | The live-feed session: leave it out of live runs if the run machine shows the 95th percentile of a frame above 40 ms | kept, on its own thread | a claim of real time |
 | 39 | The wait of `merge-feeds` for the part of the slower tool [entry "The live feed of the detector engine", item 13; the live mode of `tools/run_tool.py` and the merger, item 10 of the round-5 entry, are built] | 1 s (the default of `--wait`); another value | The live-feed session: a wait above the time per frame of the slower tool, or most of its parts go out late; 1 s bounds what a stalled tool costs | 1 s | a live run with a slow tool |
 | 43 | The calibration in a live run [entry "The live feed of the detector engine", item 13] | `--skip-behind` (the tool takes the newest frame when it is behind, and the skipped frames go out as missing parts); the stream waits for it | The live-feed session: `--skip-behind` when the calibration takes more than 40 ms per frame on the run machine (its published time is 439 ms); else let the stream wait | the stream waits (no `--skip-behind`; RUNBOOK 14 gives it in its command) | a live run at 25 frames per second |
+| 45 | The cap of number requests of a live stream with numbers [entry "Shirt numbers in the live path" of 23 Nov, item 9] | a cap per stream (built: `--numbers-max`, default 50, the bound of the estimate; fail closed: a ready track gets no number after it); a cap per minute as well, for a long live run | This session: the cap per stream, 50 for the first clip; read `numbers.requests_planned` and `refused_by_cap` of `result.json`, then set the cap of a longer run from them | 50 per stream (the code) | a paid live run with numbers (RUNBOOK 16) |
+| 46 | When a track of the live path is asked for its number [same entry, item 9] | 4 crops at least 1 s apart (seen for at least 3 s; built), or when its track ends or the stream ends; more crops (later, better read); fewer (sooner) | Keep 4 until the number probe (G5a) says how the reading grows with the number of crops | 4 (the code) | nothing |
+| 47 | Two ids of one person in the live path both show the number, and the stream has no roster names [same entry, item 9] | keep (the ids of a live feed are final; `run` joins them, `stream` cannot); add `--roster` to `stream` for the names only | Keep; a roster in `stream` when a demo needs names | kept | nothing |
+| 48 | After a failure of the live number step (a budget stop, an error of the model, one answer that cannot be parsed) no request is sent for the rest of the stream [same entry, item 9] | as now; go on after an answer that cannot be parsed (the budget stop and an error of the model still stop it) | As now until the first paid run shows how often an answer cannot be parsed | as now | nothing |
+| 49 | Threads of the live number step [same entry, item 7, N3] | `max_parallel` of the settings (4; at 5 s per answer they answer 0.8 requests per second, and the about 20 ids that are ready at the start of a clip wait up to 45 s for their number); more threads (the limit `MAX_PARALLEL_LIMIT` bounds what a budget stop can overshoot) | Keep 4 until the first paid run measures the time per answer of the model; then raise it only if the numbers come too late for the viewer | 4 | nothing; the number lines come late with a slow model |
 
 Results and publishing:
 

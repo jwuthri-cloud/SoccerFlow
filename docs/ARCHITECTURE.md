@@ -1798,7 +1798,8 @@ class StreamSettings: delay_frames: int | None = 25; history_frames: int | None 
     # None = the whole clip; a delay of the whole clip needs a history of the whole clip;
     # early_dissolve_windows None waits for the end of the window test of a dissolve
 def default_history_frames(config: PipelineConfig, fps: float) -> int   # max_stitch_gap_s * fps + 4 * keyframe_frames = 123 at 25 fps
-def check_stream_engines(config: PipelineConfig) -> None                 # ValueError for other engines
+STREAM_NUMBERS = ("none", "model")
+def check_stream_engines(config: PipelineConfig) -> None                 # ValueError for other engines (number none or model)
 @dataclass(frozen=True)
 class StreamInput: frame: int; people: tuple[PersonDet, ...]; balls: tuple[BallCandidate, ...]; camera: HomographyRecord
     detector_seconds: float | None = None; calibration_seconds: float | None = None
@@ -1820,6 +1821,8 @@ class DetectorStream:
                  kit_clusters: KitClusters | None = None, clock: StageClock | None = None)
     def push(self, item: StreamInput, image: np.ndarray | Callable[[], np.ndarray]) -> list[FrameState]  # at most one: frame t - L
     def finish(self) -> list[FrameState]     # the frames not decided yet, with every frame known
+    on_given: Callable[..., None] | None     # each state as it is given (liveout; livenumbers.wire)
+    on_arrived: Callable[[int, np.ndarray, Sequence[PersonDet]], None] | None   # stage "numbers"; livenumbers
     def result(self) -> ClipResult           # after finish
     paint_seconds: list[float]               # time of each paint score on its thread
     transition_log: list[tuple[str, tuple[int, int], int]]   # ("early" | "final", (start, stop), newest frame then)
@@ -1971,13 +1974,17 @@ def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a 
 ```python
 # liveout.py
 LIVE_FORMAT = "pitchvlm-live-1"; PIPE_PENDING_LINES = 1; PIPE_BLOCKED_S = 0.05; PIPE_MAX_LINES = 250; CLOSE_WAIT_S = 5.0
+LIVE_FORMAT_NUMBERS = "pitchvlm-live-2"; NUMBER_KIND = "number"   # with the live number step (livenumbers.py)
 class LiveOutError(RuntimeError)                     # a file that cannot be opened or written; a writer that failed
 @dataclass(frozen=True) class LiveReport:            # target, policy, given, written, dropped, undelivered, reader_gone
-def header_document(info, *, delay_frames, history_frames, policy) -> dict
+def header_document(info, *, delay_frames, history_frames, policy, numbers=False) -> dict   # numbers: LIVE_FORMAT_NUMBERS
+def number_document(*, track_id, export, display, first_frame, last_frame, crop_frames, reason, decided_at, decided_unix) -> dict
 def frame_document(state, *, fps, camera, last, transition, cut, decided_unix, dropped) -> dict
 class LiveOut:
     def __init__(self, fd, info, *, target, pipe: bool, close_fd: bool, pending_lines=1, clock=time.time)
-    def start(self, *, delay_frames, history_frames) -> None
+    def start(self, *, delay_frames, history_frames, numbers=False) -> None
+    def number(self, *, track_id, export, display, first_frame, last_frame, crop_frames, reason, last) -> None  # never left out
+    numbers_given: int
     def given(self, state, *, camera, last, transition, cut) -> None   # the hook DetectorStream.on_given
     def finish(self) -> None                                           # the end line
     def close(self, wait_s=5.0) -> LiveReport
@@ -2025,8 +2032,9 @@ def open_live_out(target: str, info: ClipInfo) -> LiveOut               # "-", a
 MAX_CLIENTS = 8; CLIENT_MAX_BEHIND = 25; RING_EVENTS = 100; MAX_CONNECTIONS = 32; MAX_LINE_BYTES = 1 << 20
 class RadarError(ValueError)                              # an address that is not loopback; a feed that is not a live output
 def check_loopback(host: str) -> IPv4Address | IPv6Address  # numbers only, loopback, no zone, no mapped IPv4
-class Board:                                              # header, the newest frames, the end; per client: wait(after, timeout)
-def feed_documents(lines) -> Iterator[dict]               # checked documents; stops after the end line
+class Board:                                              # header, the newest frames, the newest number per id, the end;
+                                                          # per client: wait(after, timeout), events in board order
+def feed_documents(lines) -> Iterator[dict]               # checked documents (live-1 or live-2); stops after the end line
 def follow_file(path, stop) -> Iterator[str]              # a file that grows
 def read_lines(fd) -> Iterator[str]                        # a pipe to its end of file
 def pump(lines, board, *, replay=False) -> int            # the feed onto the board; replay at the frame rate
@@ -2054,11 +2062,11 @@ def serve(lines, *, host="127.0.0.1", port=0, replay=False, ready=None, stop=Non
   processes: another source tree, no option, a file, a reader of one line per second), `latency`
   (a paced stream, `radar -` and a client as three processes).
 
-### `livenumbers.py` — shirt numbers in the live path (2026-11-24)
+### `livenumbers.py` — shirt numbers in the live path (2026-11-23)
 
 The paid number step of the model (the one of `configs/engines/detector_calibration_numbers.yaml`)
 for `stream`, off the frame path: the frame path hands work to one worker thread and never waits
-for a model answer (`docs/DECISIONS.md`, entry "Shirt numbers in the live path" of 2026-11-24).
+for a model answer (`docs/DECISIONS.md`, entry "Shirt numbers in the live path" of 2026-11-23).
 
 ```python
 # livenumbers.py
@@ -2097,7 +2105,9 @@ def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
 - Crops (worker thread): the worker cuts every box of a stride frame out of its image
   (`pipeline._cut_crop`, the padding of `steps.crop_rect`) and keeps the crops of the frames that
   are not decided yet, by (frame, box); the image is let go at once. A crop of a frame is dropped
-  when that frame is decided.
+  when that frame is decided. With `--delay clip` no frame is decided before the end, so the crops
+  of every stride frame wait until then (memory grows with the clip: 50 to 100 MB for 30 s of
+  1080p, estimated). After a failure no crop is cut; after a fault of the worker the frame path keeps nothing.
 - Hand-over on decision (frame path): with each given state the worker gets a reference to it
   (an unbounded deque of references: the stream keeps every state anyway, so it costs no copy;
   `given` never blocks). The worker counts, per stream id (`PlayerState.track_id`, the id of the
@@ -2109,8 +2119,8 @@ def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
   - when `crop_choice` over its pool gives `ready_crops` = 4 crops (so it was seen for at least
     3 s, 4 crops at least 1 s apart): reason `ready`; or
   - when it has had no observed given state for `close_frames` frames (the history of the stream,
-    123 frames at 25 fps: after it the window cannot give the id again), with at least one crop:
-    reason `closed`; or
+    123 frames at 25 fps, at least 1: after it the window cannot give the id again), with at least
+    one crop: reason `closed`; or
   - at the end of the stream, with at least one crop: reason `end`.
   The request is the request of the clip path (`pipeline._number_request` on a `_CropPlan` with the
   team key `none`, `crop_choice` of the pool with `number_crops` = 8 crops, enlarged by
