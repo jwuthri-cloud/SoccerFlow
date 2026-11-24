@@ -2309,8 +2309,9 @@ def apply_numbers(result: ClipResult, lines: Sequence[NumberLine]) -> ClipResult
   run is 1 kit legend + `max_requests` number requests: a stated bound for a stream of any length.
   The budget guard of the cost ledger stops the run above 1.3 times this estimate, as for `run`.
 - Answers reach the outputs (thread of the stream): `take` returns the decided numbers that came;
-  the wiring calls it after each given state and writes one number line per answer to the live
-  output (below), after the frame line of that decision. So a number line always comes after the
+  the wiring calls it after each given state and after each decision that the overload policy
+  drops (`on_dropped`), and writes one number line per answer to the live output (below), after
+  the frame line of that decision. So a number line always comes after the
   frame lines of the frames that it was read from (they were decided before the crops were
   taken), and it never changes a frame line.
 - End of the stream: `finish` hands the last states to the worker, asks every open id that has a

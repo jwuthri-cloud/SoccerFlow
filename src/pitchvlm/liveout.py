@@ -309,6 +309,8 @@ class LiveOut:
         self.numbers_written = 0
         self._numbers_lost = 0
         self._numbers_undelivered = 0
+        #: The three counts of the number lines frozen by ``close`` (a writer given up may still finish a write).
+        self._number_counts: dict[str, int] | None = None
         #: The overload policy of the stream (``overload``): its wait, and the frames it dropped so far.
         self._overload_s: float | None = None
         self._overload_dropped = 0
@@ -317,6 +319,17 @@ class LiveOut:
     def closed(self) -> bool:
         """Whether ``close`` was called."""
         return self._closed
+
+    @property
+    def number_counts(self) -> dict[str, int]:
+        """The counts of the number lines as ``close`` froze them: ``given``, ``written``, ``undelivered``.
+
+        ``written + undelivered == given``. A writer that ``close`` gave up may finish its write later;
+        these counts stay as they were (the line counts as not delivered, as for ``LiveReport``).
+        """
+        if self._number_counts is None:
+            raise ValueError("the counts of the number lines are known after close")
+        return dict(self._number_counts)
 
     @property
     def numbers_undelivered(self) -> int:
@@ -561,6 +574,11 @@ class LiveOut:
                 + sum(1 for kind, _ in self._queue if kind == _NUMBER)
                 + int(stuck and self._writing_kind == _NUMBER)
             )
+            self._number_counts = {
+                "given": self.numbers_given,
+                "written": self.numbers_written,
+                "undelivered": self._numbers_undelivered,
+            }
             report = LiveReport(
                 target=self._target,
                 policy=self.policy,

@@ -5283,15 +5283,15 @@ real model, a real clip or a real cost.
    states with no number. With `none` there is no worker and no hook, and every output is the one
    of `41c5552` (checked byte for byte below).
 2. **Off the frame path.** `DetectorStream.on_arrived(frame, image, people)` (the one hook added
-   to `push`, stage `numbers` of the frame sample) hands a reference to the image and the boxes of
+   to the stream, stage `numbers` of the frame sample; since item 12 at the start of `_arrive`) hands a reference to the image and the boxes of
    every stride frame (the keyframe step, 12 frames at 25 fps) and of the frames of the kit legend
    (0, 1 and 2 s) to one worker thread, through a queue of at most 8 images: a full queue drops the
    new image and counts it (`images_dropped`); no image is copied on the frame path. Each given
    state goes into the same queue as a reference (never dropped: the stream keeps every state).
    The worker cuts the crops (the padding of the clip path), and frees them when their frame is
    decided. Nothing assumes that every frame of a track is there: a frame without image has no
-   crop, a frame without decision has no state (the overload policy of the other session of this
-   round will drop frames).
+   crop, a frame without decision has no state (the overload policy of the speed session drops
+   frames; item 12).
 3. **When a track is asked.** Per stream id (the id of the live feed, which is final): the crops
    of its observed states of a player or a goalkeeper (most observed states) go to a pool (at most
    16, `crop_choice`). The id is asked once: `ready` when `crop_choice` gives 4 crops at least
@@ -5438,6 +5438,29 @@ real model, a real clip or a real cost.
 11. **Not verified.** A real model (its time per answer, how it reads crops of a live clip), the
     real number of ids of a clip and so the real cost, a real camera, Linux timing (CI runs the
     tests only).
+12. **The merges of round 8** (added 2026-11-24). (a) The second read of round 7 (`b0889a6`): the
+    end-of-stream wait and `abort` hold stop signals (item 5). (b) The count rule of `main`
+    (`3764d2a`): the header is in no count of `LiveReport`; number lines have counts of their own
+    outside it, frozen by `close` (`LiveOut.number_counts`: `given`, `written`, `undelivered`,
+    the last two adding up to the first), written to `result.json` as `numbers.live_out` (before
+    the merge the key was `numbers.number_lines_given_to_live_out`). The rule as `main` states it,
+    `written + dropped + undelivered == given + 1`, holds when the end line did not go out; when
+    it went out, `written + dropped == given` (`written` counts frame lines only). (c) The frame
+    feeder and the overload policy (`b4f19a4`): the hook moves to the start of `_arrive`, where the
+    thread of the stream has the picture (`push`, or `push_fed` with the picture the feeder read),
+    after the motion stage; a dropped frame calls nothing; a dropped decision writes the number
+    lines that came (`wire`, `on_dropped`), so a run of dropped frames does not hold them back.
+    The live output is one of four (`liveout.py`, table): `pitchvlm-live-1` without the number
+    step and `pitchvlm-live-2` with it, each with the two overload keys only when the policy is
+    on; a reader of version 1 reads the first two and refuses the name `pitchvlm-live-2`. Owner
+    decision 48 (whether the overload keys get a name of their own) is described there, not
+    decided: the other choice would add a third and a fourth name, or one version with both
+    parts optional. With the number engine `none` and the policy off every output stays that of
+    `41c5552` (checked below); `result.json` of `stream` has the timing key `feeder_timing` of
+    the speed branch. Tests: frames dropped in the middle of tracks give the same numbers (an
+    injected still clock); the number step and the policy in one stream, whose end holds 20 stop
+    signals; a dropped decision writes the numbers that came. The bench feeds its frames through
+    the frame feeder since `9ab0d29`, as `stream` does.
 
 ## Open questions (to settle with measurements)
 

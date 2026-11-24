@@ -2136,7 +2136,11 @@ number step are refused with the number engine `none`, and `--cache`, `--replay`
   after the first one no request is sent, and the stream goes on without new numbers).
 - `result.json` gets `numbers`: the counts (`requests_planned`, `answers`, `refused_by_cap`,
   `closed_without_crop`, `images_dropped`, `kit_legend`, `failure`, `latency_s`) and every number
-  line; `provenance.cost` holds the cost record; `frame_timing` gets the stage `numbers` (the hand-over).
+  line, and with `--live-out` the counts of the number lines of the live output (`numbers.live_out`:
+  `given`, `written`, `undelivered`); `provenance.cost` holds the cost record; `frame_timing` gets
+  the stage `numbers` (the hand-over). With `--max-behind` (section 14) the number step works on
+  the frames that are not dropped; a dropped frame gives no crop, and the number lines still go
+  out during a run of dropped frames.
 - A number line: `{"kind": "number", "id", "number" (shown: display, else export), "export",
   "display", "frames": [first crop, last crop], "crops", "reason" ("ready", "closed", "end"),
   "decided_at", "decided_unix"}`. The radar keeps the newest number of each id and draws it on the

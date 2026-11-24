@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from pitchvlm import cli, livenumbers, pipeline, radar, stopsignals
+from pitchvlm import cli, livenumbers, radar, stopsignals
 from pitchvlm.config import EngineSettings, PipelineConfig
 from pitchvlm.fallbacks.fake import fake_calibration_answers, fake_detector_answers
 from pitchvlm.livenumbers import LiveNumbers, NumberLine, NumberSettings, apply_numbers, wire
@@ -533,6 +533,7 @@ def test_stream_with_the_number_engine_model_writes_numbers_that_equal_its_numbe
     assert told and lines[0]["format"] == LIVE_FORMAT_NUMBERS
     document = json.loads((tmp_path / "out" / "SNGS-999" / "result.json").read_text())
     assert {line["track_id"]: line["export"] for line in document["numbers"]["lines"]} == told
+    assert document["numbers"]["live_out"] == {"given": len(told), "written": len(told), "undelivered": 0}
     assert document["result"]["engines"]["number"].startswith("model:")
     assert "numbers" in document["frame_timing"]
     for state in document["result"]["frames"]:
@@ -679,7 +680,7 @@ def test_stop_signals_at_the_end_of_the_stream_wait_for_the_number_requests_in_f
             os.kill(os.getpid(), signal.SIGINT)
         _until(lambda: stopsignals.held_cause() is not None)
         seen["held"], seen["raised"] = stopsignals.held_cause(), stopsignals._HOLD.raised
-        time.sleep(3 * pipeline.STOP_LOOK_S)  # the wait looks at the record meanwhile
+        _until(lambda: numbers._stopping)  # the wait saw the stop (and warned) before the answer comes
         gate.set()
 
     helper = threading.Thread(target=signals_then_release, daemon=True)
@@ -787,7 +788,7 @@ def test_the_number_step_and_the_overload_policy_in_one_stream_and_its_end_holds
         for _ in range(20):
             os.kill(os.getpid(), signal.SIGINT)
         _until(lambda: stopsignals.held_cause() is not None)
-        time.sleep(3 * pipeline.STOP_LOOK_S)
+        _until(lambda: numbers._stopping)  # the wait saw the stop (and warned) before the answer comes
         gate.set()
 
     helper = threading.Thread(target=signals_then_release, daemon=True)
@@ -807,3 +808,23 @@ def test_the_number_step_and_the_overload_policy_in_one_stream_and_its_end_holds
     assert all("overload_dropped" in line for line in frames) and lines[-1]["overload_dropped"] == 2
     assert all("overload_dropped" not in line for line in lines if line.get("kind") == "number")
     assert "a stop signal came while" in caplog.text
+
+
+def test_a_dropped_decision_writes_the_numbers_that_came(tmp_path: Path) -> None:
+    """A run of dropped decisions (the overload policy) does not hold the number lines back."""
+    stream = DetectorStream(NUMBERS, StreamSettings(), clip_id="c", fps=25.0, size=(640, 360))
+    numbers = LiveNumbers(NUMBERS, StubBackend(), NumberSettings(), info=INFO)
+    path = tmp_path / "live.jsonl"
+    live = open_live_out(str(path), INFO)
+    live.overload(max_behind_s=1.0)
+    stream.on_dropped = live.skipped
+    live.start(delay_frames=25, history_frames=123, numbers=True)
+    wire(stream, numbers, live)
+    numbers._answers.append((NumberLine(4, 9, 9, 0, 36, (0, 36), (9, 9), "high", "ready", 0), None))
+    stream.on_dropped(40)
+    live.finish()
+    live.close()
+    numbers.abort()
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [line["id"] for line in lines if line.get("kind") == "number"] == [4]
+    assert lines[-1]["overload_dropped"] == 1 and live.number_counts == {"given": 1, "written": 1, "undelivered": 0}

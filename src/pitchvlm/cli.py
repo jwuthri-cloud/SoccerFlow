@@ -2375,11 +2375,7 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
             "lines": [dataclasses.asdict(line) for line in numbers.lines],
         }
         if live_out is not None:
-            document["numbers"]["live_out"] = {
-                "given": live_out.numbers_given,
-                "written": live_out.numbers_written,
-                "undelivered": live_out.numbers_undelivered,
-            }
+            document["numbers"]["live_out"] = live_out.number_counts
     write_json(clip_dir / RESULT_NAME, document)
     print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
     video_path = clip_dir / f"{info.clip_id}.mp4"
@@ -4854,7 +4850,8 @@ def _add_stream(commands: Any) -> None:
         type=_file_or_dash,
         metavar="FILE",
         help=(
-            f"write each decided frame as one JSON line (format {LIVE_FORMAT}) as it is decided: a file, a named "
+            f"write each decided frame as one JSON line (format {LIVE_FORMAT}; {LIVE_FORMAT_NUMBERS} with number lines "
+            "for the number engine model) as it is decided: a file, a named "
             "pipe, or - for the standard output (the output of the command then goes to the error stream)"
         ),
     )

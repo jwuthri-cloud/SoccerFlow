@@ -5,7 +5,9 @@ The clip path asks the model for the shirt number of every track after the whole
 it, so the number of a track comes later, as its own line of the live output. This module is the
 worker that does it. The frame path only hands references to it and never waits for an answer:
 
-- ``arrived`` (hook ``DetectorStream.on_arrived``, in ``push`` after the image is read): on a
+- ``arrived`` (hook ``DetectorStream.on_arrived``, at the start of ``DetectorStream._arrive``, once the
+  picture of the frame is in the thread of the stream; a frame that the overload policy drops calls
+  nothing): on a
   stride frame and on the frames of the kit legend, a reference to the image and the boxes of the
   frame go into a queue of at most ``max_pending_images`` images; when it is full the new image is
   dropped and counted (``images_dropped``). Nothing is copied on the frame path.
@@ -663,7 +665,9 @@ def wire(stream: Any, numbers: LiveNumbers | None, live_out: Any | None) -> Numb
 
     Without a number step this is the hook of the live output alone, as before. With one, each
     given state goes to the live output first, then to the number step, and the numbers that came
-    are written after that frame line.
+    are written after that frame line. A decision that the overload policy drops
+    (``DetectorStream.on_dropped``, set before this call) writes the numbers that came too, so that
+    a run of dropped frames does not hold them back.
     """
     if numbers is None:
         stream.on_given = None if live_out is None else live_out.given
@@ -678,6 +682,14 @@ def wire(stream: Any, numbers: LiveNumbers | None, live_out: Any | None) -> Numb
         writer.write(numbers.take(), flags["last"])
 
     stream.on_given = on_given
+    dropped = stream.on_dropped
+
+    def on_dropped(frame: int) -> None:
+        if dropped is not None:
+            dropped(frame)
+        writer.write(numbers.take(), stream.n_frames - 1)
+
+    stream.on_dropped = on_dropped
     return writer
 
 
