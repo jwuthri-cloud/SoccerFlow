@@ -4098,6 +4098,336 @@ decisions, and what changed in the documents.
     `tests/test_guard.py` 152 passed.
 
 
+## 2026-11-23 — Second read of the live feed, and a cache key of video requests that survives a new write
+
+1. **What and how.** An independent second read of the live feed of round 6 (pull request 22,
+   `git diff 7e89517 6b6a803`: `feed.py`, `merge-feeds`, the live mode of `tools/run_tool.py`,
+   the live parts of `stream.py`, `evalx/livebench.py`, `tools/stand_in_tool.py`), a planted-bug
+   check of the same code, the latency run of round 6 repeated under a load made on purpose, and
+   the cache key of video requests (finding V3 of round 6; owner's yes). The reader did not write
+   the live feed. Each finding was reproduced before it was called one, fixed with a test, and
+   the test was seen to fail with the fix undone. Build machine only: no model call, no key, no
+   footage, no install. Held-out seeds of this entry: 700 to 719 (not used before).
+2. **Findings.** Ranks: major (a normal run hangs, gives wrong numbers or loses money), minor
+   (wrong on a plausible edge), small (wrong only on unusual input).
+
+   | Id | Rank | Finding | Reproduction (build machine) | Status | Test |
+   |---|---|---|---|---|---|
+   | L0 | major | At a low load the live chain hung: a tool that waited in the open of its named pipe was paired with a process that opened the pipe for reading and closed it again before `merge-feeds` opened it. Its first write broke (exit 2, nothing written), and `merge-feeds` waited for ever in its own `os.open`, the other tool with it. Reported by the session "eng - linux ci" (3 tests of `tests/test_live_feed.py` failed at load 3 to 4). | On 72fad94 at load 3 to 6: the 3 chain tests hung in 3 of 3 runs (200 s limit); one chain run timed out at 20 s. The tool's open returned 0.7 s before `merge-feeds` reached its open. A writer probe that opens without blocking saw a reader on the pipe 8 to 27 ms after the start of every `python -m <module> <pipe>` process (3 of 3, also another Python and a module that does not exist) and never for `python -c ... <pipe>`, `python <script> <pipe>`, `sleep` or `sh -c` (0 of 3 each): a program outside the project. At a high load the tools reach their open after that reader is gone, so the tests passed there. | fixed: `run_tool.NamedPipeFeed`: on a broken pipe the feed waits up to `FEED_REOPEN_WAIT_S` = 10 s for a reader (an open that does not block, every 50 ms) and sends the whole feed again from its header; it says so on the error stream and counts it (`feed_reopened` in `<stem>-runner.json`); no reader in time: the broken pipe as before | `test_a_reader_that_opens_the_pipe_and_goes_away_does_not_stop_the_tool` (without the fix the reader waits for ever: timeout), `test_a_feed_whose_reader_does_not_come_back_stops_after_its_wait`; repeats in item 3 |
+   | L1 | minor | A tool that stopped before it opened its feed (a wrong job file, a tool that cannot be built: the feed was opened after the tool was built) left `merge-feeds` waiting for ever in the open of that pipe, and the other tool with it. | detector job file missing: after 15 s `merge-feeds` and the calibration still running | fixed: `open_feed` opens a named pipe (and `-`) first, before the job is read; any later stop closes it and `merge-feeds` stops with "the feed of the detector ended before its header" (exit 2). A plain file is opened as before, when the frames start (second read: opened first, `--feed` on the job file emptied the job) | `test_a_tool_that_stops_before_its_first_frame_ends_the_chain` (codes 2, 2, 2) |
+   | L2 | minor | With `--feed -` the feed is the standard output, but what a tool or a library prints while it is built or per frame went into it too: the merger refuses a feed whose first line is not its header (exit 2), and a print without a line end breaks the next frame line. | a stand-in that prints while the tool is built: the first line of the standard output was the print | fixed: `StandardOutputFeed` keeps the standard output for the feed alone and points the descriptor 1 of the process at the error stream while the feed is open (and back when it is closed: second read) | `test_with_the_feed_on_the_standard_output_a_print_of_the_tool_goes_to_the_error_stream` |
+   | L3 | small | `--feed` and `--out` on one file wrote every line twice through two handles into one file (the second reader ran it: the same bytes at the same offsets, so the file stayed whole; the refusal is mostly for clarity), and `--feed` on the job file is refused too. | (by reading, and the run of the second reader) | fixed: refused before the feed is opened, by `os.path.samefile` when both exist | `test_the_feed_and_its_copy_cannot_be_one_file`, `test_a_feed_that_names_the_job_file_is_refused_and_the_job_is_kept` |
+   | L4 | minor (docs) | The owner decision of round 6 said the wait of the merger "must be above the time of the slower tool per frame". The wait bounds the lag of a tool, which grows with every frame when the tool is slower than the pace without `--skip-behind`, and it never catches up. | `FeedMerger` with simulated arrivals, 25 fps, wait 1 s, 1,500 frames: a calibration of 41 ms per frame lost 521 parts (from about frame 980), 45 ms 1,305, 60 ms 1,452 | fixed in RUNBOOK section 14 (`--skip-behind` at 40 ms per frame or more at 25 fps) and in item 9 | `test_a_tool_a_little_slower_than_the_pace_loses_every_part_once_its_lag_passes_the_wait` |
+   | L5 | small (test) | `test_the_chain_ends_when_the_stream_stops_before_it_reads` depended on the load: a tool that started after the shared start had every frame due at once and, without a time per frame, put all 40 lines into the pipe before the merger stopped (exit 0, not 2). | 72fad94 at load 66 to 84: 2 of 6 runs | fixed: the stand-ins of that test take 100 ms per frame | the same test, repeats in item 3 |
+   | L7 | minor | Found by the planted-bug check: a tool that hung after the last frame (alive, its pipe open, nothing written) kept `merge-feeds` reading it for ever (policy 7), so the merged lines never ended, and `stream` read to the end of its input: it never reached `finish`, the last `delay` frames were never decided and no result was written. The module docstring said that a stalled tool delays the stream by at most one wait. | `merge_feeds` with a calibration that writes every frame and then waits: all 5 frames out at 0.21 s, `merge_feeds` still running after 5 s | fixed: the merged lines end once the last frame went out (`end`: `merge-feeds` points its standard output at nothing); a feed silent for `drain_s` (`DEFAULT_DRAIN_S` = 10 s) after the last frame is left and counted (`left_open`, exit 1); `stream` reads no line after frame `n_frames - 1` | `test_a_tool_that_hangs_after_the_last_frame_does_not_hold_the_merger`, `test_the_stream_reads_no_line_after_the_last_frame` |
+   | L6 | small (docs) | RUNBOOK section 14 called the merge of the two copies "the same lines" as the live run; a part that was late in the live run is whole in them. | (by reading) | fixed in the comment of the command | none (text) |
+
+3. **Repeats of the three chain tests after the fixes** (`test_the_live_chain_gives_the_result_of_the_clip_runs`,
+   `test_a_tool_that_dies_leaves_its_part_missing_and_the_stream_goes_on`,
+   `test_the_chain_ends_when_the_stream_stops_before_it_reads`; one pytest call per run, the load
+   average before each run):
+
+   | tree | load average before the runs | runs | runs with 3 of 3 passed |
+   |---|---|---|---|
+   | 72fad94 (before the fixes), first session, stray reader present | 3 to 6 | 3 | 0 (each hung until the 200 s limit) |
+   | fixed, stray reader present then (probe 3 of 3 at the same hour) | 4.8 to 5.9 | 6 | 6 |
+   | fixed, machine growing busier | 15.8 to 32.1 | 14 | 14 |
+   | fixed, 12 processes that spin | 36 to 61 | 20 | 20 |
+   | fixed, quiet again, stray reader absent (probe 0 of 10) | 5.1 to 12.3 | 14 | 14 |
+   | 72fad94, quiet, stray reader absent | 5.6 to 6.0 | 3 | 3 |
+
+   So 20 runs at a load under 13 and 20 runs at a load of 36 to 61 passed on the fixed tree (60
+   of 60 tests each); 18 of the low ones at a load under 7. The program that opened the pipes
+   came and went: probes of `python -m nonexistent_mod <pipe>` saw a reader 3 of 3 times at a
+   load of about 5 (and 2 of 2 for `merge-feeds`), 0 of 9 at a load of 28 and later 0 of 10 at a
+   load of 8.6, when 72fad94 passed its 3 runs and the by-hand chain of RUNBOOK section 14 (two
+   stand-in tools on named pipes started first, then `merge-feeds | stream --lines -`) ended
+   with exit codes 0 in 3 of 3 runs. So the low-load runs of the fixed tree after that hour show
+   that nothing broke, not that the fix works; that is shown by the test that plays the stray
+   reader (`test_a_reader_that_opens_the_pipe_and_goes_away_does_not_stop_the_tool`: the reader
+   waits for ever without the fix). Why round 6 did not see it: its chain runs at a load of 8 to
+   29 passed, and its bench at 2.5 to 3.6 too; whether the program ran then is not known, and how
+   often it runs was not measured (inferred from the probes above: not all the time, and not
+   only at a low load).
+
+4. **Checked and found right** (read, and run where a check could run here):
+   - The bounded wait: the clock of frame `n` starts at the read time of the first line of frame
+     `n` or later (the reader thread stamps it, `time.monotonic`); the deadline is
+     `max(clock, both headers) + wait`; at exactly the deadline the frame goes out. After a
+     `Queue.get` timeout the monotonic clock is at or past the deadline, so the loop does not spin.
+   - Back-pressure: the merger applies every waiting line before it decides a frame, so the
+     queues of the two feeds are drained together; no deadlock between the bounded queues (the
+     main thread only blocks in the write to its reader). The reader threads are daemons; at
+     the end both have put their end mark before `merge_feeds` returns.
+   - The paint thread: `paint_alignment` gets the image and a new matrix and nothing writes into
+     a frame image after it is pushed; the scores go only to `result.paint`, never to a decision,
+     so two runs of the same input cannot differ through it.
+   - The early dissolve test of the fit (`synthetic_diagnostics._early_take`) is a copy of the
+     rule of `ShotMeter.open_transition`: on the held-out clips below both gave the same spans
+     in 380 of 380 clips (the 19 cases of item 5).
+   - "Delay, never drop": the stream and the merger hold back; only `--skip-behind` (at the
+     source) and the wait of the merger drop parts, as written; L4 makes the second explicit.
+
+5. **The early dissolve test on held-out seeds 700 to 719** (`ShotMeter.open_transition(4)` as
+   the stream calls it, 20 clips per case; the 8 controls of round 6 and 5 new hard cases: a
+   white flash of 1 frame, of 3 frames, three flashes 3 and 4 frames apart, a logo sting of 12
+   frames over the picture, slow motion with each frame shown twice; transitions of
+   `TwoShotSource`):
+
+   | case | clips | taken early | final | early without a final | early minus final (start; stop) |
+   |---|---|---|---|---|---|
+   | 8 controls of round 6 | 160 | 0 | 0 | 0 | - |
+   | flashes (3 cases) | 60 | 0 | 0 | 0 | - |
+   | logo sting, 12 frames | 20 | 0 | 1 | 0 | - |
+   | slow motion | 20 | 0 | 0 | 0 | - |
+   | dissolve, 5 frames | 20 | 19 | 19 | 0 | 0; -2 to 0 |
+   | dissolve, 15 frames | 20 | 17 | 17 | 0 | 0; -1 to 0 |
+   | dissolve, 25 frames | 20 | 18 | 18 | 0 | 0; -9 to 0 |
+   | fade through black, 10 frames | 20 | 0 | 0 | 0 | - |
+   | wipe, 10 frames | 20 | 19 | 19 | 0 | 0; -1 to +2 |
+   | picture in picture, 10 frames | 20 | 0 | 0 | 0 | - |
+
+   No false early transition in 260 clips without a cut (0 of 260; the 95 % upper bound of the
+   rate is about 1.1 %). The early span of a 25-frame dissolve ended up to 9 frames before the
+   final one on these seeds (round 6: up to 4), and a wipe up to 2 frames after it.
+
+   What the early span that ends before the final one does to the decided frames and the ids
+   (stream at L = 25 with the early test, L25-late without it, and the offline engine, on the
+   dissolve clips of `streambench` with dissolves of 5 to 25 frames, held-out seeds 700 to 709,
+   exact and noisy boxes; n = 10 clips per row; "gap" = the frames between the early stop and
+   the final stop, decided under the early span; paired differences to offline):
+
+   | dissolve | boxes | gap frames (all clips; most in one) | gap frames whose state differs | switches L25 - offline, mean [min, max] | switches L25-late - offline |
+   |---|---|---|---|---|---|
+   | 5 | exact | 0; 0 | 0 | +0.0 [0, 0] | -7.7 [-9, -5] |
+   | 10 | exact | 0; 0 | 0 | +0.0 [0, 0] | +4.5 [2, 7] |
+   | 15 | exact | 8; 1 | 2 | +0.0 [0, 0] | +4.4 [2, 7] |
+   | 20 | exact | 8; 1 | 3 | +0.0 [0, 0] | +4.5 [2, 7] |
+   | 25 | exact | 9; 2 | 5 | +0.0 [0, 0] | +4.2 [2, 6] |
+   | 5 | noisy | 0; 0 | 0 | +0.1 [-10, 11] | -3.7 [-15, 5] |
+   | 10 | noisy | 0; 0 | 0 | +0.8 [-8, 9] | +10.1 [-3, 29] |
+   | 15 | noisy | 5; 1 | 3 | -0.4 [-8, 6] | +8.9 [-3, 19] |
+   | 20 | noisy | 8; 1 | 6 | -0.8 [-8, 2] | +9.9 [-1, 28] |
+   | 25 | noisy | 9; 2 | 7 | +5.5 [-7, 50] | +15.0 [0, 57] |
+
+   On these clips the early span ends at most 2 frames before the final one (the clips of item 5
+   up to 9: other camera steps). A gap frame is decided as a frame of the new shot: its people
+   are in the stream and not in the offline result (26 such frames in 100 clips). With exact
+   boxes the ids are those of offline in 50 of 50 clips (switches and number of ids equal).
+   With noisy boxes the paired differences spread both ways; the largest (+50, seed 700, 25
+   frames) has +57 without the early test too, so it is the matching of a noisy late join, not
+   the gap. So: the stream gives up to 2 frames (here) of people that offline leaves out as
+   blend frames, and no id change was traced to it; on 25-frame dissolves with the gaps of item
+   5 (up to 9 frames) this was not measured. The -7.7 of the late arm on 5-frame dissolves (fewer
+   switches than offline) is not explained here; it is an arm without the early test.
+
+6. **Planted bugs.** Written before the matching tests were read (a subagent; list and table kept with the
+   session notes, not in the repository), on the code after the fixes of item 2: 37 bugs planted one
+   at a time in `feed.py` (14), the live mode of `tools/run_tool.py` (12), the live parts of
+   `stream.py` (9) and `merge-feeds` with `stream --lines` in `cli.py` (2), each run against
+   `tests/test_feed.py`, `test_live_feed.py`, `test_stream.py`, `test_detector_families.py` and
+   `test_documented_commands.py` (`-m "slow or not slow"`; 173 passed on the clean code).
+
+   | Outcome | Bugs |
+   |---|---|
+   | caught by the existing tests | 28 (one of them by a hang: the test runner stopped the silent worker after 120 s) |
+   | missed | 8 |
+   | equivalent (no change of behaviour) | 1: the report of `run_tool.py` sent to the standard output with `--feed -`, which already points at the error stream |
+
+   The 8 missed bugs, each now caught by its own test in `tests/test_live_feed_planted.py` (8 tests,
+   about 1 s, no process; each fails with its bug and passes without it):
+
+   | Id | Place | Planted change | New test |
+   |---|---|---|---|
+   | F3 | `FeedMerger.line` | a frame line of frame `n_frames` taken (`<=` for `<`) | `test_a_line_of_the_frame_just_past_the_clip_is_broken` |
+   | F13 | `FeedMerger.line` | the repeated-line check ignores skipped frames | `test_a_part_after_a_skip_line_of_the_same_frame_is_a_repeated_line` |
+   | R2 | `NamedPipeFeed._reopen` | only the last line sent again (no header) | `test_a_reader_that_comes_back_after_some_lines_gets_the_whole_feed_from_its_header` |
+   | S1 | `stream._inputs` | the later of the two arrivals (`max` for `min`) | `test_the_arrival_of_a_frame_is_the_earlier_arrival_of_its_two_parts` |
+   | S3 | `stream._part` | the reason of a missing part not checked | `test_a_missing_part_with_an_unknown_reason_is_refused` |
+   | S9 | `QueuedLines.__iter__` | `last_read_at` the time the line was taken | `test_the_queue_gives_the_time_at_which_a_line_was_read_not_the_time_at_which_it_was_taken` |
+   | S12 | `DetectorStream._log_transitions` | one log entry per span, whatever its kind | `test_a_span_known_early_is_logged_again_when_it_is_final` |
+   | C3 | `cli.stream_inputs` | `--queue` not used for `--lines FILE` | `test_stream_lines_take_the_queue_size_of_the_command_line` |
+
+   The caught ones include a moved clock start, a deadline without the header time, the lines of
+   an ended tool, the release of the reading slot, the cut-off check, deciding all frames in one
+   go, the read to the end, the pace, `--skip-behind` counting, the warm-up before the header,
+   `arrived_at`, the redirect of `--feed -`, the bounded queue, the paint bound, the early span and
+   the exit code of `merge-feeds`. The check also found the defect L7 (not planted).
+
+7. **Latency under a load made on purpose.** Round 6 reported that, before its merger fix, the 95th percentile from
+   the arrival of frame `f + L` to the decision of `f` reached 3.4 and 4.4 s in 2 of 6 runs with
+   the simulated slow calibration (20 ms detector, 439 ms calibration with `--skip-behind`) at a
+   load of 6 to 29, and that this load was not repeated after the fix.
+   - Hypothesis (fixed before the runs): after the fix this 95th percentile stays below 1 s in
+     every run at a comparable load. Baseline arm "fixed": this branch. Control arm "control": the
+     same tree with the merger deciding every due frame in one go (the merger before the round-6
+     fix of item 10; the read to the end is kept). Same bench, seed 500 as in round 6
+     (`python -m pitchvlm.evalx.livebench --runs 1 --delays 5,25 --profiles pnlcalib-paper --seed 500`
+     in each tree), the arms alternating, 250 frames, n = 250 - L decided frames per row. Load made
+     on purpose: 0 or 12 processes that spin (14 cores), on top of the other sessions of the
+     machine (not controlled; the load average before each row is given). The fixed arm ran on the
+     working tree, whose `merge-feeds` gained the end of item 2 (L7) between rows 1 and 3 of the
+     second block; that change acts after the last frame only.
+   - Milliseconds, median / 95th percentile / largest; exit codes of stream, merge-feeds and the two
+     tools (merge-feeds 1: the skipped parts):
+
+   | busy processes | run | arm | L | load | after f + L (ms) | line to decision (ms) | stream frame total (ms) | largest queue | exit codes |
+   |---|---|---|---|---|---|---|---|---|---|
+   | 0 | 1 | fixed | 5 | 27.1 | 450 / 505 / 896 | 158 / 338 / 385 | 30 / 34 / 48 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 1 | fixed | 25 | 21.7 | 461 / 509 / 914 | 170 / 364 / 414 | 32 / 35 / 48 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 1 | control | 5 | 18.0 | 445 / 504 / 880 | 156 / 336 / 390 | 30 / 32 / 46 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 1 | control | 25 | 14.3 | 474 / 513 / 888 | 178 / 388 / 429 | 34 / 37 / 53 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 2 | control | 5 | 10.8 | 458 / 507 / 893 | 164 / 356 / 413 | 32 / 35 / 47 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 2 | control | 25 | 9.5 | 470 / 512 / 901 | 176 / 377 / 420 | 32 / 36 / 51 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 2 | fixed | 5 | 8.8 | 450 / 507 / 902 | 161 / 347 / 393 | 31 / 33 / 50 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 2 | fixed | 25 | 8.2 | 470 / 512 / 896 | 175 / 379 / 424 | 33 / 36 / 50 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 3 | fixed | 5 | 7.7 | 1322 / 3994 / 4292 | 1053 / 3455 / 3489 | 52 / 82 / 128 | 49.0 | 0, 1, 0, 0 |
+   | 0 | 3 | fixed | 25 | 21.5 | 1800 / 3904 / 3946 | 1533 / 3186 / 3321 | 52 / 82 / 113 | 49.0 | 0, 1, 0, 0 |
+   | 0 | 3 | control | 5 | 25.2 | 452 / 508 / 920 | 161 / 346 / 395 | 31 / 33 / 50 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 3 | control | 25 | 20.3 | 461 / 507 / 883 | 171 / 369 / 412 | 32 / 35 / 51 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 4 | control | 5 | 16.0 | 450 / 508 / 890 | 160 / 346 / 383 | 31 / 33 / 47 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 4 | control | 25 | 15.6 | 464 / 511 / 920 | 173 / 375 / 424 | 32 / 36 / 52 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 4 | fixed | 5 | 12.3 | 449 / 506 / 898 | 158 / 344 / 389 | 30 / 33 / 47 | 10.0 | 0, 1, 0, 0 |
+   | 0 | 4 | fixed | 25 | 10.7 | 476 / 515 / 896 | 179 / 389 / 442 | 34 / 37 / 62 | 10.0 | 0, 1, 0, 0 |
+   | 12 | 1 | fixed | 5 | 36.0 | 5117 / 12687 / 12903 | 3880 / 7621 / 8007 | 75 / 185 / 292 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 1 | fixed | 25 | 43.9 | 7250 / 8618 / 8723 | 3005 / 5567 / 5703 | 57 / 159 / 234 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 1 | control | 5 | 46.1 | 3589 / 11423 / 11637 | 3250 / 6838 / 6959 | 77 / 162 / 277 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 1 | control | 25 | 49.6 | 6974 / 9762 / 9927 | 3396 / 5925 / 5994 | 68 / 150 / 216 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 2 | control | 5 | 62.6 | 2600 / 11087 / 11662 | 2270 / 6357 / 6411 | 81 / 166 / 232 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 2 | control | 25 | 62.0 | 7049 / 12218 / 12344 | 4203 / 6729 / 6859 | 74 / 159 / 226 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 2 | fixed | 5 | 68.0 | 1194 / 9661 / 10557 | 875 / 7252 / 7414 | 53 / 193 / 272 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 2 | fixed | 25 | 61.1 | 2764 / 11394 / 12048 | 2391 / 7094 / 7143 | 63 / 189 / 229 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 3 | fixed | 5 | 53.7 | 926 / 2583 / 2672 | 620 / 2292 / 2572 | 45 / 73 / 125 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 3 | fixed | 25 | 49.3 | 874 / 1948 / 2038 | 615 / 1735 / 1919 | 42 / 64 / 137 | 39.0 | 0, 1, 0, 0 |
+   | 12 | 3 | control | 5 | 50.4 | 785 / 1631 / 1668 | 538 / 1337 / 1565 | 41 / 59 / 87 | 30.0 | 0, 1, 0, 0 |
+   | 12 | 3 | control | 25 | 44.4 | 1144 / 3157 / 3322 | 827 / 2836 / 3179 | 44 / 84 / 149 | 45.0 | 0, 1, 0, 0 |
+   | 12 | 4 | control | 5 | 41.9 | 722 / 1502 / 1570 | 409 / 1263 / 1461 | 40 / 59 / 124 | 30.0 | 0, 1, 0, 0 |
+   | 12 | 4 | control | 25 | 50.5 | 817 / 1856 / 2024 | 557 / 1614 / 1910 | 43 / 62 / 104 | 36.0 | 0, 1, 0, 0 |
+   | 12 | 4 | fixed | 5 | 63.6 | 593 / 1792 / 1896 | 372 / 1523 / 1786 | 42 / 63 / 89 | 33.0 | 0, 1, 0, 0 |
+   | 12 | 4 | fixed | 25 | 66.8 | 860 / 2916 / 3119 | 655 / 2675 / 2858 | 45 / 76 / 187 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 5 | fixed | 5 | 63.3 | 591 / 1215 / 1270 | 363 / 1015 / 1177 | 39 / 56 / 96 | 25.0 | 0, 1, 0, 0 |
+   | 12 | 5 | fixed | 25 | 61.8 | 608 / 1632 / 1757 | 386 / 1408 / 1632 | 40 / 64 / 107 | 33.0 | 0, 1, 0, 0 |
+   | 12 | 5 | control | 5 | 54.2 | 794 / 1967 / 2024 | 533 / 1710 / 1949 | 42 / 65 / 91 | 38.0 | 0, 1, 0, 0 |
+   | 12 | 5 | control | 25 | 53.7 | 5776 / 15484 / 16419 | 5611 / 7058 / 7213 | 93 / 208 / 295 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 6 | control | 5 | 51.0 | 613 / 1253 / 1364 | 383 / 951 / 1212 | 40 / 60 / 98 | 22.0 | 0, 1, 0, 0 |
+   | 12 | 6 | control | 25 | 46.8 | 636 / 1543 / 1649 | 398 / 1281 / 1521 | 41 / 58 / 90 | 28.0 | 0, 1, 0, 0 |
+   | 12 | 6 | fixed | 5 | 45.0 | 4488 / 5765 / 5900 | 2652 / 4329 / 4635 | 53 / 120 / 167 | 49.0 | 0, 1, 0, 0 |
+   | 12 | 6 | fixed | 25 | 44.3 | 2508 / 8204 / 8347 | 2214 / 5564 / 5646 | 61 / 141 / 238 | 49.0 | 0, 1, 0, 0 |
+
+   - **The hypothesis fails.** With no extra process (load 7.7 to 27.1) the fixed arm stayed below
+     1 s in 6 of 8 rows (505 to 515 ms) and reached 3.9 s in 2 (one run, load 7.7 then 21.5); the
+     control stayed below 1 s in 8 of 8. With 12 extra processes (load 36 to 68) every row of both
+     arms was above 1 s: fixed 1.2 to 12.7 s, control 1.3 to 15.5 s.
+   - Cause, from the same rows: the stream itself fell behind. In every row above 1 s the median
+     frame time of the stream was 39 to 93 ms, at or above the 40 ms of a frame at 25 fps, the line
+     to decision alone was 1.0 to 7.6 s at its 95th percentile, and the queue of the stream held up
+     to 49 of its 50 lines; in the rows below 1 s the median frame time was 30 to 34 ms and the queue
+     held at most 10 lines. The merger is not the cause: the control is no better. With the
+     calibration skipping, the frames come in bursts of about 11 every 439 ms, so a stream that is
+     slower than the pace collects a backlog that only the end of the clip empties.
+   - Limit, written: on the build machine under load the decision of the stream does not keep a
+     25 fps pace (round 6 found the same for the frame time, item 5 of its entry), and the delay
+     then grows to many seconds. The fix that would help is in the stream (the decision runs the
+     window of 123 + L frames again for every frame; round 5, item 7), not in the merger; it is not
+     built here. On the run machine the 95th percentile of the frame time must be checked first
+     (RUNBOOK section 14 already asks for it).
+
+8. **The cache key of a video request** (V3 of round 6; the owner approved it).
+   - What "the same" means. A video file is written from frames of a clip. A lossy codec gives
+     other bytes, and other decoded pixels, from one codec or OpenCV build to the next, so neither
+     the hash of the bytes nor a hash of the decoded video is stable. What stays the same is the
+     request: the frames of the clip (their numbers), the rate and the size at which they are
+     written, the range, the sampling rate and the media resolution, with the prompt, the schema,
+     the model and the context of the request.
+   - Built: `VideoPart.source` (`VideoFrames`: the frames, `write_fps`, `width`, `height` and
+     `pixels_sha256`, the hash of the decoded pixels of the frames of the clip before the codec,
+     `vlm.video.frames_digest`). For such a part `identity()` (in the key) holds the frames, the
+     rate, the size, the range, the sampling rate, the resolution, the file type and the length,
+     and neither hash. A part without `source` (a file the package did not write) keeps the hash
+     of its bytes in the key. The item of a people video request is `video-` and 16 digits of a
+     hash of that identity (it was the hash of the bytes). A cassette keeps `stored()`: the
+     identity, `sha256` (the bytes that were sent) and `pixels_sha256`.
+   - A hit compares. Same pixels, other bytes (the frames written again): the stored answer is
+     used, a warning is logged, the store counts it (`CassetteStore.other_video_bytes`), and the
+     command prints the count and writes `stored_answers_on_rewritten_videos` into its cost record:
+     neither silent nor an error. Other pixels of the same frames (new footage under an old clip
+     name, or another decoder of the source images): `OtherImagesError`, as for images, or the
+     answer with a warning under `--allow-other-images`. A duration that does not fit the frames
+     and the rate is refused when the part is made.
+   - Rule 2: no path and no bytes of a video in a cassette (test: the cassette names no folder, no
+     `.mp4`, no bytes of the file; its keys are listed).
+   - No paid run has been made, so no stored answer needed a migration; the keys of video requests
+     made before this change (only fake runs of the tests) are not valid any more.
+   - Tests (`tests/test_vlm_video.py`): the same frames written again with other bytes hit and are
+     counted once; the codecs `avc1` and `mp4v` give other bytes and the same key (skipped where
+     OpenCV cannot write one of them); one other frame, the write rate, the frame size, the
+     resolution, the prompt, the model, a range and a sampling rate each change the key; other
+     pixels under the same frames are refused, and allowed with a warning; the cassette holds both
+     hashes and no path.
+
+9. **Proposed owner decisions.**
+   - The wait of the merger (round 6): replace "it must be above the time of the slower tool per
+     frame" by "it bounds the lag of a tool; give `--skip-behind` to a tool whose time per frame
+     is at or above the frame interval" (L4).
+   - Keep `FEED_REOPEN_WAIT_S` at 10 s: a tool whose reader stopped for good now ends 10 s later
+     than before (the chain-ends test takes 12 s instead of about 2 s).
+   - The early dissolve test stays on; for dissolves of 25 frames its span can end up to 9 frames
+     before the final one (item 5), so a delay of at least 35 frames stays the advice.
+   - No text of `CLAUDE.md` is proposed.
+
+10. **Not verified.** Named pipes on Linux (built and run on macOS only; the open without
+    blocking of `NamedPipeFeed` follows POSIX: it succeeds when a process has the pipe open for
+    reading, also one that waits in its open); which program opens the pipes on the build
+    machine (only what it does was measured); a real tool, the run machine, real footage, a real
+    dissolve, flash or replay; a paid video request and the bytes of a video written on another
+    machine (the test makes other bytes by another codec or by a changed writer).
+
+11. **Second read of this work.** One subagent that had not seen this reasoning got the diff of
+    the fixes and of the video key, and a copy to run. It found no major defect, 2 minor and 9
+    small ones; each was run by it unless said:
+    - Minor, fixed: opened first, `--feed` on a plain file emptied it before any check, the job
+      file included (`--feed JOB`: exit 2 and an empty job). Now only a named pipe and `-` are
+      opened first, and `--feed` on `--out` or `--job` is refused (`os.path.samefile`). Test
+      `test_a_feed_that_names_the_job_file_is_refused_and_the_job_is_kept` (fails without it).
+    - Minor (reasoning), fixed in RUNBOOK section 14: the tools load their models only after
+      `merge-feeds` opens their pipes, so `START` 60 s ahead of terminal 1 could pass before the
+      models are loaded; now 120 s, and the three terminals within 30 s.
+    - Small, fixed: `--feed -` in a process that calls `main` left its descriptor 1 on the error
+      stream after `main` (`StandardOutputFeed.close` gives it back). The first test of it ran in
+      the test process, where `sys.stdout` is the capture file of pytest, and passed without the
+      fix; the test now runs a process and fails without it.
+    - Small, fixed: with `--allow-other-images`, a hit with other image bytes and a rewritten video
+      did not count the video (test `test_a_rewritten_video_is_counted_also_when_other_image_bytes_are_allowed`).
+    - Small, fixed: after a resend that broke, the reopen loop of `NamedPipeFeed` did not look at
+      its deadline (bounded in practice: 0.33 s with a wait of 0.3 s); it does now.
+    - Small, written as limits in the docstring of `NamedPipeFeed`: a stray reader that takes some
+      bytes and closes before the next line, with `merge-feeds` open by then, takes them from the
+      feed (run with fast stand-ins; real tools write the header after the tool is built); on
+      Linux a reader that opens in the microseconds between the broken write and the close sees
+      the end at once (reasoning); a child forked without exec keeps the old end open (reasoning).
+    - Small, fixed: the docstring of `VideoPart` named `identity` as what a stored answer keeps;
+      ARCHITECTURE now says that a cassette names all written frames of a video (frame numbers,
+      no label data), also those that `stored_context` leaves out.
+    - Its design note: the review of round 6 recommended stopping a hit on other bytes; the brief of
+      this session asked for a counted note, not an error, and that is what is built (item 8).
+    - Checked and found right by it: the key of a written video changes with frames, write rate,
+      size, resolution, prompt, model, range and sampling rate and stays for other bytes; a
+      written and a foreign video cannot share a key; the pixels check refuses new footage and a
+      cassette without the hash; the counter is under a lock and counts once per hit; rule 2 holds
+      for the cassette; the open that does not block gives `ENXIO` without a reader on Linux and
+      macOS, and a reader that waits in its open counts as a reader on Linux.
+
+12. **Test runs.** Build machine, `tools/run_tests.py`, 14 workers, after the last fix: default run
+    3,516 passed, 1 skipped, 10 deselected, exit 0, 75.6 s (load 20.6); full run (`-m "slow or not
+    slow"`) 3,526 passed, 1 skipped, exit 0, 51.7 s (load 14.5); on 72fad94 the full run gave 3,501
+    passed. `python3 tools/guard.py --tracked`: exit 0. `stream --synthetic`: exit 0. The `demo`
+    predictions of both engines are byte-equal to 72fad94 (SHA-256 `bb50efd43536dd71...` for the
+    model engine, `1f97af18358d652b...` for the detector engine).
+
+13. **Files outside the area of this session.** `src/pitchvlm/cli.py`: `SessionBackend.other_video_bytes`
+    and the note in `close_session` (`print_rewritten_videos`), no option and no command;
+    `docs/HANDOVER.md` (step 21 and decision 42).
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same

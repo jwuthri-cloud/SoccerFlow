@@ -529,11 +529,12 @@ python -m pitchvlm.cli probe people --experiment configs/experiments/people_prob
   decide nothing; the three arms of RUNBOOK, section 13, on 24 clips do.
 - When not: a stop with the words "1.3 times its estimate": the video token rate is too low
   (RUNBOOK, section 13, line `video tokens`); tell the owner before a second try.
-- Before it: decision 42 of section 11.1. Until the key of a video request is the pixel hash of
-  its frames, a video that is written again with other bytes (another codec, another OpenCV build)
-  misses its stored answer, and a paid run pays it again without an error. So keep
-  `~/pitchvlm-data/video-input` between a paid run and its replay, and run every replay with
-  `--replay`: it refuses a miss and pays nothing.
+- Before it: decision 42 of section 11.1 is built (entry "Second read of the live feed, and a
+  cache key of video requests that survives a new write" of 2026-11-23): the key of a video
+  request holds its frames and settings, not the bytes of the file, so a video written again with
+  other bytes finds its stored answer and is counted (`stored_answers_on_rewritten_videos`). Keep
+  `~/pitchvlm-data/video-input` between a paid run and its replay all the same, and run every
+  replay with `--replay`: it refuses a miss and pays nothing.
 
 **Step 22. The first check of the second detector family.** Free; it downloads packages and a
 checkpoint (79 MB for D-FINE Medium, estimated). It needs the owner's yes to the install and the
@@ -800,7 +801,7 @@ Before the clip runs (M4, M5):
 | 31 | Cost of the split arm [same entry, item 11 (d)] | team slots first, then the split arm after its estimate; both together | Team slots first | as the owner starts them | nothing |
 | 32 | Video input in the pipeline (`run`) [entry "Video input for the model steps" of 23 Nov, item 7] | build it after the probes; never | Decide after the probes, with both metrics files | `run` sends images | nothing |
 | 33 | Uploads of a video request above 20,000,000 bytes (the Files API keeps a file for 48 hours); since the review of round 5 the limit counts the whole request as JSON text (inline data, text, schema, settings), not only its inline data [same entry, item 7; entry "Second read of the video input and the detector families", V1] | keep the refusal; an upload followed by a delete | This session: keep the refusal while only the probes send video (a 2.5 s file of 1080p frames is far below the limit) | refused before any call | nothing now |
-| 42 | A video written again from the same frames with other bytes (another codec or OpenCV build) gets another cache key: a paid run pays its request again without an error, where an image request stops [entry "Second read of the video input and the detector families", V3 and item 8] | keep the written videos with the data and run every replay with `--replay` (no code change); key a video request on the pixel hash of its frames and stop a hit whose file has other bytes, as for images (a change of the key; no video answer is stored yet) | The review session: the pixel key, before the first paid video probe | the file hash stays in the key; `--replay` refuses a miss, a paid run pays again | section 6, step 21, and every later video probe |
+| 42 | A video written again from the same frames with other bytes (another codec or OpenCV build) gets another cache key: a paid run pays its request again without an error, where an image request stops [entry "Second read of the video input and the detector families", V3 and item 8] | keep the written videos with the data and run every replay with `--replay` (no code change); key a video request on the pixel hash of its frames and stop a hit whose file has other bytes, as for images (a change of the key; no video answer is stored yet) | Built on 23 Nov (owner's yes): the key holds the frames of the clip and the settings of the file; a hit on other bytes is used and counted, a hit on other pixels stops as for images | the frames and settings are the key; no stored answer needed a migration | section 6, step 21, and every later video probe |
 | 34 | A video rate for an OpenRouter model [same entry, item 7] | add a `video` entry to `configs/openrouter_prices.yaml` from the model card of one model, then `doctor --video`; none | None published yet: add one only from a model card | every OpenRouter video request is refused before any call | video input through OpenRouter |
 | 35 | OpenRouter: the price table on the estimate side, the token estimates per model, which models to try [last list, three items] | price table: the highest price of any provider, or that of the provider that the routing chose; token estimates: one table for all models, or per model; models: which to try first | Keep the highest price; estimates per model when the first doctor of a model differs by more than 1.5 times; Qwen3-VL first | the highest price, one table for all models, no model tried | the OpenRouter probes |
 

@@ -76,6 +76,7 @@ tests replace each tool by a stand-in with the same interface.
 from __future__ import annotations
 
 import argparse
+import errno
 import glob
 import hashlib
 import importlib
@@ -84,6 +85,7 @@ import json
 import math
 import os
 import platform
+import stat
 import statistics
 import subprocess
 import sys
@@ -470,6 +472,101 @@ def write_clip_run(
         part.write_text(text, encoding="utf-8")
         paths.append(part)
     return paths
+
+
+#: How long the feed of a live run in a named pipe waits for a reader again after its reader went away, seconds.
+FEED_REOPEN_WAIT_S = 10.0
+
+
+class NamedPipeFeed:
+    """The feed of a live run in a named pipe: a reader that goes away is waited for again, and gets the whole feed.
+
+    A writer that waits in the open of a named pipe is paired with the first process that opens
+    it for reading. That need not be ``merge-feeds``: a program that looks at the files named on
+    the command line of a new process can open the pipe and close it again (measured on the
+    build machine: every new ``python -m ... <pipe>`` process, also of another module, had its
+    pipe opened for reading within 8 to 27 ms of its start). The next write then fails
+    (``BrokenPipeError``), and a script that stopped there left ``merge-feeds`` waiting for ever
+    in its own open of the pipe. So on a broken pipe the feed closes its end, waits up to
+    ``wait_s`` seconds for a reader (an open that does not block, tried every ``poll_s``
+    seconds), and sends every line again from the header. When no reader comes in time,
+    ``BrokenPipeError`` is raised, as before. The lines are kept in memory for this (a live run
+    is a run of one clip). ``reopened`` counts the readers that were waited for again.
+
+    Limits (second read of 2026-11-23): the feed sees a reader go only when a write breaks, so
+    a reader that took some bytes and closed before the next line, with the real reader open by
+    then, leaves the real reader without those bytes (``merge-feeds`` then refuses the header,
+    exit 2; with real tools the header comes after the tool is built, long after such a reader
+    has gone). On Linux a reader that opens in the microseconds between the broken write and the
+    close of the old end sees the end of the feed at once. A child that the tool forks without
+    exec keeps the old end open, so the end of the feed waits for it too.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        wait_s: float = FEED_REOPEN_WAIT_S,
+        poll_s: float = 0.05,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._path = path
+        self._wait_s = wait_s
+        self._poll_s = poll_s
+        self._clock = clock
+        self._sleep = sleep
+        self._lines: list[str] = []
+        self.reopened = 0
+        self._handle: Any = open(path, "w", encoding="utf-8")  # waits for a reader
+
+    def write(self, text: str) -> None:
+        self._lines.append(text)
+        try:
+            self._handle.write(text)
+            self._handle.flush()
+        except BrokenPipeError:
+            self._reopen()
+
+    def flush(self) -> None:
+        """Each line is flushed as it is written."""
+
+    def close(self) -> None:
+        close_quietly(self._handle)
+
+    def _reopen(self) -> None:
+        close_quietly(self._handle)
+        deadline = self._clock() + self._wait_s
+        while True:
+            try:
+                descriptor = os.open(self._path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:  # ENXIO: the pipe has no reader now
+                    raise
+                if self._clock() >= deadline:
+                    raise BrokenPipeError(
+                        errno.EPIPE,
+                        f"the reader of the feed went away, and no reader came back within {self._wait_s:g} s",
+                    ) from None
+                self._sleep(self._poll_s)
+                continue
+            os.set_blocking(descriptor, True)
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            try:
+                handle.write("".join(self._lines))
+                handle.flush()
+            except BrokenPipeError:
+                close_quietly(handle)
+                if self._clock() >= deadline:
+                    raise
+                continue
+            self._handle = handle
+            self.reopened += 1
+            print(
+                f"note: the reader of the feed {self._path} went away; a new reader got the feed again from its header",
+                file=sys.stderr,
+            )
+            return
 
 
 class LiveFeed:
@@ -1253,7 +1350,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The tools are code of other projects. They get no key of a model API.
     for variable in KEY_VARIABLES:
         os.environ.pop(variable, None)
+    feed: Any = None
     try:
+        if args.feed is not None:
+            for name, other in (("--out", args.out), ("--job", args.job)):
+                if args.feed != "-" and same_file(Path(args.feed), other):
+                    raise RunnerError(f"--feed and {name} name the same file")
+            # A named pipe or the standard output first, so that a stop at any later step closes it and its
+            # reader sees the feed end (``open_feed``); a plain file is opened when the frames start.
+            feed = open_feed(args.feed)
         if sys.version_info < (3, 10):
             raise RunnerError(f"this script needs Python 3.10 or newer, and this is Python {platform.python_version()}")
         job = read_job(args.job, args.tool)
@@ -1284,13 +1389,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             answer = one_at_a_time(single)
         skipped = 0
         if live:
-            frames, skipped = run_live(args, job, job_sha256, answer, batch)
+            frames, skipped = run_live(args, job, job_sha256, answer, batch, feed)
         else:
             frames = answer_frames(job, args.root, answer, batch)
         runner = {**machine, **facts, **run_facts()}
         written = [args.out]
         if live:
-            written.append(write_live_facts(args.out, job, job_sha256, runner, len(frames), skipped))
+            reopened = feed.reopened if isinstance(feed, NamedPipeFeed) else 0
+            written.append(write_live_facts(args.out, job, job_sha256, runner, len(frames), skipped, reopened))
         if clip_job and not live:
             written = write_clip_run(args.out, job, job_sha256, runner, frames)
         elif not live:
@@ -1302,6 +1408,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         traceback.print_exc()
         print(f"error: the script stopped with {type(error).__name__}; the traceback above says where", file=sys.stderr)
         return EXIT_ERROR
+    finally:
+        if feed is not None:
+            close_quietly(feed)
     # The standard output of a live run to "-" is the feed: the report goes to the error stream then.
     report = sys.stderr if args.feed == "-" else sys.stdout
     median = statistics.median(entry["seconds"] for entry in frames) if frames else float("nan")
@@ -1326,12 +1435,19 @@ def live_facts_path(out: Path) -> Path:
 
 
 def write_live_facts(
-    out: Path, job: Mapping[str, Any], job_sha256: str, runner: Mapping[str, Any], answered: int, skipped: int
+    out: Path,
+    job: Mapping[str, Any],
+    job_sha256: str,
+    runner: Mapping[str, Any],
+    answered: int,
+    skipped: int,
+    reopened: int = 0,
 ) -> Path:
     """Write the facts of a live run, which its feed has no place for, and return the file.
 
     They are those of a clip run (the device, the versions, the script, the self-check of a
-    detector of transformers, ...), with the numbers of answered and skipped frames.
+    detector of transformers, ...), with the numbers of answered and skipped frames, and of the
+    readers of a named pipe that went away and were waited for again (``NamedPipeFeed``).
     """
     path = live_facts_path(out)
     document = {
@@ -1342,18 +1458,81 @@ def write_live_facts(
         "runner": dict(runner),
         "answered_frames": answered,
         "skipped_frames": skipped,
+        "feed_reopened": reopened,
     }
     path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
     return path
 
 
+def same_file(first: Path, second: Path) -> bool:
+    """Tell whether two paths name one file: the same file on the disk when both exist, else the same resolved path."""
+    if first.exists() and second.exists():
+        return os.path.samefile(first, second)
+    return first.resolve() == second.resolve()
+
+
+def open_feed(target: str) -> Any:
+    """Open the feed of a live run (``--feed``) when it is a named pipe or ``-``, before the job is read and the tool is
+    built; return None for a plain file, which ``run_live`` opens when the frames start.
+
+    A named pipe waits here until its reader (``merge-feeds``) opens it. The feed is open from
+    the start, so a script that stops at any later step (a wrong job, a tool that cannot be
+    built, an error of a frame) closes it, and its reader sees the feed end; opened after the
+    tool, a stop before that left the reader, and through it the other tool, waiting for ever.
+    For ``-`` the feed is the standard output, and the standard output of the process (what
+    the script, a tool or a library prints) goes to the error stream until the feed is closed
+    (``StandardOutputFeed``), so that nothing but the lines of the feed reaches the reader.
+    """
+    if target == "-":
+        return StandardOutputFeed()
+    if os.path.exists(target) and stat.S_ISFIFO(os.stat(target).st_mode):
+        return NamedPipeFeed(target)
+    return None
+
+
+class StandardOutputFeed:
+    """The feed on the standard output (``--feed -``): the descriptor 1 of the process points at the error stream while
+    the feed is open, and back at the standard output when it is closed."""
+
+    def __init__(self) -> None:
+        sys.stdout.flush()
+        self._saved = os.dup(sys.stdout.fileno())
+        self._handle = os.fdopen(os.dup(self._saved), "w", encoding="utf-8")
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+
+    def write(self, text: str) -> None:
+        self._handle.write(text)
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def close(self) -> None:
+        close_quietly(self._handle)
+        sys.stdout.flush()  # what was printed meanwhile goes to the error stream, not after the feed
+        os.dup2(self._saved, sys.stdout.fileno())
+        os.close(self._saved)
+
+
+def close_quietly(handle: Any) -> None:
+    """Close a feed; a reader that has gone already (a broken pipe) is no error here, the run reported it."""
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
 def run_live(
-    args: argparse.Namespace, job: Mapping[str, Any], job_sha256: str, answer: BatchAnswer, batch: int
+    args: argparse.Namespace,
+    job: Mapping[str, Any],
+    job_sha256: str,
+    answer: BatchAnswer,
+    batch: int,
+    feed: Any,
 ) -> tuple[list[dict[str, Any]], int]:
     """Answer the frames of a clip job as a live run: write the feed and its copy at ``--out`` as frames are answered.
 
-    Returns the answered entries and the number of skipped frames. The feed is opened after the
-    tool is built, so a named pipe waits for its reader only then.
+    ``feed`` is the open feed of ``open_feed``, or None for a plain file, opened here. Returns
+    the answered entries and the number of skipped frames.
     """
     head = {
         "clip": job["clip"],
@@ -1363,16 +1542,14 @@ def run_live(
         "tool": job["tool"],
     }
     with args.out.open("w", encoding="utf-8") as copy:
-        if args.feed == "-":
-            feed = LiveFeed(
-                [copy, sys.stdout], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind
-            )
-            frames = answer_frames(job, args.root, answer, batch, live=feed)
-        else:
+        if feed is None:  # a plain file
             with open(args.feed, "w", encoding="utf-8") as target:
-                feed = LiveFeed([copy, target], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
-                frames = answer_frames(job, args.root, answer, batch, live=feed)
-    return frames, feed.skipped
+                live = LiveFeed([copy, target], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
+                frames = answer_frames(job, args.root, answer, batch, live=live)
+        else:
+            live = LiveFeed([copy, feed], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
+            frames = answer_frames(job, args.root, answer, batch, live=live)
+    return frames, live.skipped
 
 
 if __name__ == "__main__":

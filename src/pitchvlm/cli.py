@@ -901,6 +901,10 @@ class SessionBackend:
         with self._lock:
             return self._replayed_answers, self._replayed_usd
 
+    def other_video_bytes(self) -> int:
+        """Return the stored answers used so far that were recorded from other bytes of the same video frames."""
+        return self._store.other_video_bytes
+
 
 def new_run_id(command: str, label: str) -> str:
     """Make the id of one run for the cost ledger: the command, a label, the UTC time and a random part."""
@@ -1098,11 +1102,15 @@ def close_session(session: ModelSession) -> dict[str, Any]:
     requests = session.backend.requests_per_step()
     listed = ", ".join(f"{step} {count}" for step, count in requests.items()) or "none"
     print(f"requests of this run, answered by the model or from the stored answers: {listed}")
+    # A stored answer of a video that was written again with other bytes is used, and said here (``vlm.cache``).
+    rewritten = session.backend.other_video_bytes()
+    note = {"stored_answers_on_rewritten_videos": rewritten} if rewritten else {}
     if session.meter is None:
         stored_answers, stored_usd = session.backend.replayed()
         print("measured cost: 0.000 USD (replay mode: no model call was made)")
         if stored_answers:
             print(f"  stored answers used: {stored_answers}; they cost {usd(stored_usd)} when they were paid")
+        print_rewritten_videos(rewritten)
         return {
             "replay": True,
             "estimate_usd": session.estimate_usd,
@@ -1113,10 +1121,21 @@ def close_session(session: ModelSession) -> dict[str, Any]:
             "stored_answers": stored_answers,
             "stored_usd": stored_usd,
             "steps": {},
+            **note,
         }
-    cost = {"replay": False, "estimate_usd": session.estimate_usd, "requests": requests, **session.meter.report()}
+    cost = {"replay": False, "estimate_usd": session.estimate_usd, "requests": requests, **session.meter.report(), **note}
     print_measured(cost)
+    print_rewritten_videos(rewritten)
     return cost
+
+
+def print_rewritten_videos(count: int) -> None:
+    """Say how many stored answers were used for videos that were written again with other bytes, when any were."""
+    if count:
+        print(
+            f"  stored answers used for a video written again with other bytes from the same frames: {count} "
+            "(the model saw the bytes of the first file; docs/DECISIONS.md, entry of 2026-11-23 on the video key)"
+        )
 
 
 # --- Clips, labels and prediction files ----------------------------------------------
@@ -2216,9 +2235,18 @@ def _cmd_merge_feeds(args: argparse.Namespace) -> int:
     # thread may still wait in one when the reader of the merged lines stops early, and the end of
     # the process closes them (``feed.fd_lines``).
     feeds = {"detector": os.open(args.detector, os.O_RDONLY), "calibration": os.open(args.calibration, os.O_RDONLY)}
+    def end() -> None:
+        # The merged lines are whole: their reader sees their end now, not when a slow or hung tool ends.
+        out.flush()
+        if out is not sys.__stdout__:  # called in a process whose standard output was replaced (a test)
+            return
+        nothing = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(nothing, sys.stdout.fileno())
+        os.close(nothing)
+
     try:
         merger = merge_feeds(
-            {tool: fd_lines(fd) for tool, fd in feeds.items()}, write, wait_s=args.wait, queue_lines=args.queue
+            {tool: fd_lines(fd) for tool, fd in feeds.items()}, write, wait_s=args.wait, queue_lines=args.queue, end=end
         )
     except FeedError as error:
         raise CliError(f"the feeds cannot be merged: {error}") from error

@@ -42,9 +42,11 @@ live feed of the detector engine", 2026-11-23):
    is dropped for it. Frames are decided one at a time, and the lines that came while a line was
    written count before the next frame is decided: a part is late only when its tool had not
    written it by the time its frame goes out.
-7. After the last frame went out, a feed that is still open is read to its end (its lines are
-   late and counted), so that the pipe of a slow tool does not break under it and its copy at
-   ``--out`` is whole.
+7. After the last frame went out, the merged lines end (``end``), so their reader finishes at
+   once. A feed that is still open is then read to its end (its lines are late and counted), so
+   that the pipe of a slow tool does not break under it and its copy at ``--out`` is whole; but
+   a feed that sends nothing for ``drain_s`` seconds is left (``left_open``): a tool that hangs
+   does not hold the merger for ever.
 
 No model is called and nothing is paid here.
 """
@@ -72,6 +74,8 @@ TOOL_FEED_FORMAT = "pitchvlm-tool-feed-1"
 DEFAULT_WAIT_S = 1.0
 #: Default number of lines that the merger reads ahead from each feed.
 DEFAULT_QUEUE_LINES = 250
+#: After the last frame, a feed that sends nothing for this many seconds is no longer read (policy 7).
+DEFAULT_DRAIN_S = 10.0
 
 _HEADER_KEYS = frozenset({"format", "clip", "n_frames", "video_sha256", "job_sha256", "tool"})
 _DETECTOR = TypeAdapter(DetectorSettings)
@@ -99,6 +103,8 @@ class MergeCounts:
     repeated_lines: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STREAM_TOOLS, 0))
     broken_lines: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STREAM_TOOLS, 0))
     cut_off_lines: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STREAM_TOOLS, 0))
+    #: Feeds still open, and silent for the drain time, when the merger stopped reading after the last frame.
+    left_open: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STREAM_TOOLS, 0))
 
     def as_dict(self) -> dict[str, dict[str, int]]:
         return {name: dict(values) for name, values in vars(self).items()}
@@ -344,13 +350,16 @@ def merge_feeds(
     wait_s: float = DEFAULT_WAIT_S,
     queue_lines: int = DEFAULT_QUEUE_LINES,
     clock: Callable[[], float] = time.monotonic,
+    end: Callable[[], None] | None = None,
+    drain_s: float = DEFAULT_DRAIN_S,
 ) -> FeedMerger:
     """Read the feed of each tool on its own thread, merge them (``FeedMerger``) and ``write`` each merged line.
 
     ``feeds`` maps ``"detector"`` and ``"calibration"`` to their lines (an open pipe or file).
-    ``write`` gets each line without its line end, as soon as it can go out. Returns the merger
-    (its ``counts``, ``next_frame`` and ``n_frames``). A wrong header raises ``FeedError``; an
-    error of reading a feed is raised as it is.
+    ``write`` gets each line without its line end, as soon as it can go out; ``end`` is called
+    once the last line went out, before the feeds that are still open are read to their end
+    (policy 7). Returns the merger (its ``counts``, ``next_frame`` and ``n_frames``). A wrong
+    header raises ``FeedError``; an error of reading a feed is raised as it is.
     """
     if set(feeds) != set(STREAM_TOOLS):
         raise ValueError(f"the feeds must be {', '.join(STREAM_TOOLS)}")
@@ -397,10 +406,20 @@ def merge_feeds(
             for text in lines:
                 write(text)
             apply_waiting(None)
+    if end is not None:
+        end()
     # Every frame went out, or both feeds ended. A tool that is still writing is read to its end, so
-    # that its pipe does not break under it: its lines are late and counted (policy 5).
+    # that its pipe does not break under it: its lines are late and counted (policy 5). A tool that
+    # sends nothing for ``drain_s`` is left (policy 7).
     while len(merger.ended) < len(STREAM_TOOLS):
-        apply_waiting(events.get())
+        try:
+            event = events.get(timeout=drain_s)
+        except queue.Empty:
+            for tool in STREAM_TOOLS:
+                if tool not in merger.ended:
+                    merger.counts.left_open[tool] += 1
+            break
+        apply_waiting(event)
     return merger
 
 
