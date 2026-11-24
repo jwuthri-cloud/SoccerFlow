@@ -4589,7 +4589,17 @@ machine is Linux, the build machine is a Mac (arm64).
     run 45302990921): 3.13 and one process green, 3.12 one failure (item 8), 26 skipped. Round 3
     (f3731a7, run 45308492172): the stop-signal test passed on 3.12 and 3.13; 3504 passed, 1
     failed (item 13), 5 skipped in each job; runner 144.8 s (3.13) and 145.6 s (3.12), one
-    process 249.1 s; the checksum of gitleaks passed and the 21 tests of the hooks ran.
+    process 249.1 s; the checksum of gitleaks passed and the 21 tests of the hooks ran. Round 4
+    (611861c, run 45311659695): green in all three jobs, the first full pass on Linux: 3508
+    passed, 5 skipped in each; runner 206.4 s (3.12) and 207.6 s (3.13), one process 249.9 s.
+15. **Why the run in 4 processes took 132, 145 and 207 s in rounds 2 to 4.** A new clone has no
+    stored test times, so `tools/run_tests.py` balances the workers by test count, and the wall
+    time is that of the slowest worker. Its lines in the log: round 3, workers 38.6 to 138.5 s;
+    round 4, 111.7 to 198.7 s (3 more tests moved the split, and a worker got the heavy files).
+    The run in one process, the same tests in one interpreter, took 249.1 s in round 3 and 249.9
+    s in round 4; round 2 took 326.7 s without the 21 tests of the hooks. So the hooks do not
+    explain the longer runs; the split by count and a shared runner do (one run per round, so the
+    spread of the runner is not known). CI keeps no times file between runs.
 
 
 ## Open questions (to settle with measurements)
