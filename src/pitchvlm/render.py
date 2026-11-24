@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import unicodedata
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -433,23 +433,51 @@ def _crop_to_even(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image[: height - height % 2, : width - width % 2])
 
 
+#: The text on a frame that the streaming path dropped (its overload policy): it holds no measurement.
+DROPPED_TEXT = "dropped: not measured"
+
+
+def draw_dropped(image: np.ndarray) -> np.ndarray:
+    """Return a frame that holds no measurement (a frame dropped by the stream): darkened, with ``DROPPED_TEXT``."""
+    canvas = (image.astype(np.float32) * 0.4).astype(np.uint8)
+    height, width = canvas.shape[:2]
+    scale = max(0.6, width / 1280.0)
+    cv2.putText(canvas, DROPPED_TEXT, (int(20 * scale), int(50 * scale)), _FONT, scale, (255, 255, 255), 2, cv2.LINE_AA)
+    return canvas
+
+
 def _video_frames(
-    source: FrameSource, states: Sequence[FrameState], style: RenderStyle, cuts: Sequence[int]
+    source: FrameSource,
+    states: Sequence[FrameState],
+    style: RenderStyle,
+    cuts: Sequence[int],
+    dropped: Collection[int] = (),
 ) -> Iterator[np.ndarray]:
     """Yield the video image of every state: the overlay on top and the radar below."""
     radar = RadarRenderer(source.info.fps, style, cuts=cuts)
     for state in states:
-        overlay = draw_overlay(source.read(state.frame), state.players, style)
+        picture = source.read(state.frame)
+        if state.frame in dropped:
+            picture = draw_dropped(picture)
+        overlay = draw_overlay(picture, state.players, style)
         if state.ball is not None:
             overlay = draw_ball(overlay, state.ball, style)
         yield _crop_to_even(compose(overlay, radar.draw(state)))
 
 
-def render_clip(source: FrameSource, result: ClipResult, out_path: Path, style: RenderStyle = RenderStyle()) -> Path:
+def render_clip(
+    source: FrameSource,
+    result: ClipResult,
+    out_path: Path,
+    style: RenderStyle = RenderStyle(),
+    *,
+    dropped: Collection[int] = (),
+) -> Path:
     """Write the annotated video of a clip and return its path.
 
     Every frame of the source is drawn with its overlay on top and the radar
-    below. The result must hold one state for each frame of the source. The
+    below. A frame of ``dropped`` (dropped by the overload policy of the
+    streaming path) is darkened and says ``DROPPED_TEXT``. The result must hold one state for each frame of the source. The
     folder of ``out_path`` is made when it is missing. A video side must be
     even, so one pixel row or column is cut from an odd side.
 
@@ -460,7 +488,7 @@ def render_clip(source: FrameSource, result: ClipResult, out_path: Path, style: 
     fails removes the unfinished file.
     """
     out_path = Path(out_path)
-    images = _video_frames(source, _states_by_frame(result, source.info.n_frames), style, result.cuts)
+    images = _video_frames(source, _states_by_frame(result, source.info.n_frames), style, result.cuts, frozenset(dropped))
     first = next(images)
     height, width = first.shape[:2]
     out_path.parent.mkdir(parents=True, exist_ok=True)
