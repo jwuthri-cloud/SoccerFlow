@@ -421,7 +421,31 @@ def test_a_number_line_is_never_left_out_by_the_pipe_policy() -> None:
     lines = [json.loads(line) for line in b"".join(chunks).decode().splitlines()]
     assert [line["id"] for line in lines if line.get("kind") == "number"] == [0, 80, 160, 240, 320]
     assert lines[-1]["end"] is True and report.undelivered == 0
-    assert live.numbers_given == 5
+    assert (live.numbers_given, live.numbers_written, live.numbers_undelivered) == (5, 5, 0)
+    assert report.written + report.dropped == report.given  # every frame line went out or was left out
+
+
+def test_number_lines_have_their_own_counts_when_the_reader_goes_away() -> None:
+    """The counts of the report stay those of frame lines and the end line (``written + dropped + undelivered ==
+    given + 1``), and the number lines have their own (``numbers_written + numbers_undelivered == numbers_given``),
+    whether the writer thread ran before the reader went away or not."""
+    from pitchvlm.schemas import HomographyRecord
+
+    read_fd, write_fd = os.pipe()
+    live = LiveOut(write_fd, INFO, target="pipe", pipe=True, close_fd=True)
+    live.start(delay_frames=0, history_frames=0, numbers=True)
+    os.close(read_fd)  # the reader goes away at once
+    state = SyntheticScene(n_frames=2, seed=2294).frame_state(0)
+    for frame in range(30):
+        live.given(state.model_copy(update={"frame": frame}), camera=HomographyRecord(frame=frame), last=frame,
+                   transition=False, cut=False)
+        live.number(track_id=frame, export=7, display=None, first_frame=0, last_frame=frame, crop_frames=(0,),
+                    reason="ready", last=frame)
+    live.finish()
+    report = live.close(wait_s=60)
+    assert report.reader_gone is not None
+    assert report.written + report.dropped + report.undelivered == report.given + 1 == 31
+    assert live.numbers_written + live.numbers_undelivered == live.numbers_given == 30
 
 
 def test_the_live_output_takes_number_lines_only_when_started_with_them(tmp_path: Path) -> None:
