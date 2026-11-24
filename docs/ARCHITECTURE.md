@@ -900,16 +900,25 @@ def video_input_tokens(part, rate) -> tuple[int, int]      # (frame tokens, soun
 Contracts:
 
 - No bytes and no path of a video reach a result file. The cache key of a request with video parts
-  holds `identity()` of each part; a cassette holds the same identities under `videos`. A request
-  without video parts has neither entry, so its key and its cassette are those of before.
+  holds `identity()` of each part: for a file that the package wrote (`VideoPart.source`, a
+  `VideoFrames`) the frames of the clip, the rate and size at which they were written, the range,
+  the sampling rate and the resolution, and not the hash of its bytes; for any other file the hash
+  of its bytes. A cassette holds `stored()` of each part under `videos`: the identity, the hash of
+  the bytes that were sent (`sha256`) and the hash of the decoded pixels of its frames
+  (`pixels_sha256`); the identity names the written frames of the clip (frame numbers only,
+  also those of the context `video_frames` that `stored_context` leaves out). A hit on other bytes of the same frames (a file written again) is used,
+  logged and counted (`CassetteStore.other_video_bytes`; the cost record of the command gets
+  `stored_answers_on_rewritten_videos`); a hit on other pixels is refused as other image bytes
+  (`OtherImagesError`, or a warning with `--allow-other-images`). A request without video parts
+  has neither entry, so its key and its cassette are those of before.
 - A written file is frame `k` at `k / fps` seconds: the frames are written at the sampling rate,
   so the model sees each written frame. A video request lists its target frames by these times;
   `parse_people_video` takes entry `k` for target `k` only when its `time_s` is within half a
   frame interval of that time, and counts the other entries. The context of the request holds
   `frames` (the targets, kept in a cassette), `video_frames` and `times_s`.
-- A written file is never written again: its hash is in the cache key. Its name holds a hash of
-  the decoded pixels of its frames (`frames_digest`), so new footage under an old clip name gets
-  new files. The files go to a folder of the data folder (`probe --video-dir`, default
+- A written file is never written again; if it is (another machine, codec or OpenCV build), its
+  request keeps its key (above). Its name holds a hash of the decoded pixels of its frames
+  (`frames_digest`), so new footage under an old clip name gets new files. The files go to a folder of the data folder (`probe --video-dir`, default
   `~/pitchvlm-data/video-input`), never to the cache.
 - Gemini sends a video inline (`type: video`, base64 `data`, `mime_type`, `resolution`, and
   `processing: {type: static, start_offset, end_offset, fps}` when the part names one of them).
@@ -1910,7 +1919,7 @@ class FeedMerger:                                        # the policy, one event
     def deadline(self) -> float | None
     finished: bool; ended: frozenset[str]; n_frames: int | None; next_frame: int; counts: MergeCounts
 def merge_feeds(feeds: Mapping[str, Iterable[str]], write: Callable[[str], None], *, wait_s=1.0,
-                queue_lines=250, clock=time.monotonic) -> FeedMerger   # one reading thread per feed
+                queue_lines=250, clock=time.monotonic, end=None, drain_s=10.0) -> FeedMerger   # a thread per feed
 def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a last line without its end as it is
 ```
 
@@ -1925,15 +1934,26 @@ def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a 
   broken and cut-off lines are dropped and counted; each feed has a queue of `queue_lines` lines,
   and a full queue stops the reading of its pipe (back-pressure); frames are decided one at a
   time (`take(now, limit=1)`), with the lines that came during a write applied first; after the
-  last frame a feed that is still open is read to its end.
+  last frame the merged lines end (`end`, so their reader finishes at once) and a feed that is
+  still open is read to its end, unless it sends nothing for `drain_s` (`DEFAULT_DRAIN_S` = 10 s:
+  a tool that hangs is left and counted in `left_open`). `stream` reads no line after frame
+  `n_frames - 1`.
 - Command line: `merge-feeds --detector FILE --calibration FILE [--wait SECONDS] [--queue N]`:
   the merged lines to the standard output, flushed one at a time, a report to the error stream;
   exit code 0 when every frame went out whole, 1 when a part was missing, a line was dropped or
   the stream ended early, 2 when the feeds cannot be merged or the reader stopped. Named pipes
   are opened with `os.open` and read with `fd_lines`, so a reader that stops early ends the chain.
 - `tools/run_tool.py` (live mode): `--feed FILE|-` (a clip job only) writes the feed as the
-  frames are answered and a copy at `--out` (no clip run), and at the end the facts of the run
-  (those of a clip run, with the self-check of a transformers detector) at `<stem>-runner.json`; `--pace FPS` reads frame `i` not before
+  frames are answered and a copy at `--out` (no clip run; `--feed`, `--out` and `--job` must be
+  three files), and at the end the facts of the run (those of a clip run, with the self-check of
+  a transformers detector, and `feed_reopened`) at `<stem>-runner.json`. A named pipe or `-` is
+  opened first (`open_feed`, before the job is read), so any later stop closes it and its reader
+  sees it end; a plain file is opened when the frames start. A named pipe is a `NamedPipeFeed`:
+  when its reader goes away, it waits up to `FEED_REOPEN_WAIT_S` (10 s) for a reader and sends
+  the whole feed again from its header (a process that opens the pipe for reading and closes it
+  again, before `merge-feeds` opens it, no longer stops the tool; its limits are in its
+  docstring). With `-` (`StandardOutputFeed`) the standard output carries the feed alone while
+  it is open: what the script or a tool prints goes to the error stream. `--pace FPS` reads frame `i` not before
   the start plus `i / FPS` (`--start-at` seconds since the epoch, else when the tool is ready);
   `--skip-behind` (with a pace and batches of one frame, checked before the tool is built) takes
   the newest frame that has come and writes a skipped line for each frame it leaves out

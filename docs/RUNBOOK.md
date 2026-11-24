@@ -1659,9 +1659,14 @@ How it works, in short:
   written frame, and its answer names each target frame by that time. An entry with another time
   counts as no people (`n_entries_wrong_time` in the metrics file).
 - The files go to `~/pitchvlm-data/video-input` (option `--video-dir`), never to the cache
-  folder: the results branch is text only. A file that is there already is used as it is, because
-  its SHA-256 is in the cache key: a file written again with other bytes would be paid again.
-  Do not delete this folder between a paid run and its replay.
+  folder: the results branch is text only. A file that is there already is used as it is. The
+  cache key holds the frames of the clip and the settings of the file, not its bytes: a file
+  written again with other bytes (another codec or OpenCV build) finds its stored answer, the
+  command prints `stored answers used for a video written again with other bytes ...` and its
+  cost record counts them (`stored_answers_on_rewritten_videos`); the stored answer keeps the hash
+  of the bytes that were sent. A stored answer of other pixels of the same frames (new footage
+  under an old clip name) stops the command as for images. Keep this folder between a paid run and
+  its replay all the same: the model saw the bytes of the first file.
 - Gemini: the bytes go inline with the media resolution of the step and `fps`. There is no upload
   (the Files API keeps a file for 48 hours, against the intent of `store=False`): a request whose
   size as JSON text (inline data, text, schema, settings) is above 20,000,000 bytes is refused
@@ -1806,18 +1811,31 @@ in `docs/DECISIONS.md`, entry "The live feed of the detector engine" of 2026-11-
 jobs are those of section 11 (`clip-job`); `--out` of a live tool gets a copy of its feed (no
 clip run), and `<stem>-runner.json` next to it the facts of the run (device, versions, script,
 the self-check of a transformers detector). `--pace 25` plays the frames of the clip as a camera at 25 fps would send them: frame
-`i` is not read before the start plus `i / 25` s. Give both tools one start with `--start-at`
-(seconds since the epoch, after both tools have loaded their models: `START` below, written
-again for each run), so that they share one clock; without it each tool starts its clock when
-it is ready, and the frames of the tool that was ready later go out late. Start the three terminals in this order; a named
-pipe waits until both of its ends are open.
+`i` is not read before the start plus `i / 25` s. A tool opens its feed first, before it reads its job and builds the
+tool, so it waits there until `merge-feeds` opens the other end; a tool that stops at any later
+step closes its feed, and `merge-feeds` stops with exit code 2. When the reader of a named pipe
+goes away, the tool waits up to 10 s for a reader and sends its whole feed again (`note: the
+reader of the feed ... went away` on its error stream, `feed_reopened` in `<stem>-runner.json`):
+on the build machine a process opened the pipe for reading and closed it again within 30 ms of
+the start of every `python -m ... <pipe>` process, before `merge-feeds` opened it (entry
+"Second read of the live feed ..." of 2026-11-23). `--feed -` writes the feed to the standard
+output alone (all prints go to the error stream); `--feed`, `--out` and `--job` must be three
+files. Give both tools one start with `--start-at` (seconds since the epoch: `START` below,
+written again for each run), so that they share one clock; without it each tool starts its
+clock when it is ready, and the frames of the tool that was ready later go out late. A tool
+loads its model only after `merge-feeds` has opened its pipe, so `START` must lie after the
+start of terminal 3 plus the time to load both models: take it 120 s ahead and start the three
+terminals within the first 30 s (the load time of the real models on the run machine is not
+measured; when a tool prints its first frame after `START`, every frame up to then is due at
+once). Start the three terminals in this order; a named pipe waits until both of its ends are
+open.
 
 ```bash
 # Once: the clip jobs of section 11, and two named pipes.
 CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
 SETTINGS=configs/engines/detector_calibration.yaml
 LIVE=~/pitchvlm-data/live/<clip>
-START=1795500000   # one start for both tools, seconds since the epoch: python3 -c "import time; print(int(time.time()) + 60)"
+START=1795500000   # one start for both tools, seconds since the epoch: python3 -c "import time; print(int(time.time()) + 120)"
 mkdir -p $LIVE
 mkfifo $LIVE/detector.pipe $LIVE/calibration.pipe
 
@@ -1839,8 +1857,8 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration 
     | python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
       --lines - --delay 25 --out ~/pitchvlm-data/runs/dev-live
 
-# Afterwards: the same lines from the two copies of the feeds (files: nothing waits), and the
-# control of the whole clip on them.
+# Afterwards: the lines from the two copies of the feeds (files: nothing waits, so a part that was
+# late in the live run is in them), and the control of the whole clip on them.
 python -m pitchvlm.cli merge-feeds --detector $LIVE/detector-feed.jsonl --calibration $LIVE/calibration-feed.jsonl \
     | python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
       --lines - --delay clip --out ~/pitchvlm-data/runs/dev-live-control
@@ -1848,7 +1866,13 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector-feed.jsonl --calibr
 
 - `merge-feeds` writes a frame when both parts are in; a part that is not in `--wait` seconds
   after the first line of its frame came goes out as missing (`late`), as does the part of a
-  tool that skipped the frame (`skipped`) or whose feed ended (`ended`). Its report (error
+  tool that skipped the frame (`skipped`) or whose feed ended (`ended`). After the last frame its
+  output ends at once; it reads a tool that is still writing to its end, but leaves one that
+  sends nothing for 10 s (`left open` in its report, exit code 1). The wait bounds the lag
+  of a tool, not its time per frame: a tool slower than the pace without `--skip-behind` falls
+  further behind with every frame and loses every part once its lag passes the wait (60 ms per
+  frame at 25 fps with `--wait 1`: from about frame 50; 41 ms: from about frame 1,000). Give
+  `--skip-behind` to a tool whose time per frame is at or above 40 ms at 25 fps. Its report (error
   stream) counts them and the dropped lines; exit code 0 when every frame went out whole, 1
   otherwise, 2 when the feeds do not fit together (clip, number of frames, video, tools).
 - `stream` reads the merged lines on a thread into a queue of `--queue` lines (default 50); when

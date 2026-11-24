@@ -298,11 +298,12 @@ def clip_run_lines(detections: ClipRun, calibration: ClipRun) -> Iterator[str]:
 def read_stream_lines(lines: Iterable[str]) -> tuple[StreamHeader, Iterator[StreamInput]]:
     """Read the header of a stream, and return it with an iterator over the inputs of its frames.
 
-    The frames must come in order from frame 0, one per line, and at most ``n_frames`` of
-    them; an empty line is skipped. A line that is not JSON, a wrong format, a frame out of
-    order, a part that is neither an answer nor a missing answer, and a payload that the
-    adapter of its tool refuses raise ``ValueError`` with the line number. The iterator reads
-    one line at a time, so it works on a pipe.
+    The frames must come in order from frame 0, one per line; an empty line is skipped. A
+    line that is not JSON, a wrong format, a frame out of order, a part that is neither an
+    answer nor a missing answer, and a payload that the adapter of its tool refuses raise
+    ``ValueError`` with the line number. The iterator reads one line at a time, so it works on
+    a pipe, and it reads no line after frame ``n_frames - 1``: a pipe whose writer stays open
+    after the last frame (a merger that waits for a tool) does not hold the stream back.
     """
     numbered = ((number, line) for number, line in enumerate(lines, start=1) if line.strip())
     try:
@@ -342,8 +343,6 @@ def _inputs(numbered: Iterator[tuple[int, str]], header: StreamHeader) -> Iterat
             frame = data["frame"]
             if isinstance(frame, bool) or not isinstance(frame, int) or frame != expected:
                 raise ValueError(f"frame {expected} was expected, the line holds frame {frame!r}")
-            if frame >= header.n_frames:
-                raise ValueError(f"the header names {header.n_frames} frames, the line holds frame {frame}")
             parts = {tool: _part(data[tool], tool) for tool in STREAM_TOOLS}
             found, camera = parts["detector"], parts["calibration"]
             if found.payload is None:
@@ -372,6 +371,8 @@ def _inputs(numbered: Iterator[tuple[int, str]], header: StreamHeader) -> Iterat
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"line {number}: {error}") from error
         expected += 1
+        if expected == header.n_frames:
+            return
 
 
 @dataclass(frozen=True)

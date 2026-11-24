@@ -83,6 +83,22 @@ MAX_VIDEO_FPS = 24.0
 VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/mpeg", "video/mov", "video/webm"})
 
 
+class VideoFrames(Record):
+    """What a video file that the package wrote shows: frames of a clip, written at a rate and a size.
+
+    ``frames`` are the frames of the clip in the order of the file, ``write_fps`` the rate
+    at which they were written and ``width`` x ``height`` their size. ``pixels_sha256`` is a
+    hash of the decoded pixels of these frames of the clip (``vlm.video.frames_digest``),
+    before the video codec compressed them. The clip is ``RequestMeta.clip_id``.
+    """
+
+    frames: tuple[int, ...] = Field(min_length=1)
+    write_fps: float = Field(gt=0, allow_inf_nan=False)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    pixels_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class VideoPart(Record):
     """A reference to a video file, or to a time range of it, that a request sends to a model.
 
@@ -90,7 +106,14 @@ class VideoPart(Record):
     request, and it refuses the call when the bytes do not have the hash
     ``sha256`` (``vlm.client``). ``path`` is the place of the file on the run
     machine, outside the repository. It is never written to a cassette, a
-    ledger line or a result file: ``identity`` is what a stored answer keeps.
+    ledger line or a result file: ``stored`` is what a stored answer keeps (its
+    identity and two hashes, no path and no bytes).
+
+    ``source`` says what a file that the package wrote shows (``VideoFrames``);
+    it is None for a file that came from elsewhere. A file written again from
+    the same frames can get other bytes (another codec or another OpenCV build),
+    so the identity of a written file is its frames and settings, not its bytes
+    (``identity``).
 
     ``duration_s`` is the length of the whole file in seconds. ``start_s`` and
     ``end_s`` cut a range of it, ``fps`` is the sampling rate that the model is
@@ -109,6 +132,7 @@ class VideoPart(Record):
     end_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     fps: float | None = Field(default=None, gt=0, le=MAX_VIDEO_FPS, allow_inf_nan=False)
     resolution: Resolution = "high"
+    source: VideoFrames | None = None
 
     @model_validator(mode="after")
     def _check_part(self) -> VideoPart:
@@ -122,6 +146,13 @@ class VideoPart(Record):
             raise ValueError(f"the range of a video part ends at {end:g} s, after the end of its file at {self.duration_s:g} s")
         if not start < end:
             raise ValueError(f"the range of a video part is empty: {start:g} s to {end:g} s")
+        if self.source is not None and not math.isclose(
+            self.duration_s, len(self.source.frames) / self.source.write_fps, rel_tol=1e-9
+        ):
+            raise ValueError(
+                f"a video of {len(self.source.frames)} frames written at {self.source.write_fps:g} frames per second "
+                f"lasts {len(self.source.frames) / self.source.write_fps:g} s, not {self.duration_s:g} s"
+            )
         return self
 
     @property
@@ -149,14 +180,17 @@ class VideoPart(Record):
         return max(1, math.ceil((end - start) * rate - 1e-9))
 
     def identity(self) -> dict[str, Any]:
-        """Return what tells this video part apart, as plain JSON data: no path and no bytes.
+        """Return what tells this video part apart, as plain JSON data: no path and no bytes. It is part of the cache key.
 
-        It is part of the cache key and of a cassette. The hash stands for the
-        bytes of the file, so another file, range, rate or resolution gives
-        another key.
+        For a file that the package wrote (``source``): the frames of the clip, the rate and
+        the size at which they were written, the range, the sampling rate and the resolution.
+        Neither the hash of the bytes nor the hash of the pixels is in it, so the same frames
+        written again with other bytes find their stored answer, and another decoder of the
+        source images does not change the key either; a stored answer keeps both hashes
+        (``stored``), and a hit compares them (``vlm.cache``). For any other file: the hash of
+        its bytes with the range, the rate and the resolution.
         """
-        return {
-            "sha256": self.sha256,
+        identity: dict[str, Any] = {
             "mime_type": self.mime_type,
             "duration_s": self.duration_s,
             "start_s": self.start_s,
@@ -164,6 +198,21 @@ class VideoPart(Record):
             "fps": self.fps,
             "resolution": self.resolution,
         }
+        if self.source is None:
+            identity["sha256"] = self.sha256
+        else:
+            identity["frames"] = list(self.source.frames)
+            identity["write_fps"] = self.source.write_fps
+            identity["size"] = [self.source.width, self.source.height]
+        return identity
+
+    def stored(self) -> dict[str, Any]:
+        """Return what a stored answer keeps of this video part: ``identity``, the hash of the bytes that were sent, and
+        the hash of the pixels of its frames (a written file). No path and no bytes."""
+        stored = {**self.identity(), "sha256": self.sha256}
+        if self.source is not None:
+            stored["pixels_sha256"] = self.source.pixels_sha256
+        return stored
 
 
 class RequestMeta(Record):
@@ -267,18 +316,20 @@ class VLMRequest(Record):
         coordinate convention of a step is not in the key: it changes the
         prompt text and the answer schema, and both are in the key.
 
-        A request with video parts has their identities in the key: the hash of
-        each file, its range, its sampling rate and its resolution
-        (``VideoPart.identity``). A video file is sent as it is, so its hash is
-        the hash of the sent bytes. But a file that is written again from the same
-        frames can get other bytes (another OpenCV build or codec: measured with
-        the codecs ``avc1`` and ``mp4v`` on the build machine), and then its request
-        misses its stored answer without an error and is paid again, unlike an
-        image (``OtherImagesError``). So the written videos are kept with the data
-        (``vlm.video``), and a replay of stored answers uses ``--replay``, which
-        refuses a miss (docs/DECISIONS.md, entry "Second read of the video input
-        and the detector families", 2026-11-23). A request without video parts
-        has no such entry, so its key is the one of before video parts were added.
+        A request with video parts has their identities in the key
+        (``VideoPart.identity``). For a file that the package wrote, that is the
+        frames of the clip, the rate and the size at which they were written, the
+        range, the sampling rate and the resolution, and not the bytes: a file that
+        is written again from the same frames can get other bytes (another OpenCV
+        build or codec: measured with the codecs ``avc1`` and ``mp4v`` on the build
+        machine), and with the bytes in the key its request would miss its stored
+        answer without an error and be paid again. The stored answer keeps the
+        hash of the bytes that were sent; a hit on other bytes is counted and said
+        (``vlm.cache``), and a hit on other pixels of the frames is refused as for
+        images (``OtherImagesError``). The decision: docs/DECISIONS.md, entry
+        "Second read of the live feed, and a cache key of video requests that
+        survives a new write" (2026-11-23). A request without video parts has no
+        such entry, so its key is the one of before video parts were added.
         """
         identity = {
             "clip_id": self.meta.clip_id,
