@@ -40,7 +40,7 @@ from pitchvlm.livenumbers import LiveNumbers, NumberSettings, apply_numbers, wir
 from pitchvlm.liveout import open_live_out
 from pitchvlm.pipeline import ToolAnswers, run_clip
 from pitchvlm.schemas import ClipResult
-from pitchvlm.stream import DetectorStream, StreamSettings, default_history_frames, stand_in_inputs
+from pitchvlm.stream import DetectorStream, FrameFeeder, StreamSettings, default_history_frames, stand_in_inputs
 from pitchvlm.synth import SyntheticScene, SyntheticSource
 from pitchvlm.timing import StageClock
 from pitchvlm.vlm.fake import FakeBackend
@@ -81,7 +81,8 @@ def stream_case(
 ) -> dict[str, Any]:
     """Run one stream of the synthetic clip of ``seed`` with a live output to a file; return its measures.
 
-    The image of each frame is read inside the frame sample (stage ``read``), as ``stream`` does.
+    The frames go through a frame feeder, as ``stream`` does: the picture is read and the pair test
+    of the camera motion runs on the thread of the feeder, outside the frame sample.
     With ``pace_fps`` frame ``i`` is not pushed before the start plus ``i / pace_fps``.
     """
     load_before = os.getloadavg()[0]
@@ -103,12 +104,22 @@ def stream_case(
         writer = wire(stream, worker, live)
         people, balls = fake_detector_answers(scene, seed=seed)
         start = time.monotonic()
-        for item in stand_in_inputs(people, balls, fake_calibration_answers(scene)):
-            if pace_fps is not None:
-                wait = start + item.frame / pace_fps - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
-            stream.push(item, lambda frame=item.frame: source.read(frame))
+
+        def paced() -> Any:
+            for item in stand_in_inputs(people, balls, fake_calibration_answers(scene)):
+                if pace_fps is not None:
+                    wait = start + item.frame / pace_fps - time.monotonic()
+                    if wait > 0:
+                        time.sleep(wait)
+                yield item
+
+        # As ``stream`` runs since the frame feeder: the picture and the pair test on the thread of the feeder.
+        feeder = FrameFeeder(stream, paced(), source.read)
+        try:
+            for fed in feeder:
+                stream.push_fed(fed)
+        finally:
+            feeder.close()
         stream.finish()
         if worker is not None and writer is not None:
             writer.write(worker.finish(), stream.n_frames - 1)
