@@ -451,6 +451,12 @@ def test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault
             list(radar.feed_documents([json.dumps(header()), line]))
     with pytest.raises(radar.RadarError, match="too large"):
         radar.serve([json.dumps(header()), json.dumps({**frame(0), "x": 0.123456}).replace("0.123456", "1e400")])
+    # A whole number of 401 digits: math.isfinite raised OverflowError on it (second reader of round 8).
+    for field in ("t_s", "frame", "x"):
+        line = json.dumps({**frame(0), field: 0.123456}).replace("0.123456", "1" + "0" * 400)
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps(header()), line]))
+    assert next(iter(radar.feed_documents([json.dumps({**header(), "n_frames": 2**53})])))["n_frames"] == 2**53
 
 
 def test_the_viewer_stops_when_its_file_is_emptied_or_replaced(tmp_path: Path) -> None:

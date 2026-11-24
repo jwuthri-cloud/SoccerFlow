@@ -18,12 +18,15 @@ signals that cannot end the wait for paid requests", 2026-11-23). Hence two more
 - the event that tells the model clients to send nothing more (``StopEvent``) takes a lock
   that the same thread can take again, so its handler can set it while the main thread is
   inside one of its own methods;
-- a signal that comes while the handler runs only records its cause (``enter_handler``).
+- a signal that comes while the handler runs only records its cause (``enter_handler``);
+- a command is interrupted once: after its stop was raised (``mark_raised``), later signals are
+  only counted, so that they cannot cut short the code that ends the command (the removal of a
+  partial file, the error line, the exit code 2).
 
 The way to end a wait that must not wait any longer (a request that never returns) is a
 signal that Python does not handle: Ctrl-\\ (SIGQUIT) or ``kill -KILL``. The process ends at
 once; the answers in flight are lost, but the provider can still bill them, and the cost
-ledger has no line for them (``docs/RUNBOOK.md``, section 2).
+ledger has no line for them (``docs/RUNBOOK.md``, section 4).
 
 Only the main thread holds signals back: a handler of Python runs there and nowhere else.
 """
@@ -46,6 +49,8 @@ class _Hold:
     signals = 0
     #: True while the handler runs (``enter_handler``).
     in_handler = False
+    #: True once the stop of the command was raised (``mark_raised``).
+    raised = False
 
 
 _HOLD = _Hold()
@@ -57,7 +62,7 @@ def _in_main_thread() -> bool:
 
 def reset() -> None:
     """Forget every hold and every recorded stop: a command starts (``cli.main``)."""
-    _HOLD.depth, _HOLD.cause, _HOLD.signals, _HOLD.in_handler = 0, None, 0, False
+    _HOLD.depth, _HOLD.cause, _HOLD.signals, _HOLD.in_handler, _HOLD.raised = 0, None, 0, False, False
 
 
 @contextmanager
@@ -78,17 +83,27 @@ def held_stops() -> Iterator[None]:
         _HOLD.depth -= 1
         if _HOLD.depth == 0 and _HOLD.cause is not None:
             cause, _HOLD.cause = _HOLD.cause, None
+            mark_raised()
             raise KeyboardInterrupt(cause)
 
 
 def hold_back(cause: str) -> bool:
-    """Record a stop signal when a hold is open, and return whether it was held back (the handler then returns)."""
-    if _HOLD.depth == 0:
+    """Record a stop signal when a hold is open or the stop was raised, and return whether it was held back.
+
+    The handler returns when it was, and raises the stop when it was not. After the stop was
+    raised a signal is only counted: a hold that is open then does not raise it again.
+    """
+    if _HOLD.depth == 0 and not _HOLD.raised:
         return False
     _HOLD.signals += 1
-    if _HOLD.cause is None:
+    if _HOLD.cause is None and not _HOLD.raised:
         _HOLD.cause = cause
     return True
+
+
+def mark_raised() -> None:
+    """Note that the stop of the command was raised: later signals are only counted (``hold_back``)."""
+    _HOLD.raised = True
 
 
 def held_cause() -> str | None:
@@ -128,6 +143,9 @@ class StopEvent(threading.Event):
         super().__init__()
         self._stop_cond = threading.Condition(threading.RLock())
         self._stop_flag = False
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} at {id(self):#x}: {'set' if self._stop_flag else 'unset'}>"
 
     def is_set(self) -> bool:
         return self._stop_flag

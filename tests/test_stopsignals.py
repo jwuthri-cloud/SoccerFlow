@@ -5,6 +5,7 @@ No model is called: the requests go to a fake model.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
@@ -152,7 +153,11 @@ def test_a_hold_records_any_number_of_signals_and_raises_the_first_when_it_ends(
             assert cli.STOP_REQUESTED.is_set()
     assert stopsignals.held_signals() == 2000
     assert stopsignals.held_cause() is None
-    # Outside a hold a signal interrupts at once.
+    # The stop was raised: the next signal is only counted.
+    cli._interrupt(signal.SIGINT, None)
+    assert stopsignals.held_signals() == 2001
+    # Outside a hold, in a command that was not interrupted yet, a signal interrupts at once.
+    stopsignals.reset()
     with pytest.raises(KeyboardInterrupt, match="Ctrl-C"):
         cli._interrupt(signal.SIGINT, None)
 
@@ -164,6 +169,7 @@ def test_holds_nest_and_hold_nothing_outside_the_main_thread() -> None:
                 assert stopsignals.hold_back("SIGHUP")
             # The inner hold ended; the outer one still holds the stop.
             assert stopsignals.held_cause() == "SIGHUP"
+    stopsignals.reset()  # a new command
     seen: list[bool] = []
 
     def other_thread() -> None:
@@ -249,3 +255,31 @@ def test_a_pool_in_another_thread_is_not_stopped_by_a_stop_that_the_main_thread_
             thread.start()
             thread.join(timeout=30.0)
     assert results == [[0, 1, 2, 3, 4, 5]]
+
+
+def test_a_command_is_interrupted_once_so_a_second_signal_cannot_cut_its_cleanup_short(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A plain kill interrupts the command; Ctrl-C comes while the command cleans up (a partial file is removed in a
+    ``finally``). The second signal only counts: the cleanup ends, and the command ends with its error line and
+    exit code 2. It used to raise a second interruption inside the cleanup, or inside the error handling of
+    ``main``, so that the process ended without its error line (second reader of round 8)."""
+    cleaned: list[str] = []
+
+    def command(args: argparse.Namespace) -> int:
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(500):
+                threading.Event().wait(0.01)
+            return 0
+        finally:
+            os.kill(os.getpid(), signal.SIGINT)
+            for _ in range(20):
+                threading.Event().wait(0.01)
+            cleaned.append("partial file removed")
+
+    monkeypatch.setattr(cli, "_cmd_sync", command)
+    code = cli.main(["sync", "--results", "results"])
+    assert (code, cleaned) == (2, ["partial file removed"])
+    assert capsys.readouterr().err.splitlines()[-1].startswith("error: the command was interrupted (SIGTERM)")
+    assert stopsignals.held_signals() == 1

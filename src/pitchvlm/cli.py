@@ -4990,7 +4990,9 @@ def _interrupt(number: int, frame: object) -> None:
     process at once, and the answers in flight are lost but can still be billed.
 
     A signal that comes while this handler runs (a burst of signals) is only counted: the
-    handler raises nothing inside the lock of ``STOP_REQUESTED``, which would stay taken.
+    handler raises nothing inside the lock of ``STOP_REQUESTED``, which would stay taken. A
+    command is interrupted once: after that, signals are only counted, so that they do not cut
+    short the end of the command (its cleanup, its error line and its exit code 2).
     """
     cause = "Ctrl-C" if number == signal.SIGINT else signal.Signals(number).name
     if not stopsignals.enter_handler():
@@ -5001,6 +5003,7 @@ def _interrupt(number: int, frame: object) -> None:
         stopsignals.leave_handler()
     if stopsignals.hold_back(cause):
         return
+    stopsignals.mark_raised()
     raise KeyboardInterrupt(cause)
 
 

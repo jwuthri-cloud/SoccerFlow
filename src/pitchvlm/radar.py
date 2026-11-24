@@ -243,14 +243,15 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
     for a line that is not a JSON object of the format (a frame line needs a whole frame
     number of 0 or more and a time ``t_s`` that is a finite number of 0 or more). A number
     too large for a float (``1e999``) is refused as ``NaN`` and ``Infinity`` are: the
-    events are JSON without them.
+    events are JSON without them. So is a whole number beyond 2**53, which the page (a
+    JavaScript number) cannot hold and a float cannot be compared with.
     """
     seen_header = False
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
-            document = json.loads(line, parse_constant=_no_constant, parse_float=_finite_float)
+            document = json.loads(line, parse_constant=_no_constant, parse_float=_finite_float, parse_int=_safe_int)
         except (ValueError, RecursionError) as error:
             raise RadarError(f"line {number} of the feed is not JSON: {error}") from None
         if not isinstance(document, dict):
@@ -275,6 +276,17 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
 
 def _no_constant(token: str) -> Any:
     raise ValueError(f"{token} is not a number of the feed")
+
+
+#: The largest whole number of the feed: JavaScript numbers hold every whole number up to it.
+MAX_FEED_INT = 2**53
+
+
+def _safe_int(token: str) -> int:
+    value = int(token)
+    if abs(value) > MAX_FEED_INT:
+        raise ValueError(f"the whole number {token[:20]}... is too large for a number of the feed")
+    return value
 
 
 def _finite_float(token: str) -> float:
