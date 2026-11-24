@@ -5017,7 +5017,12 @@ real model, a real clip or a real cost.
      on the 95th percentile (the upper end of the interval of the median is 1.05 ms): the worker
      takes the lock of the interpreter to cut crops, to read the states and to build requests, and
      the fake model reads the truth in Python in the threads of the pool, which a real model (a
-     network call) does not.
+     network call) does not. A replication of the 5 s arm on `9763ee1` (6 more pairs, the same
+     seeds) ran at a load average of 52 falling to 7.7: paired difference of the median −4.16
+     [−14.58, +6.27] ms, of the 95th percentile −0.02 [−17.06, +17.01] ms; in pair 2 the run with
+     `none` had a median of 68.8 ms. It decides nothing: on this machine, under the load of the
+     other sessions, 6 pairs cannot show a cost of 1 ms. N1 stays failed as written; a run on a
+     quiet machine (or the run machine) is the open check.
    - **N2, the numbers against the clip path** (hypothesis: at the end of the stream the set of
      (track, number) equals that of the clip path with the same engine file and the same fake
      answers, on all 40 seeds). 500-frame clips (20 s), frames paced at 25 fps, the cap set to 1000 so
