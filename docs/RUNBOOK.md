@@ -1864,3 +1864,83 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector-feed.jsonl --calibr
   machine can say: the time of the real tools, together with the stream, at 25 fps; whether the
   calibration needs `--skip-behind` (its published time is 439 ms per frame); a camera that
   sends frames (here the frames are files of a recorded clip, read at the pace of a camera).
+
+## 15 Live output and radar viewer (2026-11-23)
+
+`stream --live-out FILE|-` writes each frame as it is decided: a header line, one flushed JSON
+line per decided frame in frame order (format `pitchvlm-live-1`), and an end line. The command
+`radar` reads those lines (a file that grows, a named pipe, or `-`) and serves a live 2D radar to
+a browser on this machine. Both are free and make no model call. The format and its contract are
+in `docs/ARCHITECTURE.md` (`liveout.py`, `radar.py`); the policy and the measurements in
+`docs/DECISIONS.md`, entry "A live output and a radar viewer" of 2026-11-23.
+
+```bash
+# The folder of the live files: outside the repository (stream refuses a --live-out inside it).
+LIVE=~/pitchvlm-data/live/synthetic
+mkdir -p $LIVE
+mkfifo $LIVE/radar.pipe
+
+# Terminal 1: the viewer. It prints its address (a free port of 127.0.0.1); open it in a browser.
+python -m pitchvlm.cli radar $LIVE/radar.pipe
+
+# Terminal 2: the stream of the synthetic clip writes its frames into the pipe of the viewer.
+python -m pitchvlm.cli stream --synthetic --frames 750 --delay 25 --out $LIVE/run --allow-dirty \
+    --live-out $LIVE/radar.pipe
+
+# A file instead of a pipe: the stream writes every line; the viewer follows the file as it grows.
+python -m pitchvlm.cli stream --synthetic --frames 750 --delay 25 --out $LIVE/run --allow-dirty \
+    --live-out $LIVE/live.jsonl
+python -m pitchvlm.cli radar $LIVE/live.jsonl
+
+# Afterwards: play the finished file again at the frame rate of the clip, from the first page that opens.
+python -m pitchvlm.cli radar $LIVE/live.jsonl --replay
+```
+
+On the build machine `~/pitchvlm-data` must not be made (its absence marks the build machine):
+take a folder below the temporary folder of the system there, and the prefix `PYTHONPATH=src`.
+
+The live run of section 14 with the viewer at the end: terminals 1 and 2 of section 14 stay as
+they are; terminal 3 gives the frames of the stream to the viewer through the standard output.
+
+```bash
+# Terminal 3: merge the two feeds, decide each frame, and serve the radar (it prints its address).
+CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+SETTINGS=configs/engines/detector_calibration.yaml
+LIVE=~/pitchvlm-data/live/<clip>
+python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration $LIVE/calibration.pipe --wait 1 \
+    | python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json --config $SETTINGS \
+      --lines - --delay 25 --out ~/pitchvlm-data/runs/dev-live --live-out - \
+    | python -m pitchvlm.cli radar -
+```
+
+- A frame line holds the frame and its time, the delay, the wall clock of the decision, the
+  camera flag (`landmarks`, `propagated` or `none`), the flags `transition` (a dissolve known at
+  the decision) and `cut`, the number of lines left out before it, and for each person the id,
+  role, team key, team side, shirt number (when known; the streaming path has no number step, so
+  `null`), pitch position in metres and box in pixels, and the ball. No pixel, no label value.
+- A line is final: the state of frame `f` in the feed is the state of frame `f` in `result.json`,
+  value for value. What the result says more: the tracks of `result.json` take the role and team
+  of an id from its last state, and its cuts hold a dissolve that was known only after some of its
+  frames went out (their `transition` stays false).
+- Policy: to a file every line is written in the thread of the stream (complete; an error of the
+  disk stops the stream with exit code 2). To a pipe, a named pipe, a terminal or `-` the stream
+  never waits: while the reader holds the writer (the pipe is full), one line waits and an older
+  one is left out and counted (`dropped`); the pipe of the system holds a few more lines. A reader that goes away ends the output, not
+  the stream. At the end the stream waits at most 5 s for a slow reader and prints
+  `live output ... (policy pipe): <n> frame lines written of <m> decided, <k> left out`.
+- With `--live-out -` the output of `stream` goes to the error stream, so that the standard
+  output carries only the lines. A named pipe as `--live-out` waits until its reader opens it.
+  `stream` refuses a `--live-out` inside a work tree of the repository (also through a link),
+  inside `--out`, a folder, an input file, and the standard output named as a path such as
+  `/dev/stdout` (give `-`).
+- `radar`: binds to `127.0.0.1` (or another loopback address given as numbers with `--host`;
+  every other address and every host name is refused); `--port 0` (the default) takes a free
+  port. It serves only the page and its event stream, refuses a request of a page of another
+  site, and ends when the feed ended and the pages got the end (or with Ctrl-C). The page shows
+  the players by team colour (A blue, B red, no team grey, referee yellow; a white ring for a
+  goalkeeper; faded when filled in), the shirt number when known, the ball, the time of the
+  frame, the delay, how far the page is behind the decision (milliseconds, wall clock of this
+  machine), and the frames it did not show.
+- A page that is slow gets the newest frame: it jumps to it when it is more than 25 frames behind.
+  The bench of the build machine: `PYTHONPATH=src python -m pitchvlm.evalx.liveoutbench latency --seeds 610-612`
+  (also `revisions` and `timing`; `docs/DECISIONS.md`).

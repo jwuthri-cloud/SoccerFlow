@@ -583,6 +583,9 @@ below are the words that it printed.
   `skipped` or `ended` in its report); exit code 2 means that the two feeds do not fit together.
   `stream` refuses lines of other pixels or of another number of frames than `--clip`, and an
   option that does not apply to its input (RUNBOOK, section 14).
+- Optional, the same live run with the radar: terminal 3 of RUNBOOK, section 15 (`stream
+  --live-out -` into `radar -`); open the address that `radar` prints and look at the players,
+  the ball and the time; write how far the page is behind the decision into `docs/DECISIONS.md`.
 
 M3 then measures both tools on all frames of the people probe and the pitch probe (RUNBOOK,
 section 3), with the check images of M3 (`--count 10`). Since 22 Nov the pipeline can also use

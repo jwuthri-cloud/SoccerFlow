@@ -375,7 +375,7 @@ EXPERIMENT_NAME = re.compile(r"^(?:people|pitch|number)_probe\w*\.yaml$")
 #: Options of other programs (uv) that the checked sections name in inline code.
 FOREIGN_OPTIONS = frozenset({"--exclude-newer"})
 #: The sections whose inline options are checked: RUNBOOK 11 to 14, HANDOVER 6.
-OPTION_SECTIONS = {"docs/RUNBOOK.md": (11, 12, 13, 14), "docs/HANDOVER.md": (6,)}
+OPTION_SECTIONS = {"docs/RUNBOOK.md": (11, 12, 13, 14, 15), "docs/HANDOVER.md": (6,)}
 #: A reference to a section of the RUNBOOK or the HANDOVER, with an optional quoted title after it.
 SECTION_REFERENCE = re.compile(
     r"(?P<document>RUNBOOK|HANDOVER)(?:\.md`?)?,?\s+sections?\s+(?P<number>\d+)(?:\.(?P<part>\d+))?"
