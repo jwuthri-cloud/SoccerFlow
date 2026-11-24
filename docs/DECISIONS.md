@@ -4428,6 +4428,273 @@ decisions, and what changed in the documents.
     and the note in `close_session` (`print_rewritten_videos`), no option and no command;
     `docs/HANDOVER.md` (step 21 and decision 42).
 
+
+## 2026-11-23 — A live output and a radar viewer (session "live output" of round 7)
+
+Base `main` 72fad94. The command `stream` decided frame `t` once frame `t + L` was in, but wrote
+its files only at the end of the clip. Built: a per-frame result feed (`liveout.py`, option
+`stream --live-out FILE|-`), a radar viewer of that feed on the loopback address (`radar.py`,
+command `radar`), one hook in `stream.py` (`DetectorStream.on_given`, 5 lines), a bench
+(`evalx/liveoutbench.py`), RUNBOOK section 15, and the contracts in `docs/ARCHITECTURE.md`.
+Everything is measured on the build machine with synthetic clips and stand-ins of the tools;
+nothing ran with a real tool, real footage or a real camera.
+
+1. **Format** `pitchvlm-live-1` (ARCHITECTURE, `liveout.py`): a header, one compact JSON line per
+   decided frame in frame order (frame, time, `decided_at`, delay, wall clock of the decision,
+   camera source, flags `transition` and `cut`, lines left out before it, and per person id,
+   role, team key, team side, shirt number or null, pitch metres, box), an end line with the
+   counts. No pixel and no label value (rule 2). The name of the option cannot be mixed up with
+   `--feed` of `tools/run_tool.py` (a tool feed) or `--lines` of `stream` (its input).
+2. **Final at delay L, no revision line.** The stream gives each state once and never changes
+   it, so the line of frame `f` equals frame `f` of `result.json` (state, camera, delay). Measured
+   on held-out seeds 600 to 609 (`liveoutbench revisions`; kinds of `evalx/streambench.py`; 160
+   clips of 250 frames, 40,000 frame lines): **0 lines differ** from their frame of the result.
+   What the result says more, and how often:
+
+   | kind | condition | delay | clips | frames | lines unequal | dissolve frames | flag known late | player states | role/team/side of the track differs |
+   |---|---|---|---|---|---|---|---|---|---|
+   | plain | exact | 25 | 10 | 2500 | 0 | 0 | 0 | 39286 | 717 (1.83%) |
+   | plain | exact | 5 | 10 | 2500 | 0 | 0 | 0 | 39275 | 1468 (3.74%) |
+   | plain | noisy | 25 | 10 | 2500 | 0 | 0 | 0 | 42510 | 375 (0.88%) |
+   | plain | noisy | 5 | 10 | 2500 | 0 | 0 | 0 | 41718 | 853 (2.04%) |
+   | cut | exact | 25 | 10 | 2500 | 0 | 0 | 0 | 41526 | 40 (0.10%) |
+   | cut | exact | 5 | 10 | 2500 | 0 | 0 | 0 | 41526 | 912 (2.20%) |
+   | cut | noisy | 25 | 10 | 2500 | 0 | 0 | 0 | 44259 | 24 (0.05%) |
+   | cut | noisy | 5 | 10 | 2500 | 0 | 0 | 0 | 43751 | 515 (1.18%) |
+   | dissolve | exact | 25 | 10 | 2500 | 0 | 93 | 0 | 40450 | 40 (0.10%) |
+   | dissolve | exact | 5 | 10 | 2500 | 0 | 93 | 85 | 41530 | 1020 (2.46%) |
+   | dissolve | noisy | 25 | 10 | 2500 | 0 | 94 | 0 | 43119 | 24 (0.06%) |
+   | dissolve | noisy | 5 | 10 | 2500 | 0 | 94 | 86 | 43766 | 699 (1.60%) |
+   | dissolve-20 | exact | 25 | 10 | 2500 | 0 | 169 | 0 | 39618 | 41 (0.10%) |
+   | dissolve-20 | exact | 5 | 10 | 2500 | 0 | 169 | 169 | 41710 | 1495 (3.58%) |
+   | dissolve-20 | noisy | 25 | 10 | 2500 | 0 | 169 | 0 | 42820 | 59 (0.14%) |
+   | dissolve-20 | noisy | 5 | 10 | 2500 | 0 | 169 | 169 | 44303 | 1063 (2.40%) |
+
+   Load average 4.5 before, 10.2 after (14 cores); 4 processes; 3.6 min.
+
+   - "flag known late": frames of a final dissolve span whose line went out without the flag
+     `transition`. At L = 25 none (the early dissolve test of round 6 knows every dissolve in
+     time); at L = 5 most dissolve frames went out before the dissolve was known (85 of 93,
+     86 of 94, 169 of 169). Their states are those of the result: the stream then drops nothing
+     on those frames, as before this change.
+   - "role/team/side of the track differs": `result.json` lists tracks whose role, team key and
+     side are those of the last state of the id (`stream.tracks_of_states`); a state given earlier
+     can have another value. 0.05 % to 3.74 % of the player states, more at L = 5.
+   - Decision: the format says "final at delay L"; no revision line. A consumer that needs the
+     final role of a track reads `result.json` at the end. A revision line would send, for a
+     dissolve, states that the stream does not change, and for a track a value that only the
+     last state has.
+3. **Policy for a slow consumer.**
+   - A regular file: every line is written with `os.write` in the thread of the stream as the
+     frame is decided (no buffer, so a reader sees it at once). Complete; a write error stops
+     the command (exit 2). Its cost per frame is in item 5.
+   - A pipe, a named pipe, a terminal or `-`: the line is made and checked in the thread of the
+     stream, then handed to a writer thread; the stream never waits for the reader. While the
+     reader holds the writer (one write has taken longer than `PIPE_BLOCKED_S` = 50 ms: the pipe
+     is full), one line waits (`PIPE_PENDING_LINES = 1`) and a newer line makes the waiting one
+     go, counted in `dropped` (each line carries the count so far, the end line the total). The
+     header and the end line never go. Why one line: for a viewer the newest state matters; the
+     pipe of the system already holds 16 to 64 kB (3 to 12 lines of about 5 kB), a second queue
+     that no count sees, so a reader that falls behind reads lines up to that many frames old;
+     `decided_unix` lets it see how old. A reader that goes away ends the output, not the stream.
+   - A first version left a line out whenever one was waiting. The first latency run (seeds 610
+     to 612, fast reader) lost 18 to 24 of 250 frames per run, all of them in the burst of the
+     last 25 frames that `finish` decides together: there the writer only waited for its turn
+     (the switch interval of Python is 5 ms), it was not held by the reader. Hence the rule
+     "held for 50 ms"; a writer that is not held takes up to `PIPE_MAX_LINES` = 250 waiting
+     lines. A test with a fast reader and a burst of 60 decisions fails without the rule.
+   - At the end the stream waits at most 5 s (`CLOSE_WAIT_S`) for a slow reader, then reports the
+     lines not delivered. Tested with a reader of one line per second (one byte per read, so the
+     pipe is not emptied in chunks): 60 frames at 25 fps, every hand-over below 0.2 s (the bound
+     of the test), frames in order with gaps, counts that add up.
+   - `--live-out -`: the output of `stream` goes to the error stream (`contextlib.redirect_stdout`),
+     the lines to a copy of the standard output.
+   - Refused (`cli.refuse_live_out`): a path inside a work tree of the repository, also through a
+     link; inside `--out`; a folder; an input file; the standard output named as a path
+     (`/dev/stdout`, `/dev/fd/1`: give `-`).
+4. **The viewer** (`radar`, standard library only). Binds to a loopback address written as numbers
+   (a name, `0.0.0.0`, `::`, an IPv6 address with a zone or a mapped IPv4 address are refused
+   before a socket is made); port 0 by default, printed. Serves `GET /` (one page: inline script
+   and style, the pitch drawn on a canvas, no external resource) and `GET /events` (server-sent
+   events of the lines, parsed and written again as compact JSON); 404 for every other path, 405
+   for every other method, 403 for a `Host` that does not name the server (DNS rebinding) and for
+   a request of a page of another site (`Origin`, `Sec-Fetch-Site`); `Cache-Control: no-store`,
+   a content security policy with `default-src 'none'` and the SHA-256 of the script and the
+   style, `nosniff`, `X-Frame-Options: DENY`. At most 8 event streams and 32 connections; a line
+   of more than 1 MiB, a line that is not UTF-8 or JSON, a nesting too deep, and a frame line
+   without a finite time are refused. A client more than 25 frames behind jumps to the newest
+   frame. It ends when the feed ended and the pages got the end. The page shows the players by
+   team colour, the shirt number when known, the ball, the time, the delay, how far the page is
+   behind the decision, and the frames it did not show. **Looked at** in the built-in browser of
+   the desktop app (Chromium), with `radar --replay` on a 120-frame synthetic feed: pitch, players,
+   referee, goalkeepers, ball, header values and a planted `transition` flag shown; shirt numbers
+   drawn on a copy of the feed with planted numbers (the stream itself has no number step); no
+   console message (no CSP violation). Not looked at: Firefox and Safari, a live (not replayed)
+   run in a browser, a phone.
+5. **Measurements.**
+
+   **Time per frame** (`liveoutbench timing`): `stream --synthetic --frames 250 --delay 25` as a
+   process per run, seeds 600 to 602 (held out), 4 rounds (forward, reverse, forward, reverse),
+   the median and the 95th percentile of the frame samples of `result.json` (the hook runs inside
+   the frame sample, so the writing of a line is in it). Arms: `base` (a copy of `72fad94`),
+   `none` (this code, no option), `file` (`--live-out` a file), `slow` (`--live-out -` into a
+   reader of one line per second, one byte per read). The frames that `finish` decides at the end
+   are in no frame sample.
+
+   Run 1, load average 3.1 to 11.3 (14 cores), 12 runs per arm (n = 12 pairs):
+
+   | arm | runs | median ms, mean (range) | p95 ms, mean (range) | load (range) |
+   |---|---|---|---|---|
+   | base | 12 | 19.53 (19.03 to 20.19) | 22.38 (21.41 to 23.60) | 3.4 to 8.5 |
+   | none | 12 | 19.96 (19.00 to 25.44) | 24.08 (21.51 to 42.04) | 3.7 to 8.1 |
+   | file | 12 | 19.98 (19.08 to 26.96) | 24.08 (21.23 to 43.67) | 3.3 to 9.1 |
+   | slow | 12 | 19.60 (19.11 to 21.57) | 22.47 (21.62 to 25.26) | 3.1 to 11.3 |
+
+   | difference (paired by seed and round) | median ms, mean [95% t interval] | p95 ms, mean [95% t interval] |
+   |---|---|---|
+   | file - base (n = 12) | +0.46 [-0.83, +1.74] | +1.70 [-2.01, +5.42] |
+   | slow - base (n = 12) | +0.07 [-0.28, +0.43] | +0.10 [-0.39, +0.59] |
+   | none - base (n = 12) | +0.43 [-0.57, +1.43] | +1.71 [-1.71, +5.13] |
+   | file - none (n = 12) | +0.03 [-0.31, +0.36] | -0.00 [-0.62, +0.61] |
+   | slow - none (n = 12) | -0.35 [-1.09, +0.38] | -1.61 [-4.67, +1.45] |
+
+   The two largest values (median 25.4 and 27.0 ms, 95th percentile 42.0 and 43.7 ms) are both in
+   one round (seed 600, round 3, arms `none` and `file`, load up to 9.1): the arm without the
+   option jumped as much as the arm with it. The medians of the paired differences: `file - base`
+   -0.17 ms (median) and +0.20 ms (95th percentile), `file - none` -0.01 and -0.05 ms.
+   In the `slow` arm the writer left 223 to 226 of 250 lines out per run (24 to 27 went into the
+   pipe; the reader read about one per second).
+
+   Run 2 (after the change of the pipe rule of item 3), load average 4.8 to 60.8 (other sessions
+   started their tests during it), same design:
+
+   | arm | runs | median ms, mean (range) | p95 ms, mean (range) | load (range) |
+   |---|---|---|---|---|
+   | base | 12 | 28.83 (19.49 to 67.11) | 54.84 (21.60 to 153.06) | 5.0 to 57.4 |
+   | none | 12 | 32.52 (19.79 to 72.20) | 58.69 (22.24 to 152.37) | 4.8 to 57.0 |
+   | file | 12 | 31.58 (20.09 to 64.79) | 55.74 (22.67 to 150.45) | 5.1 to 56.7 |
+   | slow | 12 | 31.32 (19.53 to 59.95) | 61.07 (22.28 to 137.75) | 5.3 to 60.8 |
+
+   At that load the intervals are 10 to 30 ms wide: run 2 says nothing about 1 or 2 ms.
+
+   Run 3 (the final code; started when the load of the last minute was below 10), load average
+   5.3 to 28.3, arms `base`, `slow`, `file`, 12 runs per arm:
+
+   | arm | runs | median ms, mean (range) | p95 ms, mean (range) | load (range) |
+   |---|---|---|---|---|
+   | base | 12 | 22.64 (19.65 to 35.77) | 28.98 (21.91 to 61.19) | 5.6 to 20.6 |
+   | slow | 12 | 19.94 (19.07 to 20.65) | 22.37 (21.54 to 23.30) | 5.7 to 28.3 |
+   | file | 12 | 19.94 (19.03 to 20.47) | 22.52 (21.60 to 24.45) | 5.3 to 24.3 |
+
+   | difference (paired by seed and round) | median ms, mean [95% t interval] | p95 ms, mean [95% t interval] |
+   |---|---|---|
+   | file - base (n = 12) | -2.70 [-6.51, +1.11] | -6.45 [-15.61, +2.70] |
+   | slow - base (n = 12) | -2.70 [-6.45, +1.04] | -6.60 [-15.68, +2.47] |
+
+   Here `base` had the disturbed runs (largest median 35.8 ms, 95th percentile 61.2 ms); the
+   medians of the paired differences are `file - base` -0.38 / -0.35 ms and `slow - base`
+   -0.31 / -0.69 ms. `slow - file`: -0.00 ms [-0.20, +0.20] on the median, -0.15 ms
+   [-0.46, +0.16] on the 95th percentile. The writer left 213 to 220 of 250 lines out per run.
+
+   **Verdicts.** Hypothesis 1 (file, below 1 ms on the median and 2 ms on the 95th percentile
+   against `72fad94`): the point estimates of run 1 are below both limits (+0.46 and +1.70 ms;
+   medians of the differences -0.17 and +0.20 ms), but the upper ends of the 95% intervals are
+   above them (+1.74 and +5.42 ms), because of one disturbed round that hit the arm without the
+   option as much. Against the same code without the option, which is byte-equal in its result
+   and its path to `72fad94` (item 6), the feed costs +0.03 ms [-0.31, +0.36] on the median and
+   -0.00 ms [-0.62, +0.61] on the 95th percentile: inside the limits. So: **holds against the
+   control of the same code; against `72fad94` itself not shown at 95%** with n = 12 at this
+   load; run 3 says the same (no interval against `72fad94` inside the limits, every median of the
+   differences below 0.4 ms). Hypothesis 2 (a reader of one line per second changes nothing):
+   **holds**: run 1 `slow - base` +0.07 ms [-0.28, +0.43] and +0.10 ms [-0.39, +0.59] (the pipe
+   rule of run 1 differs from the final one only when the writer is not held; here it is held),
+   run 3 `slow - file` -0.00 ms [-0.20, +0.20] and -0.15 ms [-0.46, +0.16]. A repeat on a quiet
+   machine with more rounds would settle hypothesis 1 against `72fad94` itself.
+
+   **Latency** from the decision of a frame (`decided_unix`, the wall clock in the stream) to the
+   event at a client of the event stream (`liveoutbench latency`): three processes, the stream
+   of the synthetic clip paced at 25 frames per second with `--live-out` into a pipe, `radar -`
+   on that pipe, and a client with `urllib` in the bench process; seeds 610 to 612, 250 frames.
+
+   Run 1 (the first pipe rule; it left the burst of the last frames out):
+
+   | run | load | frames received / decided | dropped by the writer | median ms | p95 ms | largest ms |
+   |---|---|---|---|---|---|---|
+   | seed 610 | 3.4 | 227 / 250 | 23 | 0.40 | 0.49 | 6.80 |
+   | seed 611 | 3.1 | 232 / 250 | 18 | 0.42 | 0.54 | 5.95 |
+   | seed 612 | 2.7 | 226 / 250 | 24 | 0.41 | 0.50 | 0.61 |
+   | all (685 frames) | - | - | - | 0.41 | 0.51 | 6.80 |
+
+   Run 2 (the rule of item 3), load average 47 to 49:
+
+   | run | load | frames received / decided | dropped by the writer | median ms | p95 ms | largest ms |
+   |---|---|---|---|---|---|---|
+   | seed 610 | 48.6 | 227 / 250 | 2 | 0.86 | 57.56 | 176.14 |
+   | seed 611 | 47.5 | 250 / 250 | 0 | 0.85 | 14.06 | 63.99 |
+   | seed 612 | 48.5 | 250 / 250 | 0 | 1.18 | 23.99 | 64.64 |
+   | all (727 frames) | - | - | - | 0.99 | 23.99 | 176.14 |
+
+   In run 2 the client of seed 610 got 227 frames while the writer left out only 2: at that load
+   the client fell more than 25 frames behind once and jumped to the newest frame (the rule of the
+   viewer).
+
+   Run 3 (the final code), load average 6.4 to 7.0 (last minute; 13 to 27 over 5 minutes):
+
+   | run | load | frames received / decided | dropped by the writer | median ms | p95 ms | largest ms |
+   |---|---|---|---|---|---|---|
+   | seed 610 | 6.5 | 250 / 250 | 0 | 0.46 | 104.57 | 248.78 |
+   | seed 611 | 7.0 | 249 / 250 | 1 | 0.43 | 32.89 | 93.77 |
+   | seed 612 | 6.4 | 250 / 250 | 0 | 0.44 | 90.84 | 190.76 |
+   | all (749 frames) | - | - | - | 0.44 | 74.27 | 248.78 |
+
+   Split by where the frame was decided (the two runs with all 250 frames, n = 450 and 50):
+   frames decided as the clip came in (0 to 224): median **0.44 ms**, 95th percentile **0.56 ms**,
+   largest **2.86 ms**; the last 25 frames, which `finish` decides together when the clip ends:
+   median 100.8 ms, 95th percentile 221.7 ms, largest 248.8 ms. In that burst the writer gets the
+   interpreter lock once per switch interval while the stream decides the next frame, so the 25
+   lines go out over about the time of the 25 decisions. Run 1 had no such tail because its rule
+   left those lines out. A limit at the end of a clip only: in a live run one frame is decided per
+   frame that comes in.
+
+6. **Controls** (byte comparison against a copy of `72fad94` from `git archive`, seed 615, 250
+   frames, delay 25): `stream --synthetic` without the option gives the same prediction file,
+   the same `result` of `result.json`, the same identity and diagnostics, and the same video;
+   with `--live-out` the same again, and `result.json` has the key `live_out` in addition. The
+   prediction files of `demo` and `demo --engine detector` are byte-equal.
+7. **Second readers.** Code (liveout, hook, CLI): 2 medium findings, both fixed with a test that
+   fails without the fix: a writer thread that failed with an error other than its reader's
+   ended without a word (now raised by `close`), and a link outside the repository that pointed
+   into it passed the refusal. Low findings fixed: the report read outside the lock and a writer
+   that went on after `close` (now copied under the lock and given up); a close without `finish`
+   that left the writer waiting (now stops it); the header of a pipe written in the thread of
+   the stream (now queued); `/dev/stdout` as a path and a path inside `--out`; the wording of
+   "not delivered". Security (server, page): no high finding. Fixed with tests: no limit on the
+   length of a line and a reading that took quadratic time (a 64 MB line took 93.5 s; now a cap
+   of 1 MiB, linear); a page of another site could hold the event streams and start a replay
+   (now 403); no cap on connections (now 32); a hostile feed gave a traceback (now a clean
+   error); error pages without the security headers; mapped and zoned IPv6 addresses. Not
+   changed: a local process can read the feed (no token, by design: the server is for this
+   machine), and the read timeout is per read, not per request.
+8. **Tests** (14 workers): default run 3,535 passed, 1 skipped, 11 deselected, exit 0 (load 5.1);
+   full run 3,546 passed, 1 skipped, exit 0 (`72fad94`: 3,501 passed, 1 skipped). 45 new tests
+   (`tests/test_liveout.py` 21, `tests/test_radar.py` 24); every fix of the second reads has a
+   test that failed with the fix undone (8 checks). `tests/test_documented_commands.py` now reads
+   the options of RUNBOOK section 15 too. An earlier default run at a load of 7 to 10 failed in the
+   3 tests of `tests/test_live_feed.py` that are known to race when the named pipes are opened
+   (another session has them), and in the guard test for two addresses of this change (fixed).
+   After the merge of `main` d0c5589 (the second read of the live feed): default run 3,560
+   passed, 1 skipped, 11 deselected, exit 0; full run 3,571 passed, 1 skipped, exit 0. The live
+   run of RUNBOOK sections 14 and 15 as processes (two stand-in tools paced at 25 fps into named
+   pipes, `merge-feeds`, `stream --lines - --live-out -`, `radar -`, a client; 125 frames, seed
+   617): every exit code 0, 125 of 125 frames and the end event at the client. The same with a
+   calibration that keeps its pipe open for 30 s after its last frame: `stream` exit 0, its live
+   output complete (125 written, 0 left out, end line) and the end event at the client after
+   13.2 s, while the hung tool ran to 43 s; `merge-feeds` exit 1 (`left open: calibration 1`).
+9. **Not verified.** A real detector, calibration and camera; Linux (named pipes, the pipe size);
+   a browser other than Chromium; a live (not replayed) run in a browser; the 95th percentile at
+   25 fps with the tools on the run machine; hypothesis 1 against `72fad94` at 95% (item 5).
+10. **Proposed text** (no change to `CLAUDE.md`): none.
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same

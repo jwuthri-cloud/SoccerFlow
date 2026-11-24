@@ -1962,6 +1962,94 @@ def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a 
   answers file (by the SHA-256 of the pixels) after a simulated time per frame; for
   `tests/test_live_feed.py` and `evalx/livebench.py` (four processes, two named pipes, a pipe).
 
+### `liveout.py` — the live output of the streaming path (2026-11-23)
+
+```python
+# liveout.py
+LIVE_FORMAT = "pitchvlm-live-1"; PIPE_PENDING_LINES = 1; PIPE_BLOCKED_S = 0.05; PIPE_MAX_LINES = 250; CLOSE_WAIT_S = 5.0
+class LiveOutError(RuntimeError)                     # a file that cannot be opened or written; a writer that failed
+@dataclass(frozen=True) class LiveReport:            # target, policy, given, written, dropped, undelivered, reader_gone
+def header_document(info, *, delay_frames, history_frames, policy) -> dict
+def frame_document(state, *, fps, camera, last, transition, cut, decided_unix, dropped) -> dict
+class LiveOut:
+    def __init__(self, fd, info, *, target, pipe: bool, close_fd: bool, pending_lines=1, clock=time.time)
+    def start(self, *, delay_frames, history_frames) -> None
+    def given(self, state, *, camera, last, transition, cut) -> None   # the hook DetectorStream.on_given
+    def finish(self) -> None                                           # the end line
+    def close(self, wait_s=5.0) -> LiveReport
+def open_live_out(target: str, info: ClipInfo) -> LiveOut               # "-", a file, or a named pipe
+```
+
+- The hook: `DetectorStream.on_given` (None by default) is called in `_decide` with each state at
+  the moment it is given, with the camera record of the frame, the newest frame `last`, and the
+  flags `transition` (the frame lies in a transition span known then, early or final) and `cut`
+  (a hard cut starts a shot at the frame). It is the only change of `stream.py`; with no hook the
+  stream does what it did.
+- Lines, compact JSON, one per line:
+  - header: `{"format": "pitchvlm-live-1", "clip", "n_frames", "fps", "width", "height",
+    "delay_frames", "history_frames", "pitch_m": [105.0, 68.0], "policy": "file"|"pipe"}`;
+  - frame (in frame order, each frame at most once): `{"frame", "t_s", "decided_at",
+    "delay_frames", "decided_unix", "camera": "landmarks"|"propagated"|"none", "transition",
+    "cut", "dropped", "players": [{"id", "role", "team", "side", "number", "x", "y", "box",
+    "observed"}], "ball": {"x", "y", "box", "observed"}|null}`; `x`, `y` are pitch metres (section
+    2), `box` is `[x1, y1, x2, y2]` in pixels or null, `number` is the shown shirt number or null,
+    `team` the team key, `side` the team side or null, `dropped` the lines left out before this one;
+  - end: `{"end": true, "frames", "written", "dropped"}`.
+- Contract: a frame line is final. The line of frame `f` equals `frame_document` of
+  `result.frames[f]` and `result.homographies[f]` of the finished stream (`tests/test_liveout.py`).
+  The result says more in two places, neither a state: `ClipResult.tracks` takes the role, team
+  key and side of an id from its last state, and `ClipResult.cuts` holds dissolves known after
+  some of their frames went out (their `transition` stays false). No revision line is sent.
+- Policy: a regular file is written in the thread of the stream (complete; `LiveOutError` stops
+  the stream). Anything else (a pipe, a named pipe, a terminal) takes the pipe policy: the frame
+  line is made and checked in the thread of the stream, a writer thread writes it; while the
+  reader holds the writer (one write longer than `PIPE_BLOCKED_S`), at most `PIPE_PENDING_LINES`
+  frame lines wait, and a newer one makes the oldest waiting one go (`dropped`); otherwise up to
+  `PIPE_MAX_LINES` wait (a burst of decisions at the end of a clip); the header and the end line
+  never go; a reader that goes away ends the output
+  (`reader_gone`), not the stream; `close` waits at most `wait_s`, then gives the writer up
+  (`undelivered`); an error of the writer that is not one of its reader is raised by `close`.
+- Command line: `stream --live-out FILE|-` (`cli.refuse_live_out`: refused inside a work tree of
+  the repository through links, inside `--out`, a folder, an input file, the standard output as a
+  path). With `-` the output of `stream` goes to the error stream. `result.json` gets `live_out`
+  (the `LiveReport`) only when the option is given.
+
+### `radar.py` — the radar viewer of a live output (2026-11-23)
+
+```python
+# radar.py
+MAX_CLIENTS = 8; CLIENT_MAX_BEHIND = 25; RING_EVENTS = 100; MAX_CONNECTIONS = 32; MAX_LINE_BYTES = 1 << 20
+class RadarError(ValueError)                              # an address that is not loopback; a feed that is not a live output
+def check_loopback(host: str) -> IPv4Address | IPv6Address  # numbers only, loopback, no zone, no mapped IPv4
+class Board:                                              # header, the newest frames, the end; per client: wait(after, timeout)
+def feed_documents(lines) -> Iterator[dict]               # checked documents; stops after the end line
+def follow_file(path, stop) -> Iterator[str]              # a file that grows
+def read_lines(fd) -> Iterator[str]                        # a pipe to its end of file
+def pump(lines, board, *, replay=False) -> int            # the feed onto the board; replay at the frame rate
+PAGE_HTML: str; CONTENT_SECURITY_POLICY: str; SECURITY_HEADERS
+class RadarServer(ThreadingHTTPServer); class RadarHandler(BaseHTTPRequestHandler)
+def serve(lines, *, host="127.0.0.1", port=0, replay=False, ready=None, stop=None) -> tuple[int, Board]
+```
+
+- Standard library only. `GET /` gives `PAGE_HTML`; `GET /events` gives server-sent events
+  `header` (the header line with `"replay"`), `frame` (a frame line, its frame as the event id)
+  and `end` (the end line with `"complete": true`, or `{"end": true, "complete": false}` when the
+  feed closed without it). Every other path is 404, every other method 405, a request whose
+  `Host` does not name the server or that comes from a page of another site (`Origin`,
+  `Sec-Fetch-Site`) 403. Every answer has `Cache-Control: no-store`, the content security policy
+  (`default-src 'none'`, the script and the style by their SHA-256, `connect-src 'self'`,
+  `frame-ancestors 'none'`), `nosniff`, `X-Frame-Options: DENY` and closes its connection.
+- A line of the feed is parsed and written again as compact JSON before it goes out, so it can
+  add no event. The page writes text only with `textContent` and draws on a canvas.
+- A new client gets the header and the newest frame; a client more than `CLIENT_MAX_BEHIND`
+  frames behind jumps to the newest. `serve` ends when the feed ended and the clients got the
+  end (at most `END_WAIT_S`), or when `stop` is set.
+- Command line: `radar FILE|- [--host 127.0.0.1] [--port 0] [--replay]`; it prints
+  `radar: http://<address>:<port>/ ...` once it listens, and `the feed ended: ...` at the end.
+- `evalx/liveoutbench.py`: `revisions` (lines against the result), `timing` (four arms as
+  processes: another source tree, no option, a file, a reader of one line per second), `latency`
+  (a paced stream, `radar -` and a client as three processes).
+
 ## 5. Tests
 
 - `pytest` runs offline and without the model SDK. No test may open a network connection.
