@@ -164,10 +164,14 @@ def test_the_events_are_the_lines_of_the_feed_and_the_server_ends_with_the_feed(
     assert response.headers["Content-Type"] == "text/event-stream; charset=utf-8"
     assert response.headers["Cache-Control"] == "no-store"
     lines = [header(8), *(frame(index) for index in range(8)), {"end": True, "frames": 8, "written": 8, "dropped": 0}]
-    for line in lines:
+    # The client has the header before the frames come: a client that takes its first events later gets the header
+    # and only the newest frame (by design), which a pause of 20 ms between the lines left to timing.
+    feed.send(lines[0])
+    stream = read_events(response)
+    first = next(stream)
+    for line in lines[1:]:
         feed.send(line)
-        time.sleep(0.02)
-    events = list(read_events(response))
+    events = [first, *stream]
     assert [kind for kind, _, _ in events] == ["header", *["frame"] * 8, "end"]
     assert events[0][2] == {**lines[0], "replay": False}
     for (kind, event_id, data), line in zip(events[1:-1], lines[1:-1], strict=True):

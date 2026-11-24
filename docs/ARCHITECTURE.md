@@ -2042,6 +2042,8 @@ def open_live_out(target: str, info: ClipInfo) -> LiveOut               # "-", a
   never go; a reader that goes away ends the output
   (`reader_gone`), not the stream; `close` waits at most `wait_s`, then gives the writer up
   (`undelivered`); an error of the writer that is not one of its reader is raised by `close`.
+  The counts of `LiveReport` are of frame lines and the end line, never of the header, whether it
+  went out or not: after `finish`, `written + dropped + undelivered == given + 1`.
 - Command line: `stream --live-out FILE|-` (`cli.refuse_live_out`: refused inside a work tree of
   the repository through links, inside `--out`, a folder, an input file, the standard output as a
   path). With `-` the output of `stream` goes to the error stream. `result.json` gets `live_out`

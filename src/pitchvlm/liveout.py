@@ -76,7 +76,11 @@ class LiveOutError(RuntimeError):
 
 @dataclass(frozen=True)
 class LiveReport:
-    """What the live output did: frames given by the stream, lines written, frames left out, lines not delivered."""
+    """What the live output did: frames given by the stream, lines written, frames left out, lines not delivered.
+
+    The counts are of frame lines and the end line; the header is in none of them, whether it was
+    written or not. So after ``finish`` ``written + dropped + undelivered == given + 1``.
+    """
 
     target: str
     policy: str
@@ -221,9 +225,11 @@ class LiveOut:
         #: Items that wait for the writer of a pipe: (kind, line or frame document), in order.
         self._queue: deque[tuple[str, Any]] = deque()
         self._waiting_frames = 0
-        #: The writer of a pipe is in a write now (outside the lock), since this time of ``time.monotonic``.
+        #: The writer of a pipe is in a write now (outside the lock), since this time of ``time.monotonic``, of a
+        #: line of this kind.
         self._writing = False
         self._write_started = 0.0
+        self._writing_kind: str | None = None
         #: ``close`` gave the writer up: it stops after the write it is in.
         self._abandoned = False
         self._given = 0
@@ -334,6 +340,7 @@ class LiveOut:
                 elif kind == _END:
                     value = self._end_document()
                 self._writing = True
+                self._writing_kind = kind
                 self._write_started = time.monotonic()
             # The line is made outside the lock, so that the stream never waits for it.
             data = value if kind == _HEADER else dumps(value)
@@ -343,7 +350,9 @@ class LiveOut:
                 with self._lock:
                     self._writing = False
                     self._reader_gone = str(error) or type(error).__name__
-                    self._lost += 1 + self._waiting_frames + sum(1 for queued, _ in self._queue if queued == _END)
+                    # The header that its reader did not take is in no count, as a header that went out.
+                    self._lost += int(kind != _HEADER) + self._waiting_frames
+                    self._lost += sum(1 for queued, _ in self._queue if queued == _END)
                     self._queue.clear()
                     self._waiting_frames = 0
                 return
@@ -397,13 +406,14 @@ class LiveOut:
             self._lock.notify_all()
             stuck = thread is not None and thread.is_alive() and self._writing
             waiting = self._waiting_frames + sum(1 for kind, _ in self._queue if kind == _END)
+            stuck_line = int(stuck and self._writing_kind != _HEADER)
             report = LiveReport(
                 target=self._target,
                 policy=self.policy,
                 given=self._given,
                 written=self._written,
                 dropped=self._dropped,
-                undelivered=self._lost + waiting + int(stuck),
+                undelivered=self._lost + waiting + stuck_line,
                 reader_gone=self._reader_gone,
             )
             failure = self._failure
