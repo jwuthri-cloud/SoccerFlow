@@ -43,7 +43,20 @@ jobs:
 
       - name: Install the pinned packages
         run: |
-          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt -r locks/ci-linux-hooks.txt
+
+      # The secret scan of the git hooks. Without it the tests of the hooks skip.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Show the machine
         run: |
@@ -52,13 +65,19 @@ jobs:
           nproc
           python -c "import multiprocessing as m, sys, cv2, numpy; print('start method', m.get_start_method(), sys.platform); print('cv2', cv2.__version__, 'numpy', numpy.__version__)"
           python -m pip list
+          gitleaks version
+          pre-commit --version
 
       - name: Leak check of the tracked files (no deny-list in CI)
         run: python3 tools/guard.py --tracked
 
       - name: Full offline run in several processes
         if: ${{ !cancelled() }}
-        run: python tools/run_tests.py -m "slow or not slow"
+        run: python tools/run_tests.py -m "slow or not slow" --results "$RUNNER_TEMP/results.txt"
+
+      - name: List the skipped tests (the reasons are in the job of one process)
+        if: ${{ !cancelled() }}
+        run: grep '^skipped ' "$RUNNER_TEMP/results.txt" || echo "no test was skipped"
 
       - name: Demo, model engine
         if: ${{ !cancelled() }}
@@ -96,7 +115,20 @@ jobs:
 
       - name: Install the pinned packages
         run: |
-          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+          python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt -r locks/ci-linux-hooks.txt
+
+      # The secret scan of the git hooks. Without it the tests of the hooks skip.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Full offline run in one process
-        run: python -m pytest -m "slow or not slow"
+        run: python -m pytest -m "slow or not slow" -rs

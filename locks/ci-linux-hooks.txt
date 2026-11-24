@@ -1,0 +1,35 @@
+# Pinned packages of the git hooks in CI (.github/workflows/offline-tests.yml): pre-commit and
+# what it needs, beyond locks/ci-linux.txt (pyyaml and packaging come from there). Install both
+# files in one command:
+#   python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt -r locks/ci-linux-hooks.txt
+# The versions are those of the pre-commit of the build machine (docs/DECISIONS.md, entry "The
+# offline tests on Linux in CI" of 2026-11-23). Without pre-commit and gitleaks, the tests of
+# the hooks skip. A hash is that of the wheel on the public index (pypi.org, its JSON page of the
+# release); the date is the first upload of the release.
+# cfgv 3.5.0, uploaded 2025-11-19
+cfgv==3.5.0 \
+    --hash=sha256:a8dc6b26ad22ff227d2634a65cb388215ce6cc96bbcc5cfde7641ae87e8dacc0
+# distlib 0.4.4, uploaded 2026-10-16
+distlib==0.4.4 \
+    --hash=sha256:cf09d55b1e85a89576b036aeb71550bfd68320f3f21761ca329eadadad918638
+# filelock 4.2.4, uploaded 2026-10-19
+filelock==4.2.4 \
+    --hash=sha256:301241438c57936ef93f4243a94f2559022268bfcf9b375a9a72eb0f8db8358e
+# identify 2.6.20, uploaded 2026-09-26
+identify==2.6.20 \
+    --hash=sha256:6a16b69b93187244e0548cbfd25b3e4a6f9a7a2ad784625c3bec2b8d27b81aaa
+# nodeenv 1.11.0, uploaded 2026-09-26
+nodeenv==1.11.0 \
+    --hash=sha256:edaa16e6c14d7cf395d75d4bbd5a26390f4dc06501a33b4e76282b02cc688a25
+# platformdirs 4.13.5, uploaded 2026-10-19
+platformdirs==4.13.5 \
+    --hash=sha256:53d3ec4280b815c1e0b02edad7f9ee8fda1ba9c0865dd9c2e6e63849ce82fc1e
+# pre-commit 4.7.0, uploaded 2026-10-12
+pre-commit==4.7.0 \
+    --hash=sha256:2e229038ad3656081b70c27913157e4b636ef306f643f024a8a8e3f0f7b2f877
+# python-discovery 1.6.4, uploaded 2026-10-19
+python-discovery==1.6.4 \
+    --hash=sha256:530179cc51a1816d512b15635b3dc931295ae12efb183783ad31190a5d425d2b
+# virtualenv 21.14.5, uploaded 2026-10-02
+virtualenv==21.14.5 \
+    --hash=sha256:b0651e0174982bba17cc6f0aaa2ef496730cb85a3f35eb5d1119d1c904f7d1da

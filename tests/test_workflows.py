@@ -62,6 +62,10 @@ def test_a_workflow_loads_and_keeps_the_rules_of_ci(path: Path) -> None:
             assert set(step) & {"run", "uses"}, f"job {name}: a step without run or uses"
             if step.get("uses", "").startswith("actions/checkout@"):
                 assert step["with"]["persist-credentials"] is False, f"job {name}: the checkout keeps the token"
+            if "curl " in step.get("run", ""):
+                assert "sha256sum --check" in step["run"], f"job {name}: a download without a check sum"
+            if "pip install" in step.get("run", ""):
+                assert "--require-hashes" in step["run"], f"job {name}: an install without hashes"
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)

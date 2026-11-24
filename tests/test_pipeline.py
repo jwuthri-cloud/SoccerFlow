@@ -1697,28 +1697,40 @@ def test_interrupted_thread_pool_waits_for_every_request_in_flight(
 
 
 @pytest.mark.skipif(not hasattr(signal, "pthread_kill"), reason="this system cannot send a signal to one thread")
+@pytest.mark.parametrize("second_start_s", [0.0, 0.2], ids=["prompt-start", "late-start"])
 def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
     scene: SyntheticScene,
     recorded: tuple[ClipResult, list[VLMRequest]],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    second_start_s: float,
 ) -> None:
     """An operator presses Ctrl-C a second time while the command waits for the answers of the requests in flight.
 
     The second signal is a real one, sent to the thread of the test. It is sent after the pool began
-    to wait for its threads, and the two requests in flight take 150 milliseconds more from then on.
+    to wait for its threads and after both requests reached the model, and the two requests in flight
+    take 150 milliseconds more from then on. The thread of the second request can start late (a busy
+    machine): ``late-start`` holds it back 200 milliseconds after it took its request. Before the
+    test waited for both requests, the signal could come while only one was at the model (seen once
+    in CI on Linux, Python 3.12).
     """
     _, requests = recorded
     fake = FakeBackend(scene)
     answered: list[str] = []
+    at_the_model: list[str] = []
+    both_at_the_model = threading.Event()
     pool_waits = threading.Event()
     second_signal_sent = threading.Event()
     waiting_thread = threading.get_ident()
+    taken = 0
 
     class SlowBackend:
         """The fake model. A request is answered 150 milliseconds after the second signal."""
 
         def generate(self, request: VLMRequest) -> VLMResponse:
+            at_the_model.append(request.cache_key())
+            if len(at_the_model) == 2:
+                both_at_the_model.set()
             assert second_signal_sent.wait(timeout=10.0)
             time.sleep(0.15)
             response = fake.generate(request)
@@ -1727,6 +1739,17 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 
     class WatchedPool(pipeline.ThreadPoolExecutor):
         """A thread pool that says when it begins to wait for its threads."""
+
+        def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+            nonlocal taken
+            taken += 1
+            delay = second_start_s if taken == 2 else 0.0
+
+            def start_late(*inner: Any, **named: Any) -> Any:
+                time.sleep(delay)  # in the thread of the pool, after it took the request
+                return fn(*inner, **named)
+
+            return super().submit(start_late, *args, **kwargs)
 
         def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
             pool_waits.set()
@@ -1737,6 +1760,7 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 
     def send_second_signal() -> None:
         assert pool_waits.wait(timeout=10.0)
+        assert both_at_the_model.wait(timeout=10.0)
         time.sleep(0.05)
         signal.pthread_kill(waiting_thread, signal.SIGINT)
         second_signal_sent.set()

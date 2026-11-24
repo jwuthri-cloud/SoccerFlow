@@ -137,7 +137,7 @@ on a GitHub runner (`ubuntu-24.04`, x86_64), with no secret and a token that can
 The same commands run on any Linux machine with the pinned packages of CI:
 
 ```bash
-python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt
+python -m pip install --require-hashes --only-binary :all: -r locks/ci-linux.txt -r locks/ci-linux-hooks.txt
 python3 tools/guard.py --tracked
 python tools/run_tests.py -m "slow or not slow"
 PYTHONPATH=src python -m pitchvlm.cli demo --out /tmp/demo-vlm
@@ -151,9 +151,16 @@ PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --out /tmp/stream
   "Show the machine" gives the Python, the kernel, the core count, the start method of
   processes and the installed packages.
 - CI has no deny-list (`.git/guard-deny.txt` stays on each machine), so the guard prints its
-  notice and the rule `deny` is off; every other rule of `--tracked` runs. The secret scan does
-  not run in CI (no `gitleaks`), and the tests that need it skip. `doctor --no-api` is left out:
-  it needs the hooks and the deny-list.
+  notice and the rule `deny` is off; every other rule of `--tracked` runs. CI installs
+  `pre-commit` (`locks/ci-linux-hooks.txt`) and `gitleaks` (the release file of its version on
+  github.com, checked against its SHA-256 in the workflow), so the tests of the hooks and of the
+  secret scan run; without them 21 tests skip. `doctor --no-api` is left out: it needs the hooks
+  installed in the clone and the deny-list.
+- Skipped tests on Linux: 5. Four tests of a disk that does not tell letter cases apart (a
+  Linux disk tells them apart, so another spelling is another path there; the tests of that
+  side run), and the reader of images of `tools/run_tool.py` (Pillow is in the environment of
+  the tool only), as on the build machine. The step "List the skipped tests" names them; the
+  job of one process gives the reasons (`-rs`).
 - OpenCV is the headless wheel (`opencv-python-headless`) of the same version as
   `opencv-python`: the same `cv2` module without the window functions, which need a system
   graphics library on Linux. The package does not use those functions.
@@ -164,8 +171,11 @@ PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --out /tmp/stream
   `https://pypi.org/pypi/<package>/<version>/json` (the field `digests.sha256` of every wheel
   for Linux x86_64 with CPython 3.12 or 3.13, and of the wheel for any platform), and write the
   date of the release in the comment line. `--require-hashes` refuses a package without a hash,
-  so a missing dependency stops the install. The actions of the workflow are pinned by commit:
-  take a new commit from the release page of the action and write its version in the comment.
+  so a missing dependency stops the install. The same for `locks/ci-linux-hooks.txt` with the
+  versions of `pre-commit` of the build machine. The actions of the workflow are pinned by
+  commit: take a new commit from the release page of the action and write its version in the
+  comment. For `gitleaks`, take the line of `linux_x64` from the file
+  `gitleaks_<version>_checksums.txt` of its release page.
 
 The key lives in the environment variable `GEMINI_API_KEY`. Set it in each new terminal:
 
