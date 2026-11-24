@@ -237,6 +237,9 @@ class LiveOut:
         self._finished = False
         self._closed = False
         self._thread: threading.Thread | None = None
+        #: The overload policy of the stream (``overload``): its wait, and the frames it dropped so far.
+        self._overload_s: float | None = None
+        self._overload_dropped = 0
 
     @property
     def closed(self) -> bool:
@@ -255,14 +258,37 @@ class LiveOut:
         except OSError as error:
             raise LiveOutError(f"the live output {self._target} cannot be written: {error}") from error
 
+    def overload(self, *, max_behind_s: float) -> None:
+        """Say that the stream drops frames by its overload policy (``stream.OverloadPolicy``); call before ``start``.
+
+        Then the header holds ``overload_max_behind_s``, and every frame line and the end line hold
+        ``overload_dropped``: the frames that the stream dropped so far. A dropped frame has no line
+        (``skipped``). Without this call the lines are those of ``LIVE_FORMAT`` alone.
+        """
+        if self._started:
+            raise ValueError("the overload policy is named before the header")
+        self._overload_s = max_behind_s
+
+    def skipped(self, frame: int) -> None:
+        """Count a frame that the stream dropped (the hook ``DetectorStream.on_dropped``): it gets no line."""
+        if self._overload_s is None:
+            raise ValueError(f"frame {frame} was dropped, but the live output was not told of an overload policy")
+        self._overload_dropped += 1
+
+    def _with_overload(self, document: dict[str, Any]) -> dict[str, Any]:
+        if self._overload_s is not None:
+            document["overload_dropped"] = self._overload_dropped
+        return document
+
     def start(self, *, delay_frames: int | None, history_frames: int | None) -> None:
         """Write the header line (a file), or hand it to the writer thread that starts here (a pipe)."""
         if self._started:
             raise ValueError("the live output is already started")
         self._started = True
-        header = dumps(
-            header_document(self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy)
-        )
+        head = header_document(self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy)
+        if self._overload_s is not None:
+            head["overload_max_behind_s"] = self._overload_s
+        header = dumps(head)
         if not self._pipe:
             self._write(header)
             return
@@ -286,6 +312,7 @@ class LiveOut:
             decided_unix=self._clock(),
             dropped=0,
         )
+        self._with_overload(document)
         self._given += 1
         if not self._pipe:
             self._write(dumps(document))
@@ -306,7 +333,7 @@ class LiveOut:
             self._lock.notify()
 
     def _end_document(self) -> dict[str, Any]:
-        return {"end": True, "frames": self._given, "written": self._written, "dropped": self._dropped}
+        return self._with_overload({"end": True, "frames": self._given, "written": self._written, "dropped": self._dropped})
 
     def _run(self) -> None:
         """Write the waiting lines of a pipe in order, until the end line is out, the reader went away or ``close``."""

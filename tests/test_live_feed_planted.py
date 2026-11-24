@@ -210,7 +210,7 @@ def test_stream_lines_take_the_queue_size_of_the_command_line(monkeypatch: pytes
     monkeypatch.setattr(cli, "QueuedLines", recording)
     path = tmp_path / "lines.jsonl"
     path.write_text("not json\n", encoding="utf-8")
-    args = argparse.Namespace(lines=path, queue=7, detections=None, calibration=None)
+    args = argparse.Namespace(lines=path, queue=7, max_behind=None, detections=None, calibration=None)
     with pytest.raises(cli.CliError, match="the stream cannot be read"):
         cli.stream_inputs(args, None, None, None)  # type: ignore[arg-type]
     assert sizes == [7]
