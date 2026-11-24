@@ -75,6 +75,7 @@ that. So does ``PYTHONPATH=src`` in the top folder of the repository, without an
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import glob
 import hashlib
@@ -107,7 +108,7 @@ import pydantic
 import yaml
 from pydantic import Field, model_validator
 
-from pitchvlm import __version__, doctor, probes
+from pitchvlm import __version__, doctor, probes, radar
 from pitchvlm.config import (
     DEFAULT_MODEL,
     EngineSettings,
@@ -173,6 +174,7 @@ from pitchvlm.frames import (
 )
 from pitchvlm.geometry import matrix_from_record, paint_alignment
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
+from pitchvlm.liveout import LIVE_FORMAT, LiveOut, LiveOutError, open_live_out
 from pitchvlm.motion import MotionField
 from pitchvlm.overlays import MappedFrame, caption, choose_frames, image_name, list_document
 from pitchvlm.pipeline import ToolAnswers, keyframe_frames, run_clip
@@ -357,7 +359,14 @@ class CliError(Exception):
 #: failed model call, a model answer that cannot be used, a budget stop, and an error of the
 #: operating system (a file, a folder or a connection that cannot be used). Their message says
 #: enough, so ``main`` prints it as one line. Any other error can be a fault of the code.
-KNOWN_ERRORS: tuple[type[Exception], ...] = (CliError, BackendError, BudgetExceeded, ParseError, OSError)
+KNOWN_ERRORS: tuple[type[Exception], ...] = (
+    CliError,
+    BackendError,
+    BudgetExceeded,
+    ParseError,
+    OSError,
+    LiveOutError,
+)
 
 
 # --- Repository and git --------------------------------------------------------------
@@ -2051,14 +2060,79 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     The state of frame ``t`` is decided once frame ``t + delay`` is in (``stream``). The files
     are those of ``run``: ``<out>/<clip id>/result.json``, the prediction file with a label
     file (the synthetic clip has its own labels), and the video. The result file also holds
-    the per-frame times (``frame_timing``). The exit code follows ``run``.
+    the per-frame times (``frame_timing``). The exit code follows ``run``. ``--live-out``
+    writes each decided frame as it is decided (``liveout``); with ``--live-out -`` the
+    standard output carries those lines, so the output of the command goes to the error stream.
     """
+    with contextlib.ExitStack() as stack:
+        if args.live_out == "-":
+            stack.enter_context(contextlib.redirect_stdout(sys.stderr))
+        return _stream_command(args, stack)
+
+
+#: Folders whose entries are the open files of a process (macOS, Linux): a ``--live-out`` there is refused.
+_DESCRIPTOR_FOLDERS = ("/dev/fd/", "/proc/self/fd/", "/proc/thread-self/fd/")
+
+
+def refuse_live_out(args: argparse.Namespace) -> None:
+    """Refuse a ``--live-out`` path that lies in the repository or in ``--out``, a folder, an input file or the output.
+
+    The lines hold the boxes and pitch positions of every frame of a clip; for a clip of the
+    dataset they never go into a work tree of the repository (rule 2 of ``CLAUDE.md``), where
+    ``git add`` could take them. The check is the one of ``refuse_pixels_in_repository``: the
+    file (through its links) and each folder above it, as places on the disk. A path that is
+    the standard output itself (``/dev/stdout``) must be given as ``-``, so that the output of
+    the command goes elsewhere.
+    """
+    if args.live_out is None or args.live_out == "-":
+        return
+    path = Path(args.live_out)
+    if path.is_dir():
+        raise CliError(f"--live-out {path} is a folder: give a file, a named pipe or -")
+    real = os.path.realpath(path)
+    descriptor = real in ("/dev/stdin", "/dev/stdout", "/dev/stderr") or real.startswith(_DESCRIPTOR_FOLDERS)
+    if descriptor or (path.exists() and os.path.samestat(os.stat(path), os.fstat(1))):
+        raise CliError(f"--live-out {path} is the standard output or another open file of the command: give - instead")
+    target = path.resolve()
+    if _lies_in(target, args.out.resolve()):
+        raise CliError(f"--live-out {path} lies in --out {args.out}: the command writes its result files there")
+    existing = [folder for folder in (target, *target.parents) if folder.exists()]
+    for tree in [repository_root(), *repository_work_trees()]:
+        if tree.exists() and any(os.path.samefile(folder, tree) for folder in existing):
+            raise CliError(
+                f"--live-out {path} lies inside the work tree {tree} of the repository: the frame lines of a clip "
+                f"never go into the repository (rule 2 of CLAUDE.md). Write them below the data folder, for example "
+                f"{DATA_DIR}/live"
+            )
+    inputs = {
+        "--clip": args.clip,
+        "--labels": args.labels,
+        "--config": args.config,
+        "--detections": args.detections,
+        "--calibration": args.calibration,
+        "--lines": None if args.lines is None or str(args.lines) == "-" else args.lines,
+    }
+    written = path.resolve()
+    for option, given in inputs.items():
+        if given is not None and (written == given.resolve() or (path.exists() and given.exists() and path.samefile(given))):
+            raise CliError(f"--live-out names the same file as {option} ({path}): the command would replace its input")
+
+
+def _close_live_out(live_out: LiveOut) -> None:
+    """Close the live output of a ``stream`` that stopped early, without waiting for its reader."""
+    if not live_out.closed:
+        live_out.close(wait_s=0.0)
+
+
+def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> int:
+    """Run ``stream`` (``_cmd_stream``); ``stack`` closes the live output when the command stops early."""
     config = PipelineConfig(engines=DEMO_ENGINES["detector"]) if args.config is None else read_settings(args.config)
     try:
         check_stream_engines(config)
     except ValueError as error:
         raise CliError(str(error)) from error
     check_stream_options(args)
+    refuse_live_out(args)
     state = require_clean_tree(args.allow_dirty)
     scene: SyntheticScene | None = None
     labels: GsrLabels | None
@@ -2093,6 +2167,14 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     stream = DetectorStream(
         config, settings, clip_id=info.clip_id, fps=info.fps, size=(info.width, info.height), clock=clock
     )
+    live_out: LiveOut | None = None
+    if args.live_out is not None:
+        if args.live_out != "-" and Path(args.live_out).is_fifo():
+            print(f"live output: waiting for a reader of the named pipe {args.live_out}")
+        live_out = open_live_out(args.live_out, info)
+        stack.callback(_close_live_out, live_out)
+        live_out.start(delay_frames=settings.delay_frames, history_frames=settings.history_frames)
+        stream.on_given = live_out.given
     latency = LatencyLog(settings.delay_frames)
     missing: dict[str, dict[str, int]] = {}
     for item in inputs:
@@ -2112,6 +2194,8 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     if stream.n_frames != info.n_frames:
         raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
     stream.finish()
+    if live_out is not None:
+        live_out.finish()
     result = stream.result()
     if missing:
         parts = "; ".join(
@@ -2188,6 +2272,9 @@ def _cmd_stream(args: argparse.Namespace) -> int:
     if live is not None:
         print_latency(live)
     tool_timing = {name: percentiles_ms(seconds) for name, seconds in stream.tool_seconds.items() if seconds}
+    live_report = None if live_out is None else live_out.close()
+    if live_report is not None:
+        print(live_report.text())
     document = {
         "provenance": provenance,
         "prediction_file": prediction_file,
@@ -2206,11 +2293,90 @@ def _cmd_stream(args: argparse.Namespace) -> int:
         "diagnostics": diagnostics.as_dict(),
         "result": result.model_dump(mode="json"),
     }
+    if live_report is not None:
+        document["live_out"] = dataclasses.asdict(live_report)
     write_json(clip_dir / RESULT_NAME, document)
     print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
     video = render_clip(source, result, clip_dir / f"{info.clip_id}.mp4")
     print(f"video: {video}")
     return EXIT_FAILED if problems or empty is not None else EXIT_OK
+
+
+# --- radar --------------------------------------------------------------------------
+
+
+def radar_lines(source: str, stop: threading.Event) -> Iterator[str]:
+    """Return the lines of the feed of ``radar``: the standard input, a named pipe, or a file that grows."""
+    if source == "-":
+        return radar.read_lines(sys.stdin.fileno())
+    path = Path(source)
+    if not path.exists():
+        raise CliError(f"the feed {source} is not there: start the viewer after the stream made it, or give a named pipe")
+    if path.is_dir():
+        raise CliError(f"the feed {source} is a folder")
+    if path.is_fifo():
+        return _fifo_lines(path)
+    return radar.follow_file(source, stop)
+
+
+def _fifo_lines(path: Path) -> Iterator[str]:
+    """Yield the lines of a named pipe; it is opened only when the first line is wanted (the open waits for a writer)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        yield from radar.read_lines(fd)
+    finally:
+        os.close(fd)
+
+
+def _cmd_radar(args: argparse.Namespace) -> int:
+    """Serve a live 2D radar of a live output (``stream --live-out``) to a browser on this machine (``radar``).
+
+    The server binds to a loopback address only and serves one page and one event stream. It
+    ends when the feed ended and the pages got the end, or with Ctrl-C.
+    """
+    try:
+        radar.check_loopback(args.host)
+    except radar.RadarError as error:
+        raise CliError(str(error)) from error
+    stop = threading.Event()
+    lines = radar_lines(args.feed, stop)
+
+    def ready(server: radar.RadarServer) -> None:
+        print(f"radar: {server.url} (this machine only; open it in a browser, Ctrl-C ends the viewer)", flush=True)
+
+    try:
+        frames, board = radar.serve(lines, host=args.host, port=args.port, replay=args.replay, ready=ready, stop=stop)
+    except radar.RadarError as error:
+        raise CliError(str(error)) from error
+    finally:
+        stop.set()
+    print(f"the feed ended: {frames} frame lines, {board.served} event streams served")
+    return EXIT_OK
+
+
+def _add_radar(commands: Any) -> None:
+    """Add the command ``radar`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "radar", help="serve a live 2D radar of the live output of stream (--live-out) to a browser on this machine"
+    )
+    parser.add_argument(
+        "feed",
+        type=_file_or_dash,
+        metavar="FILE",
+        help="the live output of stream: a file that grows, a named pipe, or - for the standard input",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="loopback address to bind to, written as numbers (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", type=_port, default=0, metavar="N", help="port to listen on (default: 0, a free port, printed)"
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="play the frames at the frame rate of the clip, from the first page that opens (a feed that is finished)",
+    )
+    parser.set_defaults(handler=_cmd_radar)
 
 
 # --- merge-feeds --------------------------------------------------------------------
@@ -4181,6 +4347,19 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _port(text: str) -> int:
+    """Read a port: a whole number from 0 (a free port) to 65535."""
+    value = int(text)
+    if not 0 <= value <= 65535:
+        raise argparse.ArgumentTypeError(f"{text} is not a port: give 0 to 65535")
+    return value
+
+
+def _file_or_dash(text: str) -> str:
+    """Read a file path or ``-``; a leading ``~`` of a path becomes the home folder."""
+    return text if text == "-" else str(Path(text).expanduser())
+
+
 def _seed(text: str) -> int:
     """Read a seed: a whole number that is not negative."""
     value = int(text)
@@ -4419,6 +4598,15 @@ def _add_stream(commands: Any) -> None:
         type=_positive_int,
         metavar="N",
         help=f"with --lines: lines read ahead before the reading waits (default: {STREAM_QUEUE_LINES})",
+    )
+    parser.add_argument(
+        "--live-out",
+        type=_file_or_dash,
+        metavar="FILE",
+        help=(
+            f"write each decided frame as one JSON line (format {LIVE_FORMAT}) as it is decided: a file, a named "
+            "pipe, or - for the standard output (the output of the command then goes to the error stream)"
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -4729,6 +4917,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_run,
         _add_stream,
         _add_merge_feeds,
+        _add_radar,
         _add_doctor,
         _add_data,
         _add_oracle,

@@ -836,6 +836,8 @@ class DetectorStream:
         self.tool_seconds: dict[str, list[float]] = {"detector": [], "calibration": []}
         self._n = 0
         self._finished = False
+        #: Called with each state at the moment it is given, or None (the live output, ``liveout.LiveOut.given``).
+        self.on_given: Callable[..., None] | None = None
 
     # --- Arrival ---------------------------------------------------------------------------------
 
@@ -1210,6 +1212,9 @@ class DetectorStream:
         state = FrameState(frame=frame, players=players, ball=ball)
         self._states.append(state)
         self._records.append(window["records"][frame])
+        if self.on_given is not None:
+            transition = any(start <= frame <= stop for start, stop in self._transitions)
+            self.on_given(state, camera=self._records[-1], last=last, transition=transition, cut=frame in self._hard_cuts)
         return state
 
     def _forget(self, next_frame: int) -> None:

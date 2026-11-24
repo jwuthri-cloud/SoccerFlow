@@ -29,7 +29,7 @@ Words:
 | Code | Branch `main` of the remote (public since 14 Nov 2026). Package `pitchvlm` under `src/`, tests under `tests/` |
 | Added on 22 Nov | A second model provider (OpenRouter, RUNBOOK section 10), the paint alignment of pitch mappings and the cut test (section 3), two track repairs as arms of G4 (`configs/arms`, section 4), a detector engine with `clip-job`, `run --detections --calibration` and `video-frames` (section 11), the check images of G3 (`overlay`, section 3), two test tiers (section 1), a faster guard |
 | Added on 23 Nov | Video input for the model steps: `doctor --video` and three experiment files `people_probe_video*.yaml` (RUNBOOK section 13); a second detector family, D-FINE and RT-DETRv2 through transformers, with five experiment files and an install proposal (section 11); the streaming path `stream` (section 14); new tests of the money guards; the review fixes of round 5; the live feed: `tools/run_tool.py --feed`, `merge-feeds`, `stream --lines -` from a pipe (section 14, "Live run") |
-| Offline tests | `3501 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run on 23 Nov of `main` 6b6a803 (the review fixes and the live feed of round 6) with the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have |
+| Offline tests | `3582 passed, 1 skipped` on the build machine (Python 3.13, no model SDK installed), full run on 23 Nov of round 7 (`main` aebbf1e merged with the CI on Linux) with the tests of the documents. The skipped test reads an image with Pillow, which the environment of the package does not have. CI runs the same tests on Linux, Python 3.12 and 3.13 (RUNBOOK, section 1); there the 4 tests of a disk that does not tell letter cases apart skip too |
 | Demo | `demo` gives a video, a radar and a valid prediction file from a synthetic clip and a fake model; `demo --engine detector` does the same with stand-ins of the two tools |
 | Reviews | Two reviews tested the first build, a third one the measurement of the two specialist tools, a fourth one the fixes of the third, and a fifth one the fixes of the fourth; two more read the code of 22 Nov. Each finding was repaired, kept with its reason, or recorded as not built or as an open owner decision (`docs/DECISIONS.md`) |
 | Rehearsal | On 22 Nov this file and the RUNBOOK were walked from the first line to the last on the build machine, with a synthetic dataset, the fake model, a stand-in scorer and stand-ins of the tools (`docs/DECISIONS.md`, entry "Rehearsal of the handover and the runbook"). On 23 Nov the commands of 23 Nov were walked the same way, and the estimates of every paid step were printed at both prices (entry "Rehearsal of the commands of 23 Nov, the budget at both prices and the owner decisions") |
@@ -232,8 +232,8 @@ python tools/run_tests.py -m "slow or not slow"
   on it is the test run after each change: `python tools/run_tests.py` (default run) and
   `python tools/run_tests.py -m "slow or not slow"` (full run, before a commit).
 - Passes: no failure, and the second command prints the same counts of passed and skipped tests
-  as the first, with exit code 0. On 23 Nov the build machine printed `3501 passed, 1 skipped` for
-  `main` 6b6a803 with the tests of the documents (later commits add tests). Here one more group of tests
+  as the first, with exit code 0. On 23 Nov the build machine printed `3582 passed, 1 skipped` for
+  round 7 (`main` aebbf1e with the CI on Linux) with the tests of the documents (later commits add tests). Here one more group of tests
   can run or be skipped: some tests need a disk that tells upper and lower case apart, some one
   that does not.
 - When not: a skipped test names a missing tool (`git`, `gitleaks`, `pre-commit`) or the kind of
@@ -584,6 +584,9 @@ below are the words that it printed.
   `skipped` or `ended` in its report); exit code 2 means that the two feeds do not fit together.
   `stream` refuses lines of other pixels or of another number of frames than `--clip`, and an
   option that does not apply to its input (RUNBOOK, section 14).
+- Optional, the same live run with the radar: terminal 3 of RUNBOOK, section 15 (`stream
+  --live-out -` into `radar -`); open the address that `radar` prints and look at the players,
+  the ball and the time; write how far the page is behind the decision into `docs/DECISIONS.md`.
 
 M3 then measures both tools on all frames of the people probe and the pitch probe (RUNBOOK,
 section 3), with the check images of M3 (`--count 10`). Since 22 Nov the pipeline can also use
