@@ -4013,7 +4013,7 @@ def test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_
     answered: list[str] = []
 
     class WatchedPool(pipeline.ThreadPoolExecutor):
-        """A thread pool that says when it begins to wait for its threads."""
+        """A thread pool that says when the wait for the requests in flight begins (its shutdown)."""
 
         def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
             pool_waits.set()

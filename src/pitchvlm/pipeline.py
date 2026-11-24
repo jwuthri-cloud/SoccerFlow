@@ -409,34 +409,32 @@ class _NotSent(Exception):
 
 
 class _InFlight:
-    """The requests that were given to the thread pool and have not finished, with a wait for their end.
+    """The requests that threads of the pool are sending, and the stop after which no request starts.
 
-    A request counts from its submission (its future) and while a thread of the pool works on it.
-    The futures alone miss a request whose submission an interruption cut short after the pool
-    queued it; the count of the threads alone misses a request that a thread took but has not
-    begun. The wait never uses ``Thread.join``: on Python 3.12 a ``KeyboardInterrupt`` during
-    ``Thread.join`` marks the thread as stopped although it still runs, and a later join of it
-    returns at once (fixed in 3.13). Nor does it wait on a condition: an interruption while the
-    waiting thread takes the lock of the condition back leaves the lock released, and the end of
-    the ``with`` block then raises an error that is not a ``KeyboardInterrupt``. It sleeps in short
-    steps, which an interruption ends cleanly.
+    A thread counts its request in ``working`` before it calls the model. ``close`` (at the
+    start of the wait) refuses every request that has not begun: a thread that takes a request
+    after it raises ``_NotSent`` and sends nothing. The check and the count share one lock, so a
+    request is either counted or not sent, also when an interruption cut its submission short or
+    left its future pending. The wait never uses ``Thread.join``: on Python 3.12 a
+    ``KeyboardInterrupt`` during ``Thread.join`` marks the thread as stopped although it still
+    runs, and a later join of it returns at once (fixed in 3.13). Nor does it wait on a
+    condition, whose lock an interruption can leave in a wrong state. It sleeps in short steps,
+    which an interruption ends cleanly.
     """
 
     POLL_S = 0.01
 
     def __init__(self) -> None:
-        self.futures: list[Future[VLMResponse]] = []
         self._lock = threading.Lock()
         self._working = 0
-
-    def add(self, future: Future[VLMResponse]) -> None:
-        """Count a submitted request until its future is done (answered, failed or cancelled)."""
-        self.futures.append(future)
+        self._closed = False
 
     @contextmanager
     def working(self) -> Iterator[None]:
-        """Count the request that the calling thread of the pool works on."""
+        """Count the request that the calling thread of the pool sends; refuse it after ``close``."""
         with self._lock:
+            if self._closed:
+                raise _NotSent
             self._working += 1
         try:
             yield
@@ -444,14 +442,18 @@ class _InFlight:
             with self._lock:
                 self._working -= 1
 
-    def count(self) -> int:
-        """Return the number of requests that have not finished: not done, or still worked on."""
+    def close(self) -> None:
+        """Refuse every request that has not begun."""
         with self._lock:
-            working = self._working
-        return max(sum(not future.done() for future in tuple(self.futures)), working)
+            self._closed = True
+
+    def count(self) -> int:
+        """Return the number of requests that threads of the pool are sending."""
+        with self._lock:
+            return self._working
 
     def wait(self) -> None:
-        """Return when every future is done and no thread of the pool works on a request."""
+        """Return when no thread of the pool sends a request."""
         while self.count():
             time.sleep(self.POLL_S)
 
@@ -484,15 +486,16 @@ def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel
                 raise
 
     executor = ThreadPoolExecutor(max_workers=max_parallel)
+    futures: list[Future[VLMResponse]] = []
     try:
         for request in requests:
-            in_flight.add(executor.submit(generate, request))
-        wait(in_flight.futures)
+            futures.append(executor.submit(generate, request))
+        wait(futures)
     finally:
         _finish_requests_in_flight(executor, in_flight)
     if failures:
         raise failures[0]
-    return [future.result() for future in in_flight.futures]
+    return [future.result() for future in futures]
 
 
 def _finish_requests_in_flight(executor: ThreadPoolExecutor, in_flight: _InFlight) -> None:
@@ -502,13 +505,15 @@ def _finish_requests_in_flight(executor: ThreadPoolExecutor, in_flight: _InFligh
     while it waits here (an operator who presses Ctrl-C a second time). The
     answers of the requests in flight are paid, so the wait starts again, and
     a warning names the number of requests that are still in flight. The
-    interruption is raised when all of them have finished. The threads of the
-    pool end by themselves after their last request; nothing here joins them
-    (``_InFlight`` says why).
+    interruption is raised when all of them have finished. A request that has
+    not begun is not sent any more, also when its thread took it already. The
+    threads of the pool end by themselves after their last request; nothing
+    here joins them (``_InFlight`` says why).
     """
     interruption: KeyboardInterrupt | None = None
     while True:
         try:
+            in_flight.close()
             executor.shutdown(wait=False, cancel_futures=True)
             if interruption is not None:
                 logger.warning(

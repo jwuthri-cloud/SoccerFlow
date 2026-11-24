@@ -1298,10 +1298,11 @@ sends its requests with `httpx2`.
 - After an interruption (Ctrl-C or a stop signal) the thread pool of the model requests returns
   only when every request in flight has finished, so that their answers are stored and recorded.
   This holds also when further stop signals come during the wait; a warning then names the
-  number of requests in flight. A request is in flight from its submission until its future is
-  done and no thread of the pool works on it (`pipeline._InFlight`). The wait sleeps in steps
-  of 10 ms and joins no thread: on Python 3.12 a stop signal during `Thread.join` marks a
-  running thread as stopped, and the wait would end before its answer.
+  number of requests in flight. A request is in flight once its thread counted it, just before
+  the call to the model (`pipeline._InFlight`). At the stop the set is closed: a request that
+  has not begun is not sent, also when its thread took it already. The wait sleeps in steps of
+  10 ms and joins no thread: on Python 3.12 a stop signal during `Thread.join` marks a running
+  thread as stopped, and the wait would end before its answer.
 
 Money rules of the command line (`cli.py`):
 

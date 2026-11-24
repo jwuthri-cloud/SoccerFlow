@@ -4191,20 +4191,25 @@ machine is Linux, the build machine is a Mac (arm64).
    it returns at once; on 3.13 the thread stays alive and the next join waits. The wait of
    `pipeline._finish_requests_in_flight` joined the threads of the pool, so on 3.12 a second
    Ctrl-C ended the wait while a paid request was still in flight: its answer could be lost
-   before it was stored and recorded. A model of the test that runs the code of `pipeline.py`
-   with a fake model (100 runs per arm, Python 3.12.16): old code, the warning named 1 request in
-   100 of 100 runs and an answer was lost in 32 of 100; new code, 2 requests and both answers in
-   100 of 100; on 3.13.18 both codes gave 2 and both answers (20 runs each). Fix: `_InFlight`
-   counts a request from its submission (its future) and while a thread of the pool works on it,
-   and the wait sleeps in steps of 10 ms until none is left; it joins no thread and waits on no
-   condition (an interruption while a condition takes its lock back can raise an error that is
-   not a `KeyboardInterrupt`). The pool is shut down with `wait=False`; its threads end after
-   their last request. Two tests fail with the old code on every version:
-   `test_the_wait_for_the_requests_in_flight_does_not_rely_on_joining_threads` (joins of the pool
-   return at once, as on 3.12: no answer was kept) and the case `late-start` of the stop-signal
-   test (a request that a thread took but has not begun is in flight too). My first reading
-   (commit 2776c9d: a slow start of the second thread) was wrong for 3.12; a second reader found
-   the cause. The run machine uses Python 3.13, where the old code was right; `pyproject.toml`
+   before it was stored and recorded. Fix: `_InFlight` counts a request when its thread begins
+   it, under one lock with a stop flag; at the stop the set is closed, so a request that has not
+   begun is not sent (also one whose thread took it already, or whose submission an
+   interruption cut short), and the wait sleeps in steps of 10 ms until no request is sent. It
+   joins no thread and waits on no condition or future. The pool is shut down with `wait=False`;
+   its threads end after their last request. A model of the test (the code of `pipeline.py`, a
+   fake model, the first Ctrl-C while two requests are at the model, a real second signal 50 ms
+   after the wait began; 100 runs per arm): Python 3.12.16, old code, the warning named 1 request
+   in 100 of 100 runs and an answer was lost in 43 of 100; new code, 2 requests and both answers
+   in 100 of 100; Python 3.13.18, new code, 100 of 100. Each new test fails with a code that has
+   its defect: joins of the pool that return at once (as on 3.12); a request whose thread took it
+   but had not begun at the stop; a request queued by an interrupted submission; a second Ctrl-C
+   while the pool cancels a queued request (a wait on futures hung there). Two first versions of
+   this fix were wrong and are replaced: commit 2776c9d (only the test: a slow start of the
+   second thread) and commit e5daf53 (a wait on futures: a request queued by an interrupted
+   submission was sent after the return, and a cancel cut short by a second Ctrl-C made the wait
+   hang). Two second readers found both. In the command line a stop also sets the stop flag of
+   the model clients, which refuse a new request, so the risk of these windows was low there.
+   The run machine uses Python 3.13, where the joins of the old code were right; `pyproject.toml`
    allows 3.12.
 9. **Skipped tests.** The build machine skips 1. Round 2 on Linux skipped 26: 21 tests of the git
    hooks and the secret scan (`pre-commit` and `gitleaks` were not installed; the run machine has
