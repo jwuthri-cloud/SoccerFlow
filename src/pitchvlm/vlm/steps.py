@@ -369,7 +369,9 @@ def build_people_video_request(
 
     The context holds the targets (``frames``, which a stored answer keeps), all
     written frames (``video_frames``) and the times of the targets (``times_s``).
-    The item names the hash of the file, so another file gives another key.
+    The item names a hash of the identity of the video (``VideoPart.identity``),
+    so another video gives another key, and the same frames written again with
+    other bytes give the same key.
     """
     _check_video(video, len(video_frames), fps)
     written = [operator.index(frame) for frame in video_frames]
@@ -400,12 +402,17 @@ def build_people_video_request(
             clip_id=clip_id,
             step="people_video",
             frame=wanted[0],
-            item=f"video-{video.sha256[:16]}",
+            item=f"video-{_video_digest(video)[:16]}",
             repeat=repeat,
         ),
         settings=settings,
         context={"frames": wanted, "video_frames": written, "times_s": target_times},
     )
+
+
+def _video_digest(video: VideoPart) -> str:
+    """Return a SHA-256 of the identity of a video part (``VideoPart.identity``)."""
+    return hashlib.sha256(json.dumps(video.identity(), sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def crop_rect(box: Box, width: int, height: int) -> tuple[int, int, int, int] | None:

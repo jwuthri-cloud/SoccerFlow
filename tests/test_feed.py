@@ -336,3 +336,80 @@ def test_the_merger_reads_a_slow_tool_to_its_end_so_that_its_pipe_does_not_break
     writer.join(10.0)
     assert broke == [] and merger.next_frame == n_frames
     assert merger.counts.late["calibration"] >= 1 and merger.counts.late_lines["calibration"] >= 1
+
+
+def test_a_tool_a_little_slower_than_the_pace_loses_every_part_once_its_lag_passes_the_wait() -> None:
+    """Second read of round 7: the wait does not bound the time of a tool per frame but its lag. A calibration of 60 ms
+    per frame at 25 frames per second falls 20 ms further behind with each frame, so from about frame 1.0 / 0.020 = 50
+    on its parts come after the wait of 1 s, and they never catch up (the advice is --skip-behind, RUNBOOK section 14)."""
+    n_frames = 200
+    merger = started(n_frames, wait_s=1.0)
+    events = sorted(
+        [(frame / 25 + 0.02, "detector", frame) for frame in range(n_frames)]
+        + [((frame + 1) * 0.060, "calibration", frame) for frame in range(n_frames)]
+    )
+    late_from = None
+    for at, tool, frame in events:
+        for text in merger.take(at):
+            part = json.loads(text).get("calibration")
+            if part == {"missing": "late"} and late_from is None:
+                late_from = json.loads(text)["frame"]
+        merger.line(tool, line(tool, frame), at)
+    merger.end("detector")
+    merger.end("calibration")
+    merger.take(1e9)
+    assert late_from is not None and 45 <= late_from <= 55
+    assert merger.counts.late["calibration"] == n_frames - late_from
+    assert merger.counts.late_lines["calibration"] == n_frames - late_from
+
+
+def test_a_tool_that_hangs_after_the_last_frame_does_not_hold_the_merger() -> None:
+    """Planted-bug check of round 7: a tool that hung (its pipe open, nothing more written) after every frame had gone
+    out kept merge_feeds reading it for ever, and the merged lines never ended. Now the lines end with the last frame
+    (``end``), and a feed silent for ``drain_s`` is left and counted."""
+    n_frames = 4
+    hang = threading.Event()
+
+    def calibration() -> Any:
+        yield header("calibration", n_frames) + "\n"
+        for frame in range(n_frames):
+            yield line("calibration", frame) + "\n"
+        hang.wait()  # alive, nothing more written
+
+    detector = [header("detector", n_frames) + "\n", *(line("detector", frame) + "\n" for frame in range(n_frames))]
+    out: list[str] = []
+    ended: list[int] = []
+    done: dict[str, Any] = {}
+
+    def run() -> None:
+        done["merger"] = merge_feeds(
+            {"detector": iter(detector), "calibration": calibration()},
+            out.append,
+            wait_s=0.2,
+            end=lambda: ended.append(len(out)),
+            drain_s=0.3,
+        )
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(10.0)
+    hang.set()
+    assert not worker.is_alive()
+    assert ended == [1 + n_frames]  # the end came right after the header and the last frame
+    assert done["merger"].counts.left_open == {"detector": 0, "calibration": 1}
+
+
+def test_the_stream_reads_no_line_after_the_last_frame() -> None:
+    """Planted-bug check of round 7: the stream read on after the last frame, so a pipe that stayed open held it."""
+    head = json.dumps({"format": STREAM_FORMAT, "clip": "CLIP-A", "n_frames": 2, "video_sha256": None,
+                       "detector": DETECTOR, "calibration": CALIBRATION})
+
+    def lines() -> Any:
+        yield head
+        for frame in range(2):
+            yield json.dumps({"frame": frame, "detector": {"seconds": 0.02, "payload": PEOPLE},
+                              "calibration": {"seconds": 0.03, "payload": CAMERA}})
+        raise AssertionError("a line after the last frame was asked for")
+
+    _, inputs = read_stream_lines(lines())
+    assert [item.frame for item in inputs] == [0, 1]
