@@ -23,7 +23,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -31,6 +31,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from pitchvlm import stopsignals
 from pitchvlm.ball import BallCandidate, BallTrack, track_ball
 from pitchvlm.config import PipelineConfig, StepSettings, TrackingConfig, model_label
 from pitchvlm.fill import dense_frame_states
@@ -466,18 +467,24 @@ def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel
     reaches its budget limit must stop spending. The requests in flight then
     finish, and the first failure is raised.
 
-    An interruption (Ctrl-C or a stop signal) also ends here: the requests that
-    have not started are cancelled, and the function returns only after every
-    request in flight has finished. So the answers of these requests are stored
-    and recorded before the caller goes on. A further interruption does not end
-    this wait (``_finish_requests_in_flight``).
+    A stop signal of the command line (Ctrl-C, a plain kill, a closed terminal)
+    is held back while the requests are in flight (``stopsignals.held_stops``):
+    the handler records it, no request starts after it, a warning names the
+    requests that are still in flight, and the stop is raised as
+    ``KeyboardInterrupt`` when every request in flight has finished. So the
+    answers of these requests are stored and recorded before the caller goes on,
+    and no number of further signals ends this wait. An interruption that is
+    raised all the same (a handler that is not the one of the command line)
+    also ends here: the requests that have not started are cancelled, and the
+    function returns only after every request in flight has finished
+    (``_finish_requests_in_flight``).
     """
     failures: list[Exception] = []
     in_flight = _InFlight()
 
     def generate(request: VLMRequest) -> VLMResponse:
         with in_flight.working():
-            if failures:
+            if failures or stopsignals.held_cause() is not None:
                 raise _NotSent
             try:
                 return backend.generate(request)
@@ -485,17 +492,40 @@ def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel
                 failures.append(error)
                 raise
 
-    executor = ThreadPoolExecutor(max_workers=max_parallel)
-    futures: list[Future[VLMResponse]] = []
-    try:
-        for request in requests:
-            futures.append(executor.submit(generate, request))
-        wait(futures)
-    finally:
-        _finish_requests_in_flight(executor, in_flight)
+    with stopsignals.held_stops():
+        executor = ThreadPoolExecutor(max_workers=max_parallel)
+        futures: list[Future[VLMResponse]] = []
+        try:
+            for request in requests:
+                futures.append(executor.submit(generate, request))
+            _wait_for_answers(futures, in_flight)
+        finally:
+            _finish_requests_in_flight(executor, in_flight)
     if failures:
         raise failures[0]
     return [future.result() for future in futures]
+
+
+#: Seconds between two looks of the wait of the thread pool at the stop signals that were held back.
+STOP_LOOK_S = 0.1
+
+
+def _wait_for_answers(futures: Sequence[Future[VLMResponse]], in_flight: _InFlight) -> None:
+    """Wait until every request is answered, refused or failed; warn when stop signals were held back meanwhile."""
+    pending: Iterable[Future[VLMResponse]] = futures
+    warned = stopsignals.held_signals()
+    while True:
+        _, pending = wait(pending, timeout=STOP_LOOK_S)
+        if not pending:
+            return
+        signals = stopsignals.held_signals()
+        if stopsignals.held_cause() is not None and signals > warned:
+            warned = signals
+            logger.warning(
+                "a stop signal came while %d model requests were in flight; the command waits for their answers, so "
+                "that they are stored and recorded",
+                in_flight.count(),
+            )
 
 
 def _finish_requests_in_flight(executor: ThreadPoolExecutor, in_flight: _InFlight) -> None:

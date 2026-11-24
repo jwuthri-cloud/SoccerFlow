@@ -108,7 +108,7 @@ import pydantic
 import yaml
 from pydantic import Field, model_validator
 
-from pitchvlm import __version__, doctor, probes, radar
+from pitchvlm import __version__, doctor, probes, radar, stopsignals
 from pitchvlm.config import (
     DEFAULT_MODEL,
     EngineSettings,
@@ -338,8 +338,9 @@ STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SI
 #: Loggers of the HTTP libraries below the model SDK. Each one writes a line for every request.
 HTTP_LOGGERS = ("httpx2", "httpcore2", "httpx", "httpcore")
 #: Set by a stop signal, and cleared when a command starts. The model backend of a command gets this
-#: event: while it is set, the backend sends no request and no new attempt.
-STOP_REQUESTED = threading.Event()
+#: event: while it is set, the backend sends no request and no new attempt. Its lock can be taken
+#: again by one thread, so the handler can set it at any point of the main thread (``StopEvent``).
+STOP_REQUESTED: threading.Event = stopsignals.StopEvent()
 
 ProbeKind = Literal["people", "pitch", "number"]
 PROBE_KINDS: tuple[ProbeKind, ...] = ("people", "pitch", "number")
@@ -780,21 +781,6 @@ class CostMeter:
         }
 
 
-class _CallInFlight:
-    """What the stop signal handler knows about a model call that runs in the main thread.
-
-    Only the main thread reads and writes this state: a signal handler runs there too.
-    """
-
-    #: True while ``finish_in_flight`` runs a model call in the main thread.
-    active = False
-    #: The cause of the first stop signal that was held back during that call, or None.
-    held_back: str | None = None
-
-
-_CALL_IN_FLIGHT = _CallInFlight()
-
-
 def finish_in_flight(call: Callable[[], VLMResponse]) -> VLMResponse:
     """Run one model call so that a stop signal cannot cut it off, and return its answer.
 
@@ -810,18 +796,11 @@ def finish_in_flight(call: Callable[[], VLMResponse]) -> VLMResponse:
     answer is paid.
 
     In any other thread the call runs as it is: no signal is raised there, and the
-    thread pool of the pipeline waits for its own requests.
+    thread pool of the pipeline waits for its own requests. The hold is
+    ``stopsignals.held_stops``, as in the wait of the thread pool.
     """
-    if threading.current_thread() is not threading.main_thread() or _CALL_IN_FLIGHT.active:
+    with stopsignals.held_stops():
         return call()
-    _CALL_IN_FLIGHT.active = True
-    try:
-        return call()
-    finally:
-        _CALL_IN_FLIGHT.active = False
-        held_back, _CALL_IN_FLIGHT.held_back = _CALL_IN_FLIGHT.held_back, None
-        if held_back is not None:
-            raise KeyboardInterrupt(held_back)
 
 
 class MeteredBackend:
@@ -4974,7 +4953,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     in_main_thread = threading.current_thread() is threading.main_thread()
     if in_main_thread:
         # A stop signal of an earlier command in this process must not reach a call of this one.
-        _CALL_IN_FLIGHT.active, _CALL_IN_FLIGHT.held_back = False, None
+        stopsignals.reset()
     earlier_handlers = {number: signal.signal(number, _interrupt) for number in STOP_SIGNALS} if in_main_thread else {}
     try:
         return args.handler(args)
@@ -5003,15 +4982,24 @@ def _interrupt(number: int, frame: object) -> None:
     """Handle a stop signal: tell the model backend to send nothing more, and interrupt the command.
 
     The interruption is a ``KeyboardInterrupt`` that names the cause: Ctrl-C, or the name
-    of the signal. While a model call runs in the main thread (``finish_in_flight``), the
-    signal is held back: that function raises the interruption, with the cause of the
-    first signal, when the call has ended.
+    of the signal. While paid requests are in flight (a model call in the main thread,
+    ``finish_in_flight``, or the thread pool of the pipeline, ``pipeline._generate_all``),
+    the signal is held back (``stopsignals.held_stops``): the code that waits raises the
+    interruption, with the cause of the first signal, when the requests have ended. No
+    number of further signals ends that wait; Ctrl-\\ (SIGQUIT) or ``kill -KILL`` ends the
+    process at once, and the answers in flight are lost but can still be billed.
+
+    A signal that comes while this handler runs (a burst of signals) is only counted: the
+    handler raises nothing inside the lock of ``STOP_REQUESTED``, which would stay taken.
     """
-    STOP_REQUESTED.set()
     cause = "Ctrl-C" if number == signal.SIGINT else signal.Signals(number).name
-    if _CALL_IN_FLIGHT.active:
-        if _CALL_IN_FLIGHT.held_back is None:
-            _CALL_IN_FLIGHT.held_back = cause
+    if not stopsignals.enter_handler():
+        return
+    try:
+        STOP_REQUESTED.set()
+    finally:
+        stopsignals.leave_handler()
+    if stopsignals.hold_back(cause):
         return
     raise KeyboardInterrupt(cause)
 

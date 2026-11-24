@@ -1685,7 +1685,7 @@ class AtTheModel:
 def interrupted_once(event: threading.Event) -> Callable[[object], None]:
     """A stand-in for the wait of the pool: Ctrl-C comes once ``event`` is set."""
 
-    def interrupted_wait(futures: object) -> None:
+    def interrupted_wait(futures: object, timeout: float | None = None) -> None:
         assert event.wait(timeout=10.0)
         raise KeyboardInterrupt
 
