@@ -163,12 +163,15 @@ def test_a_hold_records_any_number_of_signals_and_raises_the_first_when_it_ends(
 
 
 def test_holds_nest_and_hold_nothing_outside_the_main_thread() -> None:
+    reached: list[str] = []
     with pytest.raises(KeyboardInterrupt, match="SIGHUP"):
         with stopsignals.held_stops():
             with stopsignals.held_stops():
                 assert stopsignals.hold_back("SIGHUP")
             # The inner hold ended; the outer one still holds the stop.
+            reached.append("after the inner hold")
             assert stopsignals.held_cause() == "SIGHUP"
+    assert reached == ["after the inner hold"]
     stopsignals.reset()  # a new command
     seen: list[bool] = []
 
@@ -207,8 +210,9 @@ def test_the_stop_event_can_be_set_by_the_thread_that_holds_its_lock() -> None:
     assert not waiter.is_alive()
 
 
-def test_no_request_starts_after_a_stop_that_a_hold_recorded() -> None:
-    """The thread pool sends no request once a stop is recorded, so the wait ends with the requests in flight."""
+def test_no_request_starts_after_a_stop_that_a_hold_recorded(caplog: pytest.LogCaptureFixture) -> None:
+    """The thread pool sends no request once a stop is recorded, so the wait ends with the requests in flight. The
+    first stop already gives the warning that names the requests in flight."""
     sent: list[int] = []
     gate = threading.Event()
 
@@ -223,14 +227,16 @@ def test_no_request_starts_after_a_stop_that_a_hold_recorded() -> None:
             threading.Event().wait(0.01)
         stopsignals._HOLD.cause = "Ctrl-C"  # what the handler records in the main thread
         stopsignals._HOLD.signals += 1
+        threading.Event().wait(3 * pipeline.STOP_LOOK_S)  # the wait looks at the record meanwhile
         gate.set()
 
     helper = threading.Thread(target=stop_then_release)
     helper.start()
-    with pytest.raises(KeyboardInterrupt, match="Ctrl-C"):
+    with caplog.at_level("WARNING", logger="pitchvlm.pipeline"), pytest.raises(KeyboardInterrupt, match="Ctrl-C"):
         pipeline._generate_all(Model(), list(range(10)), 2)  # type: ignore[arg-type]
     helper.join()
     assert sorted(sent) == [0, 1]
+    assert caplog.text.count("a stop signal came while 2 model requests were in flight") == 1
 
 
 def test_a_pool_in_another_thread_is_not_stopped_by_a_stop_that_the_main_thread_holds() -> None:

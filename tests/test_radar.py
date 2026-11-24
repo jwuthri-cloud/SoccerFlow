@@ -457,6 +457,9 @@ def test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault
         with pytest.raises(radar.RadarError, match="too large"):
             list(radar.feed_documents([json.dumps(header()), line]))
     assert next(iter(radar.feed_documents([json.dumps({**header(), "n_frames": 2**53})])))["n_frames"] == 2**53
+    for value in (2**53 + 1, -(2**53) - 1):
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps({**header(), "n_frames": value})]))
 
 
 def test_the_viewer_stops_when_its_file_is_emptied_or_replaced(tmp_path: Path) -> None:
