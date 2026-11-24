@@ -4930,6 +4930,126 @@ machine is Linux, the build machine is a Mac (arm64).
     handler can block the wait (reasoning). The docstrings now name the gap of two signals.
 
 
+## 2026-11-23 — Second read of the live output, and stop signals that cannot end the wait for paid requests
+
+Session "eng - review round 7" of round 8. Base `main` 41c5552. An outside read of the code that
+round 7 merged (pull requests 24, 25 and 26), with fixes, and the fix of the gap of stop signals
+that the CI session of round 7 reported. No model call, no spend: every request went to a fake
+model. Build machine, Python 3.13.18; the load of the machine (`vm.loadavg`, 1 min) was high
+during the whole session (other sessions ran tests): it is in each table.
+
+**S. Stop signals during the wait for paid requests (major, fixed).**
+
+1. *What happened on 41c5552.* The handler of the command line (`cli._interrupt`) set
+   `STOP_REQUESTED` and raised `KeyboardInterrupt` in the main thread, at whatever point that
+   thread was. The wait of `pipeline._generate_all` caught one interruption and waited again,
+   but a second one could come inside its `except` clause, at its entry or at the jump back of
+   its loop. Worse, the next signal could come inside the handler itself, while
+   `threading.Event.set` held the lock of its condition: the inner handler raised there, the
+   lock stayed taken, and the outer handler (and every later one) waited for it for ever. The
+   command then never ended: the threads of the pool stored their answers, but the command
+   printed no measured cost and needed `kill -9`. Seen with `faulthandler`: the main thread
+   stopped in `threading.py`, `Condition.__enter__`, called by `Event.set` inside `_interrupt`,
+   nested many times.
+2. *Fix.* New module `stopsignals.py`. While paid requests are in flight in the main thread
+   (`finish_in_flight`, and now the whole of `_generate_all`), the handler only records the stop
+   (`held_stops`, `hold_back`) and returns, however many signals come. The pool sends no request
+   after a recorded stop (a request that has not begun is refused), the main thread looks at the
+   record every 0.1 s and logs the warning "a stop signal came while N model requests were in
+   flight" (now also after the first signal), and the first stop is raised with its cause when
+   the requests in flight have ended. A signal that comes while the handler runs is only
+   counted (`enter_handler`): nothing is raised inside the lock of the event. `STOP_REQUESTED` is
+   a `StopEvent`: a `threading.Event` whose lock the same thread can take again, so the handler
+   can set it also while the main thread is inside `wait` of the event (a model client that
+   waits before a new attempt, in the main thread). Behaviour for one signal and for two: as
+   documented (the requests in flight end, their answers are stored and recorded, exit code 2;
+   a second signal does not shorten the wait). Changed: no number of signals ends the wait. The
+   way to force the end: Ctrl-\ (SIGQUIT) or `kill -KILL`; the answers in flight are then lost,
+   can still be billed, and have no ledger line (RUNBOOK, section 4; owner decision 45 of
+   `docs/HANDOVER.md`, section 11.1). A defect of the first version of this fix (commit
+   cf05905), found by its own test before any report: a thread pool run by another thread
+   refused its requests while the main thread held a stop, and raised the internal refusal to
+   its caller; fixed in 5cc5b8e (only a call in the main thread refuses). Found by the second
+   reader of the fix (b2b0e72): (a) after the stop was raised, a further signal raised again,
+   inside the cleanup of the command or inside the error handling of `main`, so the process ended
+   without its error line and exit code 2 (reproduced in 2 of 12 runs of its script; no answer
+   was lost): a command is now interrupted once, and later signals are only counted
+   (`mark_raised`); (b) `test_measured_cost_of_a_run_that_is_stopped_two_times_holds_every_answer_in_flight`
+   waited for the shutdown of the pool, which now comes after the requests in flight, so it
+   failed after 60 s: it now waits for the recorded stop.
+3. *Hypothesis S1 and its measurement.* S1: under a burst of 2,000 stop signals from another
+   process (SIGINT and SIGTERM in turn, sent with `os.kill` as fast as the parent can: in 0.021 s, median, range 0.001 to
+   0.039 s), the wait ends early in 0 of 40 runs, where it was 40 of 40 on 41c5552 (the CI
+   session's number). Script (`round8-review-scripts/burst_measure.py` and `burst_child.py` in
+   the notes folder of the round): a child process installs `cli._interrupt` as `main` does and
+   runs `_generate_all` on 12 requests with 4 in parallel against a fake model; when 4 requests
+   are at the model the parent sends the burst, then lets the model answer 200 ms later. Early
+   end: an answer came after `_generate_all` returned, or the child hung (stopped by
+   `faulthandler` after 15 s; the place is classified from its traceback). Arms: the source of
+   HEAD (5cc5b8e) and of 41c5552, run by run in turn, the order flipped every run.
+
+   | arm | runs | ended early | returned before the answers in flight | hung inside the handler | hung elsewhere | the 4 answers before the return | load, median [range] |
+   |---|---|---|---|---|---|---|---|
+   | HEAD 5cc5b8e | 40 | **0** (95 % interval 0 to 8.8 %) | 0 | 0 | 0 | 40 | 8.7 [5.7, 12.9] |
+   | 41c5552 | 40 | **40** (91.2 to 100 %) | 17 | 14 | 9 | 0 | 8.6 [5.7, 13.0] |
+   | control, 1 signal, HEAD | 10 | 0 | 0 | 0 | 0 | 10 | 6.4 to 7.0 |
+   | control, 1 signal, 41c5552 | 10 | 0 | 0 | 0 | 0 | 10 | 6.4 to 7.0 |
+
+   S1 holds (measured; intervals: Clopper-Pearson). On 41c5552, in 4 of the 17 early returns the
+   pool then started all 8 requests that were still queued: the fake model does not read the stop
+   event; the real clients refuse a new request once `STOP_REQUESTED` is set, so there they would
+   not be sent (reasoning, not measured). "Hung elsewhere": the child was stopped by
+   `faulthandler` with no handler in its main stack; not looked at further. The pilot before the
+   fix (4 runs, load 20 to 25) gave 4 of 4 early, 3 of them hangs in the handler.
+
+4. *Test.* `tests/test_stopsignals.py`: three bursts of 2,000 signals from the test process to a
+   child (about 5 s; a child that hangs is stopped after 30 s), and five tests without real
+   signals (a signal inside the handler; a hold that records 2,000 signals; nested holds and
+   other threads; the event set by the thread that holds its lock; no request after a recorded
+   stop) and the pool of another thread. On 41c5552 the burst test fails (the child hung inside
+   the handler) and the others cannot import `stopsignals`.
+
+**Findings of the read, by severity.** Fixed means: a test that fails on 41c5552 passes now.
+
+| # | Severity | Where (41c5552) | What | State |
+|---|---|---|---|---|
+| S | major | `cli.py:5002-5016`, `pipeline.py:461-533` | item S above: a burst of signals ended the wait for paid requests, or blocked the command for ever | fixed, `tests/test_stopsignals.py` |
+| R1 | minor | `radar.py:251`, `radar.py:176`, `radar.py:269` | a number too large for a float (`1e400`) anywhere but `t_s` passed the check, then the events (JSON without infinity) stopped `radar` with a `ValueError` and a traceback, as a fault of the code; a whole number of 401 digits in `t_s` raised `OverflowError` (found by the second reader in the first fix) | fixed: both refused as wrong input (whole numbers up to 2**53, what the page can hold); `test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault` |
+| R2 | minor | `radar.py:278-291` | a second `stream` to the same `--live-out` file empties it (`O_TRUNC`); the viewer read on from its old place and waited for ever; a file replaced under its name was never seen either | fixed: `RadarError`; `test_the_viewer_stops_when_its_file_is_emptied_or_replaced` |
+| B1 | minor (a claim) | `evalx/liveoutbench.py:117-128` | the bench `revisions` rebuilds each line from the result with the line's own `decided_at`, `transition` and `cut`, and both sides take `fps=25.0`: its "0 of 40,000 lines differ" covers the people, the ball and the camera of each frame, not those three flags, `t_s` or `delay_frames` | written here; the flags are covered by `tests/test_liveout.py` (planted bugs below) |
+| N1 | nit | `liveout.py:395-413` | `close` can count a line that its writer has just written, but whose lock it has not taken again, as not delivered (`stuck`), and then leaves the file descriptor open | not fixed: a window of a few instructions, only at the end, only the count |
+| N2 | nit | `liveout.py:319`, `346` | the counts of lines not delivered: a header that its reader never took counts as a line (the report says "frame lines and the end line"); a writer that fails with an error that is not one of its reader does not count the line it was making | not fixed: the second needs a value that is not finite, which the records refuse (`FiniteFloat`) |
+| N3 | nit | `liveout.py:195` | the docstring says that each line is made and checked in the thread of the stream; for a pipe, the JSON is made in the writer | not fixed (text) |
+| N4 | nit | `cli.py` `_stream_command` | `live_out.close()` runs before `result.json` is written: a writer that failed (not its reader) would stop the command without its result files | not fixed: same unreachable failure as N2 |
+| N5 | nit | `radar.py` `_check_same_feed` | a new `stream` that writes more bytes than the old file had before the next look (50 ms) is not seen; a file system whose inode numbers change between looks (some network mounts) would stop the viewer | not changed: the local disk of the run machine keeps the inode under `O_TRUNC` (second reader, reasoning) |
+| N6 | design | `radar.py:797` | a live viewer that no page ever opened ends as soon as the feed ended | not changed: as documented (`--replay` for a finished file) |
+
+The security read of the radar server found no fault: it binds only addresses that
+`check_loopback` accepts (numbers, loopback, no zone, no mapped IPv4: `localhost`, `0.0.0.0`,
+`::ffff:127.0.0.1`, `::1%lo0`, `127.1` and `0127.0.0.1` are refused before a socket is made); the
+`Host` header must be exactly one of `<address>:<port>` and `localhost:<port>`; `Origin` and
+`Sec-Fetch-Site` refuse the requests of other sites; only `/` and `/events` are served, the query
+and the absolute form of a path are 404; the request line and headers are bounded by
+`http.client` (65,536 bytes per line, 100 headers) and a request body is never read; 32
+connections and 8 event streams at most, each read and write at most 10 s; every value of the
+feed reaches the page through `textContent` or the canvas, and the events are JSON written again,
+whose `\n` and `\r` are escaped. Limit (accepted): a local program can hold the 32 connections.
+The workflow of CI (read-only token, actions pinned by hash, no value of a pull request in a
+command) and the video cache key of pull request 25 (the frames, size, rates and range; the bytes
+and the pixels in the cassette and compared on a hit) gave no finding. The resend of the feed
+from its header (`NamedPipeFeed`) gives one reader each line once, from the header; a second
+header reaches `merge-feeds` only in the documented case of a reader that took bytes and left,
+and is then counted as a broken line.
+
+**Planted bugs.** The check of at least 30 single-line bugs in `liveout.py`, `radar.py`, `pipeline.py`,
+`stopsignals.py`, the handler and the resend of the feed runs; its table follows in a later commit
+of this branch.
+
+Not verified: Python 3.12 and Linux (CI runs both after the push); the burst on a machine with a
+low load; a real model client (the second reader checked the main thread inside
+`STOP_REQUESTED.wait(10)` in a hold with a script: it returned after 0.2 s, for 1 signal and for
+a burst of 3,000).
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same
