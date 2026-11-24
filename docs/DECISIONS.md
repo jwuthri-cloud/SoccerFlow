@@ -5269,6 +5269,221 @@ the box recall and the identity values of `evalx.metrics` instead.
     `render_clip`), `src/pitchvlm/cli.py` (the options and the input loop of `stream`; the signal
     handling is not touched), `tests/test_live_feed_planted.py` (one argument of a namespace).
 
+## 2026-11-23 — Shirt numbers in the live path (session "numbers in the stream" of round 8)
+
+Context: `stream` refused every number engine but `none`, so the live feed and the radar showed
+no shirt number. The clip path asks the model for the number of every track after the whole clip
+(`configs/engines/detector_calibration_numbers.yaml`). This entry builds the live form of that
+step: a worker beside the stream (`src/pitchvlm/livenumbers.py`). Build machine only: the model
+is the fake backend of the synthetic scene, no call was made, nothing here is a measurement of a
+real model, a real clip or a real cost.
+
+1. **Engines.** `stream` takes the number engine `model` besides `none`
+   (`stream.STREAM_NUMBERS`). The frame path is the same code for both: the stream decides its
+   states with no number. With `none` there is no worker and no hook, and every output is the one
+   of `41c5552` (checked byte for byte below).
+2. **Off the frame path.** `DetectorStream.on_arrived(frame, image, people)` (the one hook added
+   to the stream, stage `numbers` of the frame sample; since item 12 at the start of `_arrive`) hands a reference to the image and the boxes of
+   every stride frame (the keyframe step, 12 frames at 25 fps) and of the frames of the kit legend
+   (0, 1 and 2 s) to one worker thread, through a queue of at most 8 images: a full queue drops the
+   new image and counts it (`images_dropped`); no image is copied on the frame path. Each given
+   state goes into the same queue as a reference (never dropped: the stream keeps every state).
+   The worker cuts the crops (the padding of the clip path), and frees them when their frame is
+   decided. Nothing assumes that every frame of a track is there: a frame without image has no
+   crop, a frame without decision has no state (the overload policy of the speed session drops
+   frames; item 12).
+3. **When a track is asked.** Per stream id (the id of the live feed, which is final): the crops
+   of its observed states of a player or a goalkeeper (most observed states) go to a pool (at most
+   16, `crop_choice`). The id is asked once: `ready` when `crop_choice` gives 4 crops at least
+   1 s apart (seen for at least 3 s); `closed` when it has had no observed state for the history of
+   the stream (123 frames: no window can give the id again), with a crop; `end` at the end of the
+   stream, with a crop. The request is that of the clip path (`pipeline._number_request` with up
+   to `number_crops` = 8 crops, the team key `none`), after one kit legend request; the answer is
+   decided with `tracking.decide_number(reading, ())`, the rule of the clip path.
+4. **How an answer reaches the outputs.** The thread of the stream takes the answers that came
+   after each decision and writes each as a number line of the live output: a new format
+   `pitchvlm-live-2` (the lines of `pitchvlm-live-1` plus `{"kind": "number", "id", "number",
+   "export", "display", "frames": [first, last], "crops", "reason", "decided_at",
+   "decided_unix"}`). A number line comes after the frame lines it was read from and changes none;
+   the pipe policy never leaves one out. Without the number step the output stays
+   `pitchvlm-live-1`. The radar reads both: it keeps the newest number of every id, gives all of
+   them to a page that opens late, and draws the number of an id when its frame line has none.
+   At the end `apply_numbers` gives every state and track of an id its number line, so
+   `result.json`, the prediction file and the video hold what the feed said
+   (`tests/test_livenumbers.py`). Why not revise frame lines: a frame line is final by the
+   contract of round 7, and a reader that drew a frame must not have to draw it again.
+5. **End of the stream and stops.** `finish` asks the open ids, waits for the kit legend, sends
+   the waiting requests and waits for every request in flight; `abort` (an early stop, also
+   Ctrl-C through the exit stack of the command) sends nothing more and waits for the requests in
+   flight. Both reuse `pipeline._InFlight` and `pipeline._finish_requests_in_flight`, and (after
+   the merge of the second read of round 7) hold stop signals back with `stopsignals.held_stops`,
+   as `pipeline._generate_all` does: a stop during the wait is recorded, no id is asked and no
+   request is sent after it, a warning names the requests in flight, and the stop is raised when
+   they have ended; no number of signals ends the wait (`Ctrl-\` or `kill -KILL` does, owner
+   decision 45; tested with 50 signals). After the
+   first failure (a budget stop, an error of the model, an answer that cannot be parsed) no
+   request is sent any more; the stream goes on, prints the failure, and the command exits with 1.
+6. **Money: the cap.** A live stream has no known length, so the command takes a cap of number
+   requests per stream, `--numbers-max` (default 50, `cli.EXPECTED_NUMBER_REQUESTS` of one clip).
+   The estimate is 1 kit legend + the cap, printed before the first frame by `open_session`; the
+   budget guard of the cost ledger of the cache folder stops the run above 1.3 times it, as for
+   `run`. When the cap is reached a ready id gets no request (fail closed): a warning says it once,
+   the end prints the count (`refused_by_cap`). Estimate of one pilot clip with the default cap
+   (estimated, not measured; token estimates of `vlm.cost`, `gemini-4-argon`, standard tier):
+   0.463 USD until 30 Nov, 0.926 USD from 1 Dec; the run stops above 0.602 / 1.204 USD. With
+   `--synthetic` the model is the fake one: no ledger, no cost.
+7. **Measurements** (build machine, synthetic clips, the fake model of the scene behind a set
+   delay per answer; `src/pitchvlm/evalx/numberbench.py`; thresholds and method fixed in the
+   Parallax record before the first run; held-out seeds 2200 to 2239, used before only by the git
+   states of a guard test, never by a synthetic clip; the tests use seeds 2290 to 2296). The load of
+   the machine came from two other sessions of this round and was not under my control.
+   - **N1, cost to the frame path** (hypothesis: the worker adds at most 1.0 ms to the median and
+     2.0 ms to the 95th percentile of the time per frame, stage `total`, against the same code with
+     the number engine `none`). 750-frame clips, seeds 2200 to 2205, frames as fast as the stream
+     goes (the worker competes with the frame path all the time), a live output to a file in both
+     arms, pairs back to back on the same seed with the order flipped every pair, 6 pairs per answer
+     delay (6 runs per arm and delay, 36 runs). Load average 9.7 before, 4.9 after (1 min).
+     Code of `9c4e3a9` (the fixes of item 11 came after; they add one flag test to the hand-over).
+
+     | Answer delay | Pairs | Median per frame, none / model (median of runs) | Paired difference of the median: mean [95% t] (median) | 95th percentile, none / model | Paired difference of the 95th percentile: mean [95% t] (median) | Verdict (mean against the threshold) |
+     |---|---|---|---|---|---|---|
+     | 0.5 s | 6 | 20.97 / 21.71 ms | +0.55 [+0.05, +1.05] (+0.48) ms | 23.84 / 24.91 ms | +1.05 [+0.33, +1.78] (+1.18) ms | pass |
+     | 2 s | 6 | 21.22 / 20.90 ms | −0.14 [−0.77, +0.49] (−0.33) ms | 24.36 / 23.96 ms | −0.25 [−1.13, +0.64] (−0.49) ms | pass |
+     | 5 s | 6 | 19.65 / 21.11 ms | +2.23 [−2.10, +6.55] (+0.62) ms | 22.23 / 24.38 ms | +4.33 [−7.81, +16.48] (+1.13) ms | **fail** |
+     | all | 18 | | +0.88 [−0.36, +2.12] (+0.37) ms | | +1.71 [−1.57, +5.00] (+0.65) ms | pass on the means, not shown at 95% |
+
+     **N1 fails as written** (the 5 s arm). Its mean comes from two pairs: pair 3, where the model
+     run had a median of 29.9 ms against 19.4 ms (+10.4 ms), and pair 2, where both arms were slow
+     (the run with `none` had a 95th percentile of 38.0 ms). The paired medians of all three arms
+     are below the thresholds, and with 5 s per answer the threads of the pool only wait, so I infer
+     a load spike of the other sessions, not a cost of the worker; this is an inference, not a
+     measurement. What the 0.5 s arm shows is a real cost of about +0.5 ms on the median and +1 ms
+     on the 95th percentile (the upper end of the interval of the median is 1.05 ms): the worker
+     takes the lock of the interpreter to cut crops, to read the states and to build requests, and
+     the fake model reads the truth in Python in the threads of the pool, which a real model (a
+     network call) does not. A replication of the 5 s arm on `9763ee1` (6 more pairs, the same
+     seeds) ran at a load average of 52 falling to 7.7: paired difference of the median −4.16
+     [−14.58, +6.27] ms, of the 95th percentile −0.02 [−17.06, +17.01] ms; in pair 2 the run with
+     `none` had a median of 68.8 ms. It decides nothing: on this machine, under the load of the
+     other sessions, 6 pairs cannot show a cost of 1 ms. After the merge of the second read of
+     round 7, the 5 s arm again on `165b668` (6 pairs, both orders, the same seeds, the load average
+     of 1 min noted before and after each run: from 7.0 to 36.6, rising during pairs 2 to 4): paired
+     difference of the median +4.66 [−3.67, +12.99] ms (median of the pairs +2.20), of the 95th
+     percentile +14.14 [−20.25, +48.53] ms (−0.77). **Fail as measured.** The two largest
+     differences came with the load rising during the run with numbers (pair 0: 39.7 against
+     20.7 ms at a load of 17.7 to 18.7; pair 2: 25.3 against 20.7 ms while the load rose from 7.0 to
+     20.9); in pair 4 at a load of 35 both arms took 33.6 to 33.9 ms. N1 stays failed as written; a
+     run on a quiet machine (or the run machine) is the open check.
+   - **N2, the numbers against the clip path** (hypothesis: at the end of the stream the set of
+     (track, number) equals that of the clip path with the same engine file and the same fake
+     answers, on all 40 seeds). 500-frame clips (20 s), frames paced at 25 fps, the cap set to 1000 so
+     that it takes no number; a stream id is mapped to the clip-path track that holds most of its
+     observed boxes. **N2 fails: 37 of 40 seeds equal**, the same 37 at each answer delay (0.5, 2
+     and 5 s, 120 runs). The three other seeds, each looked at by hand:
+     - 2227 (10 tracks) and 2223 (1 track): the stream itself votes these players `referee` (seed
+       2227: ids 10 and 12 have 434 and 452 observed states as referee, 22 as player; seed 2223: id
+       19 has 145 as referee, 78 as player), where the clip path votes them players. The worker asks
+       only ids that most states call a player or a goalkeeper, as the clip path does, so they get no
+       number. The cause is the role of the stream (its kit clusters and kit roles in a window),
+       which the number engine `none` shows the same; it is not a fault of the number step, and it
+       is a lead for the stream: a whole team called referee on 1 of 40 seeds.
+     - 2235 (1 track): the clip path gives one person two tracks (5 and 10, 304 and 145 boxes), both
+       with the number 11; the stream gives one id over the boxes of both, with the number 11. The
+       numbers agree box for box; the set of my comparison counts the second track of the clip path
+       as missing. An identity difference, not a number difference.
+     Requests per clip: median 38 (21 to 40) in the stream, median 38 (38 to 40) in the clip path;
+     none above the default cap of 50. No image was dropped by the queue in the 120 runs, and no
+     failure.
+   - **N3, the time from the first frame of an id to its number line** (description; arrival of the
+     first frame of the id to the moment the stream writes the line; 40 seeds per delay, 1,517
+     lines each; the load average rose from 12.7 to 56 during the runs):
+
+     | Answer delay | Median | 95th percentile | Largest | `ready` lines: median / 95th (n = 1,010) | `closed` (n = 219) | `end` (n = 288) |
+     |---|---|---|---|---|---|---|
+     | 0.5 s | 6.22 s | 9.94 s | 11.66 s | 6.26 / 6.90 s | 9.54 / 11.10 s | 3.56 / 4.91 s |
+     | 2 s | 12.15 s | 18.36 s | 20.16 s | 12.42 / 18.06 s | 17.38 / 19.47 s | 9.65 / 11.09 s |
+     | 5 s | 49.25 s | 60.67 s | 64.57 s | 50.06 / 60.09 s | 60.50 / 64.39 s | 41.54 / 43.89 s |
+
+     The floor is the rule: 4 crops 1 s apart on a stride of 12 frames are frames 0, 36, 72 and 108
+     of the id (4.3 s), plus the delay of the stream (1 s), plus one answer. Above it the pool of
+     `max_parallel` = 4 threads queues the requests: about 20 ids are ready in the same second at the
+     start of a clip, and 4 threads answer 0.8 requests per second at 5 s per answer, so at 5 s the
+     line of an id comes about 45 s after the floor. `end` lines are short because their ids were
+     first seen late. On a real model the time per answer is not known (owner decision 53).
+8. **Checks** (on `9763ee1` with these documents). The runner: 3,598 passed, 1 skipped (default),
+   3,609 passed, 1 skipped (`-m "slow or not slow"`), exit 0; one process: 3,608 passed, 1 skipped,
+   1 failed at a load average of 43 (`tests/test_run_tests.py::test_ctrl_c_stops_every_worker_and_their_children`:
+   its runner did not end within 60 s; the file is not touched here, and the test passed 3 times of 3
+   alone). `tools/guard.py --tracked`: no finding. With the number engine `none`, against `41c5552`:
+   the predictions of `demo` (SHA-256 `bb50efd43536…` and `1f97af18358d…`) and both videos byte for
+   byte, the result and the prediction file of `stream --synthetic` equal, and its live feed equal
+   line for line but for `decided_unix` (the wall clock). 27 new tests in `tests/test_livenumbers.py`:
+   with the module copied into the tree of `41c5552`, 12 of the first 23 fail there (the 11 others
+   test the module alone, which does not exist there), and the changed test of `tests/test_stream.py`
+   fails there too.
+9. **Owner decisions** (HANDOVER 11.1, items 49 to 53): the cap per stream (and whether a cap per
+   minute is needed for long live runs); the readiness rule of 4 crops; that two ids of one person
+   both show the number and `stream` has no roster names; that one answer that cannot be parsed
+   stops the asking for the rest of the stream; the threads of the step (N3).
+10. **Second read.** A reader with fresh context read the change (code only) and found: a history
+    of 0 frames failed after the model session was opened, without printing the measured cost; a
+    fault of the code that reads an answer was swallowed (no failure, the step went on); after a
+    fault of the worker the frame path still kept every state and arrival time (memory growth); the
+    test of `abort` depended on 0.3 s of scheduling; the stream tests could drop images on a slow
+    machine. All fixed in `9763ee1`; the first three and the closing of the session each have a test
+    that fails on the code before it (4 tests).
+    Kept as they are: the count of undelivered lines of the pipe report now holds number lines too
+    (its words say "frame lines and the end line"); `stream --help` lists the model options also
+    for the number engine `none` (they are refused there).
+11. **Not verified.** A real model (its time per answer, how it reads crops of a live clip), the
+    real number of ids of a clip and so the real cost, a real camera, Linux timing (CI runs the
+    tests only).
+12. **The merges of round 8** (added 2026-11-24). (a) The second read of round 7 (`b0889a6`): the
+    end-of-stream wait and `abort` hold stop signals (item 5). (b) The count rule of `main`
+    (`3764d2a`): the header is in no count of `LiveReport`; number lines have counts of their own
+    outside it, frozen by `close` (`LiveOut.number_counts`: `given`, `written`, `undelivered`,
+    the last two adding up to the first), written to `result.json` as `numbers.live_out` (before
+    the merge the key was `numbers.number_lines_given_to_live_out`). The rule as `main` states it,
+    `written + dropped + undelivered == given + 1`, holds when the end line did not go out; when
+    it went out, `written + dropped == given` (`written` counts frame lines only). (c) The frame
+    feeder and the overload policy (`b4f19a4`): the hook moves to the start of `_arrive`, where the
+    thread of the stream has the picture (`push`, or `push_fed` with the picture the feeder read),
+    after the motion stage; a dropped frame calls nothing; a dropped decision writes the number
+    lines that came (`wire`, `on_dropped`), so a run of dropped frames does not hold them back.
+    The live output is one of four (`liveout.py`, table): `pitchvlm-live-1` without the number
+    step and `pitchvlm-live-2` with it, each with the two overload keys only when the policy is
+    on; a reader of version 1 reads the first two and refuses the name `pitchvlm-live-2`. Owner
+    decision 48 (whether the overload keys get a name of their own) is described there, not
+    decided: the other choice would add a third and a fourth name, or one version with both
+    parts optional. With the number engine `none` and the policy off every output stays that of
+    `41c5552` (checked below); `result.json` of `stream` has the timing key `feeder_timing` of
+    the speed branch. Tests: frames dropped in the middle of tracks give the same numbers (an
+    injected still clock); the number step and the policy in one stream, whose end holds 20 stop
+    signals; a dropped decision writes the numbers that came. The bench feeds its frames through
+    the frame feeder since `9ab0d29`, as `stream` does.
+13. **N1 and N2 on the merged code** (`9d167b9`, measured 2026-11-24, the other sessions idle; the
+    bench feeds the frame feeder, so the frame sample no longer holds the read and the motion and
+    the times per frame are about 12 ms instead of 20). N1: 6 pairs per answer delay, both orders,
+    seeds 2200 to 2205, the load average of 1 min 2.7 to 11.0 (median 4.4) over the 36 runs.
+
+    | Answer delay | Median per frame, none / model | Paired difference of the median: mean [95% t] (median) | Paired difference of the 95th percentile: mean [95% t] (median) | Verdict |
+    |---|---|---|---|---|
+    | 0.5 s | 11.82 / 12.52 ms | +0.64 [+0.19, +1.09] (+0.54) ms | +0.84 [−0.31, +1.98] (+0.61) ms | pass |
+    | 2 s | 12.35 / 12.27 ms | −0.05 [−0.39, +0.30] (−0.10) ms | −0.17 [−0.57, +0.22] (−0.27) ms | pass |
+    | 5 s | 11.99 / 12.33 ms | +1.87 [−2.42, +6.15] (+0.35) ms | +4.48 [−5.88, +14.84] (+0.56) ms | **fail** |
+
+    **N1 fails as measured, again on the 5 s arm**, by one pair: seed 2205, the run with numbers
+    had a median of 22.4 ms (95th percentile 39.9 ms) while the load average rose from 8.0 to 10.8
+    during it; the 5 other pairs differ by −0.58 to +0.47 ms. With 5 s per answer the first answer
+    comes about 10 s after the start, when the 750 frames (about 9 s) are already decided, so the
+    threads of the pool and the fake model do nothing during the frame samples; the worker only
+    cuts crops and builds requests, as at 0.5 s. I infer a load event, but in all four measurements
+    of the 5 s arm one or two pairs had such a difference, and at 0.5 s and 2 s none: that pattern
+    is not explained, and a run on the run machine is the check. N2 (40 seeds, 0.5 s per answer,
+    paced at 25 fps): 37 of 40 equal, the same three seeds with the same causes as in item 7;
+    requests per clip median 38 (21 to 40); no image dropped; no failure. N3 of that run: median
+    6.21 s, 95th percentile 9.92 s (1,517 lines), as before.
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same

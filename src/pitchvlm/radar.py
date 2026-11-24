@@ -23,10 +23,14 @@ code, the players by team colour with the shirt number when it is known, the bal
 of the frame, and how far the page is behind the decision (wall clock of this machine).
 
 Events: ``header`` (the header line, with ``"replay"``), then ``frame`` (one frame line, its
-frame index as the event id), then ``end`` (the end line, or ``{"end": true, "complete": false}``
+frame index as the event id) and ``number`` (a number line of the format ``pitchvlm-live-2``:
+the shirt number of one id, read later than its frames), then ``end`` (the end line, or ``{"end": true, "complete": false}``
 when the feed closed without one). A client gets the header and then every frame from the
 newest one on; a client that falls more than ``CLIENT_MAX_BEHIND`` frames behind jumps to the
-newest frame (a viewer needs the newest state, the gaps show in the frame index). The server
+newest frame (a viewer needs the newest state, the gaps show in the frame index). The number of
+every id is kept (the newest line of the id): a new client gets all of them after the header, and
+every client gets each new one, also when it jumps; the page draws the number of an id when its
+frame line has none. A feed of ``pitchvlm-live-1`` has no number line. The server
 ends when the feed ended and every client got the end event (or after ``END_WAIT_S``).
 """
 
@@ -51,7 +55,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from pitchvlm.liveout import LIVE_FORMAT
+from pitchvlm.liveout import LIVE_FORMAT, LIVE_FORMAT_NUMBERS, NUMBER_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +122,8 @@ class Board:
         self._replay = replay
         self._header: Event | None = None
         self._frames: deque[Event] = deque(maxlen=RING_EVENTS)
+        #: The newest number line of every id.
+        self._numbers: dict[int, Event] = {}
         self._end: Event | None = None
         self._seq = 0
         self._closed = False
@@ -187,6 +193,12 @@ class Board:
             self._frames.append(self._next("frame", int(document["frame"]), document))
             self._lock.notify_all()
 
+    def number(self, document: dict[str, Any]) -> None:
+        """Take one number line: it replaces the earlier number line of its id."""
+        with self._lock:
+            self._numbers[int(document["id"])] = self._next("number", None, document)
+            self._lock.notify_all()
+
     def end(self, document: dict[str, Any]) -> None:
         """Take the end line (or the end of a feed without one)."""
         with self._lock:
@@ -226,11 +238,13 @@ class Board:
         if after < self._header.seq:
             events.append(self._header)
             newer = list(self._frames)[-1:]
+            numbers = list(self._numbers.values())
         else:
             newer = [event for event in self._frames if event.seq > after]
             if len(newer) > CLIENT_MAX_BEHIND:
                 newer = newer[-1:]
-        events.extend(newer)
+            numbers = [event for event in self._numbers.values() if event.seq > after]
+        events.extend(sorted((*numbers, *newer), key=lambda event: event.seq))
         if self._end is not None and after < self._end.seq:
             events.append(self._end)
         return events
@@ -239,14 +253,16 @@ class Board:
 def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
     """Yield the header, the frame lines and the end line of a live output, checked; stop after the end line.
 
-    ``RadarError`` is raised for a first line that is not a header of ``LIVE_FORMAT`` and
-    for a line that is not a JSON object of the format (a frame line needs a whole frame
-    number of 0 or more and a time ``t_s`` that is a finite number of 0 or more). A number
-    too large for a float (``1e999``) is refused as ``NaN`` and ``Infinity`` are: the
-    events are JSON without them. So is a whole number beyond 2**53, which the page (a
-    JavaScript number) cannot hold and a float cannot be compared with.
+    ``RadarError`` is raised for a first line that is not a header of ``LIVE_FORMAT`` or
+    ``LIVE_FORMAT_NUMBERS`` and for a line that is not a JSON object of the format (a frame line
+    needs a whole frame number of 0 or more and a time ``t_s`` that is a finite number of 0 or
+    more; a number line, only in ``LIVE_FORMAT_NUMBERS``, needs an id of 0 or more, a number of 0
+    to 99 or null and two frames in order). A number too large for a float (``1e999``) is refused
+    as ``NaN`` and ``Infinity`` are: the events are JSON without them. So is a whole number beyond
+    2**53, which the page (a JavaScript number) cannot hold and a float cannot be compared with.
     """
     seen_header = False
+    numbers = False
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -257,14 +273,22 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
         if not isinstance(document, dict):
             raise RadarError(f"line {number} of the feed is not a JSON object")
         if not seen_header:
-            if document.get("format") != LIVE_FORMAT:
-                raise RadarError(f"the feed is not a live output of the format {LIVE_FORMAT} (line {number})")
+            if document.get("format") not in (LIVE_FORMAT, LIVE_FORMAT_NUMBERS):
+                raise RadarError(
+                    f"the feed is not a live output of the format {LIVE_FORMAT} or {LIVE_FORMAT_NUMBERS} (line {number})"
+                )
             seen_header = True
+            numbers = document["format"] == LIVE_FORMAT_NUMBERS
             yield document
             continue
         if document.get("end") is True:
             yield document
             return
+        if "kind" in document:
+            if not numbers or document["kind"] != NUMBER_KIND or not _number_line(document):
+                raise RadarError(f"line {number} of the feed is not a number line of the format {LIVE_FORMAT_NUMBERS}")
+            yield document
+            continue
         frame = document.get("frame")
         if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
             raise RadarError(f"line {number} of the feed is neither a frame line nor the end line")
@@ -272,6 +296,23 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
         if not isinstance(t_s, (int, float)) or isinstance(t_s, bool) or not math.isfinite(t_s) or t_s < 0:
             raise RadarError(f"line {number} of the feed has no time t_s of 0 or more")
         yield document
+
+
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _number_line(document: dict[str, Any]) -> bool:
+    """Tell whether a document has the fields of a number line that the page uses, with their types."""
+    shown, frames = document.get("number"), document.get("frames")
+    return (
+        _whole(document.get("id"))
+        and (shown is None or (_whole(shown) and shown <= 99))
+        and isinstance(frames, list)
+        and len(frames) == 2
+        and all(_whole(frame) for frame in frames)
+        and frames[0] <= frames[1]
+    )
 
 
 def _no_constant(token: str) -> Any:
@@ -400,6 +441,9 @@ def pump(
             if document.get("end") is True:
                 board.end({**document, "complete": True})
                 return frames
+            if document.get("kind") == NUMBER_KIND:
+                board.number(document)
+                continue
             if replay:
                 if start is None:
                     while not board.first_client.wait(0.1):
@@ -446,6 +490,7 @@ const el = (id) => document.getElementById(id);
 const COLOURS = { A: "#3d7eff", B: "#ff4d5e", none: "#b9c2cc" };
 const TEXT_ON = { A: true, B: true };
 let header = null, latest = null, lastFrame = null, gaps = 0, lagMs = null, state = "waiting for the feed";
+const numbers = new Map();
 
 function size() {
   const ratio = window.devicePixelRatio || 1;
@@ -494,11 +539,12 @@ function draw() {
     ctx.fillStyle = colour; ctx.fill();
     ctx.lineWidth = p.role === "goalkeeper" ? Math.max(2, r * 0.35) : 1;
     ctx.strokeStyle = p.role === "goalkeeper" ? "#ffffff" : "#0b0f14"; ctx.stroke();
-    if (Number.isInteger(p.number)) {
+    const shown = Number.isInteger(p.number) ? p.number : numbers.get(p.id);
+    if (Number.isInteger(shown)) {
       ctx.fillStyle = p.role === "referee" || !(p.team in TEXT_ON) ? "#0b0f14" : "#ffffff";
       ctx.font = "600 " + Math.round(r * 1.1) + "px system-ui, sans-serif";
       ctx.textAlign = "center"; ctx.textBaseline = "middle";
-      ctx.fillText(String(p.number), sx(p.x), sy(p.y) + 0.5);
+      ctx.fillText(String(shown), sx(p.x), sy(p.y) + 0.5);
     }
   }
   ctx.globalAlpha = 1;
@@ -541,6 +587,12 @@ events.addEventListener("frame", (e) => {
   latest = line;
   window.requestAnimationFrame(() => { draw(); text(); });
 });
+events.addEventListener("number", (e) => {
+  const line = JSON.parse(e.data);
+  numbers.set(line.id, line.number);
+  el("numbers").textContent = String(Array.from(numbers.values()).filter(Number.isInteger).length);
+  window.requestAnimationFrame(draw);
+});
 events.addEventListener("end", (e) => {
   const end = JSON.parse(e.data);
   state = end.complete ? "the feed ended" : "the feed closed without its end line";
@@ -568,6 +620,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <span class="stat">page behind the decision <b id="behind">-</b></span>
 <span class="stat">frames not shown <b id="gaps">0</b></span>
 <span class="stat">people <b id="count">-</b></span>
+<span class="stat">shirt numbers known <b id="numbers">0</b></span>
 <span class="stat">flags <b id="flags">-</b></span>
 <span class="stat"><b id="status"></b></span>
 </header>

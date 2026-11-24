@@ -691,6 +691,23 @@ clip of 30 s with 50 number requests, the guess of the code):
 - Not in the plan of `docs/PLAN.md`: the three video arms (last row) and the number step of the
   detector engine (0.463 USD per clip until 30 Nov, 0.926 USD from 1 Dec;
   `configs/engines/detector_calibration_numbers.yaml`). The detector engine without it is free.
+- The same number step in the live path (`stream` with that engine file, RUNBOOK section 16) is
+  bounded by its cap of number requests per stream (`--numbers-max`, default 50): one kit legend
+  request plus the cap, 0.463 USD until 30 Nov and 0.926 USD from 1 Dec with the default
+  (estimated, not measured); the run stops above 1.3 times it. Not in the plan either. The
+  command of the owner for one clip (paid: only with the owner's go-ahead, after the clip runs
+  of the two tools of RUNBOOK section 11):
+
+  ```bash
+  CLIP=~/pitchvlm-data/SoccerNetGS-valid/<clip>
+  mkdir -p ~/pitchvlm-data/live/<clip>
+  python -m pitchvlm.cli stream --clip $CLIP --labels $CLIP/Labels-GameState.json \
+      --config configs/engines/detector_calibration_numbers.yaml \
+      --detections ../pitchvlm-results/results/tools/<clip>/detections.json \
+      --calibration ../pitchvlm-results/results/tools/<clip>/calibration.json \
+      --delay 25 --numbers-max 50 --out ~/pitchvlm-data/runs/dev-stream-numbers --tracker pitchvlm-stream-numbers \
+      --live-out ~/pitchvlm-data/live/<clip>/numbers.jsonl
+  ```
 - The lines of `docs/PLAN.md` for the people probe (14 USD) and the pitch probe (15 USD) hold
   several settings; one setting prints 2.36 and 1.49 USD until 30 Nov. The line of the number
   probe (11 USD for two settings) is too small at the standard price from 1 Dec (15.96 USD).
@@ -820,7 +837,12 @@ The streaming path (live):
 | 43 | The calibration in a live run [entry "The live feed of the detector engine", item 13] | `--skip-behind` (the tool takes the newest frame when it is behind, and the skipped frames go out as missing parts); the stream waits for it | The live-feed session: `--skip-behind` when the calibration takes more than 40 ms per frame on the run machine (its published time is 439 ms); else let the stream wait | the stream waits (no `--skip-behind`; RUNBOOK 14 gives it in its command) | a live run at 25 frames per second |
 | 46 | The overload policy of a live run (`stream --max-behind S`) [entry "A faster stream and an overload policy" of 23 Nov, item 9] | off (no frame is dropped; the latency grows without bound when the stream is slower than the feed); on with `S` = 0.3 s (frames whose line waited more than 0.15 s are not used, no state later than 0.3 s plus one push after its line); on with a larger `S` | The speed session: on, with `S` above twice the largest wait of a line in a run without the option on the run machine (RUNBOOK 14). 0.3 s is the only setting measured (build machine): it bounded the latency under load, dropped 0 frames of a steady feed without load, but 12 to 15% of the grouped slow-calibration feed (about 11 lines at once) without load and 33 to 54% under load | off (the code); RUNBOOK 14 names the option | a live run whose stream falls behind |
 | 47 | What a dropped frame shows [same entry, item 9] | no players and no ball (built: a frame without any measurement, cheap, and the video says `dropped: not measured`); the gap fill of the tracks of its window (players with `observed` false; costs a decision per frame, which is what the policy saves) | No players and no ball | no players and no ball | the look of a live run under load; the GS-HOTA of a run with drops |
-| 48 | The live output of a stream with the policy keeps the format `pitchvlm-live-1` with two more keys (`overload_max_behind_s` in the header, `overload_dropped` on the frame and end lines) [same entry, item 9] | keep the version (readers of version 1 ignore the keys; the viewer counts the gaps); a new version `pitchvlm-live-2` for a stream with the policy, the reader of version 1 kept | Keep the version: the lines of a stream without the policy do not change | version 1 with the two keys | nothing |
+| 48 | The live output of a stream with the policy keeps the format `pitchvlm-live-1` with two more keys (`overload_max_behind_s` in the header, `overload_dropped` on the frame and end lines) [same entry, item 9] | keep the version (readers of version 1 ignore the keys; the viewer counts the gaps; built: the keys come in `pitchvlm-live-1` and, with the live number step, in `pitchvlm-live-2`, whose name is taken by the number lines: entry "Shirt numbers in the live path" of 23 Nov, items 4 and 12, and `liveout.py`, table of the four outputs); a format name of its own for a stream with the policy (then `pitchvlm-live-2` cannot be it: a third name, and a fourth for numbers with the policy, or one new version in which both parts are optional; the readers of the older names kept) | Keep the version: the lines of a stream without the policy do not change | version 1 with the two keys | nothing |
+| 49 | The cap of number requests of a live stream with numbers [entry "Shirt numbers in the live path" of 23 Nov, item 9] | a cap per stream (built: `--numbers-max`, default 50, the bound of the estimate; fail closed: a ready track gets no number after it); a cap per minute as well, for a long live run | This session: the cap per stream, 50 for the first clip; read `numbers.requests_planned` and `refused_by_cap` of `result.json`, then set the cap of a longer run from them | 50 per stream (the code) | a paid live run with numbers (RUNBOOK 16) |
+| 50 | When a track of the live path is asked for its number [same entry, item 9] | 4 crops at least 1 s apart (seen for at least 3 s; built), or when its track ends or the stream ends; more crops (later, better read); fewer (sooner) | Keep 4 until the number probe (G5a) says how the reading grows with the number of crops | 4 (the code) | nothing |
+| 51 | Two ids of one person in the live path both show the number, and the stream has no roster names [same entry, item 9] | keep (the ids of a live feed are final; `run` joins them, `stream` cannot); add `--roster` to `stream` for the names only | Keep; a roster in `stream` when a demo needs names | kept | nothing |
+| 52 | After a failure of the live number step (a budget stop, an error of the model, one answer that cannot be parsed) no request is sent for the rest of the stream [same entry, item 9] | as now; go on after an answer that cannot be parsed (the budget stop and an error of the model still stop it) | As now until the first paid run shows how often an answer cannot be parsed | as now | nothing |
+| 53 | Threads of the live number step [same entry, item 7, N3] | `max_parallel` of the settings (4; at 5 s per answer they answer 0.8 requests per second, and the about 20 ids that are ready at the start of a clip wait up to 45 s for their number); more threads (the limit `MAX_PARALLEL_LIMIT` bounds what a budget stop can overshoot) | Keep 4 until the first paid run measures the time per answer of the model; then raise it only if the numbers come too late for the viewer | 4 | nothing; the number lines come late with a slow model |
 
 Results and publishing:
 

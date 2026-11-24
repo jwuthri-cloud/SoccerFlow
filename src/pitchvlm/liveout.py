@@ -15,6 +15,30 @@ pixel, no image, no label value (rule 2 of ``CLAUDE.md``). The format (``LIVE_FO
   ``"players"`` and the ``"ball"``;
 - an end line ``{"end": true, "frames", "written", "dropped"}`` when the stream ends.
 
+With the live number step (``livenumbers``) the header names the format ``LIVE_FORMAT_NUMBERS``
+(``pitchvlm-live-2``): the same lines, plus a number line ``{"kind": "number", "id", "number",
+"export", "display", "frames": [first, last], "crops", "reason", "decided_at", "decided_unix"}``
+for each number that the model read (``number_document``), after the frame lines of the frames
+that it was read from. A number line changes no frame line; the pipe policy never leaves one out.
+Without the number step the output is ``pitchvlm-live-1``, as before.
+
+The overload policy of the stream (``stream.OverloadPolicy``, ``overload``) adds two keys, in either
+format and only when the policy is on: ``"overload_max_behind_s"`` in the header and
+``"overload_dropped"`` (the frames dropped so far) on every frame line and the end line; a dropped
+frame has no line. So a stream writes one of four outputs:
+
+| number step | overload policy | format name | lines |
+|---|---|---|---|
+| none | off | ``pitchvlm-live-1`` | header, frames, end: as in round 7, byte for byte |
+| none | on | ``pitchvlm-live-1`` | the same, with the two overload keys |
+| model | off | ``pitchvlm-live-2`` | header, frames, number lines, end |
+| model | on | ``pitchvlm-live-2`` | the same, with the two overload keys (none on a number line) |
+
+A reader of ``pitchvlm-live-1`` reads the first two (an extra key is free to pass over) and refuses
+the name ``pitchvlm-live-2``, whose number lines it would not know. Whether the overload keys
+should get a format name of their own is owner decision 48 (``docs/HANDOVER.md``, 11.1); it is not
+decided here.
+
 A frame line is final: the stream gives each state once and never changes it, so the line of
 frame ``f`` holds the state of frame ``f`` of the result file, value for value
 (``tests/test_liveout.py``). Only two things of the result file can differ from the lines, and
@@ -59,6 +83,10 @@ from pitchvlm.schemas import BallState, Box, ClipInfo, FrameState, HomographyRec
 
 #: Format name of the live output: a header line, one line per decided frame, an end line.
 LIVE_FORMAT = "pitchvlm-live-1"
+#: Format name of the live output with number lines (module docstring): ``LIVE_FORMAT`` plus number lines.
+LIVE_FORMAT_NUMBERS = "pitchvlm-live-2"
+#: The value of ``"kind"`` of a number line.
+NUMBER_KIND = "number"
 #: Lines that wait for the writer of a pipe that its reader holds, before the oldest one is left out: the newest state.
 PIPE_PENDING_LINES = 1
 #: A write of a pipe that takes longer than this, seconds, means that the reader holds the writer (the pipe is full).
@@ -100,10 +128,12 @@ class LiveReport:
         return f"live output {self.target} (policy {self.policy}): " + ", ".join(parts)
 
 
-def header_document(info: ClipInfo, *, delay_frames: int | None, history_frames: int | None, policy: str) -> dict:
-    """Return the header line of a live output."""
+def header_document(
+    info: ClipInfo, *, delay_frames: int | None, history_frames: int | None, policy: str, numbers: bool = False
+) -> dict:
+    """Return the header line of a live output (``LIVE_FORMAT_NUMBERS`` when number lines can come)."""
     return {
-        "format": LIVE_FORMAT,
+        "format": LIVE_FORMAT_NUMBERS if numbers else LIVE_FORMAT,
         "clip": info.clip_id,
         "n_frames": info.n_frames,
         "fps": info.fps,
@@ -172,6 +202,35 @@ def frame_document(
     }
 
 
+def number_document(
+    *,
+    track_id: int,
+    export: int | None,
+    display: int | None,
+    first_frame: int,
+    last_frame: int,
+    crop_frames: tuple[int, ...],
+    reason: str,
+    decided_at: int,
+    decided_unix: float,
+) -> dict[str, Any]:
+    """Return a number line (module docstring): ``number`` is the shown number, the displayed one else the export one."""
+    if not 0 <= first_frame <= last_frame:
+        raise ValueError(f"the frames of a number line must be in order from 0, got {first_frame} and {last_frame}")
+    return {
+        "kind": NUMBER_KIND,
+        "id": track_id,
+        "number": display if display is not None else export,
+        "export": export,
+        "display": display,
+        "frames": [first_frame, last_frame],
+        "crops": list(crop_frames),
+        "reason": reason,
+        "decided_at": decided_at,
+        "decided_unix": decided_unix,
+    }
+
+
 def dumps(document: dict[str, Any]) -> bytes:
     """Return one line of the live output: compact JSON without NaN, and its line end."""
     return (json.dumps(document, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -186,7 +245,7 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 #: The kinds of the items that wait for the writer of a pipe.
-_HEADER, _FRAME, _END = "header", "frame", "end"
+_HEADER, _FRAME, _END, _NUMBER = "header", "frame", "end", "number"
 
 
 class LiveOut:
@@ -243,6 +302,15 @@ class LiveOut:
         self._finished = False
         self._closed = False
         self._thread: threading.Thread | None = None
+        self._numbers = False
+        #: Number lines given by the stream; their own counts, in no count of ``LiveReport``: after ``close``
+        #: ``numbers_written + numbers_undelivered == numbers_given``.
+        self.numbers_given = 0
+        self.numbers_written = 0
+        self._numbers_lost = 0
+        self._numbers_undelivered = 0
+        #: The three counts of the number lines frozen by ``close`` (a writer given up may still finish a write).
+        self._number_counts: dict[str, int] | None = None
         #: The overload policy of the stream (``overload``): its wait, and the frames it dropped so far.
         self._overload_s: float | None = None
         self._overload_dropped = 0
@@ -251,6 +319,22 @@ class LiveOut:
     def closed(self) -> bool:
         """Whether ``close`` was called."""
         return self._closed
+
+    @property
+    def number_counts(self) -> dict[str, int]:
+        """The counts of the number lines as ``close`` froze them: ``given``, ``written``, ``undelivered``.
+
+        ``written + undelivered == given``. A writer that ``close`` gave up may finish its write later;
+        these counts stay as they were (the line counts as not delivered, as for ``LiveReport``).
+        """
+        if self._number_counts is None:
+            raise ValueError("the counts of the number lines are known after close")
+        return dict(self._number_counts)
+
+    @property
+    def numbers_undelivered(self) -> int:
+        """Number lines that never went out (known after ``close``): their reader went away, the writer failed or was given up."""
+        return self._numbers_undelivered
 
     @property
     def policy(self) -> str:
@@ -286,12 +370,18 @@ class LiveOut:
             document["overload_dropped"] = self._overload_dropped
         return document
 
-    def start(self, *, delay_frames: int | None, history_frames: int | None) -> None:
-        """Write the header line (a file), or hand it to the writer thread that starts here (a pipe)."""
+    def start(self, *, delay_frames: int | None, history_frames: int | None, numbers: bool = False) -> None:
+        """Write the header line (a file), or hand it to the writer thread that starts here (a pipe).
+
+        ``numbers`` names the format with number lines (``LIVE_FORMAT_NUMBERS``) and allows ``number``.
+        """
         if self._started:
             raise ValueError("the live output is already started")
         self._started = True
-        head = header_document(self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy)
+        self._numbers = numbers
+        head = header_document(
+            self._info, delay_frames=delay_frames, history_frames=history_frames, policy=self.policy, numbers=numbers
+        )
         if self._overload_s is not None:
             head["overload_max_behind_s"] = self._overload_s
         header = dumps(head)
@@ -338,6 +428,46 @@ class LiveOut:
             self._waiting_frames += 1
             self._lock.notify()
 
+    def number(
+        self,
+        *,
+        track_id: int,
+        export: int | None,
+        display: int | None,
+        first_frame: int,
+        last_frame: int,
+        crop_frames: tuple[int, ...],
+        reason: str,
+        last: int,
+    ) -> None:
+        """Take one number line, decided at the frame ``last``: write it, or hand it to the writer (never left out)."""
+        if not self._numbers:
+            raise ValueError("the live output was started without number lines")
+        if not self._started or self._finished:
+            raise ValueError("the live output takes number lines only between start and finish")
+        document = number_document(
+            track_id=track_id,
+            export=export,
+            display=display,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            crop_frames=crop_frames,
+            reason=reason,
+            decided_at=last,
+            decided_unix=self._clock(),
+        )
+        self.numbers_given += 1
+        if not self._pipe:
+            self._write(dumps(document))
+            self.numbers_written += 1
+            return
+        with self._lock:
+            if self._reader_gone is not None or self._failure is not None:
+                self._numbers_lost += 1
+                return
+            self._queue.append((_NUMBER, document))
+            self._lock.notify()
+
     def _end_document(self) -> dict[str, Any]:
         return self._with_overload({"end": True, "frames": self._given, "written": self._written, "dropped": self._dropped})
 
@@ -350,6 +480,7 @@ class LiveOut:
                 self._failure = error
                 self._writing = False
                 self._lost += self._waiting_frames + sum(1 for kind, _ in self._queue if kind == _END)
+                self._numbers_lost += sum(1 for kind, _ in self._queue if kind == _NUMBER)
                 self._queue.clear()
                 self._waiting_frames = 0
 
@@ -377,9 +508,11 @@ class LiveOut:
                 with self._lock:
                     self._writing = False
                     self._reader_gone = str(error) or type(error).__name__
-                    # The header that its reader did not take is in no count, as a header that went out.
-                    self._lost += int(kind != _HEADER) + self._waiting_frames
+                    # The header that its reader did not take is in no count, as a header that went out; a number
+                    # line has counts of its own.
+                    self._lost += int(kind not in (_HEADER, _NUMBER)) + self._waiting_frames
                     self._lost += sum(1 for queued, _ in self._queue if queued == _END)
+                    self._numbers_lost += int(kind == _NUMBER) + sum(1 for queued, _ in self._queue if queued == _NUMBER)
                     self._queue.clear()
                     self._waiting_frames = 0
                 return
@@ -387,6 +520,8 @@ class LiveOut:
                 self._writing = False
                 if kind == _FRAME:
                     self._written += 1
+                elif kind == _NUMBER:
+                    self.numbers_written += 1
                 if kind == _END:
                     return
 
@@ -433,7 +568,17 @@ class LiveOut:
             self._lock.notify_all()
             stuck = thread is not None and thread.is_alive() and self._writing
             waiting = self._waiting_frames + sum(1 for kind, _ in self._queue if kind == _END)
-            stuck_line = int(stuck and self._writing_kind != _HEADER)
+            stuck_line = int(stuck and self._writing_kind not in (_HEADER, _NUMBER))
+            self._numbers_undelivered = (
+                self._numbers_lost
+                + sum(1 for kind, _ in self._queue if kind == _NUMBER)
+                + int(stuck and self._writing_kind == _NUMBER)
+            )
+            self._number_counts = {
+                "given": self.numbers_given,
+                "written": self.numbers_written,
+                "undelivered": self._numbers_undelivered,
+            }
             report = LiveReport(
                 target=self._target,
                 policy=self.policy,

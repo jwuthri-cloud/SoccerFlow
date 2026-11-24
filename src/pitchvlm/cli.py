@@ -175,7 +175,8 @@ from pitchvlm.frames import (
 )
 from pitchvlm.geometry import matrix_from_record, paint_alignment
 from pitchvlm.labels import GsrLabels, gsr_frame_states, load_gsr_labels
-from pitchvlm.liveout import LIVE_FORMAT, LiveOut, LiveOutError, open_live_out
+from pitchvlm.livenumbers import DEFAULT_MAX_REQUESTS, LiveNumbers, NumberSettings, apply_numbers, wire
+from pitchvlm.liveout import LIVE_FORMAT, LIVE_FORMAT_NUMBERS, LiveOut, LiveOutError, open_live_out
 from pitchvlm.motion import MotionField
 from pitchvlm.overlays import MappedFrame, caption, choose_frames, image_name, list_document
 from pitchvlm.pipeline import ToolAnswers, keyframe_frames, run_clip
@@ -2150,6 +2151,7 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     except ValueError as error:
         raise CliError(str(error)) from error
     check_stream_options(args)
+    check_number_options(args, config)
     refuse_live_out(args)
     state = require_clean_tree(args.allow_dirty)
     scene: SyntheticScene | None = None
@@ -2180,7 +2182,14 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         f"delay of {frames_text(settings.delay_frames, info.fps)} and a window of "
         f"{frames_text(settings.history_frames, info.fps)} before the decided frame"
     )
-    print("no step of the settings asks a model: this run makes no model call and costs nothing")
+    numbers: LiveNumbers | None = None
+    numbers_closer: _NumbersCloser | None = None
+    if config.engines.number == "model":
+        numbers_closer = open_live_numbers(args, config, info, scene, settings, stack)
+        numbers = numbers_closer.numbers
+        assert numbers is not None
+    else:
+        print("no step of the settings asks a model: this run makes no model call and costs nothing")
     clock = StageClock()
     stream = DetectorStream(
         config, settings, clip_id=info.clip_id, fps=info.fps, size=(info.width, info.height), clock=clock
@@ -2194,8 +2203,10 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         if args.max_behind is not None:
             live_out.overload(max_behind_s=args.max_behind)
             stream.on_dropped = live_out.skipped
-        live_out.start(delay_frames=settings.delay_frames, history_frames=settings.history_frames)
-        stream.on_given = live_out.given
+        live_out.start(
+            delay_frames=settings.delay_frames, history_frames=settings.history_frames, numbers=numbers is not None
+        )
+    writer = wire(stream, numbers, live_out)
     latency = LatencyLog(settings.delay_frames)
     missing: dict[str, dict[str, int]] = {}
     policy = None if args.max_behind is None else OverloadPolicy(args.max_behind)
@@ -2231,9 +2242,15 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     if stream.n_frames != info.n_frames:
         raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
     stream.finish()
+    if numbers_closer is not None:
+        last_lines = numbers_closer.finish()
+        if writer is not None:
+            writer.write(last_lines, stream.n_frames - 1)
     if live_out is not None:
         live_out.finish()
     result = stream.result()
+    if numbers is not None:
+        result = apply_numbers(result, numbers.lines)
     if missing:
         parts = "; ".join(
             f"{tool}: " + ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
@@ -2252,6 +2269,8 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         "stream": dataclasses.asdict(settings),
         "inputs": facts,
     }
+    if numbers_closer is not None:
+        provenance["cost"] = numbers_closer.cost
     problems: list[str] = []
     prediction_file: dict[str, Any] | None = None
     scored: tuple[int, int] | None = None
@@ -2348,6 +2367,15 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         document["live_out"] = dataclasses.asdict(live_report)
     if overload is not None:
         document["overload"] = overload
+    numbers_failed = False
+    if numbers is not None:
+        numbers_failed = print_live_numbers(numbers)
+        document["numbers"] = {
+            **numbers.report(),
+            "lines": [dataclasses.asdict(line) for line in numbers.lines],
+        }
+        if live_out is not None:
+            document["numbers"]["live_out"] = live_out.number_counts
     write_json(clip_dir / RESULT_NAME, document)
     print(f"result: {clip_dir / RESULT_NAME} ({len(result.tracks)} tracks)")
     video_path = clip_dir / f"{info.clip_id}.mp4"
@@ -2356,7 +2384,134 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
     else:
         video = render_clip(source, result, video_path)
     print(f"video: {video}")
-    return EXIT_FAILED if problems or empty is not None else EXIT_OK
+    return EXIT_FAILED if problems or empty is not None or numbers_failed else EXIT_OK
+
+
+# --- stream: the live number step -----------------------------------------------------
+
+
+def check_number_options(args: argparse.Namespace, config: PipelineConfig) -> None:
+    """Refuse the options of the live number step that do not apply, so that none is ignored without a word."""
+    model_options = (
+        ("--cache", args.cache),
+        ("--replay", args.replay),
+        ("--start-over-budget", args.start_over_budget),
+        ("--allow-other-images", args.allow_other_images),
+    )
+    if config.engines.number != "model":
+        given = [name for name, value in (("--numbers-max", args.numbers_max is not None), *model_options) if value]
+        if given:
+            raise CliError(f"{', '.join(given)} apply only to the number engine model (the settings name none)")
+        return
+    if args.synthetic:
+        given = [name for name, value in model_options if value]
+        if given:
+            raise CliError(
+                f"stream --synthetic takes no {', '.join(given)}: its number step asks the fake model of the scene"
+            )
+
+
+@dataclass
+class _NumbersCloser:
+    """The live number step of a ``stream`` and its model session: closed once, at the end or on an early stop."""
+
+    session: ModelSession | None
+    numbers: LiveNumbers | None = None
+    cost: dict[str, Any] | None = None
+    closed: bool = False
+
+    def finish(self) -> list[Any]:
+        """Ask the open tracks, wait for every answer, then close the session (the measured cost)."""
+        assert self.numbers is not None
+        try:
+            return self.numbers.finish()
+        finally:
+            self._close_session()
+
+    def abort(self) -> None:
+        """An early stop: send nothing more, wait for the requests in flight, then close the session."""
+        if self.closed:
+            return
+        try:
+            if self.numbers is not None:
+                self.numbers.abort()
+        finally:
+            self._close_session()
+
+    def _close_session(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.session is not None:
+            self.cost = close_session(self.session)
+
+
+def open_live_numbers(
+    args: argparse.Namespace,
+    config: PipelineConfig,
+    info: ClipInfo,
+    scene: SyntheticScene | None,
+    settings: StreamSettings,
+    stack: contextlib.ExitStack,
+) -> _NumbersCloser:
+    """Start the live number step of ``stream`` (``livenumbers``), before the first frame and the first model call.
+
+    The estimate is bounded by the cap: one kit legend request and ``--numbers-max`` number
+    requests. The synthetic clip asks the fake model of its scene (no ledger, no cost); any other
+    clip opens a model session: the estimate is printed before the first call, the cost ledger of
+    the cache folder records every answer, and the run stops above 1.3 times the estimate.
+    """
+    cap = DEFAULT_MAX_REQUESTS if args.numbers_max is None else args.numbers_max
+    history = settings.history_frames
+    # A history of 0 frames: no window holds an earlier frame, so an id that is not seen in a frame is closed.
+    number_settings = NumberSettings(max_requests=cap, close_frames=None if history is None else max(1, history))
+    session: ModelSession | None = None
+    if scene is not None:
+        backend: Any = FakeBackend(scene, seed=0 if args.seed is None else args.seed, coords=config.number.coords)
+        print(
+            f"shirt numbers: the live number step asks the fake model of the synthetic scene (no model call, no cost), "
+            f"at most {cap} number requests"
+        )
+    else:
+        plan: list[PlannedCalls] = [("kit_legend", config.kit_legend, 1), ("number", config.number, cap)]
+        session = open_session(
+            "stream",
+            info.clip_id,
+            plan,
+            cache_dir=_cache_dir(args),
+            replay=args.replay,
+            repeat=config.repeat,
+            over_budget=args.start_over_budget,
+            allow_other_images=args.allow_other_images,
+        )
+        backend = session.backend
+        print(
+            f"shirt numbers: at most {cap} number requests in this stream (--numbers-max), the bound of the estimate; "
+            "a track that is ready after the cap gets no number, and the stream goes on"
+        )
+    closer = _NumbersCloser(session=session)
+    stack.callback(closer.abort)  # from here on, any stop closes the session and prints its cost
+    closer.numbers = LiveNumbers(config, backend, number_settings, info=info)
+    return closer
+
+
+def print_live_numbers(numbers: LiveNumbers) -> bool:
+    """Print what the live number step did; return True when it failed (the exit code of the command)."""
+    report = numbers.report()
+    print(
+        f"shirt numbers: {report['number_lines']} number lines ({report['with_number']} with a number) from "
+        f"{report['requests_planned']} number requests of at most {report['max_requests']}; "
+        f"images dropped by the worker: {report['images_dropped']}"
+    )
+    if numbers.cap_reached:
+        print(
+            f"shirt numbers: the cap of {report['max_requests']} number requests was reached: "
+            f"{report['refused_by_cap']} tracks got no number request"
+        )
+    if report["failure"] is not None:
+        print(f"shirt numbers: the number step stopped asking after a failure: {report['failure']}")
+        return True
+    return False
 
 
 # --- radar --------------------------------------------------------------------------
@@ -4412,6 +4567,14 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _requests_cap(text: str) -> int:
+    """Read a cap of model requests: a whole number of 0 or more."""
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text} is not a whole number of 0 or more")
+    return value
+
+
 def _port(text: str) -> int:
     """Read a port: a whole number from 0 (a free port) to 65535."""
     value = int(text)
@@ -4470,6 +4633,14 @@ def _cache_dir(args: argparse.Namespace) -> Path:
 
 def _add_model_options(parser: argparse.ArgumentParser) -> None:
     """Add the options that every command with model calls has."""
+    _add_cache_options(parser, allow_dirty=True)
+
+
+def _add_cache_options(parser: argparse.ArgumentParser, *, allow_dirty: bool = False) -> None:
+    """Add the options of the cache folder and of the hard stop; ``allow_dirty`` adds ``--allow-dirty`` between them.
+
+    ``stream`` has its own ``--allow-dirty``.
+    """
     parser.add_argument(
         "--cache",
         type=_path,
@@ -4479,11 +4650,12 @@ def _add_model_options(parser: argparse.ArgumentParser) -> None:
             f"(default: ../{RESULTS_WORKTREE}/{RESULTS_FOLDER}/{CACHE_FOLDER} next to the repository)"
         ),
     )
-    parser.add_argument(
-        "--allow-dirty",
-        action="store_true",
-        help="start although the git work tree of the code has changes; the output file records it",
-    )
+    if allow_dirty:
+        parser.add_argument(
+            "--allow-dirty",
+            action="store_true",
+            help="start although the git work tree of the code has changes; the output file records it",
+        )
     parser.add_argument(
         "--start-over-budget",
         action="store_true",
@@ -4678,7 +4850,8 @@ def _add_stream(commands: Any) -> None:
         type=_file_or_dash,
         metavar="FILE",
         help=(
-            f"write each decided frame as one JSON line (format {LIVE_FORMAT}) as it is decided: a file, a named "
+            f"write each decided frame as one JSON line (format {LIVE_FORMAT}; {LIVE_FORMAT_NUMBERS} with number lines "
+            "for the number engine model) as it is decided: a file, a named "
             "pipe, or - for the standard output (the output of the command then goes to the error stream)"
         ),
     )
@@ -4709,6 +4882,17 @@ def _add_stream(commands: Any) -> None:
     parser.add_argument(
         "--allow-dirty", action="store_true", help="run on a work tree with changes; the result file says so"
     )
+    parser.add_argument(
+        "--numbers-max",
+        type=_requests_cap,
+        metavar="N",
+        help=(
+            "with the number engine model: the cap of number requests of this stream, the bound of its cost "
+            f"estimate; a track that is ready after it gets no number (default: {DEFAULT_MAX_REQUESTS})"
+        ),
+    )
+    _add_stored_answer_options(parser)
+    _add_cache_options(parser)
     parser.set_defaults(handler=_cmd_stream)
 
 
