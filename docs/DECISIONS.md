@@ -4891,6 +4891,43 @@ machine is Linux, the build machine is a Mac (arm64).
     both engines are byte-equal to 72fad94 (SHA-256 `bb50efd43536dd71...` and
     `1f97af18358d652b...`); `stream --synthetic` exit 0. The RUNBOOK now says 11 slow tests (it
     said 9) and the HANDOVER the counts of this full run.
+17. **The video writer on Linux has no H.264.** Round 5 (4fad128 with `main` d0c5589, run
+    45313141791, green: 3532 passed, 6 skipped in each job; runner 115.0 s on 3.12 and 130.4 s on
+    3.13, one process 272.7 s) skipped one more test: `tests/test_vlm_video.py:931`, "OpenCV
+    cannot write the codec avc1 here". Measured: the headless wheel 5.0.0.93 on the Linux runner
+    cannot open `avc1`, so `vlm/video.py` writes the videos of the model steps with `mp4v`
+    (MPEG-4 Part 2) in an MP4 file; the annotated video (`render.py`) is `mp4v` on every machine.
+    On the build machine (the full wheel 5.0.0.93, macOS) `avc1` opens through the FFmpeg backend
+    of the wheel and through AVFoundation, and `mp4v` through FFmpeg only (a check of
+    `cv2.VideoWriter`, 64 x 48 pixels). Published (read on 2026-11-23): the README of
+    opencv-python (github.com/opencv/opencv-python and its page on pypi.org) says that all wheels
+    ship with FFmpeg under the LGPLv2.1 and that the headless wheels have no GUI; it names no
+    H.264 encoder and does not say that the video input and output of the four packages are the
+    same. So whether the full wheel on Linux (the run machine) opens `avc1` is not known; the same
+    FFmpeg in both is likely (inferred, not measured). The providers: the video page of Gemini
+    (ai.google.dev, now aistudio.google.com/docs/video-understanding) lists MIME types such as
+    `video/mp4` and names no codec; the video page of OpenRouter (openrouter.ai/docs) lists
+    `video/mp4`, `video/mpeg`, `video/mov` and `video/webm` and names no codec. So an `mp4v` file
+    is a `video/mp4` request of an accepted type, and whether the model decodes MPEG-4 Part 2 as
+    well as H.264 is not published. The video cache key of pull request 25 holds the frames of the
+    clip and the settings, not the bytes: an answer stored for an H.264 video of the build machine
+    is found again for the `mp4v` video of the run machine and counted as other bytes (the test
+    above checks it where both codecs open; on Linux it skips). The model would see other pixels
+    than the stored answer saw only on a paid run after a replay that used another machine. What
+    the owner checks on the run machine: the codec (RUNBOOK, section 1, the CI part: one free
+    command), then `doctor --video` (gate G0), whose video checks send a video written by the same
+    code. Open owner decision 44 of `docs/HANDOVER.md`, section 11.1.
+18. **Readers of the change in `pipeline.py`.** Four readers that had not seen my reasoning read
+    the code. The first found the cause on 3.12 (item 8), the second the two faults of e5daf53,
+    the third and the fourth (the fourth from the diff against 72fad94 alone) found no fault for
+    one stop signal, the same normal and failure paths as at 72fad94 (the fourth: 299 random
+    cases, the same answers and the same errors on 3.12 and 3.13), and the gap of two different
+    signals at the same time (item 8; 40 of 40 bursts of 2,000 signals from another process ended
+    the wait early, on 3.12 and 3.13, and 20 of 20 on the code of 72fad94; 0 of 60 at the rate of a
+    person). Both named limits that are not new: a single Ctrl-C logs no warning (the warning is
+    for a second signal), an interruption at two instructions inside `executor.submit` can leave
+    a thread of the pool that never ends, and on 3.12 a third signal inside the lock of a logging
+    handler can block the wait (reasoning). The docstrings now name the gap of two signals.
 
 
 ## Open questions (to settle with measurements)

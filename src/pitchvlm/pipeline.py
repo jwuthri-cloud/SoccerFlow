@@ -405,7 +405,7 @@ def _read_frame(source: FrameSource, frame: int) -> np.ndarray:
 
 
 class _NotSent(Exception):
-    """Marks a request that the thread pool did not send, because an earlier request had failed."""
+    """Marks a request that the thread pool did not send: an earlier request had failed, or a stop came first."""
 
 
 class _InFlight:
@@ -508,7 +508,11 @@ def _finish_requests_in_flight(executor: ThreadPoolExecutor, in_flight: _InFligh
     interruption is raised when all of them have finished. A request that has
     not begun is not sent any more, also when its thread took it already. The
     threads of the pool end by themselves after their last request; nothing
-    here joins them (``_InFlight`` says why).
+    here joins them (``_InFlight`` says why). A limit: two different stop
+    signals that are pending at the same time can raise the second one outside
+    the ``try`` (at the entry of this function or at the jump back of its loop);
+    the function then returns with requests in flight (docs/DECISIONS.md, entry
+    "The offline tests on Linux in CI", item 8).
     """
     interruption: KeyboardInterrupt | None = None
     while True:

@@ -166,6 +166,16 @@ PYTHONPATH=src python -m pitchvlm.cli stream --synthetic --out /tmp/stream
   graphics library on Linux. The package does not use those functions.
 - What CI does not cover: a model call, a real tool, footage, a dataset, a GPU. A GitHub runner
   is not the run machine.
+- The video writer of OpenCV on Linux: in CI it cannot open H.264 (`avc1`), so the videos of the
+  model steps fall back to MPEG-4 Part 2 (`mp4v`); the annotated video is `mp4v` everywhere. On the
+  run machine, check it once (free, no model call): the command prints the codecs that open.
+
+```bash
+python -c "import cv2, tempfile, os; print([c for c in ('avc1', 'mp4v') if cv2.VideoWriter(os.path.join(tempfile.mkdtemp(), 'v.mp4'), cv2.VideoWriter_fourcc(*c), 25.0, (64, 48)).isOpened()])"
+```
+
+  Then `doctor --video` (gate G0, paid) sends a video written by the same code to the model
+  (`docs/HANDOVER.md`, section 11.1, decision 44).
 - To update the pins: change the version in `locks/ci-linux.txt` to the version of the build
   machine, only for a release that is 7 days old or older. Take each hash from the page
   `https://pypi.org/pypi/<package>/<version>/json` (the field `digests.sha256` of every wheel
