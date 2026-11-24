@@ -4188,7 +4188,11 @@ machine is Linux, the build machine is a Mac (arm64).
    "1 model requests were in flight" instead of 2. Cause (measured on the build machine with its
    Python 3.12.16 and 3.13.18, stdlib only): on 3.12 a `KeyboardInterrupt` during `Thread.join`
    of a running thread marks that thread as stopped (`is_alive()` false) and every later join of
-   it returns at once; on 3.13 the thread stays alive and the next join waits. The wait of
+   it returns at once; on 3.13 the thread stays alive and the next join waits. Upstream: CPython
+   issue 90882 on github.com (python/cpython, "Thread spuriously marked dead after interrupting a
+   join call", first filed in 2022 as bpo-46726), closed on 2025-03-05 with the words that it is
+   fixed in Python 3.13 and that 3.12 still has it (read on 2026-11-23; published, not measured).
+   The wait of
    `pipeline._finish_requests_in_flight` joined the threads of the pool, so on 3.12 a second
    Ctrl-C ended the wait while a paid request was still in flight: its answer could be lost
    before it was stored and recorded. Fix: `_InFlight` counts a request when its thread begins
@@ -4211,12 +4215,22 @@ machine is Linux, the build machine is a Mac (arm64).
    the model clients, which refuse a new request, so the risk of these windows was low there.
    The run machine uses Python 3.13, where the joins of the old code were right; `pyproject.toml`
    allows 3.12.
+   Planted bugs in the new wait, one at a time, against `tests/test_pipeline.py` and
+   `tests/test_cli.py` (413 tests): no close at the stop, the stop flag ignored, no retry after a
+   second signal, and P01 of the entry "A planted-bug check of the money guards" (no stop after a
+   failure) each end with exit code 1 (2 to 4 tests fail); a wait that returns at once and a count
+   that is never lowered each end with exit code 2 (a worker of the runner did not end normally).
+   6 of 6 found.
 9. **Skipped tests.** The build machine skips 1. Round 2 on Linux skipped 26: 21 tests of the git
    hooks and the secret scan (`pre-commit` and `gitleaks` were not installed; the run machine has
    both, so these skips were a hole: CI installs both now), 4 tests of a disk that does not tell
    letter cases apart (`tests/test_cli.py`: a Linux disk tells them apart, so another spelling is
    another path; right, and the tests of that side run), and the image reader of
-   `tools/run_tool.py` (Pillow is in the environment of the tool only; right, as on the Mac).
+   `tools/run_tool.py`. Round 3 skipped 5: the 4 tests of letter case and the image reader. The
+   image reader skips on the build machine too (its environment has no Pillow); the script runs
+   in the environment of the tool, which brings its own Pillow, and no version of Pillow is
+   known from the build machine to pin. So Pillow stays out of the pins of CI, and the skip
+   stays: CI tests what the build machine tests.
 10. **Times of round 2** (run 45302990921, one run, 4 CPUs, a shared machine; measured): install
     13 s, guard below 1 s, full run in 4 processes 132 s (3.12 and 3.13), each demo 6 s, `stream
     --synthetic` 6 s, a job about 3 min; the job of one process 5 min 46 s (pytest 327 s).
@@ -4228,8 +4242,23 @@ machine is Linux, the build machine is a Mac (arm64).
 12. **The build machine** at the time of this work: the three tests of the live chain in
     `tests/test_live_feed.py` hang there at a low load (a stand-in tool ends with a broken pipe
     and `merge-feeds` waits in the open of the other named pipe). Session "eng - review round 6"
-    owns that code and its fix; until the fix is on `main` the full run on the build machine can fail in these three
-    tests only. They passed in CI.
+    owns that code and its fix; until the fix is on `main` the full run on the build machine can
+    fail in these three tests only. They passed in CI.
+13. **The secret scan of the tests read compiled files.** Round 3 failed in all three jobs in
+    `test_text_of_the_repository_passes_the_secret_scan[tests]`: `gitleaks dir` read the folder
+    on the disk, with the `__pycache__` files that the run had written, where the fake keys of
+    the tests stand without their allow marks (rules `openrouter-key`, `google-auth-key`). The
+    build machine never failed so: its shell sets `PYTHONDONTWRITEBYTECODE=1`, so Python writes no
+    compiled file there; with that variable unset the old test failed on the build machine too.
+    The run machine writes compiled files by default, so its first full run would have failed
+    the same way. The test now scans a copy of the files that git tracks (`git ls-files`), which
+    is what a commit holds; the scan stays on for every folder, and `.github` and `locks` are
+    scanned too. A new test checks that the copy holds no compiled file.
+14. **CI rounds.** Round 1 (6528870): the workflow file was refused (item 7). Round 2 (9f51927,
+    run 45302990921): 3.13 and one process green, 3.12 one failure (item 8), 26 skipped. Round 3
+    (f3731a7, run 45308492172): the stop-signal test passed on 3.12 and 3.13; 3504 passed, 1
+    failed (item 13), 5 skipped in each job; runner 144.8 s (3.13) and 145.6 s (3.12), one
+    process 249.1 s; the checksum of gitleaks passed and the 21 tests of the hooks ran.
 
 
 ## Open questions (to settle with measurements)

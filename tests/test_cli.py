@@ -92,6 +92,8 @@ REPOSITORY_TEXT = (
     ".gitignore",
     ".gitleaks.toml",
     ".pre-commit-config.yaml",
+    ".github",
+    "locks",
 )
 #: Clip id of every synthetic scene.
 CLIP_ID = "SNGS-999"
@@ -1958,22 +1960,53 @@ def test_hook_file_runs_the_guard_and_the_secret_scan_before_a_commit_and_before
     assert all(hook["pass_filenames"] is False for hook in hooks.values())
 
 
+def copy_of_tracked_files(target: str, folder: Path) -> Path:
+    """Copy the files that git tracks below ``target`` (their text in the working tree) into ``folder``.
+
+    The secret scan of a folder reads every file on the disk, also what a test run leaves there: the
+    compiled files in ``__pycache__`` hold the fake keys of the tests without their allow marks. A
+    commit holds only the tracked files, so the scan reads a copy of them.
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z", "--", target], capture_output=True, check=True
+    ).stdout.decode("utf-8")
+    paths = [path for path in listed.split("\0") if path]
+    assert paths, f"git tracks no file below {target}"
+    for path in paths:
+        destination = folder / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / path, destination)
+    return folder / target
+
+
 @pytest.mark.parametrize("target", REPOSITORY_TEXT)
-def test_text_of_the_repository_passes_the_secret_scan(target: str) -> None:
+def test_text_of_the_repository_passes_the_secret_scan(target: str, tmp_path: Path) -> None:
     """A finding in a file of the repository stops every commit, because the hooks must not be bypassed.
 
     A value that only looks like a key, for example a pinned cache key next to the name "key", needs
-    the mark ``gitleaks:allow`` on its line.
+    the mark ``gitleaks:allow`` on its line. The scan reads the files that git tracks, not what a
+    test run wrote next to them.
     """
     if shutil.which("gitleaks") is None:
         pytest.skip("gitleaks is not installed")
     options = ["--config", str(SECRET_SCAN_FILE), "--redact", "--no-banner", "--no-color", "--verbose"]
+    scanned = copy_of_tracked_files(target, tmp_path)
 
     completed = subprocess.run(
-        ["gitleaks", "dir", *options, str(REPO / target)], capture_output=True, text=True, check=False
+        ["gitleaks", "dir", *options, str(scanned)], capture_output=True, text=True, check=False
     )
 
     assert completed.returncode == 0, completed.stdout
+
+
+def test_the_secret_scan_of_the_repository_ignores_what_a_test_run_leaves(tmp_path: Path) -> None:
+    """A compiled file in ``__pycache__`` holds the fake keys of a test without their allow marks (CI on Linux,
+    where Python writes such files). The copy that the scan reads has the tracked files only."""
+    scanned = copy_of_tracked_files("tests", tmp_path)
+
+    assert (scanned / "test_cli.py").is_file()
+    assert not any(part == "__pycache__" for path in scanned.rglob("*") for part in path.parts)
+    assert not list(scanned.rglob("*.pyc"))
 
 
 def test_environment_checks_never_show_the_value_of_the_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
