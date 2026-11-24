@@ -239,19 +239,67 @@ def test_a_reader_that_never_reads_does_not_hold_the_end_of_the_stream() -> None
     os.close(read_fd)
 
 
-def test_a_reader_that_goes_away_ends_the_output_and_not_the_stream() -> None:
+@pytest.mark.parametrize("header_out", [True, False], ids=["header-written-before-the-close", "header-not-written"])
+def test_a_reader_that_goes_away_ends_the_output_and_not_the_stream(
+    monkeypatch: pytest.MonkeyPatch, header_out: bool
+) -> None:
+    """The reader goes away right after the start. Whether the writer had written the header by then was left to
+    timing, and the counts differed by one: a header that was not written counted as not delivered, one that was
+    written counted nowhere (CI on Linux, 1 of 3 jobs). The header is in no count now; both orders are forced."""
     scene, result = states_of(20)
     read_fd, write_fd = os.pipe()
+    closed = threading.Event()
+    write_all = liveout._write_all
+
+    def header_after_the_close(fd: int, data: bytes) -> None:
+        if data.startswith(b'{"format"'):
+            assert closed.wait(timeout=30.0)
+        write_all(fd, data)
+
+    if not header_out:
+        monkeypatch.setattr(liveout, "_write_all", header_after_the_close)
     live = LiveOut(write_fd, scene.info, target="a pipe", pipe=True, close_fd=True)
     live.start(delay_frames=5, history_frames=123)
+    if header_out:
+        received = b""
+        while not received.endswith(b"\n"):
+            received += os.read(read_fd, 65536)
+        assert json.loads(received)["format"] == LIVE_FORMAT
     os.close(read_fd)
+    closed.set()
     for state, camera in zip(result.frames, result.homographies, strict=True):
         live.given(state, camera=camera, last=state.frame, transition=False, cut=False)
         time.sleep(0.002)
     live.finish()
-    report = live.close(wait_s=2.0)
-    assert report.reader_gone is not None
+    report = live.close(wait_s=10.0)
+    assert report.reader_gone is not None and report.given == 20 and report.written == 0
     assert report.written + report.dropped + report.undelivered == 21  # 20 frames and the end line
+
+
+def test_a_header_whose_write_is_still_held_at_the_close_is_in_no_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reader holds the write of the header until after the close (a terminal that is stopped): the frames wait
+    or are left out, the end line waits, and the header that never went out is not a line not delivered."""
+    scene, result = states_of(20)
+    release = threading.Event()
+    written: list[bytes] = []
+
+    def held_header(fd: int, data: bytes) -> None:
+        if data.startswith(b'{"format"'):
+            assert release.wait(timeout=30.0)
+        written.append(data)
+
+    monkeypatch.setattr(liveout, "_write_all", held_header)
+    live = LiveOut(-1, scene.info, target="a pipe", pipe=True, close_fd=False)
+    live.start(delay_frames=5, history_frames=123)
+    time.sleep(liveout.PIPE_BLOCKED_S * 4)
+    for state, camera in zip(result.frames, result.homographies, strict=True):
+        live.given(state, camera=camera, last=state.frame, transition=False, cut=False)
+    live.finish()
+    try:
+        report = live.close(wait_s=0.2)
+    finally:
+        release.set()
+    assert (report.given, report.written, report.dropped, report.undelivered) == (20, 0, 19, 2)
 
 
 def test_a_named_pipe_takes_the_pipe_policy(tmp_path: Path) -> None:
@@ -448,7 +496,9 @@ def test_a_close_without_finish_stops_the_writer_and_ends_the_pipe() -> None:
     live = LiveOut(write_fd, scene.info, target="a pipe", pipe=True, close_fd=True)
     live.start(delay_frames=5, history_frames=123)
     live.given(result.frames[0], camera=result.homographies[0], last=5, transition=False, cut=False)
-    time.sleep(0.1)
+    received = b""
+    while received.count(b"\n") < 2:  # the writer is idle once both lines are out (a sleep left it to timing)
+        received += os.read(read_fd, 65536)
     before = time.monotonic()
     report = live.close(wait_s=5.0)  # the stream stopped: the idle writer stops at once, nothing waits
     assert time.monotonic() - before < 1.0
@@ -457,7 +507,7 @@ def test_a_close_without_finish_stops_the_writer_and_ends_the_pipe() -> None:
     fast.set()
     slow_line_reader(read_fd, lines, 0.0, fast)  # returns at the end of the pipe: the writer closed it
     os.close(read_fd)
-    assert [json.loads(line).get("frame") for line in lines] == [None, 0]
+    assert [json.loads(line).get("frame") for line in received.splitlines()] == [None, 0] and lines == []
     assert report.undelivered == 0 and report.written == 1
 
 

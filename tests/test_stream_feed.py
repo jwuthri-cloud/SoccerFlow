@@ -545,3 +545,33 @@ def test_stream_refuses_the_policy_on_a_file_given_as_the_standard_input_and_wit
     done = subprocess.run([*base, "--queue", "5"], input="", capture_output=True, text=True, env=environment, timeout=120,
                           check=False)
     assert done.returncode == 2 and "--max-behind takes no --queue" in done.stderr
+
+
+def test_the_pipe_writer_carries_the_overload_keys_and_its_counts_keep_the_header_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer thread of a pipe: the lines are recorded instead of written (no reader to wait for), and up to 1000
+    lines may wait, so no line is left out whatever the threads do. The dropped frames of the stream are in no count
+    of the report, and neither is the header: every frame line that went out is written, none is left out."""
+    from pitchvlm import liveout
+
+    scene, images = clip_of("plain", 21, n_frames=30)
+    written: list[bytes] = []
+    monkeypatch.setattr(liveout, "_write_all", lambda fd, data: written.append(data))
+    clock, line_clock, inputs = scripted_waits([3.0 if frame in (10, 11) else 0.0 for frame in range(30)])
+    live = LiveOut(-1, scene.info, target="a pipe", pipe=True, close_fd=False, pending_lines=1000)
+    live.overload(max_behind_s=1.0)
+    live.start(delay_frames=SETTINGS.delay_frames, history_frames=SETTINGS.history_frames)
+    fed(
+        scene, images, policy=OverloadPolicy(1.0, clock=clock), line_clock=line_clock, inputs=inputs(inputs_of(scene)),
+        on_dropped=live.skipped, on_given=live.given,
+    )
+    live.finish()
+    report = live.close(wait_s=30.0)
+    lines = [json.loads(data) for data in written]
+    dropped = {5, 6, 10, 11}
+    assert lines[0]["overload_max_behind_s"] == 1.0
+    assert [line["frame"] for line in lines[1:-1]] == [frame for frame in range(30) if frame not in dropped]
+    assert lines[-1] == {"end": True, "frames": 26, "written": 26, "dropped": 0, "overload_dropped": 4}
+    assert (report.given, report.written, report.dropped, report.undelivered) == (26, 26, 0, 0)
+    assert report.written + report.dropped + report.undelivered == report.given
