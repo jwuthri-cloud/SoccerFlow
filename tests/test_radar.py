@@ -436,10 +436,46 @@ def test_a_hostile_feed_gives_a_clean_refusal() -> None:
     assert list(radar.read_lines_of([b"ab", b"c\nde", b"f\n", b"g"])) == ["abc", "def", "g"]
     with pytest.raises(radar.RadarError, match="not JSON"):
         list(radar.feed_documents([json.dumps(header()), "[" * 100000 + "]" * 100000]))
-    for t_s in (None, "1", -1.0, True, 1e400):
+    for t_s in (None, "1", -1.0, True):
         line = {**frame(0), "t_s": t_s}
         with pytest.raises(radar.RadarError, match="t_s"):
-            list(radar.feed_documents([json.dumps(header()), json.dumps(line).replace("Infinity", "1e400")]))
+            list(radar.feed_documents([json.dumps(header()), json.dumps(line)]))
+
+
+def test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault() -> None:
+    """``1e400`` reads as an infinite float. In a time it was refused; anywhere else it reached the events, whose
+    JSON has no infinity, and the command stopped with a ValueError and a traceback (a fault of the code)."""
+    for field, value in (("t_s", "1e400"), ("delay_frames", "1e400"), ("x", "-1e999")):
+        line = json.dumps({**frame(0), field: 0.123456}).replace("0.123456", value)
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps(header()), line]))
+    with pytest.raises(radar.RadarError, match="too large"):
+        radar.serve([json.dumps(header()), json.dumps({**frame(0), "x": 0.123456}).replace("0.123456", "1e400")])
+
+
+def test_the_viewer_stops_when_its_file_is_emptied_or_replaced(tmp_path: Path) -> None:
+    """A second ``stream --live-out`` to the same path empties the file (or a new file takes its name). The viewer
+    read on from its old place and waited for ever; now it stops with a refusal."""
+    lines = json.dumps(header(3)) + "\n" + json.dumps(frame(0)) + "\n"
+    for change in ("emptied", "replaced"):
+        path = tmp_path / f"{change}.jsonl"
+        path.write_text(lines, encoding="utf-8")
+        stop = threading.Event()
+        followed = radar.follow_file(str(path), stop, poll_s=0.01)
+        assert [json.loads(next(followed))["format"], json.loads(next(followed))["frame"]] == [LIVE_FORMAT, 0]
+        if change == "emptied":
+            path.write_text(json.dumps(header(3)) + "\n", encoding="utf-8")  # shorter than what was read
+        else:
+            (tmp_path / "new.jsonl").write_text(lines + json.dumps(frame(1)) + "\n", encoding="utf-8")
+            os.replace(tmp_path / "new.jsonl", path)
+        stopper = threading.Timer(10.0, stop.set)  # the old code waited here until this stop
+        stopper.start()
+        try:
+            with pytest.raises(radar.RadarError, match=change):
+                next(followed)
+        finally:
+            stopper.cancel()
+            stop.set()
 
 
 def test_connections_above_the_limit_are_closed_at_once() -> None:

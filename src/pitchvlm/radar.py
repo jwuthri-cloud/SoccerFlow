@@ -241,14 +241,16 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
 
     ``RadarError`` is raised for a first line that is not a header of ``LIVE_FORMAT`` and
     for a line that is not a JSON object of the format (a frame line needs a whole frame
-    number of 0 or more and a time ``t_s`` that is a finite number of 0 or more).
+    number of 0 or more and a time ``t_s`` that is a finite number of 0 or more). A number
+    too large for a float (``1e999``) is refused as ``NaN`` and ``Infinity`` are: the
+    events are JSON without them.
     """
     seen_header = False
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
-            document = json.loads(line, parse_constant=_no_constant)
+            document = json.loads(line, parse_constant=_no_constant, parse_float=_finite_float)
         except (ValueError, RecursionError) as error:
             raise RadarError(f"line {number} of the feed is not JSON: {error}") from None
         if not isinstance(document, dict):
@@ -275,20 +277,43 @@ def _no_constant(token: str) -> Any:
     raise ValueError(f"{token} is not a number of the feed")
 
 
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"{token} is too large for a number of the feed")
+    return value
+
+
 def follow_file(path: str, stop: threading.Event, poll_s: float = FOLLOW_POLL_S) -> Iterator[str]:
     """Yield the whole lines of a file that grows, as they are written, until ``stop`` is set.
 
     A last line without its line end waits until its end is written. A named pipe or the
-    standard input ends at its end of file instead (``read_lines``).
+    standard input ends at its end of file instead (``read_lines``). A file that becomes
+    shorter than what was read (a new ``stream`` empties it) or that another file replaces
+    under its name raises ``RadarError``: its new lines are another feed.
     """
     splitter = _Lines()
     with open(path, "rb") as handle:
         while not stop.is_set():
             chunk = handle.read(65536)
             if not chunk:
+                _check_same_feed(path, handle)
                 stop.wait(poll_s)
                 continue
             yield from splitter.add(chunk)
+
+
+def _check_same_feed(path: str, handle: Any) -> None:
+    """Raise ``RadarError`` when the followed file was emptied or replaced under its name."""
+    opened = os.fstat(handle.fileno())
+    if opened.st_size < handle.tell():
+        raise RadarError(f"the feed {path} was emptied while it was read (a new stream writes it): start the viewer again")
+    try:
+        named = os.stat(path)
+    except FileNotFoundError:
+        return  # a file that was removed keeps its lines; its writer can still add to it
+    if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+        raise RadarError(f"the feed {path} was replaced by another file while it was read: start the viewer again")
 
 
 def read_lines(fd: int) -> Iterator[str]:
