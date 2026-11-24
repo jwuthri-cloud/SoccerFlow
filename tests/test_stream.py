@@ -10,8 +10,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -548,6 +550,49 @@ def test_stream_with_a_wait_no_line_can_keep_drops_every_frame_and_says_so_in_ev
     lines = [json.loads(line) for line in live.read_text(encoding="utf-8").splitlines()]
     assert len(lines) == 2 and lines[0]["overload_max_behind_s"] == 1e-9
     assert lines[1] == {"end": True, "frames": 0, "written": 0, "dropped": 0, "overload_dropped": 60}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("policy", [[], ["--max-behind", "600"]])
+def test_one_stop_signal_ends_a_live_stream_with_its_frame_feeder_cleanly(
+    policy: list[str], clip_on_disk: tuple[Path, SyntheticScene], clip_runs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Ctrl-C while the stream waits for its next line (the pipe stays open): exit 2, the line of a stop, no traceback,
+    no result file, and a live output without its end line, as before the frame feeder."""
+    root, _ = clip_on_disk
+    clip = root / "SoccerNetGS-valid" / CLIP_ID
+    lines = list(clip_run_lines(load_clip_run(clip_runs[0]), load_clip_run(clip_runs[1])))
+    live = tmp_path / "live.jsonl"
+    command = [sys.executable, "-m", "pitchvlm.cli", "stream", "--clip", str(clip), "--labels", str(clip / LABEL_NAME),
+               "--allow-dirty", "--delay", "5", "--lines", "-", "--live-out", str(live), "--out", str(tmp_path / "out"),
+               *policy]
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "PYTHONPATH": str(REPO / "src")},
+    )
+    try:
+        assert process.stdin is not None
+        process.stdin.write("\n".join(lines[:21]) + "\n")  # the header and frames 0 to 19: frames 0 to 14 are decided
+        process.stdin.flush()
+        deadline = time.monotonic() + 120.0
+        while not (live.exists() and live.read_text(encoding="utf-8").count("\n") >= 16):
+            if process.poll() is not None:
+                pytest.fail(f"the stream ended before the signal: {process.communicate()[1]}")
+            assert time.monotonic() < deadline, "the stream did not decide its frames"
+            time.sleep(0.05)
+        process.send_signal(signal.SIGINT)
+        _, errors = process.communicate(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert process.returncode == 2
+    assert "error: the command was interrupted (Ctrl-C)" in errors
+    assert "Traceback" not in errors
+    assert not (tmp_path / "out" / CLIP_ID / "result.json").exists()
+    written = [json.loads(line) for line in live.read_text(encoding="utf-8").splitlines()]
+    assert written[0]["format"] == "pitchvlm-live-1" and all("end" not in line for line in written)
+    assert [line["frame"] for line in written[1:]] == list(range(len(written) - 1))
 
 
 def test_stream_command_runs_the_synthetic_clip_and_refuses_a_model_engine(

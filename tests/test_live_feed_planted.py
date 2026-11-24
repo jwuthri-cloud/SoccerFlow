@@ -131,6 +131,80 @@ def test_a_reader_that_comes_back_after_some_lines_gets_the_whole_feed_from_its_
     assert got == ["H\nA\nB\n"] and feed.reopened == 1
 
 
+
+def test_a_feed_that_was_sent_again_still_waits_for_a_slow_reader(tmp_path: Path) -> None:
+    """T04 (round 8): the new end of the pipe was left non-blocking, so a reader that came back and read slowly made a
+    write of the lines after the resend fail (``BlockingIOError``) once the pipe was full."""
+    run_tool = load_run_tool()
+    pipe = tmp_path / "feed.fifo"
+    os.mkfifo(pipe)
+    stray = threading.Thread(target=lambda: open(pipe, encoding="utf-8").close(), daemon=True)
+    stray.start()
+    got: list[str] = []
+
+    def slow_reader() -> None:
+        with open(pipe, encoding="utf-8") as handle:
+            time.sleep(0.3)  # the writer fills the pipe meanwhile
+            got.append(handle.read())
+
+    second = threading.Thread(target=slow_reader, daemon=True)
+
+    def sleep(seconds: float) -> None:
+        if second.ident is None:
+            second.start()
+        time.sleep(seconds)
+
+    feed = run_tool.NamedPipeFeed(str(pipe), wait_s=10.0, poll_s=0.01, sleep=sleep)
+    stray.join(10.0)
+    lines = [f"{index:04d} " + "x" * 1000 + "\n" for index in range(300)]  # 300 kB: more than a pipe holds
+    try:
+        for text in lines:
+            feed.write(text)
+    finally:
+        feed.close()
+    second.join(30.0)
+    assert got == ["".join(lines)] and feed.reopened == 1
+
+
+def test_a_resend_that_breaks_waits_again_for_a_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T08 (round 8): when the resend itself broke (a second reader that came and went), the feed gave up at once
+    instead of waiting again for a reader until the end of its wait."""
+    run_tool = load_run_tool()
+    pipe = tmp_path / "feed.fifo"
+    os.mkfifo(pipe)
+    stray = threading.Thread(target=lambda: open(pipe, encoding="utf-8").close(), daemon=True)
+    stray.start()
+    got: list[str] = []
+    second_reader: dict[str, int] = {}
+    real = threading.Thread(target=lambda: got.append(Path(pipe).read_text(encoding="utf-8")), daemon=True)
+
+    def sleep(seconds: float) -> None:
+        if "fd" not in second_reader:  # a second reader comes, and goes before the resend is written
+            second_reader["fd"] = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+        elif second_reader["fd"] < 0 and real.ident is None:
+            real.start()
+        time.sleep(seconds)
+
+    fdopen = os.fdopen
+
+    def fdopen_after_the_second_reader_went(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        if second_reader.get("fd", -1) >= 0:
+            os.close(second_reader["fd"])
+            second_reader["fd"] = -1
+        return fdopen(descriptor, *args, **kwargs)
+
+    feed = run_tool.NamedPipeFeed(str(pipe), wait_s=10.0, poll_s=0.01, sleep=sleep)
+    stray.join(10.0)
+    monkeypatch.setattr(run_tool.os, "fdopen", fdopen_after_the_second_reader_went)
+    try:
+        feed.write("H\n")
+        feed.write("A\n")
+    finally:
+        feed.close()
+    real.join(10.0)
+    assert got == ["H\nA\n"] and feed.reopened == 1
+
+
 # --- stream.py ----------------------------------------------------------------------------------------
 
 
