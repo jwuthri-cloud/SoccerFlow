@@ -727,8 +727,15 @@ python -m pitchvlm.cli run --clip ~/pitchvlm-data/demo/<clip>.mp4 \
 - A run that stops because of the network, or that is interrupted (Ctrl-C, a plain kill, a
   closed terminal), keeps the answers that it received in the cache. Start it again: it goes
   on. The model calls in flight finish first, so a command can take up to the client timeout
-  (300 s, flex 900 s) to end after Ctrl-C, a plain kill or a closed terminal; a second signal
-  does not shorten this. A request that waits for a new attempt is not sent again. One dropped
+  (300 s, flex 900 s) to end after Ctrl-C, a plain kill or a closed terminal; a second signal,
+  or any number of them, does not shorten this (since 2026-11-23 also a burst of signals from
+  another program: `docs/DECISIONS.md`, entry "Second read of the live output, and stop signals
+  that cannot end the wait for paid requests"). A request that waits for a new attempt is not
+  sent again. A command is interrupted once: further signals do not cut short its end (the
+  removal of a partial file, the error line, exit code 2). To end a command at once anyway (a
+  request that does not come back): `Ctrl-\` (SIGQUIT) or `kill -KILL <process id>`. The
+  answers in flight are then lost: the provider can still bill them, the cache has no answer and
+  the ledger no line for them; compare the ledger with the bill of the provider. One dropped
   connection does not stop a run, because the call is tried again. When a call ends without an
   answer that can be read (a timeout, a connection that stays down, or an answer that the SDK
   cannot read), the error line and the log say that the call may still be billed. The ledger
@@ -2025,7 +2032,9 @@ python -m pitchvlm.cli merge-feeds --detector $LIVE/detector.pipe --calibration 
 - `radar`: binds to `127.0.0.1` (or another loopback address given as numbers with `--host`;
   every other address and every host name is refused); `--port 0` (the default) takes a free
   port. It serves only the page and its event stream, refuses a request of a page of another
-  site, and ends when the feed ended and the pages got the end (or with Ctrl-C). The page shows
+  site, and ends when the feed ended and the pages got the end (or with Ctrl-C). A followed file
+  that becomes shorter (a second `stream` with the same `--live-out` empties it) or that another
+  file replaces stops the viewer with an error: start it again for the new feed. The page shows
   the players by team colour (A blue, B red, no team grey, referee yellow; a white ring for a
   goalkeeper; faded when filled in), the shirt number when known, the ball, the time of the
   frame, the delay, how far the page is behind the decision (milliseconds, wall clock of this
@@ -2053,7 +2062,9 @@ legend request plus the cap, printed before the first call; the run stops above 
 the cost ledger of the cache folder records every answer, as for `run`. When the cap is reached,
 a track that is ready gets no request: the stream goes on without new numbers, a warning says it
 once, and the end prints how many tracks got none. At the end the command waits for every request
-in flight (they are paid), also after Ctrl-C.
+in flight (they are paid), also after Ctrl-C: a stop signal then sends nothing more, and the command
+ends with exit code 2 once the answers in flight are stored. No number of signals ends this wait;
+`Ctrl-\` (SIGQUIT) or `kill -KILL` ends the process at once (the answers in flight are lost but can be billed).
 
 Estimate of one pilot clip (estimated, not measured; `DEFAULT_TOKEN_ESTIMATES` and the price
 table of `src/pitchvlm/vlm/cost.py`, `gemini-4-argon`, standard tier, an empty cache):

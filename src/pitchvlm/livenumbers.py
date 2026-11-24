@@ -30,7 +30,9 @@ error of the model, an answer that cannot be parsed) no request is sent any more
 decided with ``tracking.decide_number``, the rule of the clip path, and ``take`` returns it in the
 thread of the stream, which writes it as a number line. ``finish`` asks the open ids and waits for
 every request in flight (they are paid), with the wait of the clip path
-(``pipeline._finish_requests_in_flight``). ``apply_numbers`` puts the numbers into the result.
+(``pipeline._finish_requests_in_flight``), holding stop signals back
+(``stopsignals.held_stops``): a stop that comes meanwhile sends nothing more and is raised when the
+requests in flight have ended. ``apply_numbers`` puts the numbers into the result.
 
 Design and limits: ``docs/ARCHITECTURE.md`` (section ``livenumbers.py``) and ``docs/DECISIONS.md``
 (entry "Shirt numbers in the live path").
@@ -44,12 +46,13 @@ import threading
 import time
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
 
+from pitchvlm import stopsignals
 from pitchvlm.config import PipelineConfig
 from pitchvlm.pipeline import (
     _CropPlan,
@@ -217,6 +220,8 @@ class LiveNumbers:
         # --- Requests.
         self._executor = ThreadPoolExecutor(max_workers=config.max_parallel, thread_name_prefix="pitchvlm-numbers")
         self._in_flight = _InFlight()
+        #: Only a step started in the main thread is stopped by a stop that the main thread holds back.
+        self._held = threading.current_thread() is threading.main_thread()
         self._futures: list[Future[Any]] = []
         self._failures: list[BaseException] = []
         self._legend: KitLegend | None = None
@@ -288,26 +293,49 @@ class LiveNumbers:
     def finish(self) -> list[NumberLine]:
         """Ask the open ids, wait for every answer, stop the threads, and return the numbers not taken yet.
 
-        Call it after ``DetectorStream.finish`` (every state is given). A stop signal during the
-        wait ends the asking at once and still waits for the requests in flight, which are paid
-        (``pipeline._finish_requests_in_flight``).
+        Call it after ``DetectorStream.finish`` (every state is given). The wait holds stop signals
+        back (``stopsignals.held_stops``, as ``pipeline._generate_all`` does): a stop that comes
+        meanwhile is recorded, no id is asked and no request is sent after it, a warning names the
+        requests in flight, and the stop is raised as ``KeyboardInterrupt`` once every request in
+        flight has ended (they are paid). No number of further signals ends this wait; Ctrl-\\
+        (SIGQUIT) or ``kill -KILL`` ends the process.
         """
         if self._finished:
             raise ValueError("the live number step is already finished")
-        try:
-            self._finishing = True
-            self._wake.set()
-            _wait_for(self._thread)
-            wait(list(self._futures))
-        finally:
-            self._end()
+        with stopsignals.held_stops():
+            try:
+                self._finishing = True
+                self._wake.set()
+                warned = False
+                # The worker may still ask ids and send requests; then the requests in flight must end.
+                while self._thread.is_alive() or not all(future.done() for future in list(self._futures)):
+                    if self._stop_held() and not warned:
+                        warned = True
+                        self._stopping = True  # the worker asks no id and sends nothing more
+                        self._wake.set()
+                        logger.warning(
+                            "a stop signal came while %d model requests were in flight; the command waits for their "
+                            "answers, so that they are stored and recorded",
+                            self._in_flight.count(),
+                        )
+                    time.sleep(_InFlight.POLL_S)
+            finally:
+                self._end()
         return self.take()
 
     def abort(self) -> None:
-        """Send nothing more, and return when every request in flight has finished (an early stop)."""
+        """Send nothing more, and return when every request in flight has finished (an early stop).
+
+        The wait holds stop signals back, as ``finish`` does.
+        """
         if self._finished:
             return
-        self._end()
+        with stopsignals.held_stops():
+            self._end()
+
+    def _stop_held(self) -> bool:
+        """Whether a stop signal that the main thread holds back came: then no request is sent any more."""
+        return self._held and stopsignals.held_cause() is not None
 
     def _end(self) -> None:
         self._finished = True
@@ -548,7 +576,7 @@ class LiveNumbers:
         """
         try:
             with self._in_flight.working():
-                if self._failures:
+                if self._failures or self._stop_held():
                     raise _NotSent
                 try:
                     answer = self._backend.generate(request)

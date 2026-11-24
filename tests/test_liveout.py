@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -498,3 +499,126 @@ def test_a_fast_reader_gets_every_line_of_a_burst_of_decisions() -> None:
     os.close(read_fd)
     frames = [json.loads(line)["frame"] for line in lines[1:-1]]
     assert frames == list(range(60)) and (report.written, report.dropped) == (60, 0)
+
+
+# --- Planted bugs that no test caught (second read of round 8, docs/DECISIONS.md) ----------------------------
+
+
+def test_a_frame_line_gives_the_time_of_its_frame_and_refuses_a_camera_of_another_frame() -> None:
+    scene, result = states_of(12)
+    for frame in (0, 5, 11):
+        document = frame_document(
+            result.frames[frame],
+            fps=12.5,
+            camera=result.homographies[frame],
+            last=frame + 1,
+            transition=False,
+            cut=False,
+            decided_unix=0.0,
+            dropped=0,
+        )
+        assert document["t_s"] == frame / 12.5
+        assert document["delay_frames"] == 1
+    for other in (4, 6):  # an earlier and a later camera
+        with pytest.raises(ValueError, match="names frame"):
+            frame_document(
+                result.frames[5],
+                fps=25.0,
+                camera=result.homographies[other],
+                last=5,
+                transition=False,
+                cut=False,
+                decided_unix=0.0,
+                dropped=0,
+            )
+
+
+def test_the_shirt_number_of_a_line_is_the_displayed_one_and_else_the_exported_one() -> None:
+    scene, result = states_of(8)
+    state = result.frames[4]
+    player = state.players[0]
+    cases = [((7, 9), 7), ((None, 9), 9), ((7, None), 7), ((None, None), None)]
+    for (display, export), expected in cases:
+        changed = player.model_copy(update={"number_display": display, "number_export": export})
+        document = frame_document(
+            state.model_copy(update={"players": [changed]}),
+            fps=25.0,
+            camera=result.homographies[4],
+            last=4,
+            transition=False,
+            cut=False,
+            decided_unix=0.0,
+            dropped=0,
+        )
+        assert document["players"][0]["number"] == expected
+
+
+def test_a_held_writer_keeps_exactly_the_pending_lines_and_leaves_out_the_older_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer of frame 0 is held by its reader (a write that lasts longer than ``PIPE_BLOCKED_S``). Frames 1 to 5
+    come meanwhile: one line waits (``PIPE_PENDING_LINES``), so frames 1 to 4 are left out and frame 5 goes next."""
+    scene, result = states_of(8)
+    written: list[bytes] = []
+    in_write, release = threading.Event(), threading.Event()
+
+    def held_write(fd: int, data: bytes) -> None:
+        if b'"frame":0,' in data:
+            in_write.set()
+            assert release.wait(timeout=30.0)
+        written.append(data)
+
+    monkeypatch.setattr(liveout, "_write_all", held_write)
+    live = LiveOut(-1, scene.info, target="a pipe", pipe=True, close_fd=False)
+    live.start(delay_frames=0, history_frames=None)
+    live.given(result.frames[0], camera=result.homographies[0], last=0, transition=False, cut=False)
+    assert in_write.wait(timeout=30.0)
+    time.sleep(liveout.PIPE_BLOCKED_S * 4)
+    for frame in range(1, 6):
+        live.given(result.frames[frame], camera=result.homographies[frame], last=frame, transition=False, cut=False)
+    release.set()
+    live.finish()
+    report = live.close(wait_s=30.0)
+    lines = [json.loads(data) for data in written]
+    assert [line.get("frame") for line in lines[1:-1]] == [0, 5]
+    assert lines[2]["dropped"] == 4 and lines[-1] == {"end": True, "frames": 6, "written": 2, "dropped": 4}
+    assert (report.given, report.written, report.dropped, report.undelivered) == (6, 2, 4, 0)
+
+
+def test_anything_but_a_regular_file_takes_the_pipe_policy(tmp_path: Path) -> None:
+    """A terminal, a socket or a device would block the stream with the file policy: only a regular file takes it."""
+    path = tmp_path / "live.jsonl"
+    path.write_text("", encoding="utf-8")
+    with path.open("a") as handle:
+        assert not liveout.is_pipe_like(handle.fileno())
+    first, second = socket.socketpair()
+    try:
+        assert liveout.is_pipe_like(first.fileno())
+    finally:
+        first.close()
+        second.close()
+    device = os.open(os.devnull, os.O_WRONLY)
+    try:
+        assert liveout.is_pipe_like(device)
+    finally:
+        os.close(device)
+    read_fd, write_fd = os.pipe()
+    try:
+        assert liveout.is_pipe_like(write_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_a_live_output_file_that_exists_is_emptied_first(tmp_path: Path) -> None:
+    """A second stream to the same file starts a new feed: lines added after the old ones would give two headers."""
+    scene, result = states_of(4)
+    path = tmp_path / "live.jsonl"
+    path.write_text('{"format": "an old feed"}\n' * 3, encoding="utf-8")
+    live = open_live_out(str(path), scene.info)
+    live.start(delay_frames=0, history_frames=None)
+    live.given(result.frames[0], camera=result.homographies[0], last=0, transition=False, cut=False)
+    live.finish()
+    live.close()
+    lines = read_lines(path)
+    assert [lines[0]["format"], lines[1]["frame"], lines[2]["end"]] == [LIVE_FORMAT, 0, True] and len(lines) == 3

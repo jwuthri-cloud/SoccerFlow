@@ -257,7 +257,9 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
     ``LIVE_FORMAT_NUMBERS`` and for a line that is not a JSON object of the format (a frame line
     needs a whole frame number of 0 or more and a time ``t_s`` that is a finite number of 0 or
     more; a number line, only in ``LIVE_FORMAT_NUMBERS``, needs an id of 0 or more, a number of 0
-    to 99 or null and two frames in order).
+    to 99 or null and two frames in order). A number too large for a float (``1e999``) is refused
+    as ``NaN`` and ``Infinity`` are: the events are JSON without them. So is a whole number beyond
+    2**53, which the page (a JavaScript number) cannot hold and a float cannot be compared with.
     """
     seen_header = False
     numbers = False
@@ -265,7 +267,7 @@ def feed_documents(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            document = json.loads(line, parse_constant=_no_constant)
+            document = json.loads(line, parse_constant=_no_constant, parse_float=_finite_float, parse_int=_safe_int)
         except (ValueError, RecursionError) as error:
             raise RadarError(f"line {number} of the feed is not JSON: {error}") from None
         if not isinstance(document, dict):
@@ -317,20 +319,54 @@ def _no_constant(token: str) -> Any:
     raise ValueError(f"{token} is not a number of the feed")
 
 
+#: The largest whole number of the feed: JavaScript numbers hold every whole number up to it.
+MAX_FEED_INT = 2**53
+
+
+def _safe_int(token: str) -> int:
+    value = int(token)
+    if abs(value) > MAX_FEED_INT:
+        raise ValueError(f"the whole number {token[:20]}... is too large for a number of the feed")
+    return value
+
+
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"{token} is too large for a number of the feed")
+    return value
+
+
 def follow_file(path: str, stop: threading.Event, poll_s: float = FOLLOW_POLL_S) -> Iterator[str]:
     """Yield the whole lines of a file that grows, as they are written, until ``stop`` is set.
 
     A last line without its line end waits until its end is written. A named pipe or the
-    standard input ends at its end of file instead (``read_lines``).
+    standard input ends at its end of file instead (``read_lines``). A file that becomes
+    shorter than what was read (a new ``stream`` empties it) or that another file replaces
+    under its name raises ``RadarError``: its new lines are another feed.
     """
     splitter = _Lines()
     with open(path, "rb") as handle:
         while not stop.is_set():
             chunk = handle.read(65536)
             if not chunk:
+                _check_same_feed(path, handle)
                 stop.wait(poll_s)
                 continue
             yield from splitter.add(chunk)
+
+
+def _check_same_feed(path: str, handle: Any) -> None:
+    """Raise ``RadarError`` when the followed file was emptied or replaced under its name."""
+    opened = os.fstat(handle.fileno())
+    if opened.st_size < handle.tell():
+        raise RadarError(f"the feed {path} was emptied while it was read (a new stream writes it): start the viewer again")
+    try:
+        named = os.stat(path)
+    except FileNotFoundError:
+        return  # a file that was removed keeps its lines; its writer can still add to it
+    if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+        raise RadarError(f"the feed {path} was replaced by another file while it was read: start the viewer again")
 
 
 def read_lines(fd: int) -> Iterator[str]:
@@ -631,7 +667,9 @@ class RadarServer(ThreadingHTTPServer):
 
     daemon_threads = True
     allow_reuse_address = False
-    request_queue_size = 16
+    #: The connections that wait for their accept: as many as the server holds, so that a burst of them up to the
+    #: limit is not reset while the loop of the server is late (a test of 32 connections was reset at a load of 58).
+    request_queue_size = MAX_CONNECTIONS
 
     def __init__(self, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int, board: Board) -> None:
         self.address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET

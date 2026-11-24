@@ -436,10 +436,71 @@ def test_a_hostile_feed_gives_a_clean_refusal() -> None:
     assert list(radar.read_lines_of([b"ab", b"c\nde", b"f\n", b"g"])) == ["abc", "def", "g"]
     with pytest.raises(radar.RadarError, match="not JSON"):
         list(radar.feed_documents([json.dumps(header()), "[" * 100000 + "]" * 100000]))
-    for t_s in (None, "1", -1.0, True, 1e400):
+    for t_s in (None, "1", -1.0, True):
         line = {**frame(0), "t_s": t_s}
         with pytest.raises(radar.RadarError, match="t_s"):
-            list(radar.feed_documents([json.dumps(header()), json.dumps(line).replace("Infinity", "1e400")]))
+            list(radar.feed_documents([json.dumps(header()), json.dumps(line)]))
+
+
+def test_a_number_too_large_for_a_float_is_refused_as_wrong_input_not_as_a_fault() -> None:
+    """``1e400`` reads as an infinite float. In a time it was refused; anywhere else it reached the events, whose
+    JSON has no infinity, and the command stopped with a ValueError and a traceback (a fault of the code)."""
+    for field, value in (("t_s", "1e400"), ("delay_frames", "1e400"), ("x", "-1e999")):
+        line = json.dumps({**frame(0), field: 0.123456}).replace("0.123456", value)
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps(header()), line]))
+    with pytest.raises(radar.RadarError, match="too large"):
+        radar.serve([json.dumps(header()), json.dumps({**frame(0), "x": 0.123456}).replace("0.123456", "1e400")])
+    # A whole number of 401 digits: math.isfinite raised OverflowError on it (second reader of round 8).
+    for field in ("t_s", "frame", "x"):
+        line = json.dumps({**frame(0), field: 0.123456}).replace("0.123456", "1" + "0" * 400)
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps(header()), line]))
+    assert next(iter(radar.feed_documents([json.dumps({**header(), "n_frames": 2**53})])))["n_frames"] == 2**53
+    for value in (2**53 + 1, -(2**53) - 1):
+        with pytest.raises(radar.RadarError, match="too large"):
+            list(radar.feed_documents([json.dumps({**header(), "n_frames": value})]))
+
+
+def test_the_viewer_stops_when_its_file_is_emptied_or_replaced(tmp_path: Path) -> None:
+    """A second ``stream --live-out`` to the same path empties the file (or a new file takes its name). The viewer
+    read on from its old place and waited for ever; now it stops with a refusal."""
+    lines = json.dumps(header(3)) + "\n" + json.dumps(frame(0)) + "\n"
+    for change in ("emptied", "replaced"):
+        path = tmp_path / f"{change}.jsonl"
+        path.write_text(lines, encoding="utf-8")
+        stop = threading.Event()
+        followed = radar.follow_file(str(path), stop, poll_s=0.01)
+        assert [json.loads(next(followed))["format"], json.loads(next(followed))["frame"]] == [LIVE_FORMAT, 0]
+        if change == "emptied":
+            path.write_text(json.dumps(header(3)) + "\n", encoding="utf-8")  # shorter than what was read
+        else:
+            (tmp_path / "new.jsonl").write_text(lines + json.dumps(frame(1)) + "\n", encoding="utf-8")
+            os.replace(tmp_path / "new.jsonl", path)
+        stopper = threading.Timer(10.0, stop.set)  # the old code waited here until this stop
+        stopper.start()
+        try:
+            with pytest.raises(radar.RadarError, match=change):
+                next(followed)
+        finally:
+            stopper.cancel()
+            stop.set()
+
+
+def test_connections_up_to_the_limit_that_come_while_the_server_is_late_wait_for_their_accept() -> None:
+    """The loop of the server accepts nothing here (a busy machine). Connections up to ``MAX_CONNECTIONS`` wait in the
+    queue of the system; with a queue of 16 the system reset the others (macOS) or let them hang (Linux), and the test
+    of the limit failed at a load of 58."""
+    server = radar.RadarServer(radar.check_loopback("127.0.0.1"), 0, radar.Board())
+    held: list[socket.socket] = []
+    try:
+        for _ in range(radar.MAX_CONNECTIONS):
+            held.append(socket.create_connection(("127.0.0.1", server.port), timeout=2))
+    finally:
+        for sock in held:
+            sock.close()
+        server.server_close()
+    assert len(held) == radar.MAX_CONNECTIONS
 
 
 def test_connections_above_the_limit_are_closed_at_once() -> None:
@@ -467,3 +528,23 @@ def test_connections_above_the_limit_are_closed_at_once() -> None:
     feed.send(header(1))
     feed.send({"end": True, "frames": 0, "written": 0, "dropped": 0})
     running.join()
+
+
+def test_a_replay_gives_each_frame_at_its_time_from_the_first_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--replay`` waits for the first page, then gives frame ``f`` at ``t_s`` of ``f`` after the first frame
+    (a planted bug that gave every frame at once was caught by no test). The clock of the test moves only when the
+    board sleeps."""
+    now = [100.0]
+    slept: list[float] = []
+    board = radar.Board(replay=True)
+
+    def sleep(seconds: float) -> None:
+        slept.append(round(seconds, 9))
+        now[0] += seconds
+
+    monkeypatch.setattr(board, "sleep", sleep)
+    board.first_client.set()
+    lines = [json.dumps(header(4))] + [json.dumps({**frame(index), "t_s": index * 0.5}) for index in range(4)]
+    assert radar.pump([*lines, json.dumps({"end": True})], board, replay=True, clock=lambda: now[0]) == 4
+    assert slept == [0.5, 0.5, 0.5]
+    assert [event.frame for event in board.wait(1, 0.0) if event.kind == "frame"] == [0, 1, 2, 3]

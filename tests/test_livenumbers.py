@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from pitchvlm import cli, livenumbers, radar
+from pitchvlm import cli, livenumbers, pipeline, radar, stopsignals
 from pitchvlm.config import EngineSettings, PipelineConfig
 from pitchvlm.fallbacks.fake import fake_calibration_answers, fake_detector_answers
 from pitchvlm.livenumbers import LiveNumbers, NumberLine, NumberSettings, apply_numbers, wire
@@ -608,3 +609,60 @@ def test_the_model_session_is_closed_when_the_number_step_cannot_start(
     with pytest.raises(RuntimeError, match="cannot start"), contextlib.ExitStack() as stack:
         cli.open_live_numbers(args, config, INFO, None, StreamSettings(), stack)
     assert len(closed) == 1
+
+
+@pytest.fixture
+def stop_handler() -> Any:
+    """The stop handler of the command line on SIGINT, with fresh holds; the old handler afterwards."""
+    stopsignals.reset()
+    cli.STOP_REQUESTED.clear()
+    old = signal.signal(signal.SIGINT, cli._interrupt)
+    yield
+    signal.signal(signal.SIGINT, old)
+    stopsignals.reset()
+    cli.STOP_REQUESTED.clear()
+
+
+def _until(condition: Any, timeout_s: float = 60.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_stop_signals_at_the_end_of_the_stream_wait_for_the_number_requests_in_flight(
+    stop_handler: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """50 stop signals while one paid number request is at the model and three more ids wait.
+
+    The stop is held back (not raised) while the request is in flight, no other request is sent,
+    a warning names the request in flight, and the stop is raised when its answer came.
+    """
+    gate = threading.Event()
+    backend = StubBackend(gate=gate)
+    numbers = LiveNumbers(
+        NUMBERS.model_copy(update={"max_parallel": 1}), backend, NumberSettings(max_pending_images=QUEUE), info=INFO
+    )
+    drive(numbers, {0: range(0, 120), 1: range(0, 120), 2: range(0, 120), 3: range(100, 120)})
+    assert backend.numbers_started.acquire(timeout=60)
+    seen: dict[str, Any] = {}
+
+    def signals_then_release() -> None:
+        _until(lambda: stopsignals._HOLD.depth > 0)  # finish holds the stops now
+        for _ in range(50):
+            os.kill(os.getpid(), signal.SIGINT)
+        _until(lambda: stopsignals.held_cause() is not None)
+        seen["held"], seen["raised"] = stopsignals.held_cause(), stopsignals._HOLD.raised
+        time.sleep(3 * pipeline.STOP_LOOK_S)  # the wait looks at the record meanwhile
+        gate.set()
+
+    helper = threading.Thread(target=signals_then_release, daemon=True)
+    helper.start()
+    with caplog.at_level(logging.WARNING, logger="pitchvlm"), pytest.raises(KeyboardInterrupt, match="Ctrl-C"):
+        numbers.finish()
+    helper.join(60)
+    assert seen == {"held": "Ctrl-C", "raised": False}
+    assert len(backend.number_requests()) == 1 and numbers.answers == 1
+    assert "a stop signal came while 1 model requests were in flight" in caplog.text
