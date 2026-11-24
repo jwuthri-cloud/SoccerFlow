@@ -1707,18 +1707,16 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 ) -> None:
     """An operator presses Ctrl-C a second time while the command waits for the answers of the requests in flight.
 
-    The second signal is a real one, sent to the thread of the test. It is sent after the pool began
-    to wait for its threads and after both requests reached the model, and the two requests in flight
-    take 150 milliseconds more from then on. The thread of the second request can start late (a busy
-    machine): ``late-start`` holds it back 200 milliseconds after it took its request. Before the
-    test waited for both requests, the signal could come while only one was at the model (seen once
-    in CI on Linux, Python 3.12).
+    The second signal is a real one, sent to the thread of the test 50 milliseconds after the wait
+    began, and the two requests in flight take 150 milliseconds more from then on. On Python 3.12 the
+    signal came during ``Thread.join``, which marked the thread as stopped: the warning named 1
+    request and the wait could end before both answers (CI on Linux; the wait joins no thread now).
+    ``late-start`` holds the thread of the second request back 200 milliseconds after it took its
+    request (a busy machine): that request is in flight too, although it has not reached the model.
     """
     _, requests = recorded
     fake = FakeBackend(scene)
     answered: list[str] = []
-    at_the_model: list[str] = []
-    both_at_the_model = threading.Event()
     pool_waits = threading.Event()
     second_signal_sent = threading.Event()
     waiting_thread = threading.get_ident()
@@ -1728,9 +1726,6 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
         """The fake model. A request is answered 150 milliseconds after the second signal."""
 
         def generate(self, request: VLMRequest) -> VLMResponse:
-            at_the_model.append(request.cache_key())
-            if len(at_the_model) == 2:
-                both_at_the_model.set()
             assert second_signal_sent.wait(timeout=10.0)
             time.sleep(0.15)
             response = fake.generate(request)
@@ -1760,7 +1755,6 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 
     def send_second_signal() -> None:
         assert pool_waits.wait(timeout=10.0)
-        assert both_at_the_model.wait(timeout=10.0)
         time.sleep(0.05)
         signal.pthread_kill(waiting_thread, signal.SIGINT)
         second_signal_sent.set()
@@ -1789,43 +1783,83 @@ def test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight(
 def test_wait_for_the_requests_in_flight_starts_again_after_every_stop_signal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class Worker:
-        """A stand-in for a thread: the first two waits for it are interrupted, the third one ends it."""
+    class InFlight:
+        """A stand-in for the requests in flight: the first two waits are interrupted, the third one ends."""
 
         def __init__(self) -> None:
-            self.joins = 0
+            self.waits = 0
 
-        def is_alive(self) -> bool:
-            return self.joins < 3
+        def count(self) -> int:
+            return 1
 
-        def join(self) -> None:
-            self.joins += 1
-            if self.joins < 3:
-                raise KeyboardInterrupt(f"signal {self.joins}")
+        def wait(self) -> None:
+            self.waits += 1
+            if self.waits < 3:
+                raise KeyboardInterrupt(f"signal {self.waits}")
 
     class Pool:
-        """A stand-in for the thread pool that counts its shutdown calls."""
+        """A stand-in for the thread pool that records its shutdown calls."""
 
         def __init__(self) -> None:
-            self.shutdowns: list[bool] = []
+            self.shutdowns: list[tuple[bool, bool]] = []
 
-        def shutdown(self, *, cancel_futures: bool) -> None:
-            self.shutdowns.append(cancel_futures)
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            self.shutdowns.append((wait, cancel_futures))
 
-    worker, pool = Worker(), Pool()
+    in_flight, pool = InFlight(), Pool()
     with caplog.at_level(logging.WARNING, logger="pitchvlm.pipeline"):
         with pytest.raises(KeyboardInterrupt, match="signal 2"):
-            pipeline._finish_requests_in_flight(pool, {worker})  # type: ignore[arg-type]
-    assert worker.joins == 3
-    assert pool.shutdowns == [True, True, True]
+            pipeline._finish_requests_in_flight(pool, in_flight)  # type: ignore[arg-type]
+    assert in_flight.waits == 3
+    # The pool is never asked to join its threads: on Python 3.12 an interrupted join ends the wait too early.
+    assert pool.shutdowns == [(False, True)] * 3
     assert caplog.text.count("a stop signal came while 1 model requests were in flight") == 2
 
     # Without a signal the wait ends without an error and without a warning.
     caplog.clear()
-    done = Worker()
-    done.joins = 2
-    pipeline._finish_requests_in_flight(Pool(), {done})  # type: ignore[arg-type]
+    done = InFlight()
+    done.waits = 2
+    pipeline._finish_requests_in_flight(Pool(), done)  # type: ignore[arg-type]
     assert caplog.text == ""
+
+
+def test_the_wait_for_the_requests_in_flight_does_not_rely_on_joining_threads(
+    scene: SyntheticScene, recorded: tuple[ClipResult, list[VLMRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Python 3.12 a stop signal during ``Thread.join`` marks the thread as stopped although it still runs,
+    and every later join of it returns at once. Here every join of a thread of the pool returns at once, on
+    every version: the interrupted call still returns only after both requests in flight are answered."""
+    _, requests = recorded
+    fake = FakeBackend(scene)
+    answered: list[str] = []
+
+    class SlowBackend:
+        """The fake model. Every request takes 200 milliseconds."""
+
+        def generate(self, request: VLMRequest) -> VLMResponse:
+            time.sleep(0.2)
+            response = fake.generate(request)
+            answered.append(request.cache_key())
+            return response
+
+    real_join = threading.Thread.join
+
+    def join_as_after_an_interruption(self: threading.Thread, timeout: float | None = None) -> None:
+        if self.name.startswith("ThreadPoolExecutor"):
+            return
+        real_join(self, timeout)
+
+    def interrupted_wait(futures: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading.Thread, "join", join_as_after_an_interruption)
+    monkeypatch.setattr(pipeline, "wait", interrupted_wait)
+    two_requests = requests_of(requests, "people")[:2]
+
+    with pytest.raises(KeyboardInterrupt):
+        pipeline._generate_all(SlowBackend(), [*two_requests, *requests_of(requests, "landmarks")], 2)
+
+    assert sorted(answered) == sorted(request.cache_key() for request in two_requests)
 
 
 def test_answer_that_cannot_be_parsed_names_its_request(scene: SyntheticScene, source: SyntheticSource) -> None:

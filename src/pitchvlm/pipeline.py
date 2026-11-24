@@ -22,8 +22,9 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -407,6 +408,54 @@ class _NotSent(Exception):
     """Marks a request that the thread pool did not send, because an earlier request had failed."""
 
 
+class _InFlight:
+    """The requests that were given to the thread pool and have not finished, with a wait for their end.
+
+    A request counts from its submission (its future) and while a thread of the pool works on it.
+    The futures alone miss a request whose submission an interruption cut short after the pool
+    queued it; the count of the threads alone misses a request that a thread took but has not
+    begun. The wait never uses ``Thread.join``: on Python 3.12 a ``KeyboardInterrupt`` during
+    ``Thread.join`` marks the thread as stopped although it still runs, and a later join of it
+    returns at once (fixed in 3.13). Nor does it wait on a condition: an interruption while the
+    waiting thread takes the lock of the condition back leaves the lock released, and the end of
+    the ``with`` block then raises an error that is not a ``KeyboardInterrupt``. It sleeps in short
+    steps, which an interruption ends cleanly.
+    """
+
+    POLL_S = 0.01
+
+    def __init__(self) -> None:
+        self.futures: list[Future[VLMResponse]] = []
+        self._lock = threading.Lock()
+        self._working = 0
+
+    def add(self, future: Future[VLMResponse]) -> None:
+        """Count a submitted request until its future is done (answered, failed or cancelled)."""
+        self.futures.append(future)
+
+    @contextmanager
+    def working(self) -> Iterator[None]:
+        """Count the request that the calling thread of the pool works on."""
+        with self._lock:
+            self._working += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._working -= 1
+
+    def count(self) -> int:
+        """Return the number of requests that have not finished: not done, or still worked on."""
+        with self._lock:
+            working = self._working
+        return max(sum(not future.done() for future in tuple(self.futures)), working)
+
+    def wait(self) -> None:
+        """Return when every future is done and no thread of the pool works on a request."""
+        while self.count():
+            time.sleep(self.POLL_S)
+
+
 def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel: int) -> list[VLMResponse]:
     """Send requests to the backend through a thread pool. The answers are in the order of the requests.
 
@@ -422,56 +471,52 @@ def _generate_all(backend: Backend, requests: Sequence[VLMRequest], max_parallel
     this wait (``_finish_requests_in_flight``).
     """
     failures: list[Exception] = []
-    workers: set[threading.Thread] = set()
+    in_flight = _InFlight()
 
     def generate(request: VLMRequest) -> VLMResponse:
-        workers.add(threading.current_thread())
-        if failures:
-            raise _NotSent
-        try:
-            return backend.generate(request)
-        except Exception as error:
-            failures.append(error)
-            raise
+        with in_flight.working():
+            if failures:
+                raise _NotSent
+            try:
+                return backend.generate(request)
+            except Exception as error:
+                failures.append(error)
+                raise
 
     executor = ThreadPoolExecutor(max_workers=max_parallel)
     try:
-        futures = [executor.submit(generate, request) for request in requests]
-        wait(futures)
+        for request in requests:
+            in_flight.add(executor.submit(generate, request))
+        wait(in_flight.futures)
     finally:
-        _finish_requests_in_flight(executor, workers)
+        _finish_requests_in_flight(executor, in_flight)
     if failures:
         raise failures[0]
-    return [future.result() for future in futures]
+    return [future.result() for future in in_flight.futures]
 
 
-def _finish_requests_in_flight(executor: ThreadPoolExecutor, workers: set[threading.Thread]) -> None:
+def _finish_requests_in_flight(executor: ThreadPoolExecutor, in_flight: _InFlight) -> None:
     """Cancel the requests that have not started, and return only when every request in flight has finished.
-
-    ``workers`` holds every thread that took a request. An interruption can
-    come while the pool starts a thread. That thread then works, but the pool
-    does not know it and does not wait for it. So these threads are joined
-    here too.
 
     A stop signal raises ``KeyboardInterrupt`` in the calling thread, also
     while it waits here (an operator who presses Ctrl-C a second time). The
     answers of the requests in flight are paid, so the wait starts again, and
     a warning names the number of requests that are still in flight. The
-    interruption is raised when all of them have finished.
+    interruption is raised when all of them have finished. The threads of the
+    pool end by themselves after their last request; nothing here joins them
+    (``_InFlight`` says why).
     """
     interruption: KeyboardInterrupt | None = None
     while True:
         try:
+            executor.shutdown(wait=False, cancel_futures=True)
             if interruption is not None:
-                n_in_flight = sum(worker.is_alive() for worker in tuple(workers))
                 logger.warning(
                     "a stop signal came while %d model requests were in flight; the command waits for their "
                     "answers, so that they are stored and recorded",
-                    n_in_flight,
+                    in_flight.count(),
                 )
-            executor.shutdown(cancel_futures=True)
-            for worker in tuple(workers):
-                worker.join()
+            in_flight.wait()
             break
         except KeyboardInterrupt as error:
             interruption = error

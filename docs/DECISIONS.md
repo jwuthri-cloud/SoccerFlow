@@ -4098,6 +4098,135 @@ decisions, and what changed in the documents.
     `tests/test_guard.py` 152 passed.
 
 
+## 2026-11-23 — The offline tests on Linux in CI
+
+Session "eng - linux ci" of round 7. Base `main` 72fad94. The owner approved a workflow in the
+public repository with no secret. Until now nothing of this project had run on Linux; the run
+machine is Linux, the build machine is a Mac (arm64).
+
+1. **The workflow** `.github/workflows/offline-tests.yml`, on every pull request and every push
+   to `main`. Never `pull_request_target`; `permissions: contents: read`; the checkout keeps no
+   credentials (`persist-credentials: false`); no secret and no token beyond the checkout; a
+   `concurrency` group per ref that cancels older runs; `timeout-minutes: 30` per job; the runner
+   image `ubuntu-24.04`. Jobs: "full run, Python 3.12" and "full run, Python 3.13" (the guard on
+   the tracked files, `tools/run_tests.py -m "slow or not slow"`, both demos, `stream
+   --synthetic`, each later step also after a failed one) and "full run in one process, Python
+   3.13" (`python -m pytest -m "slow or not slow" -rs`). `tests/test_workflows.py` loads every
+   workflow with the YAML parser of the project and checks these rules, actions pinned by full
+   commit, a check sum for every download and hashes for every install.
+2. **Actions**, pinned by commit; the commit of each release tag was read on 2026-11-23 through
+   the API of github.com (published, not measured):
+
+   | Action | Version | Commit | Release page, date |
+   |---|---|---|---|
+   | `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | github.com/actions/checkout/releases/tag/v7.0.1, 2026-07-20 |
+   | `actions/setup-python` | v7.1.0 | `6d4fd22b20465ccc0f7354476588e8df7c9ca0e0` | github.com/actions/setup-python/releases/tag/v7.1.0, 2026-10-22 |
+
+3. **Packages.** `locks/ci-linux.txt` holds the versions of the build machine (read from its
+   environment) for the offline tests; `locks/ci-linux-hooks.txt` those of its `pre-commit`.
+   Exact versions with `--require-hashes --only-binary :all:`; each hash is the SHA-256 of a wheel
+   on the JSON page of the release on pypi.org (every wheel for Linux x86_64 with CPython 3.12 or
+   3.13, and the wheel for any platform), read on 2026-11-23 without a download. The date is the
+   first upload of the release; the youngest is 25 days old (published, not measured):
+
+   | Package | Version | Uploaded | | Package | Version | Uploaded |
+   |---|---|---|---|---|---|---|
+   | numpy | 2.5.4 | 2026-10-10 | | pre-commit | 4.7.0 | 2026-10-12 |
+   | opencv-python-headless | 5.0.0.93 | 2026-07-02 | | cfgv | 3.5.0 | 2025-11-19 |
+   | scipy | 1.18.1 | 2026-08-21 | | distlib | 0.4.4 | 2026-10-16 |
+   | pydantic | 2.14.2 | 2026-10-29 | | filelock | 4.2.4 | 2026-10-19 |
+   | pydantic-core | 2.50.2 | 2026-10-29 | | identify | 2.6.20 | 2026-09-26 |
+   | pyyaml | 6.0.3 | 2025-09-25 | | nodeenv | 1.11.0 | 2026-09-26 |
+   | pytest | 9.2.0 | 2026-10-27 | | platformdirs | 4.13.5 | 2026-10-19 |
+   | pluggy | 1.7.0 | 2026-10-15 | | python-discovery | 1.6.4 | 2026-10-19 |
+   | iniconfig | 2.3.1 | 2026-10-06 | | virtualenv | 21.14.5 | 2026-10-02 |
+   | packaging | 26.3 | 2026-08-04 | | | | |
+   | pygments | 2.21.0 | 2026-08-17 | | | | |
+   | annotated-types | 0.8.0 | 2026-07-23 | | | | |
+   | typing-extensions | 4.16.0 | 2026-07-02 | | | | |
+   | typing-inspection | 0.4.4 | 2026-08-12 | | | | |
+
+   `gitleaks` 8.30.1 (the version of the build machine; release of 2026-03-21) comes from the
+   file `gitleaks_8.30.1_linux_x64.tar.gz` of its release page on github.com and is checked
+   against the line of that file in `gitleaks_8.30.1_checksums.txt` (SHA-256 `551f6fc8...70eb`,
+   in the workflow). The model SDK and the external tools are not installed. No lock file of
+   another form is committed (rule 3).
+4. **OpenCV: the headless wheel.** The full wheel `opencv-python` needs the system graphics
+   library (`libGL.so.1`) on Linux; installing a system package needs the package index of the
+   runner image, which is neither pinned nor hashed. The headless wheel of the same version gives
+   the same `cv2` module without the window functions, and the package calls none of them
+   (`imshow`, `namedWindow`, `waitKey`: no hit). `import cv2` is unchanged. The video writer of
+   the Linux wheel has `mp4v` and `MJPG`; it has no H.264 encoder, so `vlm/video.py` falls back
+   from `avc1` to `mp4v` there.
+5. **The leak check in CI has no deny-list** (`.git/guard-deny.txt` stays on each machine): the
+   guard prints its notice and the rule `deny` is off; every other rule of `--tracked` runs, and
+   it passed. `doctor --no-api` is left out: it needs the hooks installed in the clone and the
+   deny-list. The workflow names one host, github.com, which `tools/allowed_hosts.txt` has.
+6. **One process, a second job: yes.** It runs beside the other jobs (no longer wall time than
+   the slowest job), and it is the only run where all tests share one interpreter, as with
+   `python -m pytest`. With `-rs` it also prints the reason of every skipped test.
+7. **Prediction against result.** Hypothesis: the full offline run passes on Linux without a code
+   change. The ranked list was written before the first result (notes of this group of sessions).
+
+   | Predicted (rank) | Result on Linux |
+   |---|---|
+   | 1 live chain with a pace ends with code 2 before the tools end | passed |
+   | 2-5 thread and pipe timing of `test_feed.py`, `test_live_feed.py` | passed |
+   | 6 frame rate of a rewritten mp4 (FFmpeg of the wheel) | passed |
+   | 7 dissolve found on decoded `mp4v` frames | passed |
+   | 8 git process counts and messages of the guard | passed |
+   | 9-10 `avc1` fallback, truncated Motion JPEG | passed |
+   | process start method, `sysctl` (no risk: none used) | no failure |
+   | skips: 9 to 10 | 26 (below) |
+   | not predicted: YAML of the workflow | round 1 refused the file |
+   | not predicted: a stop signal during `Thread.join` on Python 3.12 | round 2 failed (item 8) |
+
+   So the hypothesis failed twice for reasons that the static read did not see: once in the
+   workflow, once in the code (a real defect, item 8). None of the ten predicted risks failed.
+8. **A defect of Python 3.12 in the wait for paid requests in flight.** Round 2 failed on Python
+   3.12 only: `test_second_stop_signal_does_not_end_the_wait_for_the_requests_in_flight` logged
+   "1 model requests were in flight" instead of 2. Cause (measured on the build machine with its
+   Python 3.12.16 and 3.13.18, stdlib only): on 3.12 a `KeyboardInterrupt` during `Thread.join`
+   of a running thread marks that thread as stopped (`is_alive()` false) and every later join of
+   it returns at once; on 3.13 the thread stays alive and the next join waits. The wait of
+   `pipeline._finish_requests_in_flight` joined the threads of the pool, so on 3.12 a second
+   Ctrl-C ended the wait while a paid request was still in flight: its answer could be lost
+   before it was stored and recorded. A model of the test that runs the code of `pipeline.py`
+   with a fake model (100 runs per arm, Python 3.12.16): old code, the warning named 1 request in
+   100 of 100 runs and an answer was lost in 32 of 100; new code, 2 requests and both answers in
+   100 of 100; on 3.13.18 both codes gave 2 and both answers (20 runs each). Fix: `_InFlight`
+   counts a request from its submission (its future) and while a thread of the pool works on it,
+   and the wait sleeps in steps of 10 ms until none is left; it joins no thread and waits on no
+   condition (an interruption while a condition takes its lock back can raise an error that is
+   not a `KeyboardInterrupt`). The pool is shut down with `wait=False`; its threads end after
+   their last request. Two tests fail with the old code on every version:
+   `test_the_wait_for_the_requests_in_flight_does_not_rely_on_joining_threads` (joins of the pool
+   return at once, as on 3.12: no answer was kept) and the case `late-start` of the stop-signal
+   test (a request that a thread took but has not begun is in flight too). My first reading
+   (commit 2776c9d: a slow start of the second thread) was wrong for 3.12; a second reader found
+   the cause. The run machine uses Python 3.13, where the old code was right; `pyproject.toml`
+   allows 3.12.
+9. **Skipped tests.** The build machine skips 1. Round 2 on Linux skipped 26: 21 tests of the git
+   hooks and the secret scan (`pre-commit` and `gitleaks` were not installed; the run machine has
+   both, so these skips were a hole: CI installs both now), 4 tests of a disk that does not tell
+   letter cases apart (`tests/test_cli.py`: a Linux disk tells them apart, so another spelling is
+   another path; right, and the tests of that side run), and the image reader of
+   `tools/run_tool.py` (Pillow is in the environment of the tool only; right, as on the Mac).
+10. **Times of round 2** (run 45302990921, one run, 4 CPUs, a shared machine; measured): install
+    13 s, guard below 1 s, full run in 4 processes 132 s (3.12 and 3.13), each demo 6 s, `stream
+    --synthetic` 6 s, a job about 3 min; the job of one process 5 min 46 s (pytest 327 s).
+    `stream --synthetic` on the runner: total per frame median 25.84 ms, 95th percentile 31.99
+    ms, largest 39.07 ms. The runner had Python 3.12.16 and 3.13.18 and pip 26.3.
+11. **What CI does not cover:** no model call, no real tool, no footage, no dataset, no GPU, and
+    a GitHub runner is not the run machine. The full wheel `opencv-python` that `pyproject.toml`
+    installs on the run machine is not tested in CI.
+12. **The build machine** at the time of this work: the three tests of the live chain in
+    `tests/test_live_feed.py` hang there at a low load (a stand-in tool ends with a broken pipe
+    and `merge-feeds` waits in the open of the other named pipe). Session "eng - review round 6"
+    owns that code and its fix; until the fix is on `main` the full run on the build machine can fail in these three
+    tests only. They passed in CI.
+
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same
