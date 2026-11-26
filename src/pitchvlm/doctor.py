@@ -107,6 +107,7 @@ KEY = "API key"
 HOOK = "guard hooks"
 DENY = "deny-list"
 DISK = "free disk space"
+CAMERA_INPUT = "camera input"
 BOXES = "boxes"
 BOX_ACCURACY = "box accuracy"
 LANDMARKS = "landmarks"
@@ -242,6 +243,7 @@ def environment_checks(
         _hook_check(repo),
         _deny_check(repo),
         _disk_check(data_dir),
+        camera_input_check(cv2.getBuildInformation()),
     ]
 
 
@@ -475,6 +477,24 @@ def _deny_check(repo: Path) -> CheckResult:
         return CheckResult(DENY, "fail", f"{shown} cannot be read")
     n_entries = sum(1 for line in lines if line and not line.startswith("#"))
     return CheckResult(DENY, "ok", f"{shown} has {n_entries} entries")
+
+
+def camera_input_check(build_information: str) -> CheckResult:
+    """Say whether OpenCV can read a camera: ``capture`` opens RTSP through its FFmpeg backend (a fact, no verdict).
+
+    ``build_information`` is the text of ``cv2.getBuildInformation()``: its lines ``FFMPEG: YES`` or ``NO``
+    (and ``GStreamer``, which the capture does not use) of the part "Video I/O".
+    """
+    found: dict[str, str] = {}
+    for line in build_information.splitlines():
+        name, sep, value = line.strip().partition(":")
+        if sep and name.strip() in ("FFMPEG", "GStreamer") and name.strip() not in found:
+            found[name.strip()] = value.strip().split()[0] if value.strip() else "?"
+    ffmpeg = found.get("FFMPEG", "not named")
+    usable = "the command capture can open RTSP" if ffmpeg == "YES" else "the command capture cannot open RTSP"
+    return CheckResult(
+        CAMERA_INPUT, "info", f"OpenCV video input: FFmpeg {ffmpeg}, GStreamer {found.get('GStreamer', 'not named')}: {usable}"
+    )
 
 
 def _disk_check(data_dir: Path) -> CheckResult:

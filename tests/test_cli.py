@@ -1747,6 +1747,7 @@ def test_environment_checks_fail_without_the_guard_hook(
         doctor.HOOK,
         doctor.DENY,
         doctor.DISK,
+        doctor.CAMERA_INPUT,
     }
     assert "numpy" in after[doctor.PACKAGES].detail
     assert "GB" in after[doctor.DISK].detail

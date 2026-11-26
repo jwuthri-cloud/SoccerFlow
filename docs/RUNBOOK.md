@@ -999,6 +999,11 @@ Check each one with its first check before you rely on it.
 | Video decoding | `src/pitchvlm/frames.py` | The free dry run of the demo clip (section 4) prints the frames, the frame rate and the keyframes: frames divided by the rate must be the length of the clip in seconds, and the clip must have about 2.1 keyframes per second at any frame rate. Only synthetic clips of 25 frames per second ran before | A video with a variable frame rate, rotation data or interlaced frames was never read here. Convert it to a constant frame rate, or extract its frames into a folder and use `--fps`. |
 | Roster file | `src/pitchvlm/roster.py` | The same dry run with `--roster` reads the roster file before any model call. After the paid run, the video shows a name next to every displayed number of the roster | The error names the key and, for YAML, the line (section 4). |
 | Tool script | `tools/run_tool.py`, `src/pitchvlm/fallbacks/` | After the install of the two tools (section 3): the three commands of each tool, with `--max-clips 2` for `tool-job` and `tool-score`. The script was written from the source of the tools (`rfdetr` 1.12.0 and 1.12.1, PnLCalib at one commit) and never ran with them: the tests replace each tool by a stand-in. Its image reader needs Pillow and ran nowhere. RF-DETR: the recall is far above 0, and the largest box values of the run file are near the width and the height of the frames. PnLCalib: `axis_check.as_given` is the smallest of its four values and small (some metres at most), `tool-score` ends with the exit code 0, `valid_share` is above 0, and the payloads of the run file show a camera on the near side above the grass (`camera_position_m`: y above 34, z below 0). Then compare the device `mps` with `cpu` on the same two clips | An `error:` line about a version or a commit: install the version that the line names. A traceback inside a tool: the line before it names the frame on which the tool stopped. A traceback without such a line comes from before the first frame: the import of the tool or the building of its model. When it ends with `ModuleNotFoundError` or `ImportError`, a package of the tool environment is missing or has another version: repair the environment, not the script. When the first frame fails, the tool does not have the interface that the script expects: read the source of the installed version, repair `tools/run_tool.py` with a test, and do not change the tool. When one later frame fails, the tool has an error for that picture: tell the owner; the script counts no frame as a frame without an answer because of an error. An error of the operating system inside a tool (for example a full disk) gives the frame line, its traceback and one `error:` line. An error of `torch.load` about the weights of PnLCalib: the file is not plain weights. Do not switch that check off without the owner: a file that is not plain weights can run code when it is loaded. A recall near 0 with many boxes: the boxes are not in pixels of the frame, or the class names are not those of the tool (read `label` in the run file). `axis check failed` with a large `as_given`, one small other value and `plausible_share` 0: the matrix is in another pitch convention; repair `camera_homography` of the script, with a test. The same with `plausible_share` above 0: the tool mirrors the pitch on a part of the frames; do not change the script, tell the owner. All four values of `axis_check` large (about 10 m and more): the check decides nothing, and the output of the tool is wrong for another reason (device, weights, frame size); compare with `--device cpu` first and do not change `camera_homography`. No frame with a camera (`valid_share` 0), no box at all, a camera on the wrong side, or four large values also on `cpu`: read `fault` and the payloads of the run file, change no threshold and no line of the script without a cause, and tell the owner. Values of `counts`, `valid_share`, `axis_check` or the errors that differ between `mps` and `cpu`: tell the owner, and use `cpu` for the measurement. A `ValueError` of an adapter names the key or the value of a payload that does not follow its format. |
+| Camera input of OpenCV | `src/pitchvlm/camera.py` (`open_ffmpeg`) | `doctor --no-api` shows `camera input: OpenCV video input: FFmpeg YES`. The build machine had OpenCV 5.0.0 with FFmpeg; the run machine has its own wheel | Without FFmpeg the capture cannot open RTSP: install the OpenCV wheel of the pinned list of the run machine again, not another build |
+| A real RTSP server and the options of FFmpeg | `camera.ffmpeg_options`, `open_ffmpeg` (section 17) | Never ran: every test used a stand-in camera. A capture of one minute (`capture --out ~/pitchvlm-data/live/<test> --start-at $START --seconds 60`) ends `complete` with 1500 of 1500 frames given, `camera_fps` 25 and `camera_size` 1920 x 1080 in the end line of `frames.jsonl`. The TCP transport, the protocol whitelist (`rtsp,rtp,tcp`, and `rtsps,tls` for `rtsps`) and the two timeouts of OpenCV (`CAP_PROP_OPEN_TIMEOUT_MSEC`, `CAP_PROP_READ_TIMEOUT_MSEC`) were only checked on a local video file | `never opened` on a camera that works: try `--transport udp`; a camera that needs another protocol (HTTP tunnelling) is refused by the whitelist on purpose. Write what helped into `docs/DECISIONS.md` |
+| The messages of the real FFmpeg and OpenCV | `camera.RedactedOutput`, `CameraAddress.redact` | Never seen: the tests planted the address in messages of their own. Run one capture with a wrong password and one with a host that does not answer (each ends `never opened` within about 36 s, exit code 2), then look for the user name, the host and the port of the address in the output and in the camera folder (`grep -ri`): nothing may be found. Do not paste the address into the command of `grep`: type each part at a `read -rs` prompt into a variable | A part that shows: stop, do not send the output anywhere, and fix the redaction with a test first |
+| Time stamps and stalls of a real camera | `camera.CameraSource` (the slot rule) | Never seen. In the minute above, `extra` and the `gap` count of the end line are 0 and `lost_connections` is 0; pull the network cable for 5 s during a second minute: one lost connection, the frames of the outage lost (`outage`), the run goes on after the reconnect | Many `gap` frames on a camera at 25 frames per second: its time stamps do not follow its frames; write the end line into `docs/DECISIONS.md` before a match |
+| Two tools and `stream` on the frames of a camera | section 17 | Never ran with the real tools: the five terminals of section 17 for 5 minutes; `missing_parts` of `result.json` holds only the frames that the ledger lost (and `skipped` of the calibration with `--skip-behind`) | A part `late` or `ended`: a tool is slower than the camera, or stopped; read its error stream |
 | Git hooks | `.pre-commit-config.yaml` | `doctor --no-api` shows `[ok  ] guard hooks`. The first commit that the owner asks for must list the guard and the secret scan as passed, and the first push the two push hooks. `git -C ../pitchvlm-results rev-parse --git-path hooks` must name the hook folder of this clone: the results work tree then runs the same hooks | `pre-commit install --hook-type pre-commit --hook-type pre-push`. Before 14 Nov 2026 the hooks ran in scratch clones only. Since then they ran on the build machine in this repository, for the first commits and for the pushes to `origin`. They never ran on the run machine and never with signed commits. A results work tree that names another hook folder has its own `core.hooksPath`: remove that setting. |
 
 The cost pilot is also the first use of the stored answers and of the ledger with real probe
@@ -2149,3 +2154,135 @@ number step are refused with the number engine `none`, and `--cache`, `--replay`
   final), and no roster name is given (`stream` takes no roster).
 - What only the run machine can say: the real time of an answer (the bench used 0.5, 2 and 5 s),
   how many ids a real clip gives, how well the model reads crops of a live clip, and the cost.
+
+## 17 Camera input: a match camera instead of a recorded clip (built 2026-11-26; stand-in camera only on the build machine)
+
+`capture` reads the camera once, through RTSP, and writes its frames into a camera clip folder
+below the data folder. The two tools of section 14 read that folder with `--camera`, and
+`stream --clip <camera folder>` reads the same frames: the frame index is the only key between
+the parts, and all of them see the same pixels. The rest of the live run (named pipes,
+`merge-feeds`, `--max-behind`, `--live-out`, `radar`) is that of sections 14 and 15. Free: no
+model call (the number step of section 16 works on a camera run too, with its own money rules).
+The design and its measurements: `docs/DECISIONS.md`, entry "A camera as the clip of a live run"
+of 2026-11-26; the contract: `docs/ARCHITECTURE.md`, `camera.py`.
+
+What the camera must be:
+
+- The main camera of the match (the wide view of the broadcast or a fixed tactical camera), with
+  the pitch lines in view most of the time: the calibration needs them. Close-ups, replays and
+  other cameras give frames without a camera (as in a broadcast clip).
+- 1920 x 1080 pixels, 25 frames per second at a constant rate, H.264 over RTSP. TCP transport is
+  the default (`--transport udp` only when the camera has no TCP).
+- Another size: the capture stops at the first frame with `refused` and says the size; give
+  `--size WxH` of the camera if that size is meant (the tools and `stream` then run at it; the
+  tools were never measured at another size than the clips of the dataset). A frame of another
+  size in the middle of a run is lost (`size`).
+- Another frame rate: a camera that names a rate more than 1% below `--fps` (25) is refused at
+  the first frame; give `--fps` of the camera if it cannot be changed (the delay of `stream`
+  is in frames, so `--delay 25` is then more than 1 s). A faster camera (30 or 50 frames per
+  second) is taken at 25: a frame whose slot is taken already is not used (`extra`). A camera
+  that names no rate and sends fewer frames leaves slots empty (`gap`).
+- The clock: slot `i` of the run is due at `START + i / 25`. Each frame takes its slot by the
+  time stamp of the camera; after a reconnect, by its arrival on the clock of this machine.
+
+The address of the camera holds a user name, a password and a private host: it is a secret. It
+goes into the variable `PITCHVLM_CAMERA_URL` of the terminal of the capture, and nowhere else:
+never on a command line (the process list and the shell history show it), never in a file,
+never in a settings file. Type or paste it at the prompt of `read -rs` (nothing is shown, and the
+line does not go into the history):
+
+```bash
+read -rs PITCHVLM_CAMERA_URL && export PITCHVLM_CAMERA_URL
+```
+
+Only `rtsp://` and `rtsps://` are taken. The capture reads the variable once and removes it from
+its own environment; everything that it prints or writes, the messages of OpenCV and FFmpeg
+included, shows the address as `rtsp://<hidden>`. Run `unset PITCHVLM_CAMERA_URL` when the capture
+has ended, and close that terminal.
+
+The run of one half (45 minutes: `--seconds 2700`, 67,500 frames). Five terminals, in this
+order; set the four variables in each of them, with the same values (the camera folder and the
+run folder are new for each run: the capture refuses a folder that is there):
+
+```bash
+CAM=~/pitchvlm-data/live/<match>        # the camera clip folder; its name is the clip id
+RUN=~/pitchvlm-data/live/<match>-run
+SETTINGS=configs/engines/detector_calibration.yaml
+START=1795500000   # one start for all parts: python3 -c "import time; print(int(time.time()) + 180)"
+mkdir -p $RUN && mkfifo $RUN/detector.pipe $RUN/calibration.pipe
+
+# Terminal 1: the capture. It writes $CAM/camera.json at once, opens the camera, and waits for START.
+read -rs PITCHVLM_CAMERA_URL && export PITCHVLM_CAMERA_URL
+python -m pitchvlm.cli capture --out $CAM --start-at $START --seconds 2700
+
+# Terminal 2, once terminal 1 printed its first line: the clip jobs of the camera run, from camera.json.
+python -m pitchvlm.cli clip-job --tool rfdetr --config $SETTINGS --clip $CAM --root ~/pitchvlm-data \
+    --out $RUN/rfdetr-job.json
+python -m pitchvlm.cli clip-job --tool pnlcalib --config $SETTINGS --clip $CAM --root ~/pitchvlm-data \
+    --out $RUN/pnlcalib-job.json
+
+# Terminal 2, then: the detector takes each frame when the capture has written it (no --pace).
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/rfdetr/bin/python tools/run_tool.py rfdetr \
+    --job $RUN/rfdetr-job.json --root ~/pitchvlm-data --device cuda:0 \
+    --out $RUN/detector-feed.jsonl --feed $RUN/detector.pipe --camera
+
+# Terminal 3: the calibration, with the newest frame when it is behind.
+env -u GEMINI_API_KEY -u OPENROUTER_API_KEY ~/pitchvlm-data/envs/pnlcalib/bin/python tools/run_tool.py pnlcalib \
+    --job $RUN/pnlcalib-job.json --root ~/pitchvlm-data --device cuda:0 \
+    --repo ~/pitchvlm-data/PnLCalib \
+    --weights-kp ~/pitchvlm-data/weights/pnlcalib/SV_kp \
+    --weights-lines ~/pitchvlm-data/weights/pnlcalib/SV_lines \
+    --out $RUN/calibration-feed.jsonl --feed $RUN/calibration.pipe --camera --skip-behind
+
+# Terminal 4: merge, decide each frame, and serve the radar (it prints its address).
+python -m pitchvlm.cli merge-feeds --detector $RUN/detector.pipe --calibration $RUN/calibration.pipe --wait 1 \
+    | python -m pitchvlm.cli stream --clip $CAM --config $SETTINGS --lines - --delay 25 \
+      --out ~/pitchvlm-data/runs/<match>-live --live-out - \
+    | python -m pitchvlm.cli radar -
+
+# Afterwards: the control on the whole run, from the copies of the feeds (as in section 14).
+python -m pitchvlm.cli merge-feeds --detector $RUN/detector-feed.jsonl --calibration $RUN/calibration-feed.jsonl \
+    | python -m pitchvlm.cli stream --clip $CAM --config $SETTINGS --lines - --delay clip \
+      --out ~/pitchvlm-data/runs/<match>-control
+```
+
+- Take `START` 180 s ahead: five terminals and the load of two models must fit before it (the
+  load time of the real models is not measured). The capture opens the camera at once and uses
+  no frame before `START`. A tool warms up on `$CAM/warmup.jpg` (the first frame of the camera)
+  and then waits for frame 0 in the ledger. A tool that is ready only after `START` has every
+  frame up to then at once; `--skip-behind` takes the newest one.
+- What the capture prints at the end: `capture (<end>): <g> of <n> frames given, <l> lost (<count>
+  <reason>, ...); <e> extra frames not used, <b> before the start; <c> lost connections, <o>
+  failed opens; <size> GB of frames`. Exit code 0 when every frame was given, 1 when frames were
+  lost but the run had its whole time, 2 when the camera never opened (6 tries, about 36 s), was
+  refused (size, rate, disk), the disk became full, or a stop signal came. In each case the ledger
+  `$CAM/frames.jsonl` has a line for every frame and an end line, so the tools and `stream` end
+  by themselves: a lost frame is a skipped part of both tools (`missing_parts` of `result.json`),
+  and `stream` shows the frame given before it, without measurement.
+- The rule for a stall and a lost connection (`docs/ARCHITECTURE.md`, `camera.py`): a frame that
+  comes late but within the read timeout (`--read-timeout`, 2 s) is given late; no frame for 2 s
+  ends the connection; the capture waits 1 s, opens the camera again (each try at most
+  `--open-timeout`, 5 s), up to `--reconnects` (5) times, and meanwhile writes the frames whose
+  time has passed as lost (`outage`), so the radar goes on with empty frames. When no try opens
+  the camera again, the rest of the run is lost (`ended`) and the capture ends.
+- Disk: every frame of the run stays in `$CAM/img1` as a JPEG of quality 95 (the end video and the
+  control read every frame). The capture refuses to start when the free disk is below 1.5 times
+  the run at the size of the first frame plus 2 GB, and stops (`disk full`) when it falls below
+  2 GB. On the build machine a synthetic 1080p frame is about 0.3 MB (a half: about 20 GB); real
+  frames have more detail, so expect more (an estimate, not measured: 0.4 to 0.8 MB, 27 to 54 GB per
+  half). The camera folder holds pixels of real people: it stays below `~/pitchvlm-data` and never
+  goes to the results branch. Remove it when the runs of the match are done.
+- Memory: the capture holds one frame (175 MB resident, flat over 45,000 frames of a stand-in
+  camera). `stream` keeps every state for `result.json` and the video: it grew by 34 MB per 1,000
+  frames on the build machine, 3.6 GB at the end of 45,000 frames; a half needs about 5.4 GB
+  (extrapolated, not measured). Run one `stream` per half, not per match.
+- `result.json` of `stream` names the camera run in `provenance.inputs.camera`: the redacted form
+  (`rtsp://<hidden>`), the end line of the ledger and the lost spans. No part of the address is in
+  any file of the run. The result files of a camera run follow rule 2 of `CLAUDE.md` as those of
+  any live run (boxes and pitch positions stay on the run machine unless owner decision 17 says
+  otherwise).
+- On the build machine the chain runs with a stand-in camera (no network address is opened):
+  `PYTHONPATH=src python -m pitchvlm.evalx.camerabench equivalence --seeds 3000-3019` (and `loss`,
+  `leak`, `long`). What only the run machine can say: whether the real camera, the real RTSP
+  server and the real FFmpeg behave as the stand-in (section 8), the size of real frames on the
+  disk, and the time of the real tools on the frames of a camera.

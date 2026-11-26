@@ -134,6 +134,8 @@ a calibration tool on every frame. A tool runs in its own environment through
     flight at that time are paid too. So the upper limit bounds that overshoot at the cost of
     7 answers.
 - `frames.py` — `FrameSource` (protocol), `ImageFolderSource`, `VideoFileSource`, `keyframe_indices`.
+- `camera.py` — a camera (RTSP) as the clip of a live run: `CameraSource`, the capture into a camera clip
+  folder, and its readers (`CameraFolderSource` is a `FrameSource`); section 4, `camera.py`.
   - `read(frame)` of both sources raises `IndexError` for an index outside the clip and returns a
     new array on every call, so the caller may draw on it.
   - `ImageFolderSource`: the name of every frame file is a whole number, and the files are read
@@ -2125,6 +2127,96 @@ def fd_lines(fd: int, chunk: int = 65536) -> Iterator[str]   # os.read lines; a 
 - `tools/stand_in_tool.py`: runs `tools/run_tool.py` with the tool replaced by the answers of an
   answers file (by the SHA-256 of the pixels) after a simulated time per frame; for
   `tests/test_live_feed.py` and `evalx/livebench.py` (four processes, two named pipes, a pipe).
+
+### `camera.py` — a camera as the clip of a live run (2026-11-26)
+
+One capture step reads the camera once; every other part reads the frames it wrote, by frame
+index. The decision and its numbers: `docs/DECISIONS.md`, entry "A camera as the clip of a live
+run" of 2026-11-26; the commands: `docs/RUNBOOK.md`, section 17.
+
+```python
+# camera.py
+CAMERA_URL_VARIABLE = "PITCHVLM_CAMERA_URL"; CAMERA_SCHEMES = ("rtsp", "rtsps"); HIDDEN = "<hidden>"
+CAMERA_FORMAT = "pitchvlm-camera-1"; CAMERA_RECORD_NAME = "camera.json"; LEDGER_NAME = "frames.jsonl"
+FRAME_FOLDER = "img1"; IMAGE_SUFFIX = ".jpg"; JPEG_QUALITY = 95; WARMUP_NAME = "warmup.jpg"
+OPEN_TIMEOUT_S = 5.0; READ_TIMEOUT_S = 2.0; RETRY_WAIT_S = 1.0; RECONNECTS = 5; RATE_TOLERANCE = 0.01
+READER_WAIT_S = 15.0; DISK_FLOOR_BYTES = 2e9; DISK_CHECK_FRAMES = 250; DISK_MARGIN = 1.5
+class CameraError(Exception)                         # its message holds no part of the address
+class CameraAddress:                                 # a secret: str and repr give "rtsp://<hidden>"
+    @classmethod parse(text) / from_environment(environment=None)   # rtsp:// and rtsps:// with a host only
+    scheme: str; redacted: str; def text() -> str; def redact(text: str) -> str
+def ffmpeg_options(scheme, transport) -> str         # OPENCV_FFMPEG_CAPTURE_OPTIONS: transport, protocol whitelist
+class RedactedOutput(address)                        # context: descriptors 1 and 2 through redact (native code too)
+class CaptureDevice(Protocol)                        # isOpened, grab, retrieve, get, release: cv2.VideoCapture
+@dataclass CameraSettings(n_frames, fps, width, height, start_at, transport="tcp", open_timeout_s=5,
+                          read_timeout_s=2, retry_wait_s=1, reconnects=5)   # due(frame), slot_of(moment)
+def open_ffmpeg(address, settings) -> CaptureDevice  # cv2.VideoCapture(url, CAP_FFMPEG, [open, read timeouts])
+Warmup(image) | Given(frame, arrived_at, image) | Lost(start, stop, reason)   # reason: gap outage size ended stopped disk
+class CameraSource(address, settings, open_device=open_ffmpeg, *, clock, sleep)
+    def events() -> Iterator[CameraEvent]; counts: CameraCounts   # every slot once, in order
+class CameraRecord(Record)                           # camera.json; camera = the redacted form
+def write_capture(source, folder, clip_id, *, free_bytes, on_frame=None, report=None) -> CaptureReport
+class CameraLedger(folder, record, *, clock, sleep, wait_s=15)   # status(frame) waits; wait_end(); lost_spans()
+class CameraFolderSource(folder, record)             # FrameSource: read(frame) waits; facts() for result.json
+```
+
+- The camera clip folder (below the data folder; its name is the clip id): `camera.json` first,
+  before the camera is opened (the record: clip, frames, rate, size, start, settings, and the
+  redacted form of the address); `img1/000001.jpg` ... (frame `i` is `frame_file_name(i)`,
+  written under a hidden name and renamed); `warmup.jpg` (the first frame the camera sent, for
+  the warm-up call of a tool); `frames.jsonl`, the ledger: `{"frame": i, "arrived_at": t}` after
+  the image of a given frame, `{"lost": [a, b], "reason": r}` for the frames `a` to `b - 1`, one
+  flushed line at a time, every frame once and in order, then one end line `{"end": reason,
+  "frames", "given", "lost": {reason: count}, "extra", "before_start", "lost_connections",
+  "failed_opens", "camera_fps", "camera_size", "bytes_written"}`. End reasons: `complete`,
+  `camera ended`, `never opened`, `refused`, `stopped`, `disk full`.
+- The slot rule (`CameraSource`): slot `i` is due at `start_at + i / fps`. A frame before the
+  start is not used. The first frame of a connection takes the slot of its arrival (at least the
+  next free slot); a later frame of the connection takes the slot of its time stamp
+  (`CAP_PROP_POS_MSEC`) counted from the first one, or the next slot when the stamp does not grow.
+  A frame whose slot is taken is not used (`extra`); a slot that no frame took is lost (`gap`). A
+  read that fails or times out ends the connection: wait `retry_wait_s`, open again up to
+  `reconnects` times, and meanwhile write the slots whose time has passed as lost (`outage`), so
+  that the readers go on; after the last failed try the rest is lost (`ended`). The first frame of
+  the camera is checked: another size than the run, or a named rate more than 1% below it, raises
+  `CameraError` (end `refused`); a later frame of another size is lost (`size`). Every error of
+  OpenCV is caught and turned into a message that names no part of the address.
+- Bounds: the capture holds one frame. The disk holds the whole run (the end video and the
+  control run read every frame): `write_capture` refuses to start when the free disk is below 1.5
+  times the run at the size of the first frame plus 2 GB, and stops (`disk full`) when it falls
+  below 2 GB, read every 250 frames. A reader holds two arrays of the frame count.
+- Readers: `CameraLedger.status(frame)` waits for the line of a frame and raises `CameraError`
+  `READER_WAIT_S` (15 s) after its due time: above the longest time without a line of a working
+  capture (a read timeout, an open timeout and a retry wait: 8 s by default). A lost frame read
+  from `CameraFolderSource` gives the newest given frame before it (a black frame when there is
+  none); its tools send no answer for it, so `stream` gets missing parts. `tools/run_tool.py`
+  has its own reader of the same ledger (`CameraFrames`: it does not import the package); a test
+  checks that both give the same status for every frame.
+- The address: only `CameraAddress.from_environment` reads it, and `cli capture` removes it from
+  the environment of its process after that. `redact` replaces every part of four characters or
+  more (the address, the user information, user and password also percent-decoded, the host, the
+  port, the path, the query), letter case ignored, and hides a whole text that still holds a
+  shorter part. `RedactedOutput` points the descriptors 1 and 2 at pipes while the capture runs,
+  so that what OpenCV and FFmpeg write from native code passes `redact` too. FFmpeg gets TCP
+  transport by default and a protocol whitelist (`rtsp,rtp,tcp`, plus `rtsps,tls` for `rtsps`
+  and `udp` with `--transport udp`).
+- Command line: `capture --out DIR --start-at SECONDS (--frames N | --seconds S) [--fps 25]
+  [--size 1920x1080] [--transport tcp|udp] [--open-timeout 5] [--read-timeout 2]
+  [--reconnects 5]`: exit code 0 when every frame was given, 1 when frames were lost but the run
+  had its whole time, 2 when the camera never opened, was refused, the disk became full, or a stop
+  signal came. `clip-job --clip <camera folder>` writes the job from the record (before any frame
+  is there). `stream --clip <camera folder>` reads the frames with `CameraFolderSource` (`--fps`
+  is refused: the record has the rate) and writes `provenance.inputs.camera` (the redacted form,
+  the end line, the lost spans). Every other command refuses a camera folder (`open_clip`): its
+  images have gaps, so a plain folder of images would give other indices. `tools/run_tool.py
+  --camera` (with `--feed`, without `--pace` and `--start-at`) takes each frame when the ledger
+  has it, with the arrival of the camera, writes a lost frame as a skipped line at its due time,
+  warms up on `warmup.jpg`, and with `--skip-behind` takes the newest given frame;
+  `<stem>-runner.json` gets `camera_lost_frames`. `doctor --no-api` names whether OpenCV has
+  FFmpeg (`camera input`).
+- `evalx/standin_camera.py`: the stand-in of `cv2.VideoCapture` on a simulated clock (late frames,
+  stalls, outages, an early end, a camera that never opens, frames never sent, other sizes and
+  rates). `evalx/camerabench.py`: the measurements C1 to C4 through the real commands.
 
 ### `liveout.py` — the live output of the streaming path (2026-11-23)
 
