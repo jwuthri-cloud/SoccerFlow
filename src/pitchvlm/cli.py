@@ -13,6 +13,7 @@ Commands:
 - ``tool-job``: write the frames and the settings that an external tool must run on.
 - ``tool-score``: measure the answers of an external tool on the frames of a probe.
 - ``clip-job``: write every frame of one clip and the settings that an external tool must run on.
+- ``capture``: read a camera (RTSP) once and write its frames into a camera clip folder, for a live run.
 - ``video-frames``: write every frame of a video file as an image below the data folder, for ``clip-job``.
 - ``overlay``: draw the pitch lines of mappings on their frames, for the check by eye of gate G3.
 - ``eval``: run the scorer on prediction files.
@@ -110,6 +111,25 @@ import yaml
 from pydantic import Field, model_validator
 
 from pitchvlm import __version__, doctor, probes, radar, stopsignals
+from pitchvlm.camera import (
+    CAMERA_URL_VARIABLE,
+    OPEN_TIMEOUT_S,
+    READ_TIMEOUT_S,
+    READER_WAIT_S,
+    RECONNECTS,
+    CameraAddress,
+    CameraError,
+    CameraFolderSource,
+    CameraSettings,
+    CameraSource,
+    CaptureReport,
+    DeviceFactory,
+    RedactedOutput,
+    frame_file_name,
+    open_ffmpeg,
+    read_camera_record,
+    write_capture,
+)
 from pitchvlm.config import (
     DEFAULT_MODEL,
     EngineSettings,
@@ -371,6 +391,7 @@ KNOWN_ERRORS: tuple[type[Exception], ...] = (
     ParseError,
     OSError,
     LiveOutError,
+    CameraError,
 )
 
 
@@ -1213,8 +1234,14 @@ def disk_spelling(path: Path) -> Path:
     return spelled
 
 
-def open_clip(path: Path, *, fps: float | None, labels: GsrLabels | None) -> FrameSource:
-    """Open a clip: a folder of frame images or a video file.
+def open_clip(path: Path, *, fps: float | None, labels: GsrLabels | None, camera: bool = False) -> FrameSource:
+    """Open a clip: a folder of frame images or a video file, and with ``camera`` also a camera clip folder.
+
+    A camera clip folder (``camera.json``, written by ``capture``) is read while the capture
+    writes it (``camera.CameraFolderSource``); its record names the frame rate, so ``fps`` must
+    be None for it. A command that does not read a camera run (``camera`` false) refuses such
+    a folder: its frame images have gaps where frames were lost, so a plain folder of images
+    would give the frames other indices.
 
     A folder may be the frame folder itself, or a clip folder of the dataset that holds
     the frame folder ``img1``. The clip id is the name of the clip folder. The folder is
@@ -1227,6 +1254,15 @@ def open_clip(path: Path, *, fps: float | None, labels: GsrLabels | None) -> Fra
     the ending, as the disk spells it; a link keeps its own name.
     """
     if path.is_dir():
+        record = camera_record_of(path)
+        if record is not None:
+            if not camera:
+                raise CliError(
+                    f"{path} is the folder of a camera run (written by capture): only stream and clip-job read it"
+                )
+            if fps is not None:
+                raise CliError("--fps applies only to a folder of frame images: a camera run has its own frame rate")
+            return CameraFolderSource(path.resolve(), record)
         folder = frame_folder(path)
         return ImageFolderSource(folder, clip_id_of_folder(folder), folder_frame_rate(fps, labels))
     if path.is_file():
@@ -1234,6 +1270,21 @@ def open_clip(path: Path, *, fps: float | None, labels: GsrLabels | None) -> Fra
             raise CliError("--fps is for a folder of frame images; a video file has its own frame rate")
         return VideoFileSource(disk_spelling(path.absolute()))
     raise CliError(f"{path} is not a folder of frame images and not a video file")
+
+
+def camera_record_of(path: Path) -> Any:
+    """Return the record of a camera clip folder (``camera.json``), or None for any other folder.
+
+    A record that does not follow its format, or whose clip is not the name of the folder, raises ``CliError``.
+    """
+    folder = path.resolve()
+    try:
+        record = read_camera_record(folder)
+    except ValueError as error:
+        raise wrong_file("camera record", folder, error) from error
+    if record is not None and record.clip != folder.name:
+        raise CliError(f"the camera record in {folder} names the clip {record.clip}, not the name of its folder")
+    return record
 
 
 def frame_folder(path: Path) -> Path:
@@ -1989,6 +2040,19 @@ def print_frame_timing(report: Mapping[str, Mapping[str, float]], tools: Mapping
     print(f"  note: {STREAM_TIME_NOTE}")
 
 
+def print_camera_facts(facts: Mapping[str, Any]) -> None:
+    """Print what the capture of a camera run wrote at its end: the frames given and lost, and why."""
+    end = facts["end"]
+    if end is None:
+        print(f"camera run: the capture wrote no end line within {READER_WAIT_S:g} s after the last frame: its counts are not known")
+        return
+    lost = ", ".join(f"{count} {reason}" for reason, count in end["lost"].items() if count) or "none"
+    print(
+        f"camera run ({end['end']}): {end['given']} of {end['frames']} frames given, "
+        f"{sum(end['lost'].values())} lost ({lost}); a lost frame shows the frame given before it, without measurement"
+    )
+
+
 def check_stream_options(args: argparse.Namespace) -> None:
     """Refuse the options of ``stream`` that do not apply to its input, so that none is ignored without a word."""
     if args.synthetic:
@@ -2170,11 +2234,13 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
         if args.clip is None:
             raise CliError("stream needs --clip (with --detections and --calibration, or --lines), or --synthetic")
         labels = None if args.labels is None else read_labels(args.labels)
-        source = open_clip(args.clip, fps=args.fps, labels=labels)
+        source = open_clip(args.clip, fps=args.fps, labels=labels, camera=True)
         if labels is not None:
             check_labels_match(source, labels)
         video_sha256 = file_sha256(args.clip) if args.clip.is_file() else None
         inputs, facts, queued = stream_inputs(args, config, source.info, video_sha256)
+        if isinstance(source, CameraFolderSource):
+            print(f"camera run {source.record.clip}: the frames of the capture, from {source.record.camera}")
     info = source.info
     settings = stream_settings(args, config, info.fps)
     print(
@@ -2241,6 +2307,9 @@ def _stream_command(args: argparse.Namespace, stack: contextlib.ExitStack) -> in
                 latency.given(given.frame, wall=time.time(), mono=time.monotonic())
     if stream.n_frames != info.n_frames:
         raise CliError(f"the stream ended after {stream.n_frames} frames, the clip has {info.n_frames} frames")
+    if isinstance(source, CameraFolderSource):
+        facts["camera"] = source.facts()
+        print_camera_facts(facts["camera"])
     stream.finish()
     if numbers_closer is not None:
         last_lines = numbers_closer.finish()
@@ -3578,6 +3647,9 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
             f"{args.clip} is not a folder of frame images: a clip job names image files, so write the frames "
             "of a video as images below the data folder first, with the command video-frames"
         )
+    record = camera_record_of(args.clip)
+    if record is not None:
+        return write_camera_clip_job(args, settings, record)
     folder = frame_folder(args.clip)
     source = ImageFolderSource(folder, clip_id_of_folder(folder))
     video_sha256 = video_of_folder(folder, source.info)
@@ -3598,6 +3670,128 @@ def _cmd_clip_job(args: argparse.Namespace) -> int:
         print(f"the frames of the video with the SHA-256 {video_sha256}: run reads the clip run only with that video")
     print(f"job file: {args.out}")
     return EXIT_OK
+
+
+def write_camera_clip_job(args: argparse.Namespace, settings: ToolSettings, record: Any) -> int:
+    """Write the clip job of a camera run: frame ``i`` names the image that the capture writes for it.
+
+    The job can be written before the capture has given any frame: the record names the
+    number of frames, and the names of the images follow from the frame index
+    (``camera.frame_file_name``). A tool reads it with ``--camera``, which waits for each frame
+    in the ledger of the capture. A camera run has no video file, so the job names none.
+    """
+    folder = args.clip.resolve()
+    root = args.root.resolve()
+    try:
+        relative = (folder / FRAME_FOLDER).relative_to(root)
+    except ValueError as error:
+        raise CliError(
+            f"the camera folder {folder} does not lie below the data folder {root}: the job names each image by its "
+            "path below the data folder"
+        ) from error
+    images = tuple((relative / frame_file_name(frame)).as_posix() for frame in range(record.n_frames))
+    job = ClipJob(format=CLIP_JOB_FORMAT, clip=record.clip, tool=settings, images=images, video_sha256=None)
+    write_json(args.out, job.model_dump(mode="json"))
+    print(f"clip job of the tool {args.tool}: {len(images)} frames of the camera run {record.clip} (run the tool with --camera)")
+    print(f"job file: {args.out}")
+    return EXIT_OK
+
+
+# --- capture -------------------------------------------------------------------------
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    """Read the camera of ``PITCHVLM_CAMERA_URL`` once, and write its frames into a new camera clip folder.
+
+    The address is read from the variable and then removed from the environment of the
+    process, so that no later step and no child process sees it. Everything that the command
+    prints, OpenCV and FFmpeg included, goes through the redaction of the address
+    (``camera.RedactedOutput``).
+    """
+    address = CameraAddress.from_environment()
+    os.environ.pop(CAMERA_URL_VARIABLE, None)
+    return run_capture(args, address)
+
+
+def capture_settings(args: argparse.Namespace, now: float) -> CameraSettings:
+    """Return the settings of a capture from its options; a wrong value raises ``CliError``."""
+    if (args.frames is None) == (args.seconds is None):
+        raise CliError("capture needs the length of the run: give --frames N or --seconds S (one of them)")
+    n_frames = args.frames if args.frames is not None else round(args.seconds * args.fps)
+    if n_frames < 1:
+        raise CliError(f"--seconds {args.seconds:g} at {args.fps:g} frames per second is no frame")
+    if not math.isfinite(args.start_at):
+        raise CliError("--start-at must be a number of seconds since the epoch")
+    if args.start_at <= now:
+        raise CliError(
+            f"--start-at lies {now - args.start_at:.0f} s in the past: take a start ahead of every part of the run, "
+            'for example START=$(python3 -c "import time; print(int(time.time()) + 120)")'
+        )
+    width, height = args.size
+    try:
+        return CameraSettings(
+            n_frames=n_frames,
+            fps=args.fps,
+            width=width,
+            height=height,
+            start_at=args.start_at,
+            transport=args.transport,
+            open_timeout_s=args.open_timeout,
+            read_timeout_s=args.read_timeout,
+            reconnects=args.reconnects,
+        )
+    except ValueError as error:
+        raise CliError(str(error)) from error
+
+
+def run_capture(
+    args: argparse.Namespace,
+    address: CameraAddress,
+    *,
+    open_device: DeviceFactory = open_ffmpeg,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    free_bytes: Callable[[Path], int] | None = None,
+) -> int:
+    """Run ``capture`` with a given address; the tests and the bench give a stand-in camera and clock here.
+
+    Exit code 0 when every frame of the run was given, 1 when the run had its whole time but
+    frames were lost (a gap, an outage, a frame of another size, a camera that could not be
+    opened again), 2 when the camera never opened, was refused (size, frame rate, disk), the
+    disk became full or a stop signal came. The ledger has a line for every frame in each case.
+    """
+    settings = capture_settings(args, clock())
+    out = args.out
+    refuse_pixels_in_repository(out, "--out")
+    if out.exists():
+        raise CliError(f"--out {out} is already there: every camera run writes a new folder")
+    clip_id = out.resolve().name
+    if not clip_id:
+        raise CliError(f"--out {out} has no name: the name of the folder is the clip id of the camera run")
+    print(
+        f"capture {address.redacted} ({settings.transport}): {frames_text(settings.n_frames, settings.fps)} at "
+        f"{settings.fps:g} frames per second, {settings.width} x {settings.height} pixels, from "
+        f"{settings.start_at:.3f} (in {settings.start_at - clock():.0f} s); camera run {clip_id}"
+    )
+    report = CaptureReport(n_frames=settings.n_frames)
+    with RedactedOutput(address):
+        source = CameraSource(address, settings, open_device, clock=clock, sleep=sleep)
+        options: dict[str, Any] = {"report": report}
+        if free_bytes is not None:
+            options["free_bytes"] = free_bytes
+        try:
+            write_capture(source, out, clip_id, **options)
+        finally:
+            print(report.text())
+    print(f"camera run folder: {out}")
+    if report.end == "never opened":
+        raise CliError(
+            f"the camera never opened ({report.counts.failed_opens} tries): check the address in "
+            f"{CAMERA_URL_VARIABLE}, the network and the camera"
+        )
+    if report.end == "disk full":
+        raise CliError("the capture stopped: the free disk of the camera folder fell below 2 GB")
+    return EXIT_OK if report.lost_total == 0 else EXIT_FAILED
 
 
 def video_of_folder(folder: Path, info: ClipInfo) -> str | None:
@@ -5043,6 +5237,71 @@ def _add_clip_job(commands: Any) -> None:
     parser.set_defaults(handler=_cmd_clip_job)
 
 
+def _size(text: str) -> tuple[int, int]:
+    """Read an image size written as WIDTHxHEIGHT, for example 1920x1080."""
+    width, sep, height = text.lower().partition("x")
+    if not sep or not width.isdigit() or not height.isdigit() or int(width) < 1 or int(height) < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not a size: write it as WIDTHxHEIGHT, for example 1920x1080")
+    return int(width), int(height)
+
+
+def _seconds_above_zero(text: str) -> float:
+    """Read a number of seconds above zero."""
+    value = float(text)
+    if not 0.0 < value < math.inf:
+        raise argparse.ArgumentTypeError(f"{text} is not a number of seconds above zero")
+    return value
+
+
+def _count(text: str) -> int:
+    """Read a whole number of 0 or more."""
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text} is not a whole number of 0 or more")
+    return value
+
+
+def _add_capture(commands: Any) -> None:
+    """Add the command ``capture`` to the sub-parsers object of argparse."""
+    parser = commands.add_parser(
+        "capture",
+        help=f"read the camera of {CAMERA_URL_VARIABLE} (RTSP) once, and write its frames into a camera clip folder",
+    )
+    parser.add_argument(
+        "--out", type=_path, required=True, metavar="DIR",
+        help="the new camera clip folder, below the data folder; its name is the clip id",
+    )
+    parser.add_argument(
+        "--start-at", type=float, required=True, metavar="SECONDS",
+        help="seconds since the epoch: frame 0 is due then (ahead of every part of the run)",
+    )
+    parser.add_argument("--frames", type=_positive_int, metavar="N", help="the length of the run in frames")
+    parser.add_argument("--seconds", type=_seconds_above_zero, metavar="S", help="the length of the run in seconds")
+    parser.add_argument(
+        "--fps", type=_frame_rate, default=25.0, metavar="FPS", help="frames per second of the run (default: 25)"
+    )
+    parser.add_argument(
+        "--size", type=_size, default=(1920, 1080), metavar="WxH",
+        help="the size of the frames of the camera (default: 1920x1080)",
+    )
+    parser.add_argument(
+        "--transport", choices=("tcp", "udp"), default="tcp", help="the transport of RTSP (default: tcp)"
+    )
+    parser.add_argument(
+        "--open-timeout", type=_seconds_above_zero, default=OPEN_TIMEOUT_S, metavar="S",
+        help=f"seconds that one try to open the camera may take (default: {OPEN_TIMEOUT_S:g})",
+    )
+    parser.add_argument(
+        "--read-timeout", type=_seconds_above_zero, default=READ_TIMEOUT_S, metavar="S",
+        help=f"seconds without a frame that end a connection (default: {READ_TIMEOUT_S:g})",
+    )
+    parser.add_argument(
+        "--reconnects", type=_count, default=RECONNECTS, metavar="N",
+        help=f"tries to open the camera again after a lost connection (default: {RECONNECTS})",
+    )
+    parser.set_defaults(handler=_cmd_capture)
+
+
 def _add_video_frames(commands: Any) -> None:
     """Add the command ``video-frames`` to the sub-parsers object of argparse."""
     parser = commands.add_parser(
@@ -5183,6 +5442,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_tool_job,
         _add_tool_score,
         _add_clip_job,
+        _add_capture,
         _add_video_frames,
         _add_overlay,
         _add_eval,

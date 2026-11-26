@@ -113,6 +113,14 @@ CLIP_JOB_FORMAT = "pitchvlm-clip-job-1"
 CLIP_RUN_FORMAT = "pitchvlm-clip-run-1"
 #: Format name of the feed of a live run (``--feed``): that of ``pitchvlm.feed``.
 TOOL_FEED_FORMAT = "pitchvlm-tool-feed-1"
+#: The camera clip folder of a capture (``pitchvlm.camera``): its record, its ledger, its warm-up image, and how long
+#: a reader waits for the line of a frame after its time, seconds; how often it looks, seconds.
+CAMERA_FORMAT = "pitchvlm-camera-1"
+CAMERA_RECORD_NAME = "camera.json"
+CAMERA_LEDGER_NAME = "frames.jsonl"
+CAMERA_WARMUP_NAME = "warmup.jpg"
+CAMERA_WAIT_S = 15.0
+CAMERA_POLL_S = 0.005
 #: Largest size of one part of a clip run, bytes: that of ``pitchvlm.fallbacks.runs``.
 CLIP_RUN_PART_MAX_BYTES = 1_000_000
 #: Digits of the SHA-256 of a video in a clip job.
@@ -334,7 +342,13 @@ def answer_frames(
 
     frames = job["frames"]
     batches = [frames[start : start + batch] for start in range(0, len(frames), batch)]
-    ask(batches[0], [read(entry) for entry in batches[0]])
+    if live is not None and live.camera is not None:
+        # A camera run warms up on the first frame that the camera sent; a camera that sent none needs no warm-up.
+        warmup = live.camera.warmup_image()
+        if warmup is not None:
+            ask(batches[0], [read_rgb(warmup)] * len(batches[0]))
+    else:
+        ask(batches[0], [read(entry) for entry in batches[0]])
     if live is not None:
         live.start()
     entries = []
@@ -569,6 +583,112 @@ class NamedPipeFeed:
             return
 
 
+class CameraFrames:
+    """The frames of a capture that may still be running (``--camera``): the ledger of ``pitchvlm.camera``, read as it grows.
+
+    The rule is that of ``pitchvlm.camera.CameraLedger``: the ledger has one line per frame in
+    frame order, ``{"frame", "arrived_at"}`` for a frame that the camera gave and ``{"lost": [a, b],
+    "reason"}`` for the frames ``a`` to ``b - 1`` that it did not give, then an end line.
+    ``status`` waits for the line of a frame and raises ``RunnerError`` when it has not come
+    ``CAMERA_WAIT_S`` seconds after the time of the frame (the capture stopped or never ran).
+    """
+
+    def __init__(
+        self,
+        folder: Path,
+        *,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.folder = folder
+        path = folder / CAMERA_RECORD_NAME
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise RunnerError(f"the camera record {path} cannot be read: {error}") from error
+        if not isinstance(record, dict) or record.get("format") != CAMERA_FORMAT:
+            raise RunnerError(f"{path} is not a camera record of the format {CAMERA_FORMAT}")
+        self.clip = str(record["clip"])
+        self.n_frames = int(record["n_frames"])
+        self._fps = float(record["fps"])
+        self._start = float(record["start_at"])
+        self._clock = clock
+        self._sleep = sleep
+        self._handle: Any = None
+        self._partial = ""
+        #: By frame: (True, arrival time) or (False, the reason of the loss).
+        self._status: dict[int, tuple[bool, Any]] = {}
+        self.known = 0
+        self._newest: int | None = None
+        self.ended = False
+        self.lost = 0
+
+    def due(self, frame: int) -> float:
+        """Return the time at which a frame is due, seconds since the epoch."""
+        return self._start + frame / self._fps
+
+    def _read_new(self) -> None:
+        if self._handle is None:
+            path = self.folder / CAMERA_LEDGER_NAME
+            if not path.exists():
+                return
+            self._handle = path.open(encoding="utf-8")
+        lines = (self._partial + self._handle.read()).split("\n")
+        self._partial = lines.pop()
+        for text in lines:
+            if not text.strip():
+                continue
+            line = json.loads(text)
+            if "end" in line:
+                self.ended = True
+            elif "frame" in line:
+                self._take(int(line["frame"]), int(line["frame"]) + 1, (True, float(line["arrived_at"])))
+            else:
+                start, stop = (int(value) for value in line["lost"])
+                self._take(start, stop, (False, str(line["reason"])))
+
+    def _take(self, start: int, stop: int, status: tuple[bool, Any]) -> None:
+        if start != self.known or not start < stop <= self.n_frames:
+            raise RunnerError(f"the ledger of the camera run {self.clip}: frames {start} to {stop - 1} after frame {self.known - 1}")
+        for frame in range(start, stop):
+            self._status[frame] = status
+        if status[0]:
+            self._newest = start
+        self.known = stop
+
+    def status(self, frame: int) -> tuple[bool, Any]:
+        """Wait for the line of a frame; return (True, its arrival time) or (False, the reason of its loss)."""
+        deadline = self.due(frame) + CAMERA_WAIT_S
+        while True:
+            if frame >= self.known:
+                self._read_new()
+            if frame < self.known:
+                return self._status[frame]
+            if self._clock() > deadline:
+                raise RunnerError(
+                    f"the capture wrote nothing for frame {frame} of the camera run {self.clip} for {CAMERA_WAIT_S:g} s "
+                    "after its time: it stopped, or it is not running"
+                )
+            self._sleep(CAMERA_POLL_S)
+
+    def newest_given(self) -> int | None:
+        """Return the newest frame that the camera gave so far, without waiting; None before the first one."""
+        self._read_new()
+        return self._newest
+
+    def warmup_image(self) -> Path | None:
+        """Wait for the warm-up image of the capture (its first frame); None when the camera never gave one."""
+        path = self.folder / CAMERA_WARMUP_NAME
+        deadline = self.due(0) + CAMERA_WAIT_S
+        while not path.exists():
+            self._read_new()
+            if self.ended or self.known > 0 or self._clock() > deadline:
+                # The capture writes the warm-up image before any line of a frame.
+                return path if path.exists() else None
+            self._sleep(CAMERA_POLL_S)
+        return path
+
+
 class LiveFeed:
     """The feed of a live run (``--feed``): a header line, then one line per frame as soon as it is answered.
 
@@ -583,6 +703,11 @@ class LiveFeed:
     epoch, so that two tools share one clock) or the time of ``start``. ``skip_behind`` (with a
     pace and batches of one frame) takes the newest frame that has come and skips the frames
     before it that the tool did not reach. Without a pace, a frame comes when the tool reads it.
+
+    ``camera`` (``--camera``) takes the frames of a capture instead of a pace: frame ``i`` comes
+    when the capture wrote it, and its arrival is the time at which the camera gave it. A frame
+    that the camera did not give goes out as a skipped line at its due time (``lost`` counts
+    them). ``skip_behind`` then takes the newest frame that the camera gave.
     """
 
     def __init__(
@@ -593,13 +718,17 @@ class LiveFeed:
         pace: float | None = None,
         start_at: float | None = None,
         skip_behind: bool = False,
+        camera: CameraFrames | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if pace is not None and not 0.0 < pace < float("inf"):
             raise RunnerError(f"--pace must be a number of frames per second above 0, got {pace}")
-        if (start_at is not None or skip_behind) and pace is None:
+        if camera is not None and (pace is not None or start_at is not None):
+            raise RunnerError("--camera takes no --pace and no --start-at: the frames come when the capture writes them")
+        if (start_at is not None or skip_behind) and pace is None and camera is None:
             raise RunnerError("--start-at and --skip-behind need --pace")
+        self.camera = camera
         self._outputs = list(outputs)
         self._head = dict(head)
         self._detector = head["tool"]["name"] in DETECTOR_TOOLS
@@ -618,13 +747,21 @@ class LiveFeed:
 
     def due(self, frame: int) -> float | None:
         """Return the time at which a frame comes, with a pace; else None."""
+        if self.camera is not None:
+            return self.camera.due(frame)
         if self._pace is None:
             return None
         assert self._start is not None
         return self._start + frame / self._pace
 
     def arrived_at(self, frame: int) -> float:
-        """Return the time at which a frame came: its due time with a pace, else now (it comes when it is read)."""
+        """Return the time at which a frame came: its due time with a pace, else now (it comes when it is read).
+
+        With a camera it is the time at which the camera gave the frame, or its due time for a lost frame.
+        """
+        if self.camera is not None:
+            given, value = self.camera.status(frame)
+            return float(value) if given else self.camera.due(frame)
         due = self.due(frame)
         return self._clock() if due is None else due
 
@@ -632,6 +769,9 @@ class LiveFeed:
         """Yield the groups of frames to answer, in order, waiting for the last frame of each group to come."""
         if self._skip_behind and batch != 1:
             raise RunnerError(f"--skip-behind needs batches of one frame, and the job has batches of {batch}")
+        if self.camera is not None:
+            yield from self._camera_groups(frames, batch, self.camera)
+            return
         index = 0
         while index < len(frames):
             if self._skip_behind:
@@ -648,6 +788,36 @@ class LiveFeed:
                     self._sleep(wait)
             yield group
             index += len(group)
+
+    def _camera_groups(
+        self, frames: Sequence[Mapping[str, Any]], batch: int, camera: CameraFrames
+    ) -> Iterator[list[Mapping[str, Any]]]:
+        """Yield groups of up to ``batch`` frames that the camera gave, in order; write each lost frame as skipped."""
+        group: list[Mapping[str, Any]] = []
+        index = 0
+        while index < len(frames):
+            if self._skip_behind:
+                newest = camera.newest_given()
+                for skipped in range(index, newest if newest is not None and newest > index else index):
+                    self._skip(frames[skipped]["frame"])
+                index = max(index, newest if newest is not None else index)
+            frame = frames[index]["frame"]
+            given, _ = camera.status(frame)
+            index += 1
+            if not given:
+                self._skip(frame)
+                camera.lost += 1
+                continue
+            group.append(frames[index - 1])
+            if len(group) == batch:
+                yield group
+                group = []
+        if group:
+            yield group
+
+    def _skip(self, frame: int) -> None:
+        self._line({"frame": frame, "arrived_at": self.arrived_at(frame), "skipped": True})
+        self.skipped += 1
 
     def _newest_come(self, n_frames: int) -> int:
         """Return the newest frame that has come by now (with a pace), at most the last frame."""
@@ -1329,7 +1499,13 @@ def build_parser() -> argparse.ArgumentParser:
         tool.add_argument(
             "--skip-behind",
             action="store_true",
-            help="with --pace: take the newest frame that has come, and skip the frames that the tool did not reach",
+            help="with --pace or --camera: take the newest frame that has come, and skip the frames that the tool did "
+            "not reach",
+        )
+        tool.add_argument(
+            "--camera",
+            action="store_true",
+            help="with --feed: the clip job is a camera run; each frame comes when the capture wrote it (no --pace)",
         )
         if name == "pnlcalib":
             tool.add_argument(
@@ -1366,8 +1542,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         live = args.feed is not None
         if live and not clip_job:
             raise RunnerError("--feed needs a clip job: a live run is a run of one clip")
-        if not live and (args.pace is not None or args.start_at is not None or args.skip_behind):
-            raise RunnerError("--pace, --start-at and --skip-behind need --feed")
+        if not live and (args.pace is not None or args.start_at is not None or args.skip_behind or args.camera):
+            raise RunnerError("--pace, --start-at, --skip-behind and --camera need --feed")
+        if args.camera and (args.pace is not None or args.start_at is not None):
+            raise RunnerError("--camera takes no --pace and no --start-at: the frames come when the capture writes them")
+        camera = camera_frames(job, args.root) if args.camera else None
         if args.skip_behind and int(job["tool"].get("batch", 1)) != 1:
             raise RunnerError(
                 f"--skip-behind needs batches of one frame, and the job has batches of {job['tool']['batch']}"
@@ -1389,14 +1568,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             answer = one_at_a_time(single)
         skipped = 0
         if live:
-            frames, skipped = run_live(args, job, job_sha256, answer, batch, feed)
+            frames, skipped = run_live(args, job, job_sha256, answer, batch, feed, camera)
         else:
             frames = answer_frames(job, args.root, answer, batch)
         runner = {**machine, **facts, **run_facts()}
         written = [args.out]
         if live:
             reopened = feed.reopened if isinstance(feed, NamedPipeFeed) else 0
-            written.append(write_live_facts(args.out, job, job_sha256, runner, len(frames), skipped, reopened))
+            written.append(
+                write_live_facts(args.out, job, job_sha256, runner, len(frames), skipped, reopened, camera)
+            )
         if clip_job and not live:
             written = write_clip_run(args.out, job, job_sha256, runner, frames)
         elif not live:
@@ -1429,6 +1610,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     return EXIT_OK
 
 
+def camera_frames(job: Mapping[str, Any], root: Path) -> CameraFrames:
+    """Return the frames of the capture of a camera run whose clip job ``job`` is (``--camera``).
+
+    The camera clip folder is the folder above the folder of the images of the job; its record
+    must name the clip and the number of frames of the job.
+    """
+    folder = root / PurePosixPath(job["frames"][0]["image"]).parent.parent
+    if not (folder / CAMERA_RECORD_NAME).is_file():
+        raise RunnerError(
+            f"--camera: the images of the job lie in no camera run (no {CAMERA_RECORD_NAME} in {folder}): write the job "
+            "with clip-job on the folder of the capture"
+        )
+    camera = CameraFrames(folder)
+    if (camera.clip, camera.n_frames) != (job["clip"], len(job["frames"])):
+        raise RunnerError(
+            f"--camera: the job is a job of the clip {job['clip']} with {len(job['frames'])} frames, and the camera run "
+            f"is {camera.clip} with {camera.n_frames} frames"
+        )
+    return camera
+
+
 def live_facts_path(out: Path) -> Path:
     """Return the file of the facts of a live run: ``<stem>-runner.json`` next to the copy of the feed."""
     return out.with_name(f"{out.stem}-runner.json")
@@ -1442,12 +1644,14 @@ def write_live_facts(
     answered: int,
     skipped: int,
     reopened: int = 0,
+    camera: CameraFrames | None = None,
 ) -> Path:
     """Write the facts of a live run, which its feed has no place for, and return the file.
 
     They are those of a clip run (the device, the versions, the script, the self-check of a
     detector of transformers, ...), with the numbers of answered and skipped frames, and of the
-    readers of a named pipe that went away and were waited for again (``NamedPipeFeed``).
+    readers of a named pipe that went away and were waited for again (``NamedPipeFeed``), and in a
+    camera run the frames that the camera did not give (they are among the skipped frames).
     """
     path = live_facts_path(out)
     document = {
@@ -1460,6 +1664,8 @@ def write_live_facts(
         "skipped_frames": skipped,
         "feed_reopened": reopened,
     }
+    if camera is not None:
+        document["camera_lost_frames"] = camera.lost
     path.write_text(json.dumps(document, allow_nan=False) + "\n", encoding="utf-8")
     return path
 
@@ -1528,6 +1734,7 @@ def run_live(
     answer: BatchAnswer,
     batch: int,
     feed: Any,
+    camera: CameraFrames | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Answer the frames of a clip job as a live run: write the feed and its copy at ``--out`` as frames are answered.
 
@@ -1544,10 +1751,15 @@ def run_live(
     with args.out.open("w", encoding="utf-8") as copy:
         if feed is None:  # a plain file
             with open(args.feed, "w", encoding="utf-8") as target:
-                live = LiveFeed([copy, target], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
+                live = LiveFeed(
+                    [copy, target], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind,
+                    camera=camera,
+                )
                 frames = answer_frames(job, args.root, answer, batch, live=live)
         else:
-            live = LiveFeed([copy, feed], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind)
+            live = LiveFeed(
+                [copy, feed], head, pace=args.pace, start_at=args.start_at, skip_behind=args.skip_behind, camera=camera
+            )
             frames = answer_frames(job, args.root, answer, batch, live=live)
     return frames, live.skipped
 
