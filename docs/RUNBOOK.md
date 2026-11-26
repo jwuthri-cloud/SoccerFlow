@@ -2272,6 +2272,10 @@ python -m pitchvlm.cli merge-feeds --detector $RUN/detector-feed.jsonl --calibra
   frames have more detail, so expect more (an estimate, not measured: 0.4 to 0.8 MB, 27 to 54 GB per
   half). The camera folder holds pixels of real people: it stays below `~/pitchvlm-data` and never
   goes to the results branch. Remove it when the runs of the match are done.
+- Memory: the capture holds one frame (175 MB resident, flat over 45,000 frames of a stand-in
+  camera). `stream` keeps every state for `result.json` and the video: it grew by 34 MB per 1,000
+  frames on the build machine, 3.6 GB at the end of 45,000 frames; a half needs about 5.4 GB
+  (extrapolated, not measured). Run one `stream` per half, not per match.
 - `result.json` of `stream` names the camera run in `provenance.inputs.camera`: the redacted form
   (`rtsp://<hidden>`), the end line of the ledger and the lost spans. No part of the address is in
   any file of the run. The result files of a camera run follow rule 2 of `CLAUDE.md` as those of

@@ -5484,6 +5484,120 @@ real model, a real clip or a real cost.
     requests per clip median 38 (21 to 40); no image dropped; no failure. N3 of that run: median
     6.21 s, 95th percentile 9.92 s (1,517 lines), as before.
 
+## 2026-11-26 — A camera as the clip of a live run (session "camera input")
+
+Context: the owner asked for "direct camera input (rtsp)". The input of the live path was a video
+file or a folder of images (`frames.py`), which each tool and `stream` read for themselves. This
+entry adds one capture step that reads an RTSP camera once and gives the same numbered frames to
+the two tools and to `stream` (`src/pitchvlm/camera.py`, `cli capture`, `tools/run_tool.py
+--camera`). Build machine only: every run used a stand-in camera (`evalx/standin_camera.py`, a
+scripted `cv2.VideoCapture` on a simulated clock), the stand-in tools and no network address.
+Nothing here is a measurement of a real camera, a real RTSP server, the real FFmpeg or the run
+machine. Baseline: `main` at `9f1dbe2`.
+
+1. **What is built.** `capture --out DIR --start-at START (--frames N | --seconds S)` reads the
+   camera of `PITCHVLM_CAMERA_URL` and writes a camera clip folder; `clip-job --clip DIR` writes
+   the jobs of the tools from its record; `run_tool.py ... --feed PIPE --camera` takes each frame
+   when the capture has written it; `stream --clip DIR --lines -` reads the same frames. The rest
+   of the live chain (`merge-feeds`, `--max-behind`, `--live-out`, `radar`) is unchanged. Section
+   17 of `docs/RUNBOOK.md` has the commands, `docs/ARCHITECTURE.md` (`camera.py`) the contract.
+2. **One clock and the same frames: a growing folder with a ledger.** The capture writes
+   `camera.json` first (before the camera is opened, so the jobs can be written at once), each
+   frame as `img1/<i+1>.jpg` (written under a hidden name and renamed: a reader never sees a part
+   of a file), and `frames.jsonl`, one flushed line per frame in frame order (given with its
+   arrival time, or lost with a reason), then an end line. Readers wait on the ledger, not on the
+   files. Why this and not shared memory or a growing video file: (a) the tool script runs in the
+   environments of the tools and imports no package, and a folder and a JSON ledger need about 100
+   lines of standard library there (`CameraFrames`), where shared memory would need a ring
+   protocol in two code bases; (b) the frames stay for the end video of `stream` (`render_clip`
+   reads every frame at the end) and for the control run on the copies of the feeds, which a ring
+   of the last frames would lose; (c) a reader that stops or starts late loses nothing; (d) a
+   growing MP4 cannot be read before its index is written, and its decoder drops or repeats
+   frames without an error (`VideoFileSource` refuses such files for that reason). The frame index
+   is the only key: the record names the clip, the frame count and the start, and a tool and
+   `stream` refuse a job or lines of another clip or count, as before.
+3. **Storage and its bound.** JPEG of quality 95: on the build machine 2.7 ms to encode and 2.7 ms
+   to decode a synthetic 1080p frame of about 0.3 MB; PNG at compression 1 took 24.4 ms to encode
+   (9.6 ms to decode, 0.36 MB) and 106 ms on a frame of noise (6.2 MB, JPEG 7.6 ms and 2.4 MB):
+   near or above the 40 ms of a frame at 25 fps on the one thread of the capture (10 synthetic
+   frames, 1 frame of noise; measured with `cv2.imencode`). The whole run stays on the disk: a run
+   of known length has a bound, `n_frames` times the frame size. The capture refuses to start when
+   the free disk is below 1.5 times the run at the size of the first frame plus 2 GB, and stops
+   (`disk full`, the rest lost as `disk`) when it falls below 2 GB (read every 250 frames). A 45
+   minute half is 67,500 frames: about 20 GB at the synthetic size, 27 to 54 GB at 0.4 to 0.8 MB
+   per real frame (an estimate: no real frame was measured). The capture holds one frame in
+   memory; each reader holds two arrays of the frame count (0.6 MB for a half). C4 below measures
+   the long run. The real tools read JPEG with Pillow and `stream` with OpenCV: their decoders can
+   differ by one level in a pixel (not measured here; the stand-ins read with OpenCV).
+4. **Run length known at the start.** `--frames` or `--seconds` is required, so no format changes:
+   the record, the job, the tool feeds and the stream lines all name the count. A camera that ends
+   early ends the run as a tool that dies does, with what was given: its rest is lost (`ended`),
+   the tools write those frames as skipped, `merge-feeds` exits 1, `stream` decides every frame
+   and ends. An open-ended run would change `pitchvlm-stream-2`, `pitchvlm-live-1/-2`,
+   `result.json` and about 20 modules that use `n_frames`: not built, owner decision 57.
+5. **The slot rule, stalls and reconnects.** Slot `i` is due at `START + i / fps`. The first frame
+   of a connection takes the slot of its arrival on the clock, later frames the slot of their time
+   stamp (`CAP_PROP_POS_MSEC`) from the first one; a frame whose slot is taken is `extra` (not
+   used), an empty slot is lost (`gap`). Within the read timeout (2 s) a frame that comes late is
+   given late (its arrival time goes into the feeds, so the latency of `stream` counts it). No frame
+   for 2 s ends the connection: wait 1 s, open again (each try at most 5 s), up to 5 tries, and
+   meanwhile write the slots whose time has passed as lost (`outage`), so the tools, the merger
+   and the radar go on; after the last try the rest is `ended`. The longest time without a ledger
+   line of a working capture is about 8 s, so a reader waits 15 s after the due time of a frame
+   before it stops with an error. A first frame of another size stops the capture (`refused`); a
+   later one is lost (`size`). A camera that names a rate more than 1% below the run is refused;
+   a faster one is taken at the rate of the run (30 fps: 10 extra in 2 s; 50 fps: every second
+   frame). Counted at the end: frames before the start, extra frames, lost connections, failed
+   opens, the rate and size of the camera. FFmpeg gets TCP transport by default and a protocol
+   whitelist (`rtsp,rtp,tcp`, plus `rtsps,tls` or `udp`).
+6. **A lost frame in `stream`.** The tools send no answer for it (a skipped line at its due time),
+   so `stream` gets missing parts of both tools, as for a skipped frame; its picture is the frame
+   given before it (black before the first one), so the camera motion of the gap is zero and the
+   video shows a still picture. `result.json` names the camera run in `provenance.inputs.camera`:
+   the redacted form, the end line of the ledger and the lost spans.
+7. **The address is a secret.** It comes only from `PITCHVLM_CAMERA_URL` (never an option, never a
+   file); `capture` reads it once and removes it from the environment of its process. One
+   redacted form, `rtsp://<hidden>`, is all that is printed or written (the record, the report,
+   `result.json`). `CameraAddress.redact` replaces every part of 4 characters or more (the whole
+   address, the user information, user and password also percent-decoded, host, port, path,
+   query; letter case ignored) and hides a whole text that still holds a shorter part. Native
+   messages of OpenCV and FFmpeg go through it: the capture points the descriptors 1 and 2 at
+   pipes read by redacting threads (`RedactedOutput`). Every error of OpenCV is caught and
+   replaced by a message that names no part. Only `rtsp://` and `rtsps://` with a host are taken;
+   the error for another text does not repeat the scheme (`user:pass@host` puts the user name
+   where a scheme stands). The guard of the repository already refuses an address with a password
+   and a host that is not allowed, so the tests build their addresses from parts.
+8. **Measurements** (hypotheses named before each run; the stand-in camera; `evalx/camerabench.py`
+   from a detached work tree of the named commit, so that a commit cannot change files under a
+   running bench).
+
+   | | Hypothesis | n | Result | Verdict |
+   |---|---|---|---|---|
+   | C0 | `demo`, `demo --engine detector`, `stream --synthetic --frames 250 --seed 3002` byte-equal to `9f1dbe2`; the tests pass | 3 commands, 6 files | prediction files and videos equal (SHA-256 `bb50efd4...`, `66bc5760...`, `1f97af18...`, `12645a77...`, `46a5a7e7...`, `56530b7a...`), the section `result` of the stream equal (at `2647886`); tests at `aa20564`: default run 3,687 passed in 14 processes, full run 3,700 passed in 14 processes, full run 3,700 passed and 1 skipped in one process (367 s) | pass |
+   | C1 | a camera on time without loss gives the predictions, the video and the `result` of the recorded clip of the same frames (a folder of the same JPEG files through the same stand-in tools), byte for byte | 20 seeds (3000 to 3019), 250 frames | 20 of 20 equal in all three; every exit code 0 | pass |
+   | C1' | ... and of `stream --synthetic` of the same seed (the task as given) | 20 seeds | 0 of 20 equal; the recorded clip itself is not equal to `stream --synthetic` on any seed (also at `9f1dbe2`: the stand-in tools give boxes with score 0.9 through the compact payload, the synthetic stream takes the fake answers directly) | not comparable: a difference of the baseline, not of the camera |
+   | C2 | under a fixed fault schedule per seed (a stall of 0.2 to 1.5 s, a stall of 2.5 to 4 s that ends the connection, an outage of 1 to 4 s, an early end at 60 to 65% of the run, 5 late frames, 4 frames never sent, 1 frame of another size), the capture as a process at the same time as the tools, named pipes: every process ends by itself with the documented exit code, and given + lost = frames everywhere | 20 seeds (3100 to 3119), 500 frames | 20 of 20: capture 1, both tools 0, `merge-feeds` 1, `stream` 0; ledger, both tools (answered, skipped, lost) and `stream` (500 frames; its camera facts equal the ledger) account for every frame; wall time 9.3 to 10.7 s (median 10.4); given 96 to 166 (median 155); lost per run: gap 1 to 72, outage 204 to 347, size 0 to 1, ended 28 to 166; every run ended `camera ended` | pass |
+   | C3 | with a planted address of unique words (user, password, host, a port of 5 digits, path), each count is 0 in everything printed or written (capture output, camera folder; with the chain: tool outputs, feeds, runner files, merged lines, stream output, `result.json`, prediction file, live output) | 7 paths: success (chain), never opens, wrong scheme, no scheme, lost connection (chain), wrong size, stop signal; 100 frames | 0 of every part on every path; exit codes 0, 2, 2, 2, 1, 2, 2. As plain substrings the five digits of the port were found 6 times (success) and once (lost connection), every time inside the decimals of a coordinate (a box of the stand-in answers at x = 317.47913..., a pitch position of -10.918647913...) in files of processes that never see the address; the bench counts the port as a whole number since `7d1781b` | pass (the first count, as a substring, failed for the reason above) |
+   | C4 | 45,000 frames (30 min at 25 fps) of a 1920 x 1080 stand-in camera through the capture and the live chain (named pipes, `--live-out` to a file) stay bounded: the memory of each process and the disk named at the start, the middle and the end, with the growth per 1,000 frames | 1 run, seed 7, at `7d1781b`, 156 samples 10 s apart; the capture ran faster than a camera (simulated clock: 45,000 frames in 417 s) | all 45,000 given, every exit code 0, `stream` decided 45,000 frames. **Capture**, resident memory 175, 171, 177 MB at 59, 22,731 and 44,733 frames (+0.19 MB per 1,000 frames, n = 41 samples); disk of the camera folder 0.02, 6.76, 13.31 GB, 13.38 GB at the end (+297 MB per 1,000 frames: 0.30 MB per synthetic frame). **`stream`**, resident memory 303 MB at 527 decided frames, 1,100 MB at 23,848, 3,573 MB at the end of the decisions (its largest), 3,165 MB while it wrote the video; +34 MB per 1,000 decided frames over frames 1,145 to 44,794 (n = 71 samples, least squares); output folder 3.59 GB (the video and `result.json`). Wall time 42 min: 10.5 min to prepare the answers of the stand-in tools, then the capture 7 min, the decisions 13 min (beside the capture), the video about 13 min | **capture: pass** (flat memory; disk linear by design, within the bound of item 3). **`stream`: not bounded, as measured**: its memory grows with every frame, because it keeps every state for `result.json` and the end video (code of `9f1dbe2`, not of the camera: the readers of the camera hold 0.6 MB). A half of 67,500 frames: about 20 GB of synthetic frames on the disk and about 5.4 GB of memory for `stream` at its end (both extrapolated linearly from this run, not measured); a match of 90 min twice that |
+
+9. **What never ran:** a real camera, a real RTSP server, the real messages of FFmpeg and OpenCV,
+   the real time stamps of a camera, the real tools on camera frames, the size of real frames on
+   the disk. The rows of `docs/RUNBOOK.md` section 8 say how to check each one on the run machine.
+   The options of OpenCV (`CAP_PROP_OPEN_TIMEOUT_MSEC`, `CAP_PROP_READ_TIMEOUT_MSEC` with
+   `CAP_FFMPEG`) were checked on a local video file only.
+10. **Owner decisions** 54 to 61 (`docs/HANDOVER.md`, 11.1): the mechanism, the frame format, the
+    whole run on the disk, the known length, the stall rule, a slower camera, what a lost frame
+    shows, and where the address lives.
+11. **Seen and not changed (out of scope).** (a) The stand-in tools of the live benches do not give
+    the result of `stream --synthetic` (C1'), so `stream --synthetic` is no reference for the line
+    path. (b) The git hooks stash the files that are not staged while they run, so a bench that
+    starts processes from the work tree during a commit can import the files of the commit before:
+    run long benches from a separate work tree. (c) The memory of `stream` grows by about 34 MB per 1,000
+    frames (C4), so a whole match in one stream (135,000 frames) would need about 11 GB by
+    extrapolation: a stream that drops the states it has written (with a result file in parts) is a
+    change of `stream` and `result.json`, for the owner after the first match (owner decision 57
+    is the place: an open-ended run needs it too).
+
 ## Open questions (to settle with measurements)
 
 - Does the streaming path keep up with 25 fps on the run machine with the tools on the same
