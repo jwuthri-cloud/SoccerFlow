@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -476,10 +477,22 @@ def loss(seeds: Sequence[int], n_frames: int, work: Path, *, live: bool) -> list
 
 
 def count_parts(texts: Mapping[str, str]) -> dict[str, int]:
-    """Count each planted part of the address in every text, letter case ignored."""
-    return {
-        name: sum(text.lower().count(part.lower()) for text in texts.values()) for name, part in PLANTED_PARTS.items()
-    }
+    """Count each planted part of the address in every text, letter case ignored.
+
+    The port is counted as a whole number (no digit and no decimal point next to it): as a plain
+    substring its five digits also turn up inside the decimals of a coordinate, for example in
+    a box at x = 317.47913 of the answers of the stand-in tools, which never see the address.
+    ``raw_counts`` gives the plain substring counts of every part.
+    """
+    counts = {name: sum(text.lower().count(part.lower()) for text in texts.values()) for name, part in PLANTED_PARTS.items()}
+    port = re.compile(r"(?<![\d.])" + re.escape(PLANTED_PARTS["port"]) + r"(?![\d])")
+    counts["port"] = sum(len(port.findall(text)) for text in texts.values())
+    return counts
+
+
+def raw_counts(texts: Mapping[str, str]) -> dict[str, int]:
+    """Count each planted part as a plain substring in every text, letter case ignored."""
+    return {name: sum(text.lower().count(part.lower()) for text in texts.values()) for name, part in PLANTED_PARTS.items()}
 
 
 def files_text(folder: Path) -> dict[str, str]:
@@ -522,7 +535,7 @@ def leak_case(work: Path, name: str, spec: Spec, *, address: str = PLANTED_ADDRE
         codes.update(run.codes)
         texts.update({f"{key} output": value for key, value in run.outputs.items()})
     texts.update(files_text(base))
-    row = {"case": name, "codes": codes, "counts": count_parts(texts), "texts": len(texts)}
+    row = {"case": name, "codes": codes, "counts": count_parts(texts), "raw_counts": raw_counts(texts), "texts": len(texts)}
     print(json.dumps(row), flush=True)
     shutil.rmtree(base)
     return row

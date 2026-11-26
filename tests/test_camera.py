@@ -554,3 +554,9 @@ def test_no_part_of_the_address_is_printed_or_written(tmp_path: Path) -> None:
         "stop-signal": 2}
     for row in rows:
         assert row["counts"] == dict.fromkeys(camerabench.PLANTED_PARTS, 0), row
+
+
+def test_the_port_is_counted_as_a_number_and_not_inside_the_decimals_of_a_coordinate() -> None:
+    port = camerabench.PLANTED_PARTS["port"]
+    texts = {"a": f"x 317.{port}75 y -10.9186{port}89", "b": f"port {port}, again:{port}/"}
+    assert camerabench.count_parts(texts)["port"] == 2 and camerabench.raw_counts(texts)["port"] == 4
